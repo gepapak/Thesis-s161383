@@ -1,0 +1,13 @@
+{"time":"2025-05-29T13:47:15.1955199+02:00","level":"INFO","msg":"main: starting server","port-filename":"C:\\Users\\gepap\\AppData\\Local\\Temp\\tmpedou5pn4\\port-17852.txt","pid":17852,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false}
+{"time":"2025-05-29T13:47:15.2008125+02:00","level":"INFO","msg":"Will exit if parent process dies.","ppid":17852}
+{"time":"2025-05-29T13:47:15.2008125+02:00","level":"INFO","msg":"server is running","addr":{"IP":"127.0.0.1","Port":52100,"Zone":""}}
+{"time":"2025-05-29T13:47:15.3700067+02:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:15.9594883+02:00","level":"INFO","msg":"handleInformInit: received","streamId":"8lnd4rv3","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:17.1449375+02:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"8lnd4rv3","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:21.584501+02:00","level":"INFO","msg":"handleInformTeardown: server teardown initiated","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:21.584501+02:00","level":"INFO","msg":"connection: closing","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:21.584501+02:00","level":"INFO","msg":"server is shutting down"}
+{"time":"2025-05-29T13:47:21.5850805+02:00","level":"INFO","msg":"connection: closed successfully","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:22.5295164+02:00","level":"INFO","msg":"handleInformTeardown: server shutdown complete","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:22.5295164+02:00","level":"INFO","msg":"connection: ManageConnectionData: connection closed","id":"127.0.0.1:52101"}
+{"time":"2025-05-29T13:47:22.5295164+02:00","level":"INFO","msg":"server is closed"}

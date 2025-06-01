@@ -1,0 +1,15 @@
+{"time":"2025-05-19T00:38:14.4443301+02:00","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"C:\\Users\\gepap\\Desktop\\Thesis\\Framework\\wandb\\run-20250519_003814-1stwhkw1\\logs\\debug-core.log"}
+{"time":"2025-05-19T00:38:14.8091048+02:00","level":"INFO","msg":"created new stream","id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:14.8091048+02:00","level":"INFO","msg":"stream: started","id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:14.8091048+02:00","level":"INFO","msg":"sender: started","stream_id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:14.8091048+02:00","level":"INFO","msg":"handler: started","stream_id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:14.8091048+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:15.0746381+02:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-19T00:38:25.7129043+02:00","level":"INFO","msg":"stream: closing","id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:25.7129043+02:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-19T00:38:25.7129043+02:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-19T00:38:26.351929+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-19T00:38:26.6162953+02:00","level":"INFO","msg":"handler: closed","stream_id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:26.6162953+02:00","level":"INFO","msg":"writer: Close: closed","stream_id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:26.6162953+02:00","level":"INFO","msg":"sender: closed","stream_id":"1stwhkw1"}
+{"time":"2025-05-19T00:38:26.6162953+02:00","level":"INFO","msg":"stream: closed","id":"1stwhkw1"}

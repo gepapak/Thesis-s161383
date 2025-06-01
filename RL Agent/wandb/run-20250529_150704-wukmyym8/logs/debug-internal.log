@@ -1,0 +1,15 @@
+{"time":"2025-05-29T15:07:04.294108+02:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"C:\\Users\\gepap\\Desktop\\Thesis\\RL Agent\\wandb\\run-20250529_150704-wukmyym8\\logs\\debug-core.log"}
+{"time":"2025-05-29T15:07:04.6468463+02:00","level":"INFO","msg":"created new stream","id":"wukmyym8"}
+{"time":"2025-05-29T15:07:04.6474439+02:00","level":"INFO","msg":"stream: started","id":"wukmyym8"}
+{"time":"2025-05-29T15:07:04.6474439+02:00","level":"INFO","msg":"handler: started","stream_id":"wukmyym8"}
+{"time":"2025-05-29T15:07:04.6474439+02:00","level":"INFO","msg":"sender: started","stream_id":"wukmyym8"}
+{"time":"2025-05-29T15:07:04.6474439+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"wukmyym8"}
+{"time":"2025-05-29T15:07:04.9363786+02:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-29T15:07:10.1810118+02:00","level":"INFO","msg":"stream: closing","id":"wukmyym8"}
+{"time":"2025-05-29T15:07:10.1810118+02:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-29T15:07:10.1810118+02:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-29T15:07:10.8678313+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-29T15:07:11.0908627+02:00","level":"INFO","msg":"handler: closed","stream_id":"wukmyym8"}
+{"time":"2025-05-29T15:07:11.0908627+02:00","level":"INFO","msg":"writer: Close: closed","stream_id":"wukmyym8"}
+{"time":"2025-05-29T15:07:11.0908627+02:00","level":"INFO","msg":"sender: closed","stream_id":"wukmyym8"}
+{"time":"2025-05-29T15:07:11.0914528+02:00","level":"INFO","msg":"stream: closed","id":"wukmyym8"}

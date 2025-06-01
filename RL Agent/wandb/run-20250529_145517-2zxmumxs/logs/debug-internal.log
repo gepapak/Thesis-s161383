@@ -1,0 +1,15 @@
+{"time":"2025-05-29T14:55:17.5437955+02:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"C:\\Users\\gepap\\Desktop\\Thesis\\RL Agent\\wandb\\run-20250529_145517-2zxmumxs\\logs\\debug-core.log"}
+{"time":"2025-05-29T14:55:17.8874704+02:00","level":"INFO","msg":"created new stream","id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:17.8874704+02:00","level":"INFO","msg":"stream: started","id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:17.8874704+02:00","level":"INFO","msg":"sender: started","stream_id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:17.8874704+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:17.8874704+02:00","level":"INFO","msg":"handler: started","stream_id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:18.1513304+02:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-29T14:55:22.5754495+02:00","level":"INFO","msg":"stream: closing","id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:22.5754495+02:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-29T14:55:22.5754495+02:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-29T14:55:23.236308+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-29T14:55:23.4806726+02:00","level":"INFO","msg":"handler: closed","stream_id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:23.4806726+02:00","level":"INFO","msg":"sender: closed","stream_id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:23.4806726+02:00","level":"INFO","msg":"writer: Close: closed","stream_id":"2zxmumxs"}
+{"time":"2025-05-29T14:55:23.4813227+02:00","level":"INFO","msg":"stream: closed","id":"2zxmumxs"}

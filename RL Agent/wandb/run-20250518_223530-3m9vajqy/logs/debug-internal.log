@@ -1,0 +1,19 @@
+{"time":"2025-05-18T22:35:30.3953747+02:00","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"C:\\Users\\gepap\\Desktop\\Thesis\\Framework\\wandb\\run-20250518_223530-3m9vajqy\\logs\\debug-core.log"}
+{"time":"2025-05-18T22:35:30.7561022+02:00","level":"INFO","msg":"created new stream","id":"3m9vajqy"}
+{"time":"2025-05-18T22:35:30.7561022+02:00","level":"INFO","msg":"stream: started","id":"3m9vajqy"}
+{"time":"2025-05-18T22:35:30.7566123+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"3m9vajqy"}
+{"time":"2025-05-18T22:35:30.7573885+02:00","level":"INFO","msg":"handler: started","stream_id":"3m9vajqy"}
+{"time":"2025-05-18T22:35:30.7578972+02:00","level":"INFO","msg":"sender: started","stream_id":"3m9vajqy"}
+{"time":"2025-05-18T22:35:31.0602265+02:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-18T22:35:46.0828138+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-18T22:36:01.083614+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-18T22:36:16.0753953+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-18T22:36:20.2894447+02:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-18T22:36:20.2903747+02:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-18T22:36:20.916529+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-18T22:36:21.200424+02:00","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2025-05-18T22:36:21.2059939+02:00","level":"INFO","msg":"stream: closing","id":"3m9vajqy"}
+{"time":"2025-05-18T22:36:21.2059939+02:00","level":"INFO","msg":"handler: closed","stream_id":"3m9vajqy"}
+{"time":"2025-05-18T22:36:21.2059939+02:00","level":"INFO","msg":"sender: closed","stream_id":"3m9vajqy"}
+{"time":"2025-05-18T22:36:21.2059939+02:00","level":"INFO","msg":"writer: Close: closed","stream_id":"3m9vajqy"}
+{"time":"2025-05-18T22:36:21.2059939+02:00","level":"INFO","msg":"stream: closed","id":"3m9vajqy"}
