@@ -1,6 +1,0 @@
-Target,Quantile,MAE,Pinball Loss,Error
-hydro,ERROR,,,name 'quantiles' is not defined
-wind,ERROR,,,name 'quantiles' is not defined
-solar,ERROR,,,name 'quantiles' is not defined
-load,ERROR,,,name 'quantiles' is not defined
-market_price,ERROR,,,name 'quantiles' is not defined
