@@ -1,0 +1,44 @@
+{
+  "os": "Windows-11-10.0.26100-SP0",
+  "python": "CPython 3.13.2",
+  "startedAt": "2025-05-18T22:22:22.699932Z",
+  "args": [
+    "--data_path",
+    "sample.csv",
+    "--timesteps",
+    "10000"
+  ],
+  "program": "C:\\Users\\gepap\\Desktop\\Thesis\\Framework\\main.py",
+  "codePath": "main.py",
+  "email": "s161383@student.dtu.dk",
+  "root": "C:\\Users\\gepap\\Desktop\\Thesis\\Framework",
+  "host": "LAPTOP-G811PID3",
+  "executable": "C:\\Users\\gepap\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+  "codePathLocal": "main.py",
+  "cpu_count": 4,
+  "cpu_count_logical": 8,
+  "gpu": "NVIDIA GeForce MX250",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "1022659727360",
+      "used": "643851960320"
+    }
+  },
+  "memory": {
+    "total": "16968990720"
+  },
+  "cpu": {
+    "count": 4,
+    "countLogical": 8
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce MX250",
+      "memoryTotal": "2147483648",
+      "cudaCores": 384,
+      "architecture": "Pascal"
+    }
+  ],
+  "cudaVersion": "11.6"
+}

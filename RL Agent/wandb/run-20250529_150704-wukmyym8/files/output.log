@@ -1,7 +1,0 @@
-Traceback (most recent call last):
-  File "C:\Users\gepap\Desktop\Thesis\RL Agent\main.py", line 65, in <module>
-    main()
-  File "C:\Users\gepap\Desktop\Thesis\RL Agent\main.py", line 42, in main
-    forecast_gen = ForecastFeatureGenerator(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: ForecastFeatureGenerator.__init__() got an unexpected keyword argument 'forecast_horizon'

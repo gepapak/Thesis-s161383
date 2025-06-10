@@ -1,0 +1,47 @@
+🔍 Loading model for 'hydro' from 'hydro.h5'
+🔍 Loading model for 'load' from 'load.h5'
+🔍 Loading model for 'price' from 'price.h5'
+🔍 Loading model for 'solar' from 'solar.h5'
+🔍 Loading model for 'wind' from 'wind.h5'
+⚠️ Not enough history for 'hydro' (have 1, need 6)
+⚠️ Not enough history for 'load' (have 1, need 6)
+⚠️ Not enough history for 'price' (have 1, need 6)
+⚠️ Not enough history for 'solar' (have 1, need 6)
+⚠️ Not enough history for 'wind' (have 1, need 6)
+WARNING:tensorflow:5 out of the last 5 calls to <function TensorFlowTrainer.make_predict_function.<locals>.one_step_on_data_distributed at 0x00000201832A5580> triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has reduce_retracing=True option that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/guide/function#controlling_retracing and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+[INIT] Creating PPO for investor_0 with input dim 10
+Using cpu device
+[INIT] Creating PPO for battery_operator_0 with input dim 6
+Using cpu device
+[INIT] Creating PPO for risk_controller_0 with input dim 4
+Using cpu device
+⚠️ Not enough history for 'hydro' (have 2, need 6)
+⚠️ Not enough history for 'load' (have 2, need 6)
+⚠️ Not enough history for 'price' (have 2, need 6)
+⚠️ Not enough history for 'solar' (have 2, need 6)
+⚠️ Not enough history for 'wind' (have 2, need 6)
+⚠️ Not enough history for 'hydro' (have 3, need 6)
+⚠️ Not enough history for 'load' (have 3, need 6)
+⚠️ Not enough history for 'price' (have 3, need 6)
+⚠️ Not enough history for 'solar' (have 3, need 6)
+⚠️ Not enough history for 'wind' (have 3, need 6)
+⚠️ Not enough history for 'hydro' (have 4, need 6)
+⚠️ Not enough history for 'load' (have 4, need 6)
+⚠️ Not enough history for 'price' (have 4, need 6)
+⚠️ Not enough history for 'solar' (have 4, need 6)
+⚠️ Not enough history for 'wind' (have 4, need 6)
+⚠️ Not enough history for 'hydro' (have 4, need 6)
+⚠️ Not enough history for 'load' (have 4, need 6)
+⚠️ Not enough history for 'price' (have 4, need 6)
+⚠️ Not enough history for 'solar' (have 4, need 6)
+⚠️ Not enough history for 'wind' (have 4, need 6)
+⚠️ Not enough history for 'hydro' (have 5, need 6)
+⚠️ Not enough history for 'load' (have 5, need 6)
+⚠️ Not enough history for 'price' (have 5, need 6)
+⚠️ Not enough history for 'solar' (have 5, need 6)
+⚠️ Not enough history for 'wind' (have 5, need 6)
+⚠️ Not enough history for 'hydro' (have 5, need 6)
+⚠️ Not enough history for 'load' (have 5, need 6)
+⚠️ Not enough history for 'price' (have 5, need 6)
+⚠️ Not enough history for 'solar' (have 5, need 6)
+⚠️ Not enough history for 'wind' (have 5, need 6)

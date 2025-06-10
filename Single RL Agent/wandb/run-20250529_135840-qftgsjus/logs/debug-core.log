@@ -1,0 +1,13 @@
+{"time":"2025-05-29T13:58:40.3796643+02:00","level":"INFO","msg":"main: starting server","port-filename":"C:\\Users\\gepap\\AppData\\Local\\Temp\\tmpxyl7t6m9\\port-12708.txt","pid":12708,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false}
+{"time":"2025-05-29T13:58:40.3841721+02:00","level":"INFO","msg":"Will exit if parent process dies.","ppid":12708}
+{"time":"2025-05-29T13:58:40.3841721+02:00","level":"INFO","msg":"server is running","addr":{"IP":"127.0.0.1","Port":52261,"Zone":""}}
+{"time":"2025-05-29T13:58:40.5694275+02:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:41.0314105+02:00","level":"INFO","msg":"handleInformInit: received","streamId":"qftgsjus","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:41.9705909+02:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"qftgsjus","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:46.1683595+02:00","level":"INFO","msg":"handleInformTeardown: server teardown initiated","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:46.1683595+02:00","level":"INFO","msg":"connection: closing","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:46.1683595+02:00","level":"INFO","msg":"server is shutting down"}
+{"time":"2025-05-29T13:58:46.1689176+02:00","level":"INFO","msg":"connection: closed successfully","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:47.0509273+02:00","level":"INFO","msg":"handleInformTeardown: server shutdown complete","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:47.0509273+02:00","level":"INFO","msg":"connection: ManageConnectionData: connection closed","id":"127.0.0.1:52262"}
+{"time":"2025-05-29T13:58:47.0509273+02:00","level":"INFO","msg":"server is closed"}

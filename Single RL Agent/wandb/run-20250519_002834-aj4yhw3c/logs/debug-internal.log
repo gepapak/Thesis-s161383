@@ -1,0 +1,19 @@
+{"time":"2025-05-19T00:28:34.9609799+02:00","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"C:\\Users\\gepap\\Desktop\\Thesis\\Framework\\wandb\\run-20250519_002834-aj4yhw3c\\logs\\debug-core.log"}
+{"time":"2025-05-19T00:28:35.3468809+02:00","level":"INFO","msg":"created new stream","id":"aj4yhw3c"}
+{"time":"2025-05-19T00:28:35.3474401+02:00","level":"INFO","msg":"stream: started","id":"aj4yhw3c"}
+{"time":"2025-05-19T00:28:35.3474401+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"aj4yhw3c"}
+{"time":"2025-05-19T00:28:35.3474401+02:00","level":"INFO","msg":"handler: started","stream_id":"aj4yhw3c"}
+{"time":"2025-05-19T00:28:35.3474401+02:00","level":"INFO","msg":"sender: started","stream_id":"aj4yhw3c"}
+{"time":"2025-05-19T00:28:35.582124+02:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-19T00:28:50.6172357+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:29:05.6063736+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:29:20.6091238+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:29:35.5685508+02:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-19T00:29:35.5685508+02:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-19T00:29:36.244127+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-19T00:29:36.5747948+02:00","level":"INFO","msg":"handler: operation stats","stats":{"operations":[{"desc":"uploading history steps 7861-10250, summary, console lines 48-85","runtime_seconds":0.493699}],"total_operations":1}}
+{"time":"2025-05-19T00:29:37.2315266+02:00","level":"INFO","msg":"stream: closing","id":"aj4yhw3c"}
+{"time":"2025-05-19T00:29:37.2315266+02:00","level":"INFO","msg":"handler: closed","stream_id":"aj4yhw3c"}
+{"time":"2025-05-19T00:29:37.2315266+02:00","level":"INFO","msg":"sender: closed","stream_id":"aj4yhw3c"}
+{"time":"2025-05-19T00:29:37.2315266+02:00","level":"INFO","msg":"writer: Close: closed","stream_id":"aj4yhw3c"}
+{"time":"2025-05-19T00:29:37.2320417+02:00","level":"INFO","msg":"stream: closed","id":"aj4yhw3c"}

@@ -1,0 +1,55 @@
+🔍 Loading model for hydro from ann_hydro.h5
+🔍 Loading model for load from ann_load.h5
+🔍 Loading model for price from ann_price.h5
+🔍 Loading model for solar from ann_solar.h5
+🔍 Loading model for wind from ann_wind.h5
+🔍 Loading model for hydro from ceemdan_lstm_hydro.h5
+🔍 Loading model for load from ceemdan_lstm_load.h5
+🔍 Loading model for price from ceemdan_lstm_price.h5
+🔍 Loading model for solar from ceemdan_lstm_solar.h5
+🔍 Loading model for wind from ceemdan_lstm_wind.h5
+🔍 Loading model for hydro from eemd_lstm_hydro.h5
+🔍 Loading model for load from eemd_lstm_load.h5
+🔍 Loading model for price from eemd_lstm_price.h5
+🔍 Loading model for solar from eemd_lstm_solar.h5
+🔍 Loading model for wind from eemd_lstm_wind.h5
+🔍 Loading model for hydro from emd_lstm_hydro.h5
+🔍 Loading model for load from emd_lstm_load.h5
+🔍 Loading model for price from emd_lstm_price.h5
+🔍 Loading model for solar from emd_lstm_solar.h5
+🔍 Loading model for wind from emd_lstm_wind.h5
+🔍 Loading model for hydro from karijadi_hydro.h5
+🔍 Loading model for load from karijadi_load.h5
+🔍 Loading model for price from karijadi_price.h5
+🔍 Loading model for solar from karijadi_solar.h5
+🔍 Loading model for wind from karijadi_wind.h5
+🔍 Loading model for hydro from lstm_hydro.h5
+🔍 Loading model for load from lstm_load.h5
+🔍 Loading model for price from lstm_price.h5
+🔍 Loading model for solar from lstm_solar.h5
+🔍 Loading model for wind from lstm_wind.h5
+C:\Users\gepap\Anaconda3\Lib\site-packages\gymnasium\spaces\box.py:235: UserWarning: [33mWARN: Box low's precision lowered by casting to float32, current low.dtype=float64[0m
+  gym.logger.warn(
+C:\Users\gepap\Anaconda3\Lib\site-packages\gymnasium\spaces\box.py:305: UserWarning: [33mWARN: Box high's precision lowered by casting to float32, current high.dtype=float64[0m
+  gym.logger.warn(
+Traceback (most recent call last):
+  File "C:\Users\gepap\Anaconda3\Lib\site-packages\stable_baselines3\common\env_checker.py", line 442, in check_env
+    env.reset(seed=0)
+  File "C:\Users\gepap\Desktop\Thesis\RL Agent\forecast_wrapper_env.py", line 23, in reset
+    return self._concat_obs(obs), info
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\gepap\Desktop\Thesis\RL Agent\forecast_wrapper_env.py", line 31, in _concat_obs
+    forecast_values = [self.forecast_cache.get(var, 0.0) for var in self.forecast_models]
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'ForecastFeatureGenerator' object is not iterable
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\gepap\Desktop\Thesis\RL Agent\main.py", line 64, in <module>
+    main()
+  File "C:\Users\gepap\Desktop\Thesis\RL Agent\main.py", line 47, in main
+    check_env(env)
+  File "C:\Users\gepap\Anaconda3\Lib\site-packages\stable_baselines3\common\env_checker.py", line 444, in check_env
+    raise TypeError("The reset() method must accept a `seed` parameter") from e
+TypeError: The reset() method must accept a `seed` parameter

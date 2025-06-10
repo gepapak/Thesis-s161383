@@ -1,0 +1,15 @@
+{"time":"2025-05-31T01:08:56.3232063+02:00","level":"INFO","msg":"main: starting server","port-filename":"C:\\Users\\gepap\\AppData\\Local\\Temp\\tmpnkseo9nr\\port-25144.txt","pid":25144,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false}
+{"time":"2025-05-31T01:08:56.327944+02:00","level":"INFO","msg":"Will exit if parent process dies.","ppid":25144}
+{"time":"2025-05-31T01:08:56.327944+02:00","level":"INFO","msg":"server is running","addr":{"IP":"127.0.0.1","Port":55151,"Zone":""}}
+{"time":"2025-05-31T01:08:56.4996445+02:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:08:56.9173539+02:00","level":"INFO","msg":"handleInformInit: received","streamId":"akgwrbm7","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:08:57.2601066+02:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"akgwrbm7","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:24.8885697+02:00","level":"INFO","msg":"handleInformFinish: finish message received","streamId":"akgwrbm7","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:24.8885697+02:00","level":"INFO","msg":"handleInformFinish: stream closed","streamId":"akgwrbm7","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:25.8905424+02:00","level":"INFO","msg":"handleInformTeardown: server teardown initiated","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:25.8905424+02:00","level":"INFO","msg":"handleInformTeardown: server shutdown complete","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:25.8905424+02:00","level":"INFO","msg":"server is shutting down"}
+{"time":"2025-05-31T01:25:25.8905424+02:00","level":"INFO","msg":"connection: closing","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:25.8910636+02:00","level":"INFO","msg":"connection: closed successfully","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:25.8910636+02:00","level":"INFO","msg":"connection: ManageConnectionData: connection closed","id":"127.0.0.1:55152"}
+{"time":"2025-05-31T01:25:25.8910636+02:00","level":"INFO","msg":"server is closed"}

@@ -1,0 +1,20 @@
+{"time":"2025-05-19T00:43:03.0772189+02:00","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"C:\\Users\\gepap\\Desktop\\Thesis\\Framework\\wandb\\run-20250519_004302-aty64sik\\logs\\debug-core.log"}
+{"time":"2025-05-19T00:43:03.4478522+02:00","level":"INFO","msg":"created new stream","id":"aty64sik"}
+{"time":"2025-05-19T00:43:03.4488041+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"aty64sik"}
+{"time":"2025-05-19T00:43:03.4488041+02:00","level":"INFO","msg":"handler: started","stream_id":"aty64sik"}
+{"time":"2025-05-19T00:43:03.4488041+02:00","level":"INFO","msg":"sender: started","stream_id":"aty64sik"}
+{"time":"2025-05-19T00:43:03.4488041+02:00","level":"INFO","msg":"stream: started","id":"aty64sik"}
+{"time":"2025-05-19T00:43:03.7078232+02:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-19T00:43:18.7332944+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:43:33.7307793+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:43:48.7448963+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:44:03.7428678+02:00","level":"ERROR","msg":"monitor: error sampling metrics: Incorrect function."}
+{"time":"2025-05-19T00:44:09.2368682+02:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-19T00:44:09.2368682+02:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-19T00:44:10.0423961+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-19T00:44:10.2434567+02:00","level":"INFO","msg":"handler: operation stats","stats":{"operations":[{"desc":"uploading history steps 9721-10251, summary, console lines 67-85","runtime_seconds":0.1987016}],"total_operations":1}}
+{"time":"2025-05-19T00:44:10.7995993+02:00","level":"INFO","msg":"stream: closing","id":"aty64sik"}
+{"time":"2025-05-19T00:44:10.7995993+02:00","level":"INFO","msg":"handler: closed","stream_id":"aty64sik"}
+{"time":"2025-05-19T00:44:10.7995993+02:00","level":"INFO","msg":"writer: Close: closed","stream_id":"aty64sik"}
+{"time":"2025-05-19T00:44:10.7995993+02:00","level":"INFO","msg":"sender: closed","stream_id":"aty64sik"}
+{"time":"2025-05-19T00:44:10.7995993+02:00","level":"INFO","msg":"stream: closed","id":"aty64sik"}

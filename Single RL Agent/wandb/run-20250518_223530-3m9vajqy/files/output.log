@@ -1,0 +1,86 @@
+Using cpu device
+Wrapping the env with a `Monitor` wrapper
+Wrapping the env in a DummyVecEnv.
+-----------------------------
+| time/              |      |
+|    fps             | 378  |
+|    iterations      | 1    |
+|    time_elapsed    | 5    |
+|    total_timesteps | 2048 |
+-----------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 313         |
+|    iterations           | 2           |
+|    time_elapsed         | 13          |
+|    total_timesteps      | 4096        |
+| train/                  |             |
+|    approx_kl            | 0.005673412 |
+|    clip_fraction        | 0.0252      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -7.09       |
+|    explained_variance   | 0.00041     |
+|    learning_rate        | 0.0003      |
+|    loss                 | 1.53e+06    |
+|    n_updates            | 10          |
+|    policy_gradient_loss | -0.00365    |
+|    std                  | 0.997       |
+|    value_loss           | 3.27e+06    |
+-----------------------------------------
+-----------------------------------------
+| time/                   |             |
+|    fps                  | 274         |
+|    iterations           | 3           |
+|    time_elapsed         | 22          |
+|    total_timesteps      | 6144        |
+| train/                  |             |
+|    approx_kl            | 0.004972739 |
+|    clip_fraction        | 0.0228      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -7.08       |
+|    explained_variance   | 0.000201    |
+|    learning_rate        | 0.0003      |
+|    loss                 | 1.01e+06    |
+|    n_updates            | 20          |
+|    policy_gradient_loss | -0.00366    |
+|    std                  | 0.996       |
+|    value_loss           | 2.17e+06    |
+-----------------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 270          |
+|    iterations           | 4            |
+|    time_elapsed         | 30           |
+|    total_timesteps      | 8192         |
+| train/                  |              |
+|    approx_kl            | 0.0058342908 |
+|    clip_fraction        | 0.0384       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -7.09        |
+|    explained_variance   | 6.24e-05     |
+|    learning_rate        | 0.0003       |
+|    loss                 | 6.63e+05     |
+|    n_updates            | 30           |
+|    policy_gradient_loss | -0.00459     |
+|    std                  | 1            |
+|    value_loss           | 1.58e+06     |
+------------------------------------------
+------------------------------------------
+| time/                   |              |
+|    fps                  | 266          |
+|    iterations           | 5            |
+|    time_elapsed         | 38           |
+|    total_timesteps      | 10240        |
+| train/                  |              |
+|    approx_kl            | 0.0054465085 |
+|    clip_fraction        | 0.0298       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -7.09        |
+|    explained_variance   | 2.97e-05     |
+|    learning_rate        | 0.0003       |
+|    loss                 | 7.97e+05     |
+|    n_updates            | 40           |
+|    policy_gradient_loss | -0.00419     |
+|    std                  | 1            |
+|    value_loss           | 1.55e+06     |
+------------------------------------------
