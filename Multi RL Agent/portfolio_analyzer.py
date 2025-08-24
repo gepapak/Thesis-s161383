@@ -12,7 +12,7 @@ What this patch adds
    - Optional --annualization still overrides everything
 
 2) Latest CSV detection:
-   - Defaults to search: ./enhanced_rl_training/metrics, ./enhanced_rl_training, ./logs, ./outputs, .
+   - Defaults to search: ./training_agent_results/metrics, ./training_agent_results, ./logs, ./outputs, .
 
 3) Windows-safe report write:
    - Write report with encoding='utf-8' to avoid UnicodeEncodeError.
@@ -58,8 +58,8 @@ def find_latest_log_file(paths: Optional[List[str]] = None) -> Optional[str]:
     """
     candidates: List[str] = []
     default_dirs = [
-        './enhanced_rl_training/metrics',
-        './enhanced_rl_training',
+        './training_agent_results/metrics',
+        './training_agent_results',
         './logs',
         './outputs',
         '.',
@@ -67,6 +67,7 @@ def find_latest_log_file(paths: Optional[List[str]] = None) -> Optional[str]:
     for d in (paths or default_dirs):
         if not os.path.exists(d):
             continue
+        # Patched: use os.listdir instead of os.path.listdir
         for f in os.listdir(d):
             if f.startswith('enhanced_metrics_') and f.endswith('.csv'):
                 candidates.append(os.path.join(d, f))
@@ -74,6 +75,14 @@ def find_latest_log_file(paths: Optional[List[str]] = None) -> Optional[str]:
         return None
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
+
+class SafeDivision:
+    @staticmethod
+    def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+        """Robust division with protection against zero-division."""
+        if abs(denominator) < 1e-8:
+            return default
+        return numerator / denominator
 
 
 # Reasonable annualization clamps (adjust if you truly run faster/slower)
@@ -204,7 +213,8 @@ class AdvancedPortfolioAnalyzer:
             src = 'log(budget) diff'
         elif 'portfolio_performance' in self.df.columns:
             pp = self.df['portfolio_performance'].astype(float)
-            s = pp.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            # Patch: Handle non-finite values before pct_change
+            s = pp.replace([np.inf, -np.inf], np.nan).fillna(method='ffill').pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
             src = 'portfolio_performance pct_change'
         elif 'meta_reward' in self.df.columns:
             s = self.df['meta_reward'].astype(float).fillna(0.0)

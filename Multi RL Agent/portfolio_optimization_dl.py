@@ -8,6 +8,21 @@ from tensorflow.keras.layers import *
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import cvxpy as cp
+from collections import deque
+import random
+import logging
+
+# Check if CVXPY is available, otherwise use a fallback
+try:
+    import cvxpy as cp
+    _HAS_CVXPY = True
+except ImportError:
+    _HAS_CVXPY = False
+
+
+# =====================================================================
+# DL Models
+# =====================================================================
 
 class DeepPortfolioOptimizer(tf.keras.Model):
     """
@@ -150,7 +165,7 @@ class ESGScoringNetwork(tf.keras.Model):
     Neural network to score energy investments based on ESG criteria
     """
     
-    def __init__(self):
+    def __init__(self, num_assets=5):
         super(ESGScoringNetwork, self).__init__()
         
         # Environmental impact analyzer
@@ -427,10 +442,10 @@ class PortfolioOptimizationTrainer:
         concentration_penalty = tf.reduce_mean(tf.reduce_sum(tf.square(predicted_weights), axis=-1))
         
         total_loss = (return_loss + 
-                     0.5 * risk_loss + 
-                     10.0 * weight_sum_loss + 
-                     5.0 * negative_weight_penalty + 
-                     0.1 * concentration_penalty)
+                      0.5 * risk_loss + 
+                      10.0 * weight_sum_loss + 
+                      5.0 * negative_weight_penalty + 
+                      0.1 * concentration_penalty)
         
         return total_loss
     
@@ -476,51 +491,3 @@ class PortfolioOptimizationTrainer:
             'allocation_loss': allocation_loss,
             'rebalancing_loss': rebalancing_loss
         }
-
-
-# Integration with your existing system
-def integrate_with_renewable_env(env, portfolio_system):
-    """
-    Integration function to add portfolio optimization to your existing RL environment
-    """
-    
-    # Add portfolio optimization to meta-controller
-    original_meta_step = env.env._process_actions_safe
-    
-    def enhanced_meta_step(actions, timestep):
-        # Get market state
-        market_state = {
-            'price': env.env._price[timestep],
-            'risk': env.env._risk[timestep],
-            'capacities': [
-                env.env.wind_capacity,
-                env.env.solar_capacity, 
-                env.env.hydro_capacity,
-                env.env.battery_capacity
-            ]
-        }
-        
-        # Run portfolio optimization
-        portfolio_inputs = {
-            'market_state': np.array([list(market_state.values())]),
-            'current_positions': np.array([market_state['capacities']])
-        }
-        
-        portfolio_recommendation = portfolio_system.portfolio_optimizer(portfolio_inputs)
-        
-        # Modify meta-controller actions based on portfolio recommendation
-        if 'meta_controller_0' in actions:
-            meta_action = actions['meta_controller_0']
-            portfolio_weights = portfolio_recommendation['weights'][0]
-            
-            # Blend original action with portfolio recommendation
-            enhanced_action = 0.7 * meta_action + 0.3 * portfolio_weights[:len(meta_action)]
-            actions['meta_controller_0'] = enhanced_action
-        
-        # Call original method
-        return original_meta_step(actions, timestep)
-    
-    # Replace method
-    env.env._process_actions_safe = enhanced_meta_step
-    
-    return env

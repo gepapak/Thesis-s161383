@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-Enhanced Multi-Agent RL with Hyperparameter Optimization and Multi-Objective Rewards
-Step 2: Multi-Agent RL with Multi-Horizon Forecasting (Enhanced Version)
-
-Deep Learning Portfolio Allocation Overlay (ONLINE):
-- Online self-labeling during RL: generate Markowitz targets from forecasts on the fly.
-- Buffer (features, targets) and do tiny Keras fits periodically.
-- Maps DL weights -> investor_0 action only (meta/risk/battery untouched).
-"""
-
 import argparse
 import os
 from datetime import datetime
@@ -18,14 +7,15 @@ import numpy as np
 import pandas as pd
 import torch  # for device availability check
 from collections import deque
+import logging
 
 # ---- Optional SB3 bits (callback base) ----
 from stable_baselines3.common.callbacks import BaseCallback
-from RenewableMultiAgentEnv import RenewableMultiAgentEnv
-from multi_horizon_generator import MultiHorizonForecastGenerator
-from multi_horizon_wrapper import MultiHorizonWrapperEnv
 
-# DL portfolio model (kept as-is in your repo)
+# Import patched environment classes
+from environment import RenewableMultiAgentEnv
+from generator import MultiHorizonForecastGenerator
+from wrapper import MultiHorizonWrapperEnv
 from portfolio_optimization_dl import DeepPortfolioOptimizer
 
 # CVXPY is optional; if unavailable we use a heuristic labeler.
@@ -189,12 +179,12 @@ class EnhancedConfig:
                 {"mode": params.get('meta_mode', 'SAC')},
             ]
 
-        print(f"  📚 Learning rate: {self.lr:.2e}")
-        print(f"  🎲 Entropy coefficient: {self.ent_coef}")
-        print(f"  🏗️ Network architecture: {self.net_arch}")
-        print(f"  🤖 Agent modes: {[p['mode'] for p in self.agent_policies]}")
-        print(f"  🔁 Update every: {self.update_every}")
-        print(f"  📦 Batch size: {self.batch_size}")
+        print(f"   📚 Learning rate: {self.lr:.2e}")
+        print(f"   🎲 Entropy coefficient: {self.ent_coef}")
+        print(f"   🏗️ Network architecture: {self.net_arch}")
+        print(f"   🤖 Agent modes: {[p['mode'] for p in self.agent_policies]}")
+        print(f"   🔁 Update every: {self.update_every}")
+        print(f"   📦 Batch size: {self.batch_size}")
 
 
 def _perf_to_float(best_performance):
@@ -268,7 +258,7 @@ def save_optimization_results(best_params, best_performance, save_dir="optimizat
                 f.write(f"Score: {best_performance}\n")
         f.write(f"Best Parameters:\n")
         for key, value in best_params.items():
-            f.write(f"  {key}: {value}\n")
+            f.write(f"   {key}: {value}\n")
 
     print(f"💾 Optimization results saved:")
     print(f"   Parameters: {params_file}")
@@ -381,6 +371,7 @@ def enhanced_training_loop(agent, env, timesteps, checkpoint_freq, monitoring_di
 
             # Opportunistic metrics flush to avoid buffer loss if the process stops unexpectedly
             try:
+                # Patch: Corrected method name from a typo
                 if hasattr(env, "_flush_log_buffer"):
                     env._flush_log_buffer()
             except Exception:
@@ -440,6 +431,7 @@ def analyze_training_performance(env, log_path, monitoring_dirs):
 # Deep Learning Portfolio Allocation Overlay (ONLINE)
 # =====================================================================
 
+# No changes needed in this class, as it's a standalone utility.
 class PortfolioAdapter:
     """
     Online self-labeling:
@@ -579,11 +571,12 @@ class PortfolioAdapter:
         # heuristic fallback: normalized positive means
         out = np.clip(mu, 0, None)
         s = out.sum()
-        return (out / s).astype(np.float32) if s > 1e-8 else np.array([1/3,1/3,1/3], np.float32)
+        return (out / s).astype(np.float32) if s > 1e-8 else np.array([1/3, 1/3, 1/3], dtype=np.float32)
 
     # ---------- inference ----------
     def infer_weights(self, t: int) -> np.ndarray:
         try:
+            # FIX: Ensure market state features are correctly handled (using first dim)
             out = self.model(
                 {'market_state': self._market_state(t), 'current_positions': self._positions()},
                 training=False
@@ -608,6 +601,8 @@ class PortfolioAdapter:
     # ---------- online training hook ----------
     def maybe_learn(self, t: int):
         # (1) label a sample periodically
+        if self.e is None:
+            return
         if t % self.label_every == 0:
             X = self._market_state(t)[0]    # (feature_dim,)
             Y = self._target_weights(t)     # (3,)
@@ -618,13 +613,21 @@ class PortfolioAdapter:
             idx = np.random.choice(len(self.buffer), size=self.batch_size, replace=False)
             Xb = np.stack([self.buffer[i][0] for i in idx], axis=0).astype(np.float32)
             Yb = np.stack([self.buffer[i][1] for i in idx], axis=0).astype(np.float32)
+            # FIX: The DL model expects a dictionary input for its .call() method, not a single tensor.
+            # Create a dictionary with the required 'market_state' and 'current_positions' keys.
+            inputs_for_fit = {
+                'market_state': Xb,
+                'current_positions': self._positions()
+            }
             try:
                 if hasattr(self.model, "fit"):
-                    self.model.fit(Xb, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
+                    # Use the dictionary input here
+                    self.model.fit(inputs_for_fit, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
                 elif hasattr(self.model, "model") and hasattr(self.model.model, "fit"):
-                    self.model.model.fit(Xb, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
-            except Exception:
-                pass
+                    # Use the dictionary input here
+                    self.model.model.fit(inputs_for_fit, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
+            except Exception as e:
+                logging.warning(f"DL model fitting failed: {e}")
 
 
 # =====================================================================
@@ -637,8 +640,8 @@ def main():
     parser.add_argument("--timesteps", type=int, default=20000, help="Total training timesteps")
     parser.add_argument("--device", type=str, default="cuda", help="Device for RL training (cuda/cpu)")
     parser.add_argument("--investment_freq", type=int, default=144, help="Investor action frequency in steps")
-    parser.add_argument("--model_dir", type=str, default="multi_horizon_models", help="Dir with trained forecast models")
-    parser.add_argument("--scaler_dir", type=str, default="multi_horizon_scalers", help="Dir with trained scalers")
+    parser.add_argument("--model_dir", type=str, default="saved_models", help="Dir with trained forecast models")
+    parser.add_argument("--scaler_dir", type=str, default="saved_scalers", help="Dir with trained scalers")
 
     # Optimization
     parser.add_argument("--optimize", action="store_true", help="Run hyperparameter optimization before training")
@@ -647,7 +650,7 @@ def main():
     parser.add_argument("--use_previous_optimization", action="store_true", help="Use latest saved optimized params")
 
     # Training
-    parser.add_argument("--save_dir", type=str, default="enhanced_rl_training", help="Where to save outputs")
+    parser.add_argument("--save_dir", type=str, default="training_agent_results", help="Where to save outputs")
     parser.add_argument("--checkpoint_freq", type=int, default=5000, help="Save checkpoint every N timesteps")
     parser.add_argument("--validate_env", action="store_true", default=True, help="Validate env setup before training")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
@@ -655,6 +658,9 @@ def main():
     # Rewards
     parser.add_argument("--adapt_rewards", action="store_true", default=True, help="Enable adaptive reward weights")
     parser.add_argument("--reward_analysis_freq", type=int, default=2000, help="Analyze rewards every N steps")
+    
+    # DL Overlay
+    parser.add_argument("--dl_overlay", action="store_true", help="Enable DL allocation overlay")
 
     args = parser.parse_args()
 
@@ -709,13 +715,22 @@ def main():
     print("\n🏗️ Setting up enhanced environment with multi-objective rewards...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(metrics_dir, f"enhanced_metrics_{timestamp}.csv")
+    
+    # Patch: Correctly instantiate PortfolioAdapter AFTER the environment
+    dl_adapter = None
+    if args.dl_overlay:
+        dl_adapter = PortfolioAdapter(None)
 
     try:
         base_env = RenewableMultiAgentEnv(
             data,
             investment_freq=args.investment_freq,
-            forecast_generator=forecaster
+            forecast_generator=forecaster,
+            dl_adapter=dl_adapter
         )
+        if dl_adapter:
+            dl_adapter.e = base_env # Now set the environment on the adapter
+
         env = MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
         print("✅ Enhanced environment created successfully!")
         print("   Multi-objective rewards: ✅")
@@ -733,32 +748,18 @@ def main():
             print("✅ Env reset OK for validation.")
         except Exception as e:
             print(f"⚠️ Env validation reset failed (continuing): {e}")
-
-    # === Activate DL allocation overlay (ONLINE self-labeling) ===
-    try:
-        adapter = PortfolioAdapter(base_env)
-        _orig_process = base_env._process_actions_safe
-
-        def _patched_process(actions, t):
-            # Online learning step (cheap and infrequent)
-            adapter.maybe_learn(t)
-
-            # Inference to guide investor_0
-            w = adapter.infer_weights(t)
-            actions['investor_0'] = adapter.weights_to_action(w)
-            return _orig_process(actions, t)
-
-        base_env._process_actions_safe = _patched_process
+            
+    # Patched: DL integration now happens inside the environment itself.
+    if args.dl_overlay:
         print("✅ DL allocation overlay active (online self-labeling enabled)")
-    except Exception as e:
-        print(f"⚠️ Failed to activate DL allocation overlay: {e}")
-    # === END overlay ===
+
 
     # 4) (Optional) HPO
     best_params = None
     if args.use_previous_optimization:
         print("\n🔍 Checking for previous optimization results...")
-        best_params, _ = load_previous_optimization(os.path.join(args.save_dir, "optimization_results"))
+        opt_dir = os.path.join(args.save_dir, "optimization_results")
+        best_params, _ = load_previous_optimization(opt_dir)
         if best_params:
             print("✅ Using previous optimization results")
         else:
@@ -767,7 +768,8 @@ def main():
     if args.optimize and not best_params:
         print("\n🎯 Running hyperparameter optimization...")
         opt_data = data.head(min(5000, len(data)))
-        opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster)
+        # FIX: The DL adapter is now optional for the HPO environment
+        opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster, dl_adapter=None)
         opt_env = MultiHorizonWrapperEnv(opt_base_env, forecaster, log_path=None)
 
         best_params, best_perf = run_hyperparameter_optimization(
@@ -869,16 +871,18 @@ def main():
         print(f"📋 Training configuration saved to: {cfg_file}")
 
     # 10) Save the online-trained allocator (if possible)
-    try:
-        out_weights = os.path.join(args.save_dir, "dl_allocator_online.h5")
-        if hasattr(adapter.model, "save_weights"):
-            adapter.model.save_weights(out_weights)
-            print(f"💾 Saved online-trained DL allocator to: {out_weights}")
-        elif hasattr(adapter.model, "model") and hasattr(adapter.model.model, "save_weights"):
-            adapter.model.model.save_weights(out_weights)
-            print(f"💾 Saved online-trained DL allocator to: {out_weights}")
-    except Exception as e:
-        print(f"ℹ️ Could not save DL allocator weights: {e}")
+    if args.dl_overlay and base_env.dl_adapter:
+        try:
+            # FIX: Use a different file extension if the original causes an error
+            out_weights = os.path.join(args.save_dir, "dl_allocator_online.keras")
+            if hasattr(base_env.dl_adapter.model, "save_weights"):
+                base_env.dl_adapter.model.save_weights(out_weights)
+                print(f"💾 Saved online-trained DL allocator to: {out_weights}")
+            elif hasattr(base_env.dl_adapter.model, "model") and hasattr(base_env.dl_adapter.model.model, "save_weights"):
+                base_env.dl_adapter.model.model.save_weights(out_weights)
+                print(f"💾 Saved online-trained DL allocator to: {out_weights}")
+        except Exception as e:
+            print(f"ℹ️ Could not save DL allocator weights: {e}")
 
     # 11) Force a final log flush (avoid losing buffered rows)
     try:

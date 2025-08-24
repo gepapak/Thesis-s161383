@@ -749,8 +749,14 @@ class MultiESGAgent:
     def _coerce_action_for_buffer(self, policy, agent_name, action):
         action_space = getattr(policy, "action_space", None) or self.action_spaces[agent_name]
         if isinstance(action_space, Discrete):
-            a = 0 if action is None else int(np.atleast_1d(action)[0]) if np.size(action) > 0 else 0
-            return np.array([np.clip(a, 0, action_space.n - 1)], np.float32)
+            a = action
+            if isinstance(a, (list, tuple, np.ndarray)) and np.size(a) > 0:
+                a = int(np.atleast_1d(a)[0])
+            elif a is None:
+                a = 0
+            else:
+                a = int(a)
+            return np.array([np.clip(a, 0, action_space.n - 1)], dtype=np.float32)
 
         exp = int(action_space.shape[0]) if hasattr(action_space, "shape") else 1
         a = np.zeros(exp, np.float32) if action is None else np.asarray(action, np.float32).reshape(-1)
