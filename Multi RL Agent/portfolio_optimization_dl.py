@@ -68,13 +68,15 @@ class DeepPortfolioOptimizer(tf.keras.Model):
         ])
 
     def call(self, inputs, training=None):
-        # PATCH: This method now correctly handles a single tensor input by slicing it.
-        # The training loop provides a tensor that combines market features and positions.
-        
-        # The input tensor combines market features and current positions.
-        # We slice them apart here.
-        market_features = inputs[:, :self.market_dim]
-        current_positions = inputs[:, self.market_dim:]
+        # PATCH: Handle both dictionary and tensor inputs for flexibility
+        if isinstance(inputs, dict):
+            # Dictionary input from PortfolioAdapter
+            market_features = inputs['market_state']
+            current_positions = inputs['current_positions']
+        else:
+            # Tensor input from training loop - slice apart
+            market_features = inputs[:, :self.market_dim]
+            current_positions = inputs[:, self.market_dim:]
 
         # Encode market state
         market_encoded = self.market_encoder(market_features, training=training)

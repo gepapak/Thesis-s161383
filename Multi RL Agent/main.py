@@ -1,13 +1,17 @@
+# main.py
+
 import argparse
 import os
 from datetime import datetime
 import json
 import random
+from collections import deque
+import logging
+from typing import Optional, Tuple, Dict, Any, List
+
 import numpy as np
 import pandas as pd
 import torch  # for device availability check
-from collections import deque
-import logging
 
 # ---- Optional SB3 bits (callback base) ----
 from stable_baselines3.common.callbacks import BaseCallback
@@ -25,6 +29,7 @@ try:
 except Exception:
     _HAS_CVXPY = False
 
+# Meta-controller (patched)
 try:
     from metacontroller import MultiESGAgent, HyperparameterOptimizer
 except Exception:
@@ -52,7 +57,9 @@ def load_energy_data(csv_path: str) -> pd.DataFrame:
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     elif {"date", "time"}.issubset(df.columns):
-        df["timestamp"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce")
+        df["timestamp"] = pd.to_datetime(
+            df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce"
+        )
     # (We keep timestamp as a column; we do NOT set it as index so the env sees all columns.)
 
     required = ["wind", "solar", "hydro", "price", "load"]
@@ -86,17 +93,17 @@ class RewardAdaptationCallback(BaseCallback):
         self._step_count = 0
 
     def _on_training_start(self) -> None:
+        # SB3 allows returning None here
         return None
 
     def _on_step(self) -> bool:
         self._step_count += 1
-        if self._step_count % self.adaptation_freq == 0:
-            if hasattr(self.env, "adapt_reward_weights"):
-                try:
-                    self.env.adapt_reward_weights()
-                except Exception:
-                    # Never crash training on adaptation errors
-                    pass
+        if self._step_count % self.adaptation_freq == 0 and hasattr(self.env, "adapt_reward_weights"):
+            try:
+                self.env.adapt_reward_weights()
+            except Exception:
+                # Never crash training on adaptation errors
+                pass
         return True
 
 
@@ -106,7 +113,7 @@ class RewardAdaptationCallback(BaseCallback):
 
 class EnhancedConfig:
     """Enhanced configuration class with optimization support"""
-    def __init__(self, optimized_params=None):
+    def __init__(self, optimized_params: Optional[Dict[str, Any]] = None):
         # Defaults
         self.update_every = 128
         self.lr = 3e-4
@@ -138,8 +145,8 @@ class EnhancedConfig:
         if optimized_params:
             self._apply_optimized_params(optimized_params)
 
-    def _apply_optimized_params(self, params):
-        print("🎯 Applying optimized hyperparameters...")
+    def _apply_optimized_params(self, params: Dict[str, Any]):
+        print("Applying optimized hyperparameters...")
 
         # Accept either 'update_every' or 'n_steps'
         self.update_every = int(params.get('update_every', params.get('n_steps', self.update_every)))
@@ -179,15 +186,15 @@ class EnhancedConfig:
                 {"mode": params.get('meta_mode', 'SAC')},
             ]
 
-        print(f"   📚 Learning rate: {self.lr:.2e}")
-        print(f"   🎲 Entropy coefficient: {self.ent_coef}")
-        print(f"   🏗️ Network architecture: {self.net_arch}")
-        print(f"   🤖 Agent modes: {[p['mode'] for p in self.agent_policies]}")
-        print(f"   🔁 Update every: {self.update_every}")
-        print(f"   📦 Batch size: {self.batch_size}")
+        print(f"   Learning rate: {self.lr:.2e}")
+        print(f"   Entropy coefficient: {self.ent_coef}")
+        print(f"   Network architecture: {self.net_arch}")
+        print(f"   Agent modes: {[p['mode'] for p in self.agent_policies]}")
+        print(f"   Update every: {self.update_every}")
+        print(f"   Batch size: {self.batch_size}")
 
 
-def _perf_to_float(best_performance):
+def _perf_to_float(best_performance: Any) -> float:
     """Return a printable float if we can, else 0.0."""
     if isinstance(best_performance, dict):
         return float(best_performance.get("heuristic_score", 0.0))
@@ -197,8 +204,8 @@ def _perf_to_float(best_performance):
         return 0.0
 
 
-def run_hyperparameter_optimization(env, device="cpu", n_trials=30, timeout=1800):
-    print("🔧 Starting Enhanced Hyperparameter Optimization")
+def run_hyperparameter_optimization(env, device: str = "cpu", n_trials: int = 30, timeout: int = 1800):
+    print("Starting Enhanced Hyperparameter Optimization")
     print("=" * 55)
 
     if HyperparameterOptimizer is None:
@@ -212,7 +219,7 @@ def run_hyperparameter_optimization(env, device="cpu", n_trials=30, timeout=1800
         timeout=timeout
     )
 
-    print(f"⚙️ Configuration:")
+    print("Configuration:")
     print(f"   Number of trials: {n_trials}")
     print(f"   Timeout: {timeout} seconds ({timeout/60:.1f} minutes)")
     print(f"   Device: {device}")
@@ -221,19 +228,19 @@ def run_hyperparameter_optimization(env, device="cpu", n_trials=30, timeout=1800
     try:
         best_params, best_performance = optimizer.optimize()
         perf_value = _perf_to_float(best_performance)
-        print(f"\n🏆 Optimization Results:")
+        print("\nOptimization Results:")
         print(f"   Best heuristic score: {perf_value:.4f}")
         if isinstance(best_performance, dict):
             print(f"   Raw performance: {best_performance}")
-        print(f"   Optimization completed successfully!")
+        print("   Optimization completed successfully!")
         return best_params, best_performance
     except Exception as e:
-        print(f"❌ Optimization failed: {e}")
-        print("🔄 Falling back to default parameters")
+        print(f"Optimization failed: {e}")
+        print("Falling back to default parameters")
         return None, None
 
 
-def save_optimization_results(best_params, best_performance, save_dir="optimization_results"):
+def save_optimization_results(best_params: Dict[str, Any], best_performance: Any, save_dir: str = "optimization_results"):
     os.makedirs(save_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -256,24 +263,25 @@ def save_optimization_results(best_params, best_performance, save_dir="optimizat
                 f.write(f"Score: {float(best_performance):.6f}\n")
             except Exception:
                 f.write(f"Score: {best_performance}\n")
-        f.write(f"Best Parameters:\n")
+        f.write("Best Parameters:\n")
         for key, value in best_params.items():
             f.write(f"   {key}: {value}\n")
 
-    print(f"💾 Optimization results saved:")
+    print("Optimization results saved:")
     print(f"   Parameters: {params_file}")
     print(f"   Summary: {results_file}")
 
     return params_file
 
 
-def load_previous_optimization(optimization_dir="optimization_results"):
+def load_previous_optimization(optimization_dir: str = "optimization_results"):
     if not os.path.exists(optimization_dir):
         return None, None
 
-    # FIX: os.path.listdir -> os.listdir
-    param_files = [f for f in os.listdir(optimization_dir)
-                   if f.startswith("best_params_") and f.endswith(".json")]
+    param_files = [
+        f for f in os.listdir(optimization_dir)
+        if f.startswith("best_params_") and f.endswith(".json")
+    ]
     if not param_files:
         return None, None
 
@@ -282,14 +290,14 @@ def load_previous_optimization(optimization_dir="optimization_results"):
     try:
         with open(os.path.join(optimization_dir, latest_file), 'r') as f:
             best_params = json.load(f)
-        print(f"📂 Loaded previous optimization results from: {latest_file}")
+        print(f"Loaded previous optimization results from: {latest_file}")
         return best_params, latest_file
     except Exception as e:
-        print(f"⚠️ Failed to load previous optimization: {e}")
+        print(f"Failed to load previous optimization: {e}")
         return None, None
 
 
-def setup_enhanced_training_monitoring(log_path, save_dir):
+def setup_enhanced_training_monitoring(log_path: str, save_dir: str) -> Dict[str, str]:
     monitoring_dirs = {
         'checkpoints': os.path.join(save_dir, 'checkpoints'),
         'metrics': os.path.join(save_dir, 'metrics'),
@@ -298,19 +306,19 @@ def setup_enhanced_training_monitoring(log_path, save_dir):
     for _, dir_path in monitoring_dirs.items():
         os.makedirs(dir_path, exist_ok=True)
 
-    print("📊 Enhanced monitoring setup:")
+    print("Enhanced monitoring setup:")
     print(f"   Metrics log: {log_path}")
     print(f"   Checkpoints: {monitoring_dirs['checkpoints']}")
     print(f"   Model saves: {monitoring_dirs['models']}")
     return monitoring_dirs
 
 
-def enhanced_training_loop(agent, env, timesteps, checkpoint_freq, monitoring_dirs, callbacks=None):
+def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, monitoring_dirs: Dict[str, str], callbacks=None) -> int:
     """
     Train in intervals, but measure *actual* steps each time.
     Works with a meta-controller whose learn(total_timesteps=N) means "do N more steps".
     """
-    print("🚀 Starting Enhanced Training Loop")
+    print("Starting Enhanced Training Loop")
     print(f"   Total timesteps: {timesteps:,}")
     print(f"   Checkpoint frequency: {checkpoint_freq:,}")
 
@@ -322,7 +330,7 @@ def enhanced_training_loop(agent, env, timesteps, checkpoint_freq, monitoring_di
             remaining = timesteps - total_trained
             interval = min(checkpoint_freq, remaining)
 
-            print(f"\n🏃 Training interval {checkpoint_count + 1}")
+            print(f"\nTraining interval {checkpoint_count + 1}")
             print(f"   Steps: {total_trained:,} → {total_trained + interval:,}")
             print(f"   Progress: {total_trained/timesteps*100:.1f}%")
 
@@ -342,11 +350,11 @@ def enhanced_training_loop(agent, env, timesteps, checkpoint_freq, monitoring_di
 
             training_time = (end_time - start_time).total_seconds()
             sps = (trained_now / training_time) if training_time > 0 else 0.0
-            print(f"   ⏱️ Training time: {training_time:.1f}s ({sps:.1f} steps/s)")
-            print(f"   ✅ Actual steps collected this interval: {trained_now:,} (agent.total_steps = {end_steps:,})")
+            print(f"   Training time: {training_time:.1f}s ({sps:.1f} steps/s)")
+            print(f"   Actual steps collected this interval: {trained_now:,} (agent.total_steps = {end_steps:,})")
 
             if trained_now == 0:
-                print("⚠️ No steps were collected in this interval. "
+                print("No steps were collected in this interval. "
                       "Check that the meta-controller's learn() uses a relative budget or increase n_steps.")
                 # Avoid infinite loop; break so we can at least save progress.
                 break
@@ -355,7 +363,7 @@ def enhanced_training_loop(agent, env, timesteps, checkpoint_freq, monitoring_di
             if total_trained < timesteps and trained_now > 0:
                 checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"checkpoint_{total_trained}")
                 os.makedirs(checkpoint_dir, exist_ok=True)
-                print(f"💾 Saving checkpoint at {total_trained:,} steps...")
+                print(f"Saving checkpoint at {total_trained:,} steps...")
                 saved_count = agent.save_policies(checkpoint_dir)
 
                 state_file = os.path.join(checkpoint_dir, "training_state.json")
@@ -367,52 +375,51 @@ def enhanced_training_loop(agent, env, timesteps, checkpoint_freq, monitoring_di
                         'timestamp': datetime.now().isoformat(),
                         'performance_summary': {'steps_per_second': sps, 'training_time': training_time}
                     }, f, indent=2)
-                print(f"   ✅ Checkpoint saved: {saved_count} policies")
+                print(f"   Checkpoint saved: {saved_count} policies")
 
             # Opportunistic metrics flush to avoid buffer loss if the process stops unexpectedly
             try:
-                # Patch: Corrected method name from a typo
                 if hasattr(env, "_flush_log_buffer"):
                     env._flush_log_buffer()
             except Exception:
                 pass
 
-        print("\n🎉 Enhanced training completed!")
+        print("\nEnhanced training completed!")
         print(f"   Total steps (budget accumulation): {total_trained:,}")
         print(f"   Agent-reported total steps: {getattr(agent, 'total_steps', 'unknown')}")
         print(f"   Checkpoints created: {checkpoint_count}")
         return total_trained
 
     except KeyboardInterrupt:
-        print("\n⚠️ Training interrupted by user")
+        print("\nTraining interrupted by user")
         print(f"   Progress: {total_trained:,}/{timesteps:,} ({total_trained/timesteps*100:.1f}%)")
         emergency_dir = os.path.join(monitoring_dirs['checkpoints'], f"emergency_{total_trained}")
         os.makedirs(emergency_dir, exist_ok=True)
         agent.save_policies(emergency_dir)
-        print(f"💾 Emergency checkpoint saved to: {emergency_dir}")
+        print(f"Emergency checkpoint saved to: {emergency_dir}")
         return total_trained
 
     except Exception as e:
-        print(f"\n❌ Training failed: {e}")
+        print(f"\nTraining failed: {e}")
         raise
 
 
-def analyze_training_performance(env, log_path, monitoring_dirs):
-    print("\n📈 Training Performance Analysis")
+def analyze_training_performance(env, log_path: str, monitoring_dirs: Dict[str, str]) -> None:
+    print("\nTraining Performance Analysis")
     print("=" * 40)
     try:
         # If env exposes a reward analysis method
         if hasattr(env, 'get_reward_analysis'):
             env.get_reward_analysis()
 
-        if os.path.exists(log_path):
+        if log_path and os.path.exists(log_path):
             metrics = pd.read_csv(log_path)
             if len(metrics) > 100 and 'meta_reward' in metrics.columns:
                 early = metrics['meta_reward'].head(100).mean()
                 late = metrics['meta_reward'].tail(100).mean()
                 improvement = late - early
                 pct = (improvement / abs(early) * 100) if abs(early) > 1e-12 else 0.0
-                print("📊 Training Metrics Summary:")
+                print("Training Metrics Summary:")
                 print(f"   Rows logged (wrapper): {len(metrics):,}")
                 print(f"   Early performance: {early:.4f}")
                 print(f"   Late performance:  {late:.4f}")
@@ -421,17 +428,16 @@ def analyze_training_performance(env, log_path, monitoring_dirs):
         ckpt_dir = monitoring_dirs.get('checkpoints', '')
         if os.path.exists(ckpt_dir):
             ckpts = [d for d in os.listdir(ckpt_dir) if d.startswith('checkpoint_')]
-            print(f"   💾 Checkpoints available: {len(ckpts)}")
+            print(f"   Checkpoints available: {len(ckpts)}")
 
     except Exception as e:
-        print(f"⚠️ Performance analysis failed: {e}")
+        print(f"Performance analysis failed: {e}")
 
 
 # =====================================================================
 # Deep Learning Portfolio Allocation Overlay (ONLINE)
 # =====================================================================
 
-# No changes needed in this class, as it's a standalone utility.
 class PortfolioAdapter:
     """
     Online self-labeling:
@@ -440,10 +446,10 @@ class PortfolioAdapter:
       - Push (features, target_weights) into a small buffer.
       - Every 'train_every' steps, fit the DL model on a random minibatch from the buffer (few epochs).
     """
-    def __init__(self, base_env, feature_dim=9, buffer_size=2048, label_every=12, train_every=60,
+    def __init__(self, base_env, feature_dim=15, buffer_size=2048, label_every=12, train_every=60,
                  window=24, lam=5.0, batch_size=128, epochs=1):
         self.e = base_env
-        self.model = DeepPortfolioOptimizer(num_assets=3, num_market_features=feature_dim)
+        self.model = DeepPortfolioOptimizer(num_assets=3, market_dim=feature_dim)
 
         # Online training hyperparams
         self.buffer = deque(maxlen=buffer_size)
@@ -454,25 +460,26 @@ class PortfolioAdapter:
         self.batch_size = int(batch_size)
         self.epochs = int(epochs)
 
-        # Try to compile Keras model (both direct or inner .model)
+        # Compile Keras model for training
         try:
-            if hasattr(self.model, "compile"):
-                self.model.compile(optimizer="adam", loss="mse")
-            elif hasattr(self.model, "model") and hasattr(self.model.model, "compile"):
-                self.model.model.compile(optimizer="adam", loss="mse")
-        except Exception:
-            pass
+            self.model.compile(
+                optimizer="adam",
+                loss={"weights": "mse"},  # Only train on weights output
+                metrics=["mae"]
+            )
+        except Exception as e:
+            logging.warning(f"Model compilation failed: {e}")
 
         # Optional: try load previous online-trained weights to warm-start
         for candidate in ["dl_allocator_online.h5", "dl_allocator_weights.h5"]:
             try:
                 if hasattr(self.model, "load_weights"):
                     self.model.load_weights(candidate)
-                    print(f"ℹ️ Loaded allocator weights: {candidate}")
+                    print(f"Loaded allocator weights: {candidate}")
                     break
                 elif hasattr(self.model, "model") and hasattr(self.model.model, "load_weights"):
                     self.model.model.load_weights(candidate)
-                    print(f"ℹ️ Loaded allocator weights: {candidate}")
+                    print(f"Loaded allocator weights: {candidate}")
                     break
             except Exception:
                 continue
@@ -480,6 +487,7 @@ class PortfolioAdapter:
     # ---------- feature builder ----------
     def _market_state(self, t: int) -> np.ndarray:
         e = self.e
+
         def get(arr_name, default=0.0):
             try:
                 arr = getattr(e, arr_name)
@@ -487,12 +495,14 @@ class PortfolioAdapter:
             except Exception:
                 return float(default)
 
+        # Basic market data
         price = get("_price", 0.0)
-        load  = get("_load", 0.0)
-        wind  = get("_wind", 0.0)
+        load = get("_load", 0.0)
+        wind = get("_wind", 0.0)
         solar = get("_solar", 0.0)
         hydro = get("_hydro", 0.0)
 
+        # Enhanced features for PPA-based economics
         try:
             budget_ratio = float(e.budget / max(1e-6, e.init_budget))
         except Exception:
@@ -507,9 +517,49 @@ class PortfolioAdapter:
         except Exception:
             freq_norm = 0.5
 
+        # Capacity factor features (normalized renewable resource availability)
+        try:
+            wind_cf = float(wind / max(getattr(e, "wind_scale", 1.0), 1e-6))
+            solar_cf = float(solar / max(getattr(e, "solar_scale", 1.0), 1e-6))
+            hydro_cf = float(hydro / max(getattr(e, "hydro_scale", 1.0), 1e-6))
+        except Exception:
+            wind_cf = solar_cf = hydro_cf = 0.0
+
+        # Generation efficiency and portfolio performance metrics
+        try:
+            total_capacity = float(getattr(e, "wind_instrument_value", 0.0) +
+                                 getattr(e, "solar_instrument_value", 0.0) +
+                                 getattr(e, "hydro_instrument_value", 0.0))
+            capacity_utilization = float(np.clip(total_capacity / max(e.init_budget, 1e-6), 0.0, 1.0))
+        except Exception:
+            capacity_utilization = 0.0
+
+        # Market volatility and risk indicators
+        try:
+            market_vol = float(getattr(e, "market_volatility", 0.0))
+            market_stress = float(getattr(e, "market_stress", 0.5))
+        except Exception:
+            market_vol = market_stress = 0.5
+
         PRICE_SCALE = 10.0
-        feats = np.array([[price/PRICE_SCALE, load, wind, solar, hydro,
-                           budget_ratio, cap_frac, freq_norm, 1.0]], dtype=np.float32)
+        # Enhanced feature vector for PPA economics (15 features)
+        feats = np.array([[
+            price / PRICE_SCALE,     # 0: normalized price
+            load,                    # 1: load demand
+            wind_cf,                 # 2: wind capacity factor
+            solar_cf,                # 3: solar capacity factor
+            hydro_cf,                # 4: hydro capacity factor
+            budget_ratio,            # 5: cash position
+            cap_frac,                # 6: capital allocation
+            freq_norm,               # 7: investment frequency
+            capacity_utilization,    # 8: portfolio capacity utilization
+            market_vol,              # 9: market volatility
+            market_stress,           # 10: market stress indicator
+            wind_cf * price / PRICE_SCALE,  # 11: wind revenue potential
+            solar_cf * price / PRICE_SCALE, # 12: solar revenue potential
+            hydro_cf * price / PRICE_SCALE, # 13: hydro revenue potential
+            1.0                      # 14: bias term
+        ]], dtype=np.float32)
         return feats
 
     # ---------- position snapshot ----------
@@ -523,8 +573,8 @@ class PortfolioAdapter:
     # ---------- labeler ----------
     def _target_weights(self, t: int) -> np.ndarray:
         """
-        Build expected-return proxy from immediate forecasts * price, over a rolling window.
-        Solve mean-variance with non-negativity and sum-to-1 constraints.
+        Enhanced target weights calculation for PPA-based economics.
+        Combines generation revenue potential with price appreciation for optimal allocation.
         """
         def arr(name_fcast, name_actual):
             a = getattr(self.e, name_fcast, None)
@@ -538,25 +588,70 @@ class PortfolioAdapter:
         fh = arr("_hydro_forecast_immediate", "_hydro")
 
         if pf is None or fw is None or fs is None:
-            return np.array([1/3, 1/3, 1/3], dtype=np.float32)
+            return np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
 
         start = max(0, t - self.window + 1)
-        p = pf[start:t+1]
-        R = np.stack([
-            fw[start:t+1] * p,
-            fs[start:t+1] * p,
-            (fh[start:t+1] if fh is not None else np.zeros_like(p))
-        ], axis=1)
+        p = pf[start:t + 1]
+
+        # Enhanced return calculation incorporating both generation and price appreciation
+        try:
+            # Get scaling factors for capacity factor normalization
+            wind_scale = max(getattr(self.e, "wind_scale", 1.0), 1e-6)
+            solar_scale = max(getattr(self.e, "solar_scale", 1.0), 1e-6)
+            hydro_scale = max(getattr(self.e, "hydro_scale", 1.0), 1e-6)
+
+            # Normalized capacity factors
+            wind_cf = fw[start:t + 1] / wind_scale
+            solar_cf = fs[start:t + 1] / solar_scale
+            hydro_cf = (fh[start:t + 1] if fh is not None else np.zeros_like(p)) / hydro_scale
+
+            # Generation revenue component (capacity factor * price)
+            wind_gen_return = wind_cf * p
+            solar_gen_return = solar_cf * p
+            hydro_gen_return = hydro_cf * p
+
+            # Price appreciation component (for MTM gains)
+            # All technologies have identical price sensitivity since they sell at the same market price
+            price_returns = np.diff(p) / p[:-1] if len(p) > 1 else np.array([0.0])
+            if len(price_returns) < len(p):
+                price_returns = np.concatenate([[0.0], price_returns])
+
+            # Combined returns: generation revenue + price appreciation
+            # Weight generation revenue higher for PPA economics
+            gen_weight = 0.8  # 80% generation, 20% price appreciation (increased generation focus)
+            price_weight = 0.2
+
+            # All assets have same price sensitivity but different generation patterns
+            R = np.stack([
+                gen_weight * wind_gen_return + price_weight * price_returns,
+                gen_weight * solar_gen_return + price_weight * price_returns,
+                gen_weight * hydro_gen_return + price_weight * price_returns
+            ], axis=1)
+
+        except Exception:
+            # Fallback to simple calculation
+            R = np.stack([
+                fw[start:t + 1] * p,
+                fs[start:t + 1] * p,
+                (fh[start:t + 1] if fh is not None else np.zeros_like(p))
+            ], axis=1)
 
         if R.shape[0] < 2:
-            return np.array([1/3, 1/3, 1/3], dtype=np.float32)
+            return np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
 
         mu = R.mean(axis=0)
         Sigma = np.cov(R.T) + 1e-6 * np.eye(3)
 
+        # Dynamic risk aversion based on market conditions
+        try:
+            market_vol = float(getattr(self.e, "market_volatility", 0.0))
+            adaptive_lambda = self.lam * (1 + 2 * market_vol)  # Higher risk aversion in volatile markets
+        except Exception:
+            adaptive_lambda = self.lam
+
         if _HAS_CVXPY:
             w = cp.Variable(3)
-            objective = cp.Maximize(mu @ w - self.lam * cp.quad_form(w, Sigma))
+            objective = cp.Maximize(mu @ w - adaptive_lambda * cp.quad_form(w, Sigma))
             constraints = [cp.sum(w) == 1, w >= 0]
             prob = cp.Problem(objective, constraints)
             try:
@@ -564,19 +659,34 @@ class PortfolioAdapter:
                 if w.value is not None:
                     out = np.maximum(w.value, 0)
                     s = out.sum()
-                    return (out / s).astype(np.float32) if s > 1e-8 else np.array([1/3,1/3,1/3], np.float32)
+                    return (out / s).astype(np.float32) if s > 1e-8 else np.array([1 / 3, 1 / 3, 1 / 3], np.float32)
             except Exception:
                 pass
 
-        # heuristic fallback: normalized positive means
-        out = np.clip(mu, 0, None)
-        s = out.sum()
-        return (out / s).astype(np.float32) if s > 1e-8 else np.array([1/3, 1/3, 1/3], dtype=np.float32)
+        # Enhanced heuristic fallback with generation preference
+        try:
+            # Prefer assets with higher generation potential
+            current_cf = np.array([
+                fw[t] / max(getattr(self.e, "wind_scale", 1.0), 1e-6) if t < len(fw) else 0.0,
+                fs[t] / max(getattr(self.e, "solar_scale", 1.0), 1e-6) if t < len(fs) else 0.0,
+                (fh[t] if fh is not None and t < len(fh) else 0.0) / max(getattr(self.e, "hydro_scale", 1.0), 1e-6)
+            ])
+
+            # Combine expected returns with current generation potential
+            combined_score = 0.6 * np.clip(mu, 0, None) + 0.4 * current_cf
+            out = np.maximum(combined_score, 0.01)  # Minimum 1% allocation
+            s = out.sum()
+            return (out / s).astype(np.float32) if s > 1e-8 else np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
+
+        except Exception:
+            # Final fallback
+            out = np.clip(mu, 0, None)
+            s = out.sum()
+            return (out / s).astype(np.float32) if s > 1e-8 else np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
 
     # ---------- inference ----------
     def infer_weights(self, t: int) -> np.ndarray:
         try:
-            # FIX: Ensure market state features are correctly handled (using first dim)
             out = self.model(
                 {'market_state': self._market_state(t), 'current_positions': self._positions()},
                 training=False
@@ -585,7 +695,7 @@ class PortfolioAdapter:
             s = float(np.sum(w))
             return w / (s if s > 1e-8 else 1.0)
         except Exception:
-            return np.array([1/3, 1/3, 1/3], dtype=np.float32)
+            return np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
 
     # ---------- map to env action ----------
     def weights_to_action(self, w: np.ndarray) -> np.ndarray:
@@ -611,15 +721,33 @@ class PortfolioAdapter:
         # (2) fit a minibatch periodically
         if len(self.buffer) >= self.batch_size and t % self.train_every == 0:
             idx = np.random.choice(len(self.buffer), size=self.batch_size, replace=False)
-            Xb = np.stack([self.buffer[i][0] for i in idx], axis=0).astype(np.float32)
-            Yb = np.stack([self.buffer[i][1] for i in idx], axis=0).astype(np.float32)
+            Xb = np.stack([self.buffer[i][0] for i in idx], axis=0).astype(np.float32)  # Market features (15-dim)
+            Yb = np.stack([self.buffer[i][1] for i in idx], axis=0).astype(np.float32)  # Target weights (3-dim)
+
+            # Create dummy positions for training (current positions are not used in labeling)
+            positions_dummy = np.zeros((Xb.shape[0], 3), dtype=np.float32)
+
+            # Combine market features and positions for model input
+            X_combined = np.concatenate([Xb, positions_dummy], axis=1)  # Shape: (batch_size, 18)
+
             try:
-                if hasattr(self.model, "fit"):
-                    self.model.fit(Xb, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
-                elif hasattr(self.model, "model") and hasattr(self.model.model, "fit"):
-                    self.model.model.fit(Xb, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
+                # Train the model - only on weights output
+                self.model.fit(
+                    X_combined,
+                    {"weights": Yb},
+                    epochs=self.epochs,
+                    batch_size=min(self.batch_size, len(X_combined)),
+                    verbose=0,
+                    shuffle=True
+                )
+
+                # Log training progress occasionally
+                if t % (self.train_every * 10) == 0:
+                    logging.info(f"DL model training at step {t}: batch_size={len(X_combined)}, "
+                               f"features_dim={Xb.shape[1]}, buffer_size={len(self.buffer)}")
+
             except Exception as e:
-                logging.warning(f"DL model fitting failed: {e}")
+                logging.warning(f"DL model fitting failed at step {t}: {e}")
 
 
 # =====================================================================
@@ -650,24 +778,31 @@ def main():
     # Rewards
     parser.add_argument("--adapt_rewards", action="store_true", default=True, help="Enable adaptive reward weights")
     parser.add_argument("--reward_analysis_freq", type=int, default=2000, help="Analyze rewards every N steps")
-    
+
     # DL Overlay
     parser.add_argument("--dl_overlay", action="store_true", help="Enable DL allocation overlay")
+
+    # Forecasting Control
+    parser.add_argument("--no_forecast", action="store_true", help="Disable forecasting (pure MARL baseline)")
 
     args = parser.parse_args()
 
     # Safer device selection
     if args.device.lower() == "cuda" and not torch.cuda.is_available():
-        print("⚠️ CUDA requested but not available. Falling back to CPU.")
+        print("CUDA requested but not available. Falling back to CPU.")
         args.device = "cpu"
 
     # Seed everything for repeatability (uses config.seed after we create it; use a temp seed now too)
     seed_hint = 42
-    random.seed(seed_hint); np.random.seed(seed_hint); torch.manual_seed(seed_hint)
+    random.seed(seed_hint)
+    np.random.seed(seed_hint)
+    torch.manual_seed(seed_hint)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_hint)
 
-    print("🚀 Enhanced Multi-Horizon Energy Investment RL System")
+    print("Enhanced Multi-Horizon Energy Investment RL System")
     print("=" * 60)
-    print("🎯 Features: Hyperparameter Optimization + Multi-Objective Rewards")
+    print("Features: Hyperparameter Optimization + Multi-Objective Rewards")
 
     # Create save dir + metrics subdir
     os.makedirs(args.save_dir, exist_ok=True)
@@ -675,40 +810,44 @@ def main():
     os.makedirs(metrics_dir, exist_ok=True)
 
     # 1) Load data
-    print(f"\n📦 Loading data from: {args.data_path}")
+    print(f"\nLoading data from: {args.data_path}")
     try:
         data = load_energy_data(args.data_path)
-        print(f"✅ Data loaded: {data.shape}")
+        print(f"Data loaded: {data.shape}")
         print(f"Columns: {list(data.columns)}")
         if "timestamp" in data.columns and data["timestamp"].notna().any():
             ts = data["timestamp"].dropna()
-            print(f"📅 Date range: {ts.iloc[0]} → {ts.iloc[-1]}")
+            print(f"Date range: {ts.iloc[0]} → {ts.iloc[-1]}")
         if len(data) < 1000:
-            print(f"⚠️ Limited data ({len(data)} rows). More data → better training stability.")
+            print(f"Limited data ({len(data)} rows). More data → better training stability.")
     except Exception as e:
-        print(f"❌ Error loading data: {e}")
+        print(f"Error loading data: {e}")
         return
 
     # 2) Forecaster
-    print("\n🔧 Initializing multi-horizon forecaster...")
-    try:
-        forecaster = MultiHorizonForecastGenerator(
-            model_dir=args.model_dir,
-            scaler_dir=args.scaler_dir,
-            look_back=6,
-            verbose=True
-        )
-        print("✅ Forecaster initialized successfully!")
-    except Exception as e:
-        print(f"❌ Failed to initialize forecaster: {e}")
-        return
+    if args.no_forecast:
+        print("\n🚫 Forecasting disabled (pure MARL baseline)")
+        forecaster = None
+    else:
+        print("\nInitializing multi-horizon forecaster...")
+        try:
+            forecaster = MultiHorizonForecastGenerator(
+                model_dir=args.model_dir,
+                scaler_dir=args.scaler_dir,
+                look_back=6,
+                verbose=True
+            )
+            print("Forecaster initialized successfully!")
+        except Exception as e:
+            print(f"Failed to initialize forecaster: {e}")
+            return
 
     # 3) Environment setup
-    print("\n🏗️ Setting up enhanced environment with multi-objective rewards...")
+    print("\nSetting up enhanced environment with multi-objective rewards...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(metrics_dir, f"enhanced_metrics_{timestamp}.csv")
-    
-    # Patch: Correctly instantiate PortfolioAdapter AFTER the environment
+
+    # Instantiate PortfolioAdapter after env (or set env later)
     dl_adapter = None
     if args.dl_overlay:
         dl_adapter = PortfolioAdapter(None)
@@ -721,46 +860,44 @@ def main():
             dl_adapter=dl_adapter
         )
         if dl_adapter:
-            dl_adapter.e = base_env # Now set the environment on the adapter
+            dl_adapter.e = base_env  # Now set the environment on the adapter
 
         env = MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
-        print("✅ Enhanced environment created successfully!")
-        print("   Multi-objective rewards: ✅")
-        print("   Enhanced risk management: ✅")
-        print("   Forecast-augmented observations via wrapper: ✅")
+        print("Enhanced environment created successfully!")
+        print("   Multi-objective rewards: enabled")
+        print("   Enhanced risk management: enabled")
+        print("   Forecast-augmented observations via wrapper: enabled")
         print(f"   Metrics CSV: {log_path}")
     except Exception as e:
-        print(f"❌ Failed to setup environment: {e}")
+        print(f"Failed to setup environment: {e}")
         return
 
     # Optional one-time validation (safe)
     if args.validate_env:
         try:
             _obs, _ = env.reset()
-            print("✅ Env reset OK for validation.")
+            print("Env reset OK for validation.")
         except Exception as e:
-            print(f"⚠️ Env validation reset failed (continuing): {e}")
-            
+            print(f"Env validation reset failed (continuing): {e}")
+
     # Patched: DL integration now happens inside the environment itself.
     if args.dl_overlay:
-        print("✅ DL allocation overlay active (online self-labeling enabled)")
-
+        print("DL allocation overlay active (online self-labeling enabled)")
 
     # 4) (Optional) HPO
     best_params = None
     if args.use_previous_optimization:
-        print("\n🔍 Checking for previous optimization results...")
+        print("\nChecking for previous optimization results...")
         opt_dir = os.path.join(args.save_dir, "optimization_results")
         best_params, _ = load_previous_optimization(opt_dir)
         if best_params:
-            print("✅ Using previous optimization results")
+            print("Using previous optimization results")
         else:
-            print("⚠️ No previous optimization found")
+            print("No previous optimization found")
 
     if args.optimize and not best_params:
-        print("\n🎯 Running hyperparameter optimization...")
+        print("\nRunning hyperparameter optimization...")
         opt_data = data.head(min(5000, len(data)))
-        # FIX: The DL adapter is now optional for the HPO environment
         opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster, dl_adapter=None)
         opt_env = MultiHorizonWrapperEnv(opt_base_env, forecaster, log_path=None)
 
@@ -773,17 +910,27 @@ def main():
         if best_params:
             opt_dir = os.path.join(args.save_dir, "optimization_results")
             save_optimization_results(best_params, best_perf, opt_dir)
+        # Help GC
+        try:
+            if hasattr(opt_env, "close"):
+                opt_env.close()
+        except Exception:
+            pass
         del opt_env, opt_base_env
 
     # 5) Config
-    print("\n⚙️ Creating optimized training configuration...")
+    print("\nCreating optimized training configuration...")
     config = EnhancedConfig(optimized_params=best_params)
 
     # Re-seed using config.seed to ensure consistency with agent init
-    random.seed(config.seed); np.random.seed(config.seed); torch.manual_seed(config.seed)
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
 
     # 6) Agents
-    print("\n🤖 Initializing enhanced multi-agent RL system...")
+    print("\nInitializing enhanced multi-agent RL system...")
     try:
         agent = MultiESGAgent(
             config,
@@ -792,26 +939,31 @@ def main():
             training=True,
             debug=args.debug
         )
-        print("✅ Enhanced multi-agent system initialized")
+        print("Enhanced multi-agent system initialized")
         print(f"   Device: {args.device}")
         print(f"   Agents: {env.possible_agents}")
         print(f"   Learning rate: {config.lr:.2e}")
         print(f"   Update frequency: {config.update_every}")
-        print("   Multi-objective rewards: ✅")
-        print("   Adaptive hyperparameters: ✅")
+        print("   Multi-objective rewards: enabled")
+        print("   Adaptive hyperparameters: enabled")
     except Exception as e:
-        print(f"❌ Failed to initialize agents: {e}")
+        print(f"Failed to initialize agents: {e}")
+        try:
+            if hasattr(env, "close"):
+                env.close()
+        except Exception:
+            pass
         return
 
     # 7) Monitoring
     monitoring_dirs = setup_enhanced_training_monitoring(log_path, args.save_dir)
 
     # 8) Training
-    print("\n🚀 Starting Enhanced Multi-Objective Training...")
+    print("\nStarting Enhanced Multi-Objective Training...")
     print(f"   Training timesteps: {args.timesteps:,}")
     print(f"   Checkpoint frequency: {args.checkpoint_freq:,}")
-    print(f"   Adaptive rewards: {'✅' if args.adapt_rewards else '❌'}")
-    print("   Performance monitoring: ✅")
+    print(f"   Adaptive rewards: {'enabled' if args.adapt_rewards else 'disabled'}")
+    print("   Performance monitoring: enabled")
 
     try:
         callbacks = None
@@ -828,19 +980,26 @@ def main():
             monitoring_dirs=monitoring_dirs,
             callbacks=callbacks
         )
-        print("✅ Enhanced training completed!")
+        print("Enhanced training completed!")
     except Exception as e:
-        print(f"❌ Training failed: {e}")
+        print(f"Training failed: {e}")
         raise
+    finally:
+        # Close envs if they expose close()
+        try:
+            if hasattr(env, "close"):
+                env.close()
+        except Exception:
+            pass
 
     # 9) Save final models
-    print("\n💾 Saving final trained models...")
+    print("\nSaving final trained models...")
     final_dir = os.path.join(args.save_dir, "final_models")
     os.makedirs(final_dir, exist_ok=True)
     saved_count = agent.save_policies(final_dir)
 
     if saved_count > 0:
-        print(f"✅ Saved {saved_count} trained agents to: {final_dir}")
+        print(f"Saved {saved_count} trained agents to: {final_dir}")
         cfg_file = os.path.join(final_dir, "training_config.json")
         with open(cfg_file, 'w') as f:
             json.dump({
@@ -860,20 +1019,20 @@ def main():
                     'update_every': config.update_every
                 }
             }, f, indent=2)
-        print(f"📋 Training configuration saved to: {cfg_file}")
+        print(f"Training configuration saved to: {cfg_file}")
 
     # 10) Save the online-trained allocator (if possible)
-    if args.dl_overlay and base_env.dl_adapter:
+    if args.dl_overlay and getattr(base_env, "dl_adapter", None):
         try:
             out_weights = os.path.join(args.save_dir, "dl_allocator_online.h5")
             if hasattr(base_env.dl_adapter.model, "save_weights"):
                 base_env.dl_adapter.model.save_weights(out_weights)
-                print(f"💾 Saved online-trained DL allocator to: {out_weights}")
+                print(f"Saved online-trained DL allocator to: {out_weights}")
             elif hasattr(base_env.dl_adapter.model, "model") and hasattr(base_env.dl_adapter.model.model, "save_weights"):
                 base_env.dl_adapter.model.model.save_weights(out_weights)
-                print(f"💾 Saved online-trained DL allocator to: {out_weights}")
+                print(f"Saved online-trained DL allocator to: {out_weights}")
         except Exception as e:
-            print(f"ℹ️ Could not save DL allocator weights: {e}")
+            print(f"Could not save DL allocator weights: {e}")
 
     # 11) Force a final log flush (avoid losing buffered rows)
     try:

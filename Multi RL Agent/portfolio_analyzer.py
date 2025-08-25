@@ -42,7 +42,8 @@ class PortfolioAnalyzer:
         ann = self._infer_annualization()
         self.results["annualization"] = float(ann)
 
-        rt, curve = self._compute_returns_and_curve(ann)
+        rt = self._compute_returns_and_curve(ann)
+        curve = rt.get("curve", np.ones(len(self.df)))
         # store sources
         self.meta.update(rt["meta"])  # returns_source, curve_method, series_used
 

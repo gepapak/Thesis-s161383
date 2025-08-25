@@ -28,6 +28,7 @@ import gc
 import psutil
 import os
 import threading
+import inspect
 import weakref
 import logging
 from datetime import datetime
@@ -127,7 +128,7 @@ class EnhancedMemoryTracker:
 
             if memory_freed > 50:
                 self.logger.info(
-                    f"🧹 Memory cleanup ({level}): {memory_before:.1f}MB → "
+                    f"Memory cleanup ({level}): {memory_before:.1f}MB → "
                     f"{memory_after:.1f}MB (freed {memory_freed:.1f}MB)"
                 )
             return memory_freed
@@ -254,7 +255,7 @@ class StabilizedTrainingMonitor(BaseCallback):
             if cleanup_level:
                 memory_freed = self.memory_tracker.cleanup(cleanup_level)
                 if self.verbose > 0 and memory_freed > 50:
-                    print(f"🧹 Callback memory cleanup ({cleanup_level}): freed {memory_freed:.1f}MB")
+                    print(f"Callback memory cleanup ({cleanup_level}): freed {memory_freed:.1f}MB")
         return True
 
 
@@ -299,7 +300,7 @@ def safe_multithreaded_processing(function, policies, multithreading=True, max_w
             try:
                 function(polid, policy)
             except Exception as exc:
-                print(f"⚠️ Policy {polid} error: {exc}")
+                print(f"Policy {polid} error: {exc}")
         return
 
     max_workers = max_workers or min(4, len(policies))
@@ -309,9 +310,9 @@ def safe_multithreaded_processing(function, policies, multithreading=True, max_w
             try:
                 future.result(timeout=90)
             except concurrent.futures.TimeoutError:
-                print(f"⚠️ Policy {polid} training timeout")
+                print(f"Policy {polid} training timeout")
             except Exception as exc:
-                print(f"⚠️ Policy {polid} generated an exception: {exc}")
+                print(f"Policy {polid} generated an exception: {exc}")
 
 
 # ======================== Observation Validator =============================
@@ -348,7 +349,7 @@ class EnhancedObservationValidator:
                 }
                 if self.debug:
                     print(
-                        f"✅ Enhanced specs for {agent}: dim={expected_dim}, "
+                        f"Enhanced specs for {agent}: dim={expected_dim}, "
                         f"bounds=[{low.min():.2f}, {high.max():.2f}]"
                     )
             except Exception as e:
@@ -424,7 +425,7 @@ class EnhancedObservationValidator:
                 problems.append(f"{nbad} non-finite")
                 ok = False
             if np.any(obs < spec["low"]) or np.any(obs > spec["high"]):
-                out = int(np.sum((obs < spec["low"]) | (obs > spec["high"])))
+                out = int(np.sum((obs < spec["low"]) | (obs > spec["high"])) )
                 problems.append(f"{out} out-of-bounds")
 
         if problems and self.debug:
@@ -549,7 +550,7 @@ class MultiESGAgent:
             "successful_steps": 0,
         }
 
-        print(f"🚀 Enhanced MultiESGAgent initialized with {len(self.policies)} agents")
+        print(f"Enhanced MultiESGAgent initialized with {len(self.policies)} agents")
         if self.debug:
             self._print_initialization_summary()
 
@@ -567,13 +568,13 @@ class MultiESGAgent:
                 if self.debug:
                     obs_space = self.observation_spaces[agent]
                     act_space = self.action_spaces[agent]
-                    print(f"🎯 {agent} | Obs: {obs_space.shape} | Act: {getattr(act_space,'shape',act_space)}")
+                    print(f"{agent} | Obs: {obs_space.shape} | Act: {getattr(act_space,'shape',act_space)}")
             except Exception as e:
                 self.logger.error(f"Failed to get spaces for {agent}: {e}")
                 obs_dim = self.obs_validator._estimate_agent_dimension(agent)
                 self.observation_spaces[agent] = spaces.Box(low=-10, high=10, shape=(obs_dim,), dtype=np.float32)
                 self.action_spaces[agent] = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
-                print(f"🔄 Created fallback spaces for {agent}")
+                print(f"Created fallback spaces for {agent}")
 
     def _initialize_policies_enhanced(self, config, device):
         act = getattr(config, "activation_fn", nn.Tanh)
@@ -600,7 +601,7 @@ class MultiESGAgent:
                         self.memory_tracker.register_buffer(policy.rollout_buffer)
                     self.policies.append(policy)
                     if self.debug:
-                        print(f"✅ Policy created for {agent} ({policy.mode})")
+                        print(f"Policy created for {agent} ({policy.mode})")
             except Exception as e:
                 self.logger.error(f"Failed to initialize policy for {agent}: {e}")
                 self._create_fallback_policy(agent, device)
@@ -706,7 +707,7 @@ class MultiESGAgent:
             if hasattr(fallback, "rollout_buffer"):
                 self.memory_tracker.register_buffer(fallback.rollout_buffer)
             self.policies.append(fallback)
-            print(f"🔄 Created fallback PPO policy for {agent}")
+            print(f"Created fallback PPO policy for {agent}")
         except Exception as e:
             self.logger.error(f"Fallback policy creation failed for {agent}: {e}")
 
@@ -746,32 +747,113 @@ class MultiESGAgent:
                 return ((action_space.low + action_space.high) / 2.0).astype(np.float32)
             return 0
 
-    def _coerce_action_for_buffer(self, policy, agent_name, action):
-        action_space = getattr(policy, "action_space", None) or self.action_spaces[agent_name]
-        if isinstance(action_space, Discrete):
-            a = action
-            if isinstance(a, (list, tuple, np.ndarray)) and np.size(a) > 0:
-                a = int(np.atleast_1d(a)[0])
-            elif a is None:
-                a = 0
-            else:
-                a = int(a)
-            return np.array([np.clip(a, 0, action_space.n - 1)], dtype=np.float32)
+    def _process_action_enhanced(self, raw_action, action_space):
+        """Clamp/sanitize actions while preserving distributional variability."""
+        try:
+            if isinstance(action_space, Discrete):
+                if isinstance(raw_action, (list, tuple, np.ndarray)) and np.size(raw_action) > 0:
+                    a = int(np.round(np.atleast_1d(raw_action)[0]))
+                else:
+                    a = int(np.round(float(raw_action)))
+                return int(np.clip(a, 0, action_space.n - 1))
+            a = np.asarray(raw_action, np.float32).reshape(-1)
+            if np.any(~np.isfinite(a)):
+                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            low = getattr(action_space, "low", None)
+            high = getattr(action_space, "high", None)
+            if low is not None and high is not None:
+                a = np.clip(a, low, high)
+            return a.astype(np.float32)
+        except Exception:
+            return self._ensure_action_shape(raw_action, action_space)
 
-        exp = int(action_space.shape[0]) if hasattr(action_space, "shape") else 1
-        a = np.zeros(exp, np.float32) if action is None else np.asarray(action, np.float32).reshape(-1)
-        if a.size == 0:
-            a = np.zeros(exp, np.float32)
-        elif a.size == 1 and exp > 1:
-            a = np.repeat(a[0], exp).astype(np.float32)
-        if a.size < exp:
-            a = np.concatenate([a, np.zeros(exp - a.size, np.float32)])
-        elif a.size > exp:
-            a = a[:exp]
-        ps_low, ps_high = getattr(action_space, "low", None), getattr(action_space, "high", None)
-        if ps_low is not None and ps_high is not None:
-            a = np.clip(a, ps_low, ps_high)
-        return a.astype(np.float32)
+    def _coerce_action_for_buffer(self, policy, agent_name: str, action):
+        """
+        Coerce an action to be compatible with the replay buffer requirements.
+        This method ensures actions are properly formatted before being stored in replay buffers.
+
+        Args:
+            policy: The policy object (contains action_space info)
+            agent_name: Name of the agent (for debugging)
+            action: The raw action to be coerced
+
+        Returns:
+            np.ndarray: Properly formatted action for buffer storage
+        """
+        try:
+            # Get the action space from policy or fallback to class-level spaces
+            action_space = getattr(policy, "action_space", None)
+            if action_space is None:
+                action_space = self.action_spaces.get(agent_name, None)
+
+            if action_space is None:
+                # Ultimate fallback: return action as-is but ensure it's a numpy array
+                return np.asarray(action, dtype=np.float32).flatten()
+
+            # Handle discrete action spaces
+            if isinstance(action_space, Discrete):
+                if isinstance(action, (list, tuple, np.ndarray)) and np.size(action) > 0:
+                    a = int(np.round(np.atleast_1d(action)[0]))
+                else:
+                    a = int(np.round(float(action)))
+                # Return as 1D array for buffer compatibility
+                return np.array([np.clip(a, 0, action_space.n - 1)], dtype=np.float32)
+
+            # Handle continuous (Box) action spaces
+            a = np.asarray(action, dtype=np.float32).flatten()
+
+            # Handle NaN/inf values
+            if np.any(~np.isfinite(a)):
+                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Ensure correct shape for the action space
+            if hasattr(action_space, "shape") and action_space.shape is not None:
+                target_size = int(np.prod(action_space.shape))
+                if a.size == 0:
+                    # Create zero action with correct size
+                    a = np.zeros(target_size, dtype=np.float32)
+                elif a.size < target_size:
+                    # Pad with zeros
+                    padding = np.zeros(target_size - a.size, dtype=np.float32)
+                    a = np.concatenate([a, padding])
+                elif a.size > target_size:
+                    # Truncate to correct size
+                    a = a[:target_size]
+
+            # Apply bounds if available
+            if hasattr(action_space, "low") and hasattr(action_space, "high"):
+                low = getattr(action_space, "low", None)
+                high = getattr(action_space, "high", None)
+                if low is not None and high is not None:
+                    a = np.clip(a, low, high)
+
+            return a.astype(np.float32)
+
+        except Exception as e:
+            # Fallback: log warning and return a safe default action
+            if hasattr(self, 'logger'):
+                self.logger.warning(f"Action coercion failed for {agent_name}: {e}. Using fallback.")
+
+            # Try to create a safe default action
+            try:
+                if isinstance(action_space, Discrete):
+                    return np.array([0], dtype=np.float32)
+                elif hasattr(action_space, "shape") and action_space.shape is not None:
+                    target_size = int(np.prod(action_space.shape))
+                    if hasattr(action_space, "low") and hasattr(action_space, "high"):
+                        # Use midpoint of action space
+                        low = np.asarray(action_space.low).flatten()
+                        high = np.asarray(action_space.high).flatten()
+                        midpoint = (low + high) / 2.0
+                        return midpoint[:target_size].astype(np.float32)
+                    else:
+                        return np.zeros(target_size, dtype=np.float32)
+                else:
+                    # Ultimate fallback
+                    return np.array([0.0], dtype=np.float32)
+            except Exception:
+                # Last resort
+                return np.array([0.0], dtype=np.float32)
 
     # ------------------------------- Learn -----------------------------------
     def learn(
@@ -820,7 +902,7 @@ class MultiESGAgent:
                     policy.callback = policy._init_callback(callbacks[polid])
                     policy.callback.on_training_start(locals(), globals())
                     if self.debug:
-                        print(f"✅ Setup done for {policy.agent_name} ({policy.mode})")
+                        print(f"Setup done for {policy.agent_name} ({policy.mode})")
             except Exception as e:
                 self.logger.error(f"Setup failed for policy {polid}: {e}")
                 self._training_metrics["policy_errors"] += 1
@@ -833,7 +915,7 @@ class MultiESGAgent:
                     freed = self.memory_tracker.cleanup(level)
                     self._training_metrics["memory_cleanups"] += 1
                     if self.debug and freed > 100:
-                        print(f"🧹 Pre-train cleanup {policy.agent_name}: {freed:.1f}MB freed")
+                        print(f"Pre-train cleanup {policy.agent_name}: {freed:.1f}MB freed")
 
                 if getattr(policy, "mode", None) == "PPO":
                     self._train_ppo_enhanced(policy)
@@ -921,13 +1003,14 @@ class MultiESGAgent:
         except Exception as e:
             self.logger.warning(f"Off-policy training failed for {policy.agent_name}: {e}")
 
+    # ----------------------------- Core Loop ---------------------------------
     def _initialize_environment_enhanced(self):
         try:
             self._last_obs, _ = self.env.reset()
             self._episode_starts = [True] * self.num_agents
             if not self.obs_validator.validate_observation_dict(self._last_obs):
                 if self.debug:
-                    print("🔧 Fixing initial observations")
+                    print("Fixing initial observations")
                 self._last_obs = self._fix_observation_dict_enhanced(self._last_obs)
                 self._training_metrics["observation_fixes"] += 1
         except Exception as e:
@@ -985,7 +1068,12 @@ class MultiESGAgent:
                 with torch.no_grad():
                     obs_tensor = obs_as_tensor(obs, policy.device)
                     if getattr(policy, "mode", None) == "PPO":
-                        action_t, value_t, log_prob_t = policy.policy.forward(obs_tensor)
+                        # Stable SB3 API: distribution sampling + log_prob + value
+                        distribution = policy.policy.get_distribution(obs_tensor)
+                        action_t = distribution.get_actions(deterministic=False)
+                        log_prob_t = distribution.log_prob(action_t)
+                        value_t = policy.policy.predict_values(obs_tensor)
+
                         raw = action_t.detach().cpu().numpy().flatten()
                         proc = self._process_action_enhanced(raw, self.action_spaces[agent_name])
                         proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
@@ -1015,40 +1103,17 @@ class MultiESGAgent:
 
         return actions_dict, agent_data
 
-    def _process_action_enhanced(self, action, action_space):
-        try:
-            if isinstance(action_space, Box):
-                a = np.array(action, np.float32).reshape(-1) if not isinstance(action, np.ndarray) else action.astype(np.float32).reshape(-1)
-                if a.size == 0:
-                    a = np.zeros(action_space.shape[0], np.float32)
-                if a.shape[0] != action_space.shape[0]:
-                    if a.size == 1 and action_space.shape[0] > 1:
-                        a = np.repeat(a[0], action_space.shape[0]).astype(np.float32)
-                    elif a.size < action_space.shape[0]:
-                        center = ((action_space.low + action_space.high) / 2.0).astype(np.float32)
-                        pad = center[: action_space.shape[0] - a.size]
-                        a = np.concatenate([a, pad])
-                    else:
-                        a = a[: action_space.shape[0]]
-                a = np.clip(a, action_space.low, action_space.high)
-                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-                return a.astype(np.float32)
-            elif isinstance(action_space, Discrete):
-                ai = int(np.atleast_1d(action)[0]) if hasattr(action, "__len__") and np.size(action) > 0 else int(action) if action is not None else 0
-                return int(np.clip(ai, 0, action_space.n - 1))
-            else:
-                return action
-        except Exception:
-            if isinstance(action_space, Box):
-                return ((action_space.low + action_space.high) / 2.0).astype(np.float32)
-            return 0
-
     def _execute_environment_step_enhanced(self, actions_dict):
         try:
             return self.env.step(actions_dict)
         except Exception as e:
             self.logger.warning(f"Environment step error: {e}")
-            next_obs = self._last_obs.copy()
+            # reset to avoid cascading bad states
+            try:
+                self._initialize_environment_enhanced()
+            except Exception:
+                pass
+            next_obs = self._last_obs.copy() if isinstance(self._last_obs, dict) else {}
             rewards = {a: 0.0 for a in self.possible_agents}
             dones = {a: False for a in self.possible_agents}
             truncs = {a: False for a in self.possible_agents}
@@ -1095,7 +1160,7 @@ class MultiESGAgent:
 
     def _handle_rollout_failure_enhanced(self):
         if self.debug:
-            print("⚠️ Rollout failure recovery…")
+            print("Rollout failure recovery…")
         self.memory_tracker.cleanup("heavy")
         self._initialize_environment_enhanced()
 
@@ -1154,6 +1219,12 @@ class MultiESGAgent:
             log_prob_t = data["log_prob_t"]
             if value_t is None or log_prob_t is None:
                 raise RuntimeError("Missing PPO tensors (value/log_prob).")
+
+            # ensure shapes are (1, 1) for SB3 buffer consumption
+            if hasattr(value_t, "shape") and value_t.shape != (1, 1):
+                value_t = value_t.reshape(1, 1)
+            if hasattr(log_prob_t, "shape") and log_prob_t.shape != (1, 1):
+                log_prob_t = log_prob_t.reshape(1, 1)
 
             obs_np = data["obs"].reshape(1, -1).astype(np.float32)
             obs_th = torch.as_tensor(obs_np, device=policy.device)
@@ -1254,8 +1325,9 @@ class MultiESGAgent:
                         final_obs = self._last_obs[agent_name].reshape(1, -1)
                         with torch.no_grad():
                             obs_tensor = obs_as_tensor(final_obs, policy.device)
-                            _, final_value, _ = policy.policy.forward(obs_tensor)
-                        dones_b = np.array([False], dtype=bool)
+                            final_value = policy.policy.predict_values(obs_tensor)
+                        # Use true episode-start (terminal) flag for correct GAE
+                        dones_b = np.array([self._episode_starts[polid]], dtype=bool)
                         policy.rollout_buffer.compute_returns_and_advantage(final_value, dones_b)
             except Exception as e:
                 self.logger.warning(f"Rollout finalization error for policy {polid}: {e}")
@@ -1274,7 +1346,7 @@ class MultiESGAgent:
             self._print_training_summary()
 
     def _print_initialization_summary(self):
-        print("\n🔍 Initialization Summary")
+        print("\nInitialization Summary")
         print(f"   Agents: {self.num_agents}")
         print(f"   Device: {self.device}")
         print(f"   Memory limit: {self.memory_tracker.max_memory_mb}MB")
@@ -1289,7 +1361,7 @@ class MultiESGAgent:
     def _print_training_summary(self):
         final_stats = self.memory_tracker.get_memory_stats()
         val_stats = self.obs_validator.get_validation_stats()
-        print("\n🎉 Training Completed")
+        print("\nTraining Completed")
         print(f"   Total steps: {self.total_steps:,}")
         print(f"   Successful steps: {self._training_metrics['successful_steps']:,}")
         print(f"   Memory cleanups: {self._training_metrics['memory_cleanups']}")
@@ -1336,7 +1408,7 @@ class MultiESGAgent:
                     saved_count += 1
                     if self.debug:
                         used = after - before
-                        print(f"💾 Saved {agent_name} policy (Δmem {used:.1f}MB)")
+                        print(f"Saved {agent_name} policy (Δmem {used:.1f}MB)")
                     if after > self.memory_tracker.max_memory_mb * 0.8:
                         self.memory_tracker.cleanup("light")
                 finally:
@@ -1369,9 +1441,9 @@ class MultiESGAgent:
         except Exception as e:
             self.logger.warning(f"Failed to save training metadata: {e}")
 
-        print(f"✅ Save complete: {saved_count}/{len(self.policies)} policies saved")
+        print(f"Save complete: {saved_count}/{len(self.policies)} policies saved")
         if save_errors:
-            print("⚠️ Save errors:")
+            print("Save errors:")
             for err in save_errors:
                 print(f"   - {err}")
         return saved_count
@@ -1386,23 +1458,39 @@ class MultiESGAgent:
         loaded_count = 0
         load_errors: List[str] = []
 
-        for agent_name, policy in zip(self.possible_agents, self.policies):
+        for idx, (agent_name, policy) in enumerate(zip(self.possible_agents, self.policies)):
             path = os.path.join(load_dir, f"{agent_name}_policy.zip")
             if not os.path.exists(path):
                 load_errors.append(f"Policy file not found: {path}")
                 continue
             try:
+                algo_name = getattr(policy, "mode", "PPO")
+                algo_cls = {"PPO": PPO, "SAC": SAC, "TD3": TD3}.get(algo_name, PPO)
+
+                # reattach a dummy env with correct spaces
+                obs_space = self.observation_spaces[agent_name]
+                act_space = self.action_spaces[agent_name]
+                dummy_env = DummyVecEnv([partial(DummyGymEnv, obs_space, act_space)])
+
                 before = self.memory_tracker.get_memory_usage()
-                if hasattr(policy, "load"):
-                    policy.load(path)
-                else:
-                    self.logger.warning(f"Policy {agent_name} does not support loading")
-                    continue
+                loaded = algo_cls.load(path, device=self.device, env=dummy_env)
+                # keep metadata expected elsewhere
+                loaded.mode = algo_name
+                loaded.agent_name = agent_name
+                loaded.action_space = act_space
+
+                # swap in
+                self.policies[idx] = loaded
+                self.memory_tracker.register_policy(loaded)
+                if hasattr(loaded, "replay_buffer") and loaded.replay_buffer is not None:
+                    self.memory_tracker.register_buffer(loaded.replay_buffer)
+                if hasattr(loaded, "rollout_buffer") and loaded.rollout_buffer is not None:
+                    self.memory_tracker.register_buffer(loaded.rollout_buffer)
+
                 after = self.memory_tracker.get_memory_usage()
-                used = after - before
                 loaded_count += 1
                 if self.debug:
-                    print(f"📂 Loaded {agent_name} policy (Δmem {used:.1f}MB)")
+                    print(f"Loaded {agent_name} policy (Δmem {after - before:.1f}MB)")
                 if after > self.memory_tracker.max_memory_mb * 0.8:
                     self.memory_tracker.cleanup("light")
             except Exception as e:
@@ -1416,13 +1504,13 @@ class MultiESGAgent:
                 with open(meta_path, "r") as f:
                     _ = json.load(f)  # not used; kept for completeness
                 if self.debug:
-                    print(f"📋 Loaded training metadata from: {meta_path}")
+                    print(f"Loaded training metadata from: {meta_path}")
         except Exception as e:
             self.logger.warning(f"Failed to load training metadata: {e}")
 
-        print(f"✅ Load complete: {loaded_count}/{len(self.policies)} policies loaded")
+        print(f"Load complete: {loaded_count}/{len(self.policies)} policies loaded")
         if load_errors:
-            print("⚠️ Load errors:")
+            print("Load errors:")
             for err in load_errors:
                 print(f"   - {err}")
         return loaded_count
