@@ -613,19 +613,11 @@ class PortfolioAdapter:
             idx = np.random.choice(len(self.buffer), size=self.batch_size, replace=False)
             Xb = np.stack([self.buffer[i][0] for i in idx], axis=0).astype(np.float32)
             Yb = np.stack([self.buffer[i][1] for i in idx], axis=0).astype(np.float32)
-            # FIX: The DL model expects a dictionary input for its .call() method, not a single tensor.
-            # Create a dictionary with the required 'market_state' and 'current_positions' keys.
-            inputs_for_fit = {
-                'market_state': Xb,
-                'current_positions': self._positions()
-            }
             try:
                 if hasattr(self.model, "fit"):
-                    # Use the dictionary input here
-                    self.model.fit(inputs_for_fit, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
+                    self.model.fit(Xb, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
                 elif hasattr(self.model, "model") and hasattr(self.model.model, "fit"):
-                    # Use the dictionary input here
-                    self.model.model.fit(inputs_for_fit, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
+                    self.model.model.fit(Xb, Yb, epochs=self.epochs, batch_size=self.batch_size, verbose=0, shuffle=True)
             except Exception as e:
                 logging.warning(f"DL model fitting failed: {e}")
 
@@ -873,8 +865,7 @@ def main():
     # 10) Save the online-trained allocator (if possible)
     if args.dl_overlay and base_env.dl_adapter:
         try:
-            # FIX: Use a different file extension if the original causes an error
-            out_weights = os.path.join(args.save_dir, "dl_allocator_online.keras")
+            out_weights = os.path.join(args.save_dir, "dl_allocator_online.h5")
             if hasattr(base_env.dl_adapter.model, "save_weights"):
                 base_env.dl_adapter.model.save_weights(out_weights)
                 print(f"💾 Saved online-trained DL allocator to: {out_weights}")

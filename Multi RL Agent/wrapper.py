@@ -12,6 +12,7 @@ Adds logging for:
 - Ops health: step_time_ms, mem_rss_mb
 - Action health: action_clip_frac_* (investor/battery/risk/meta)
 - Forecast MAE@1 (price/wind/solar/load/hydro) vs previous logged forecast
+- PATCH: Logs true mark-to-market portfolio value/equity and computes performance from it
 
 Maintains:
 - TOTAL-dimension observation construction (base + forecasts) with strict shape checking
@@ -167,7 +168,7 @@ class EnhancedObservationValidator:
                 targets = self.forecaster.agent_targets.get(agent, [])
                 horizons = self.forecaster.agent_horizons.get(agent, [])
                 return int(len(targets) * len(horizons))
-            # defaults
+            # defaults (kept as-is because your run is stable with these totals)
             return {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
         except Exception:
             return {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
@@ -474,7 +475,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             # immediate forecasts
             "wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate",
             # perf & quick risks
-            "portfolio_performance", "overall_risk", "market_risk",
+            "portfolio_performance", "portfolio_value", "equity", "overall_risk", "market_risk",  # <-- PATCH: added value/equity
             # env snapshot
             "budget", "wind_cap", "solar_cap", "hydro_cap", "battery_energy",
             "price_actual", "load_actual", "wind_actual", "solar_actual", "hydro_actual",
@@ -744,19 +745,32 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         return default
 
     def _calc_perf_and_quick_risks(self) -> List[float]:
+        """
+        PATCH: Compute performance from true MTM equity (preferred), not capacity proxy.
+        Returns [perf, overall_risk, market_risk].
+        """
         try:
             initial_budget = float(getattr(self.env, 'init_budget', 1e7))
             initial_budget = max(initial_budget, 1.0)
-            current_budget = float(getattr(self.env, 'budget', initial_budget))
-            wind = float(getattr(self.env, 'wind_capacity', 0.0))
-            solar = float(getattr(self.env, 'solar_capacity', 0.0))
-            hydro = float(getattr(self.env, 'hydro_capacity', 0.0))
-            portfolio_value = current_budget + (wind + solar + hydro) * 100.0
+
+            # Prefer env.equity if available; otherwise reconstruct
+            if hasattr(self.env, 'equity'):
+                portfolio_value = float(self._safe_float(getattr(self.env, 'equity', initial_budget), initial_budget))
+            else:
+                cash  = float(self._safe_float(getattr(self.env, 'budget', initial_budget), initial_budget))
+                w_val = float(self._safe_float(getattr(self.env, 'wind_instrument_value', 0.0), 0.0))
+                s_val = float(self._safe_float(getattr(self.env, 'solar_instrument_value', 0.0), 0.0))
+                h_val = float(self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0))
+                portfolio_value = cash + w_val + s_val + h_val
+
             perf = float(np.clip(SafeDivision._safe_divide(portfolio_value, initial_budget, 1.0), 0.0, 10.0))
             overall_risk = float(np.clip(getattr(self.env, "overall_risk_snapshot", 0.5), 0.0, 1.0))
-            market_risk = float(np.clip(getattr(self.env, "market_risk_snapshot", 0.5), 0.0, 1.0))
+            market_risk  = float(np.clip(getattr(self.env, "market_risk_snapshot", 0.5), 0.0, 1.0))
+            # Keep portfolio_value on instance for logging reuse
+            self._last_portfolio_value = portfolio_value
             return [perf, overall_risk, market_risk]
         except Exception:
+            self._last_portfolio_value = None
             return [1.0, 0.5, 0.3]
 
     def _log_metrics_efficient(self, actions: Dict[str, Any], rewards: Dict[str, float],
@@ -799,12 +813,24 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 batt_a0 = get_action_vec("battery_operator_0", 1)[0]
                 risk_a0 = get_action_vec("risk_controller_0", 1)[0]
 
-                # PATCH: Add hydro_forecast_immediate to forecasts to be logged
+                # Forecasts logged (incl. hydro)
                 forecast_keys = ["wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate"]
                 forecasts_logged = [self._safe_float(all_forecasts.get(k, 0.0), 0.0) for k in forecast_keys]
 
-                # perf & quick risks
+                # perf & quick risks (perf based on true equity)
                 perf, overall_risk, market_risk = self._calc_perf_and_quick_risks()
+
+                # Compute/log true equity & portfolio_value
+                if hasattr(self, '_last_portfolio_value') and self._last_portfolio_value is not None:
+                    portfolio_value_logged = float(self._last_portfolio_value)
+                else:
+                    # reconstruct if needed
+                    cash  = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
+                    w_val = self._safe_float(getattr(self.env, 'wind_instrument_value', 0.0), 0.0)
+                    s_val = self._safe_float(getattr(self.env, 'solar_instrument_value', 0.0), 0.0)
+                    h_val = self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0)
+                    portfolio_value_logged = cash + w_val + s_val + h_val
+                equity_logged = portfolio_value_logged  # same thing, explicit for analyzer
 
                 # env snapshot
                 budget = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
@@ -863,7 +889,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 mae_wind  = _mae(self._prev_forecasts_for_error.get("wind_forecast_immediate"),  wind_act)
                 mae_solar = _mae(self._prev_forecasts_for_error.get("solar_forecast_immediate"), solar_act)
                 mae_load  = _mae(self._prev_forecasts_for_error.get("load_forecast_immediate"),  load_act)
-                # PATCH: Add hydro MAE
                 mae_hydro = _mae(self._prev_forecasts_for_error.get("hydro_forecast_immediate"), hydro_act)
                 
                 # Update previous forecast cache for next MAE calculation
@@ -873,7 +898,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     ts_str, int(step_t), int(self.episode_count), meta_reward, inv_freq, cap_frac,
                     meta_a0, meta_a1, inv_a0, inv_a1, inv_a2, batt_a0, risk_a0,
                     *forecasts_logged,
-                    perf, overall_risk, market_risk,
+                    # perf & quick risks (PATCH: include true value/equity)
+                    perf, portfolio_value_logged, equity_logged, overall_risk, market_risk,
+                    # env snapshot
                     budget, wind_c, solar_c, hydro_c, batt_e,
                     price_act, load_act, wind_act, solar_act, hydro_act,
                     market_stress, market_vol, revenue_step,

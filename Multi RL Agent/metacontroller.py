@@ -847,7 +847,7 @@ class MultiESGAgent:
                 self.logger.error(f"Training error for {getattr(policy, 'agent_name', polid)}: {e}")
                 self._training_metrics["policy_errors"] += 1
 
-        pbar = tqdm(total=int(total_timesteps), desc="Memory-Managed Training", unit="steps")
+        pbar = tqdm(total=int(total_timesteps), desc="Training..", unit="steps")
 
         self._initialize_environment_enhanced()
         target = self.total_steps + int(total_timesteps)
