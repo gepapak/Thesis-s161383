@@ -464,8 +464,21 @@ class PortfolioAdapter:
         try:
             self.model.compile(
                 optimizer="adam",
-                loss={"weights": "mse"},  # Only train on weights output
-                metrics=["mae"]
+                loss={
+                    "weights": "mse",
+                    "expected_returns": "mse",
+                    "portfolio_risk": "mse"
+                },
+                loss_weights={
+                    "weights": 1.0,
+                    "expected_returns": 0.0,  # Don't train on this output
+                    "portfolio_risk": 0.0     # Don't train on this output
+                },
+                metrics={
+                    "weights": ["mae"],
+                    "expected_returns": ["mae"],
+                    "portfolio_risk": ["mae"]
+                }
             )
         except Exception as e:
             logging.warning(f"Model compilation failed: {e}")
@@ -731,10 +744,18 @@ class PortfolioAdapter:
             X_combined = np.concatenate([Xb, positions_dummy], axis=1)  # Shape: (batch_size, 18)
 
             try:
-                # Train the model - only on weights output
+                # Train the model - provide targets for all outputs but focus on weights
+                # Create dummy targets for expected_returns and portfolio_risk
+                dummy_returns = np.zeros((Yb.shape[0], 3), dtype=np.float32)  # 3 assets
+                dummy_risk = np.zeros((Yb.shape[0], 1), dtype=np.float32)     # 1 risk value
+
                 self.model.fit(
                     X_combined,
-                    {"weights": Yb},
+                    {
+                        "weights": Yb,
+                        "expected_returns": dummy_returns,
+                        "portfolio_risk": dummy_risk
+                    },
                     epochs=self.epochs,
                     batch_size=min(self.batch_size, len(X_combined)),
                     verbose=0,

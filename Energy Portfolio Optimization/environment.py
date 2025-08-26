@@ -100,6 +100,17 @@ class MultiObjectiveRewardCalculator:
             'efficiency': 0.10,
             'diversification': 0.15,
         }
+
+        # Risk constraint parameters
+        self.max_leverage_ratio = 5.0  # Maximum 5x leverage
+        self.min_cash_reserve_ratio = 0.1  # Minimum 10% cash reserve
+        self.max_single_position_ratio = 0.4  # Maximum 40% in single asset
+        self.bankruptcy_threshold = 0.01  # Portfolio value threshold for bankruptcy penalty
+
+        # Stop-loss and safety parameters
+        self.max_drawdown_threshold = 0.5  # 50% max drawdown from peak
+        self.emergency_liquidation_threshold = 0.05  # 5% of initial budget triggers emergency liquidation
+        self.portfolio_peak = initial_budget  # Track portfolio peak for drawdown calculation
         self.performance_history = {
             'financial_scores': deque(maxlen=max_history_size),
             'risk_scores': deque(maxlen=max_history_size),
@@ -116,6 +127,9 @@ class MultiObjectiveRewardCalculator:
         return float(1.0 - hhi)  # max at 1/3,1/3,1/3
 
     def calculate(self, env_state: Dict[str, float], financial: Dict[str, float], risk: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+        # Check for risk constraint violations first
+        constraint_penalty = self._calculate_constraint_penalties(env_state, financial)
+
         # Enhanced financial score incorporating both MTM and generation revenue
         net_profit = financial.get('net_profit', 0.0)
         generation_revenue = financial.get('generation_revenue', 0.0)
@@ -128,6 +142,9 @@ class MultiObjectiveRewardCalculator:
 
         # Combined financial score with emphasis on generation revenue (PPA economics)
         fin = 0.5 * fin_total + 0.3 * fin_generation + 0.2 * fin_trading
+
+        # Apply constraint penalty to financial score
+        fin = fin * (1.0 - constraint_penalty)
 
         # Risk: comprehensive risk weighting using multiple risk components
         overall_risk = float(np.clip(risk.get('overall_risk', 0.5), 0.0, 1.0))
@@ -191,7 +208,71 @@ class MultiObjectiveRewardCalculator:
             'generation_performance': generation_performance,
             'efficiency': eff,
             'diversification': div,
+            'constraint_penalty': constraint_penalty,
         }
+
+    def _calculate_constraint_penalties(self, env_state: Dict[str, float], financial: Dict[str, float]) -> float:
+        """Calculate penalties for risk constraint violations"""
+        penalty = 0.0
+
+        # Get portfolio components
+        budget = env_state.get('budget', 0.0)
+        wind_pos = env_state.get('wind_pos', 0.0)
+        solar_pos = env_state.get('solar_pos', 0.0)
+        hydro_pos = env_state.get('hydro_pos', 0.0)
+        portfolio_value = financial.get('portfolio_value', budget + wind_pos + solar_pos + hydro_pos)
+
+        # 1. Bankruptcy penalty - severe punishment for portfolio near zero
+        if portfolio_value < self.bankruptcy_threshold:
+            penalty += 0.8  # 80% penalty for bankruptcy
+        elif portfolio_value < self.initial_budget * 0.1:  # Less than 10% of initial
+            penalty += 0.5  # 50% penalty for severe drawdown
+
+        # 2. Leverage constraint - prevent excessive leverage
+        total_positions = wind_pos + solar_pos + hydro_pos
+        if budget > 0 and total_positions > 0:
+            leverage_ratio = total_positions / budget
+            if leverage_ratio > self.max_leverage_ratio:
+                excess_leverage = (leverage_ratio - self.max_leverage_ratio) / self.max_leverage_ratio
+                penalty += min(0.6, excess_leverage * 0.3)  # Up to 60% penalty for excessive leverage
+
+        # 3. Cash reserve constraint - ensure minimum cash reserves
+        if portfolio_value > 0:
+            cash_ratio = budget / portfolio_value
+            if cash_ratio < self.min_cash_reserve_ratio:
+                cash_deficit = (self.min_cash_reserve_ratio - cash_ratio) / self.min_cash_reserve_ratio
+                penalty += min(0.3, cash_deficit * 0.2)  # Up to 30% penalty for insufficient cash
+
+        # 4. Position concentration constraint - prevent over-concentration
+        if total_positions > 0:
+            max_position = max(wind_pos, solar_pos, hydro_pos)
+            concentration_ratio = max_position / total_positions
+            if concentration_ratio > self.max_single_position_ratio:
+                excess_concentration = (concentration_ratio - self.max_single_position_ratio) / (1.0 - self.max_single_position_ratio)
+                penalty += min(0.2, excess_concentration * 0.1)  # Up to 20% penalty for over-concentration
+
+        return min(1.0, penalty)  # Cap total penalty at 100%
+
+
+
+    def update_portfolio_peak_and_check_stops(self, current_portfolio_value: float) -> bool:
+        """Update portfolio peak and check for stop-loss conditions. Returns True if trading should be halted."""
+
+        # Update portfolio peak
+        if current_portfolio_value > self.portfolio_peak:
+            self.portfolio_peak = current_portfolio_value
+
+        # Check for emergency liquidation threshold
+        if current_portfolio_value < self.initial_budget * self.emergency_liquidation_threshold:
+            return True  # Halt trading - emergency liquidation needed
+
+        # Check for maximum drawdown
+        if self.portfolio_peak > 0:
+            current_drawdown = (self.portfolio_peak - current_portfolio_value) / self.portfolio_peak
+            if current_drawdown > self.max_drawdown_threshold:
+                return True  # Halt trading - excessive drawdown
+
+        return False  # Continue normal trading
 
 
 # =============================================================================
@@ -425,6 +506,15 @@ class RenewableMultiAgentEnv(ParallelEnv):
         if self.t % self.investment_freq != 0:
             return 0.0  # No trading allowed this step
 
+        # Check stop-loss conditions
+        current_portfolio_value = self.budget + self.wind_instrument_value + self.solar_instrument_value + self.hydro_instrument_value
+        if hasattr(self, 'reward_calculator') and hasattr(self.reward_calculator, 'update_portfolio_peak_and_check_stops'):
+            should_halt = self.reward_calculator.update_portfolio_peak_and_check_stops(current_portfolio_value)
+            if should_halt:
+                # Emergency liquidation - sell all positions
+                self._emergency_liquidation()
+                return 0.0
+
         # DL Overlay Integration: Use DL adapter if available
         if self.dl_adapter is not None:
             try:
@@ -479,6 +569,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # current positions
         cur_w, cur_s, cur_h = self.wind_instrument_value, self.solar_instrument_value, self.hydro_instrument_value
         tgt_w, tgt_s, tgt_h = target_gross * w_w, target_gross * w_s, target_gross * w_h
+
+        # Apply risk constraints to target positions
+        tgt_w, tgt_s, tgt_h = self._apply_position_constraints(tgt_w, tgt_s, tgt_h, available_capital)
 
         # deltas (positive = buy, negative = sell)
         d_w, d_s, d_h = tgt_w - cur_w, tgt_s - cur_s, tgt_h - cur_h
@@ -980,6 +1073,84 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.comprehensive_risk = {}
         self.portfolio_risk_snapshot = 0.25
         self.liquidity_risk_snapshot = 0.15
+
+    def _apply_position_constraints(self, tgt_w: float, tgt_s: float, tgt_h: float, available_capital: float) -> Tuple[float, float, float]:
+        """Apply position size and leverage constraints to target positions"""
+
+        # 1. Leverage constraint - limit total positions relative to cash
+        total_target = tgt_w + tgt_s + tgt_h
+        max_total_positions = available_capital * 5.0  # 5x max leverage
+
+        if total_target > max_total_positions:
+            # Scale down all positions proportionally
+            scale_factor = max_total_positions / total_target
+            tgt_w *= scale_factor
+            tgt_s *= scale_factor
+            tgt_h *= scale_factor
+            total_target = max_total_positions
+
+        # 2. Single position constraint - limit individual position size
+        max_single_position = total_target * 0.6  # Maximum 60% in single asset
+
+        if tgt_w > max_single_position:
+            excess = tgt_w - max_single_position
+            tgt_w = max_single_position
+            # Redistribute excess to other assets
+            tgt_s += excess * 0.5
+            tgt_h += excess * 0.5
+
+        if tgt_s > max_single_position:
+            excess = tgt_s - max_single_position
+            tgt_s = max_single_position
+            # Redistribute excess to other assets
+            tgt_w += excess * 0.5
+            tgt_h += excess * 0.5
+
+        if tgt_h > max_single_position:
+            excess = tgt_h - max_single_position
+            tgt_h = max_single_position
+            # Redistribute excess to other assets
+            tgt_w += excess * 0.5
+            tgt_s += excess * 0.5
+
+        # 3. Ensure minimum cash reserve (reduce positions if needed)
+        new_total = tgt_w + tgt_s + tgt_h
+        min_cash_needed = self.init_budget * 0.05  # 5% minimum cash reserve
+
+        if available_capital - new_total < min_cash_needed:
+            reduction_needed = min_cash_needed - (available_capital - new_total)
+            if new_total > 0:
+                reduction_factor = max(0.0, (new_total - reduction_needed) / new_total)
+                tgt_w *= reduction_factor
+                tgt_s *= reduction_factor
+                tgt_h *= reduction_factor
+
+        return tgt_w, tgt_s, tgt_h
+
+    def _emergency_liquidation(self):
+        """Emergency liquidation of all positions to preserve capital"""
+        # Liquidate all positions and convert to cash
+        liquidation_value = self.wind_instrument_value + self.solar_instrument_value + self.hydro_instrument_value
+
+        # Apply emergency liquidation costs (higher than normal transaction costs)
+        emergency_cost_rate = 0.02  # 2% emergency liquidation cost
+        liquidation_costs = liquidation_value * emergency_cost_rate
+
+        # Convert positions to cash minus costs
+        self.budget += max(0.0, liquidation_value - liquidation_costs)
+
+        # Zero out all positions
+        self.wind_instrument_value = 0.0
+        self.solar_instrument_value = 0.0
+        self.hydro_instrument_value = 0.0
+
+        # Update capacity proxies
+        self.wind_capacity = 0.0
+        self.solar_capacity = 0.0
+        self.hydro_capacity = 0.0
+
+        # Log emergency liquidation
+        logging.warning(f"Emergency liquidation at step {self.t}: Liquidated ${liquidation_value:.2f} with ${liquidation_costs:.2f} costs")
 
     # ------------------------------------------------------------------
     # Del
