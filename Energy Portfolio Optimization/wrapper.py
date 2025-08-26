@@ -475,7 +475,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             # immediate forecasts
             "wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate",
             # perf & quick risks
-            "portfolio_performance", "portfolio_value", "equity", "overall_risk", "market_risk",  # <-- PATCH: added value/equity
+            "portfolio_performance", "portfolio_value", "equity", "total_return_nav", "overall_risk", "market_risk",  # <-- PATCH: added value/equity + total return
             # env snapshot
             "budget", "wind_cap", "solar_cap", "hydro_cap", "battery_energy",
             "price_actual", "load_actual", "wind_actual", "solar_actual", "hydro_actual",
@@ -763,12 +763,14 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 h_val = float(self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0))
                 portfolio_value = cash + w_val + s_val + h_val
 
-            perf = float(np.clip(SafeDivision._safe_divide(portfolio_value, initial_budget, 1.0), 0.0, 10.0))
+            # Don't clip performance to allow realistic returns (both positive and negative)
+            perf = float(SafeDivision._safe_divide(portfolio_value, initial_budget, 1.0))
+            perf_clipped = float(np.clip(perf, 0.0, 10.0))  # Keep clipped version for observations
             overall_risk = float(np.clip(getattr(self.env, "overall_risk_snapshot", 0.5), 0.0, 1.0))
             market_risk  = float(np.clip(getattr(self.env, "market_risk_snapshot", 0.5), 0.0, 1.0))
             # Keep portfolio_value on instance for logging reuse
             self._last_portfolio_value = portfolio_value
-            return [perf, overall_risk, market_risk]
+            return [perf_clipped, overall_risk, market_risk]  # Use clipped version for observations
         except Exception:
             self._last_portfolio_value = None
             return [1.0, 0.5, 0.3]
@@ -831,6 +833,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     h_val = self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0)
                     portfolio_value_logged = cash + w_val + s_val + h_val
                 equity_logged = portfolio_value_logged  # same thing, explicit for analyzer
+
+                # Total return NAV (includes distributed profits)
+                distributed_profits = self._safe_float(getattr(self.env, 'distributed_profits', 0.0), 0.0)
+                total_return_nav = portfolio_value_logged + distributed_profits
 
                 # env snapshot
                 budget = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
@@ -898,8 +904,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     ts_str, int(step_t), int(self.episode_count), meta_reward, inv_freq, cap_frac,
                     meta_a0, meta_a1, inv_a0, inv_a1, inv_a2, batt_a0, risk_a0,
                     *forecasts_logged,
-                    # perf & quick risks (PATCH: include true value/equity)
-                    perf, portfolio_value_logged, equity_logged, overall_risk, market_risk,
+                    # perf & quick risks (PATCH: include true value/equity + total return)
+                    perf, portfolio_value_logged, equity_logged, total_return_nav, overall_risk, market_risk,
                     # env snapshot
                     budget, wind_c, solar_c, hydro_c, batt_e,
                     price_act, load_act, wind_act, solar_act, hydro_act,

@@ -518,8 +518,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 invest = min(self.init_budget * 0.01, self.budget * 0.1)
                 self.battery_capacity = invest / capex_per_mwh
                 self.budget -= invest
-            # operate
-            price = float(np.clip(self._price[i], 0.0, 1e6))
+            # operate (allow negative prices for realistic battery arbitrage)
+            price = float(np.clip(self._price[i], -1000.0, 1e6))
             if u > 0.5:
                 # discharge
                 rate = (u - 0.5) * 2.0
@@ -547,9 +547,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # Finance & rewards
     # ------------------------------------------------------------------
     def _update_finance(self, i: int, trade_amount: float, battery_cash_delta: float) -> Dict[str, float]:
-        # price return for this step
-        price_t = float(np.clip(self._price[i], 0.0, 1e9))
-        price_tm1 = float(np.clip(self._price[i-1] if i > 0 else self._price[i], 0.0, 1e9))
+        # price return for this step (allow negative prices for realism)
+        price_t = float(np.clip(self._price[i], -1000.0, 1e9))  # Allow negative prices down to -$1000/MWh
+        price_tm1 = float(np.clip(self._price[i-1] if i > 0 else self._price[i], -1000.0, 1e9))
         price_ret = 0.0 if price_tm1 <= 0 else (price_t - price_tm1) / price_tm1
 
         # Correct PPA model: All technologies respond identically to price changes
@@ -616,6 +616,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             'cumulative_returns': self.cumulative_returns,
             'investment_capital': self.investment_capital,
             'fund_performance': self.cumulative_returns / self.init_budget if self.init_budget > 0 else 0.0,
+            'total_return_nav': self.equity + self.distributed_profits,  # Total return including distributions
         }
         # history for regime calc
         self.performance_history['revenue_history'].append(realized)
@@ -838,8 +839,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _fill_obs(self):
         i = min(self.t, self.max_steps - 1)
-        # scales
-        price_n = float(np.clip(SafeDivision.div(self._price[i], 10.0, 0.0), 0.0, 10.0))
+        # scales (allow negative normalized prices)
+        price_n = float(np.clip(SafeDivision.div(self._price[i], 10.0, 0.0), -10.0, 10.0))
         load_n  = float(np.clip(self._load[i], 0.0, 1.0))
         windf   = float(np.clip(SafeDivision.div(self._wind[i],  self.wind_scale, 0.0), 0.0, 1.0))
         solarf  = float(np.clip(SafeDivision.div(self._solar[i], self.solar_scale, 0.0), 0.0, 1.0))

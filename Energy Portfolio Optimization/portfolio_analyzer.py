@@ -16,7 +16,7 @@ class AnalyzerConfig:
     risk_free_annual: float = 0.02
     min_annualization: int = 252           # trading days
     max_annualization: int = 52560         # 10-min steps per year
-    equity_cols: Tuple[str, ...] = ("equity", "portfolio_value", "portfolio_performance")
+    equity_cols: Tuple[str, ...] = ("total_return_nav", "equity", "portfolio_value", "portfolio_performance")
     budget_cols: Tuple[str, ...] = ("budget",)
     log_prefer: bool = True                # when using equity/budget, prefer log returns
     plot_title: str = "Portfolio Analysis"
