@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Dict, Any
 import numpy as np
 import pandas as pd
-from main import load_energy_data  # <-- patched import (no utils)  # noqa: E402
+from main import load_energy_data
 from environment import RenewableMultiAgentEnv
 from metacontroller import MultiESGAgent
 from generator import MultiHorizonForecastGenerator
@@ -34,7 +34,6 @@ def _coerce_action_for_space(action: np.ndarray, action_space):
     Handles both Box and Discrete spaces.
     """
     if hasattr(action_space, "n"):  # Discrete-like
-        # action can be [[x]] or [x] or scalar; take a scalar int
         if isinstance(action, (list, tuple, np.ndarray)):
             action = np.array(action).astype(np.int64).flatten()
             return int(action[0])
@@ -46,7 +45,6 @@ def _coerce_action_for_space(action: np.ndarray, action_space):
             target = int(np.prod(action_space.shape))
             act = act.flatten()
             if act.size != target:
-                # Pad/trim defensively
                 if act.size < target:
                     act = np.pad(act, (0, target - act.size))
                 else:
@@ -67,7 +65,8 @@ def _calculate_performance_metrics(portfolio_values, episode_rewards, risk_level
 
             # Calculate returns series
             pv_series = np.array(portfolio_values)
-            returns = np.diff(pv_series) / pv_series[:-1]
+            # PATCH: Add epsilon to prevent division by zero
+            returns = np.diff(pv_series) / (pv_series[:-1] + 1e-9)
             returns = returns[np.isfinite(returns)]  # Remove inf/nan
 
             if len(returns) > 0:
@@ -82,7 +81,8 @@ def _calculate_performance_metrics(portfolio_values, episode_rewards, risk_level
                 # Drawdown calculation
                 cumulative = np.cumprod(1 + returns)
                 running_max = np.maximum.accumulate(cumulative)
-                drawdown = (cumulative - running_max) / running_max
+                # PATCH: Add epsilon to prevent division by zero
+                drawdown = (cumulative - running_max) / (running_max + 1e-9)
                 max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0
 
                 # Win rate
@@ -233,7 +233,7 @@ def evaluate_trained_agents(
     evaluation_steps = int(max(1, evaluation_steps))
     print(f"📏 Evaluating for {evaluation_steps} steps.")
 
-    # Aggregates (kept minimal & robust)
+    # Aggregates
     episode_rewards: Dict[str, list[float]] = {agent: [] for agent in eval_env.possible_agents}
     portfolio_values: list[float] = []
     risk_levels: list[float] = []
@@ -255,12 +255,10 @@ def evaluate_trained_agents(
             if hasattr(policy, "predict"):
                 act, _ = policy.predict(agent_obs, deterministic=True)
             else:
-                # Fallback sampling if a policy object has no predict()
                 act = eval_env.action_space(agent).sample()
 
             act = _coerce_action_for_space(act, eval_env.action_space(agent))
             actions[agent] = act
-            # Keep a copy for analysis
             try:
                 actions_taken[agent].append(np.array(act).copy())
             except Exception:
@@ -276,39 +274,39 @@ def evaluate_trained_agents(
             except Exception:
                 pass
 
-        # Portfolio proxy (budget + scaled capacity) if available
+        # PATCH: Correctly calculate the true portfolio value (equity)
         pv = None
         try:
-            # Prefer wrapper -> base env fields if present
-            env_ref = getattr(eval_env, "env", None)
-            budget = getattr(eval_env, "budget", None)
-            if env_ref is not None:
-                budget = getattr(env_ref, "budget", budget)
-            wc = getattr(env_ref, "wind_capacity", 0.0)
-            sc = getattr(env_ref, "solar_capacity", 0.0)
-            hc = getattr(env_ref, "hydro_capacity", 0.0)
-            if budget is not None:
-                pv = float(budget) + float(wc + sc + hc) * 100.0
+            # Access the underlying base environment
+            env_ref = getattr(eval_env, "env", eval_env)
+            # The 'equity' attribute is the true mark-to-market portfolio value
+            equity_val = getattr(env_ref, "equity", None)
+            if equity_val is not None:
+                pv = float(equity_val)
+            else: # Fallback if 'equity' is not exposed
+                budget = getattr(env_ref, "budget", 0.0)
+                w_val = getattr(env_ref, "wind_instrument_value", 0.0)
+                s_val = getattr(env_ref, "solar_instrument_value", 0.0)
+                h_val = getattr(env_ref, "hydro_instrument_value", 0.0)
+                pv = float(budget + w_val + s_val + h_val)
         except Exception:
             pv = None
+            
         if pv is not None:
             portfolio_values.append(pv)
 
         # Risk metric if exposed
         try:
-            risk_val = getattr(eval_env, "market_stress", None)
+            env_ref = getattr(eval_env, "env", eval_env)
+            risk_val = getattr(env_ref, "overall_risk_snapshot", None)
             if risk_val is not None:
                 risk_levels.append(float(risk_val))
         except Exception:
             pass
 
         # Handle termination
-        try:
-            if any(bool(x) for x in dones.values()):
-                obs, _ = eval_env.reset()
-        except Exception:
-            # If dones is absent or malformed, just continue
-            pass
+        if any(dones.values()) or any(truncs.values()):
+            obs, _ = eval_env.reset()
 
     print("✅ Evaluation loop finished.")
 
@@ -332,8 +330,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate trained agents on new data.")
     parser.add_argument("--eval_data", required=True, help="CSV with evaluation data")
     parser.add_argument("--trained_agents", required=True, help="Directory with saved agent policies")
-    parser.add_argument("--model_dir", default="models", help="Forecast model directory")
-    parser.add_argument("--scaler_dir", default="scalers", help="Forecast scaler directory")
+    parser.add_argument("--model_dir", default="saved_models", help="Forecast model directory")
+    parser.add_argument("--scaler_dir", default="saved_scalers", help="Forecast scaler directory")
     parser.add_argument("--eval_steps", type=int, default=None, help="Number of timesteps to evaluate")
     parser.add_argument("--output_dir", default="evaluation_logs", help="Where to save logs and summary")
     args = parser.parse_args()

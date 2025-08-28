@@ -110,88 +110,7 @@ class RewardAdaptationCallback(BaseCallback):
 # =====================================================================
 # Config + HPO helpers
 # =====================================================================
-
-class EnhancedConfig:
-    """Enhanced configuration class with optimization support"""
-    def __init__(self, optimized_params: Optional[Dict[str, Any]] = None):
-        # Defaults
-        self.update_every = 128
-        self.lr = 3e-4
-        self.ent_coef = 0.01
-        self.verbose = 1
-        self.seed = 42
-        self.multithreading = True
-
-        # PPO-ish bits
-        self.batch_size = 64
-        self.gamma = 0.99
-        self.gae_lambda = 0.95
-        self.clip_range = 0.2
-        self.vf_coef = 0.5
-        self.max_grad_norm = 0.5
-
-        # Network
-        self.net_arch = [128, 64]
-        self.activation_fn = "tanh"
-
-        # Agent policies
-        self.agent_policies = [
-            {"mode": "PPO"},  # investor_0
-            {"mode": "PPO"},  # battery_operator_0
-            {"mode": "PPO"},  # risk_controller_0
-            {"mode": "SAC"},  # meta_controller_0
-        ]
-
-        if optimized_params:
-            self._apply_optimized_params(optimized_params)
-
-    def _apply_optimized_params(self, params: Dict[str, Any]):
-        print("Applying optimized hyperparameters...")
-
-        # Accept either 'update_every' or 'n_steps'
-        self.update_every = int(params.get('update_every', params.get('n_steps', self.update_every)))
-
-        # Learning parameters
-        self.lr = float(params.get('lr', self.lr))
-        self.ent_coef = params.get('ent_coef', self.ent_coef)
-        self.batch_size = int(params.get('batch_size', self.batch_size))
-        self.gamma = float(params.get('gamma', self.gamma))
-        self.gae_lambda = float(params.get('gae_lambda', self.gae_lambda))
-        self.clip_range = float(params.get('clip_range', self.clip_range))
-        self.vf_coef = float(params.get('vf_coef', self.vf_coef))
-        self.max_grad_norm = float(params.get('max_grad_norm', self.max_grad_norm))
-
-        # Net arch: take explicit list if provided; otherwise map from size label
-        if isinstance(params.get('net_arch'), (list, tuple)):
-            self.net_arch = list(params['net_arch'])
-        else:
-            net_arch_mapping = {
-                'small': [64, 32],
-                'medium': [128, 64],
-                'large': [256, 128, 64]
-            }
-            self.net_arch = net_arch_mapping.get(params.get('net_arch_size', 'medium'), [128, 64])
-
-        # Activation: accept 'activation' or 'activation_fn'
-        self.activation_fn = params.get('activation', params.get('activation_fn', self.activation_fn))
-
-        # Agent modes: if a full list is provided, use it; otherwise accept *_mode aliases
-        if isinstance(params.get('agent_policies'), list) and params['agent_policies']:
-            self.agent_policies = params['agent_policies']
-        else:
-            self.agent_policies = [
-                {"mode": params.get('investor_mode', 'PPO')},
-                {"mode": params.get('battery_mode', 'PPO')},
-                {"mode": params.get('risk_mode', 'PPO')},
-                {"mode": params.get('meta_mode', 'SAC')},
-            ]
-
-        print(f"   Learning rate: {self.lr:.2e}")
-        print(f"   Entropy coefficient: {self.ent_coef}")
-        print(f"   Network architecture: {self.net_arch}")
-        print(f"   Agent modes: {[p['mode'] for p in self.agent_policies]}")
-        print(f"   Update every: {self.update_every}")
-        print(f"   Batch size: {self.batch_size}")
+from config import EnhancedConfig
 
 
 def _perf_to_float(best_performance: Any) -> float:
@@ -727,21 +646,23 @@ class PortfolioAdapter:
         if self.e is None:
             return
         if t % self.label_every == 0:
+            # PATCH: Capture and store the actual positions along with market features
             X = self._market_state(t)[0]    # (feature_dim,)
+            P = self._positions()[0]        # (3,) - Capture current positions
             Y = self._target_weights(t)     # (3,)
-            self.buffer.append((X, Y))
+            self.buffer.append((X, P, Y))   # Store all three components
 
         # (2) fit a minibatch periodically
         if len(self.buffer) >= self.batch_size and t % self.train_every == 0:
             idx = np.random.choice(len(self.buffer), size=self.batch_size, replace=False)
-            Xb = np.stack([self.buffer[i][0] for i in idx], axis=0).astype(np.float32)  # Market features (15-dim)
-            Yb = np.stack([self.buffer[i][1] for i in idx], axis=0).astype(np.float32)  # Target weights (3-dim)
+            # PATCH: Retrieve all stored components for the training batch
+            Xb = np.stack([self.buffer[i][0] for i in idx], axis=0).astype(np.float32)
+            Pb = np.stack([self.buffer[i][1] for i in idx], axis=0).astype(np.float32)
+            Yb = np.stack([self.buffer[i][2] for i in idx], axis=0).astype(np.float32)
 
-            # Create dummy positions for training (current positions are not used in labeling)
-            positions_dummy = np.zeros((Xb.shape[0], 3), dtype=np.float32)
-
-            # Combine market features and positions for model input
-            X_combined = np.concatenate([Xb, positions_dummy], axis=1)  # Shape: (batch_size, 18)
+            # PATCH: Combine market features and the REAL stored positions for model input
+            # This corrects the train-test skew.
+            X_combined = np.concatenate([Xb, Pb], axis=1)
 
             try:
                 # Train the model - provide targets for all outputs but focus on weights
@@ -806,6 +727,19 @@ def main():
     # Forecasting Control
     parser.add_argument("--no_forecast", action="store_true", help="Disable forecasting (pure MARL baseline)")
 
+    # NEW: Offline precompute control
+    parser.add_argument(
+        "--precompute_forecasts",
+        action="store_true",
+        help="Precompute all forecasts offline for O(1) lookups during training."
+    )
+    parser.add_argument(
+        "--precompute_batch_size",
+        type=int,
+        default=8192,
+        help="Batch size to use for offline forecast precompute (TF inference)."
+    )
+
     args = parser.parse_args()
 
     # Safer device selection
@@ -859,6 +793,20 @@ def main():
                 verbose=True
             )
             print("Forecaster initialized successfully!")
+
+            # --- NEW: Offline precompute pass ---
+            if args.precompute_forecasts:
+                try:
+                    print(f"Precomputing forecasts offline (batch_size={args.precompute_batch_size})…")
+                    # You can pass the full dataframe; the forecaster validates required columns internally.
+                    forecaster.precompute_offline(
+                        df=data,
+                        timestamp_col="timestamp",
+                        batch_size=max(1, int(args.precompute_batch_size)),
+                    )
+                except Exception as pe:
+                    print(f"Precompute failed (continuing with online inference): {pe}")
+
         except Exception as e:
             print(f"Failed to initialize forecaster: {e}")
             return

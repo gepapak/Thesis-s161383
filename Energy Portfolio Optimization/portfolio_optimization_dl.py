@@ -31,7 +31,9 @@ class DeepPortfolioOptimizer(tf.keras.Model):
     considering risk, return, and market conditions.
     """
 
-    def __init__(self, num_assets=3, market_dim=9, positions_dim=3, name="DeepPortfolioOptimizer"):
+    # PATCH: Changed default market_dim from 9 to 15 to match the feature vector
+    # created by the PortfolioAdapter in main.py.
+    def __init__(self, num_assets=3, market_dim=15, positions_dim=3, name="DeepPortfolioOptimizer"):
         # PATCHED: Modernized super() call and added name
         super().__init__(name=name)
         self.num_assets = num_assets

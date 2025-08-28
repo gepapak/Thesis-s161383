@@ -1,7 +1,6 @@
-# multi_horizon_wrapper.py
 #!/usr/bin/env python3
 """
-Enhanced Multi-Horizon Wrapper (fully patched)
+Enhanced Multi-Horizon Wrapper (fully patched w/ forecast normalization + horizon alignment)
 
 Adds logging for:
 - Env snapshot: budget, capacities, battery_energy, revenue_step (prefers env.last_revenue), actual price/load/wind/solar/hydro
@@ -13,6 +12,10 @@ Adds logging for:
 - Action health: action_clip_frac_* (investor/battery/risk/meta)
 - Forecast MAE@1 (price/wind/solar/load/hydro) vs previous logged forecast
 - PATCH: Logs true mark-to-market portfolio value/equity and computes performance from it
+- NEW (aligned with env economics): generation_revenue, mtm_pnl, distributed_profits,
+  cumulative_returns, investment_capital, fund_performance
+- NEW (this patch): normalized forecast features + horizon alignment prioritizing env.investment_freq
+- NEW logging fields: price_forecast_aligned, price_forecast_norm, forecast_alignment_score
 
 Maintains:
 - TOTAL-dimension observation construction (base + forecasts) with strict shape checking
@@ -28,7 +31,7 @@ from datetime import datetime
 from collections import deque
 from contextlib import nullcontext
 
-PRICE_SCALE = 10.0  # keep aligned with base env
+PRICE_SCALE = 10.0  # keep aligned with base env (env price_n = price/10 clipped to [-10,10])
 
 # =========================
 # Memory + Validation Utils
@@ -38,7 +41,112 @@ class SafeDivision:
     def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
         if denominator is None or abs(denominator) < 1e-9:
             return default
-        return numerator / denominator
+        try:
+            return float(numerator) / float(denominator)
+        except Exception:
+            return default
+
+# =========================
+# Forecast Post-Processing
+# =========================
+class ForecastPostProcessor:
+    """
+    - Normalizes forecasts to match env observation scales:
+        price -> price/PRICE_SCALE clipped [-10,10] (same dynamic range as env price_n)
+        wind/solar/hydro -> divide by env's p95 scales, clipped [0,1]
+        load -> clipped [0,1]
+      Unknown targets are passed through unchanged.
+
+    - Aligns horizons for each agent by ordering target×horizon keys so that the
+      horizon closest to env.investment_freq comes first. We DO NOT change total dims;
+      we only re-order priority when building the feature vector.
+    """
+    def __init__(self, env, normalize=True, align_horizons=True):
+        self.env = env
+        self.normalize = bool(normalize)
+        self.align_horizons = bool(align_horizons)
+
+    def normalize_value(self, key: str, val: float) -> float:
+        if not self.normalize:
+            return float(val) if np.isfinite(val) else 0.0
+
+        v = float(val) if np.isfinite(val) else 0.0
+        k = (key or "").lower()
+
+        # Price-like
+        if "price" in k:
+            return float(np.clip(v / PRICE_SCALE, -10.0, 10.0))
+
+        # Load
+        if "load" in k:
+            return float(np.clip(v, 0.0, 1.0))
+
+        # Renewables (use env p95 scales computed in env __init__)
+        try:
+            if "wind" in k:
+                scale = max(float(getattr(self.env, "wind_scale", 1.0)), 1e-6)
+                return float(np.clip(v / scale, 0.0, 1.0))
+            if "solar" in k:
+                scale = max(float(getattr(self.env, "solar_scale", 1.0)), 1e-6)
+                return float(np.clip(v / scale, 0.0, 1.0))
+            if "hydro" in k:
+                scale = max(float(getattr(self.env, "hydro_scale", 1.0)), 1e-6)
+                return float(np.clip(v / scale, 0.0, 1.0))
+        except Exception:
+            pass
+
+        # Fallback: pass through
+        return v
+
+    def order_keys_by_horizon_alignment(self, agent: str, keys: List[str]) -> List[str]:
+        """
+        Reorders forecast keys so those whose horizon is closest to env.investment_freq
+        appear first. We expect keys like "..._forecast_<h>" where <h> is an integer.
+        If parsing fails, returns keys unchanged.
+        """
+        if not self.align_horizons or not isinstance(keys, list) or len(keys) == 0:
+            return keys
+
+        try:
+            inv_freq = int(getattr(self.env, "investment_freq", 12))
+            def parse_h(k):
+                # Expect suffix after last underscore to be an int horizon
+                try:
+                    suf = str(k).split("_")[-1]
+                    return abs(int(suf) - inv_freq), int(suf)
+                except Exception:
+                    # Unparseable -> keep later
+                    return (10**9, 10**9)
+
+            # Stable sort by (distance_to_inv_freq, horizon_value) to keep near & deterministic
+            return sorted(keys, key=parse_h)
+        except Exception:
+            return keys
+
+    def normalize_and_align(self, agent: str, raw_forecasts: Mapping[str, float],
+                            expected_keys: List[str]) -> Dict[str, float]:
+        """
+        Returns a dict with the same key set as expected_keys, filled with normalized values.
+        Keys are supplied in an order that prioritizes alignment; values are pulled from raw
+        (with 0.0 fallback), normalized per target.
+        """
+        if not isinstance(raw_forecasts, Mapping):
+            raw_forecasts = {}
+
+        # Reorder keys to prioritize aligned horizons but keep count the same
+        ordered_keys = self.order_keys_by_horizon_alignment(agent, list(expected_keys))
+        out = {}
+
+        for k in ordered_keys:
+            v = raw_forecasts.get(k, 0.0)
+            out[k] = self.normalize_value(k, v)
+
+        # Ensure we only return exactly the expected set (ordered):
+        # map back to expected_keys order so the validator sees a stable layout
+        final_out = {}
+        for k in expected_keys:
+            final_out[k] = out.get(k, 0.0)
+        return final_out
 
 class EnhancedMemoryTracker:
     """Lightweight memory tracker for caches used in the wrapper."""
@@ -116,12 +224,13 @@ class EnhancedObservationValidator:
     IMPORTANT: the ENV returns BASE-only observations. The WRAPPER is responsible for:
       total_dim = base_dim + forecast_dim
 
-    Note: Forecasts are passed in raw units; no normalization is applied here.
+    Forecasts are normalized AND keys are prioritized to align horizons (closest to env.investment_freq first).
     """
-    def __init__(self, base_env, forecaster, debug=False):
+    def __init__(self, base_env, forecaster, debug=False, postproc: Optional[ForecastPostProcessor]=None):
         self.base_env = base_env
         self.forecaster = forecaster
         self.debug = debug
+        self.postproc = postproc or ForecastPostProcessor(base_env, normalize=True, align_horizons=True)
 
         self.agent_observation_specs = {}
         self.validation_errors = deque(maxlen=50)
@@ -156,7 +265,6 @@ class EnhancedObservationValidator:
             space = self.base_env.observation_space(agent)
             return int(space.shape[0])
         except Exception:
-            # safe default per agent type
             return {'investor_0': 6, 'battery_operator_0': 4, 'risk_controller_0': 9, 'meta_controller_0': 11}.get(agent, 8)
 
     def _calculate_forecast_dimension(self, agent: str) -> int:
@@ -168,7 +276,6 @@ class EnhancedObservationValidator:
                 targets = self.forecaster.agent_targets.get(agent, [])
                 horizons = self.forecaster.agent_horizons.get(agent, [])
                 return int(len(targets) * len(horizons))
-            # defaults (kept as-is because your run is stable with these totals)
             return {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
         except Exception:
             return {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
@@ -178,10 +285,12 @@ class EnhancedObservationValidator:
             if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
                 targets = self.forecaster.agent_targets.get(agent, [])
                 horizons = self.forecaster.agent_horizons.get(agent, [])
-                keys = [f"{t}_forecast_{h}" for t in targets for h in horizons]
-                while len(keys) < expected_count:
-                    keys.append(f"fallback_forecast_{len(keys)}")
-                return keys[:expected_count]
+                # Build keys and then order them so aligned horizons come first
+                raw_keys = [f"{t}_forecast_{h}" for t in targets for h in horizons]
+                ordered = self.postproc.order_keys_by_horizon_alignment(agent, raw_keys)
+                while len(ordered) < expected_count:
+                    ordered.append(f"fallback_forecast_{len(ordered)}")
+                return ordered[:expected_count]
         except Exception:
             pass
         return [f"forecast_{i}" for i in range(expected_count)]
@@ -219,12 +328,12 @@ class EnhancedObservationValidator:
 
         if fd > 0:
             keys = spec['forecast_keys'][:fd]
+            # Normalize + align forecasts to match expected keys
+            f_proc = self.postproc.normalize_and_align(agent, forecasts, keys)
             out[bd:bd + fd].fill(0.0)
             for j, key in enumerate(keys):
-                v = forecasts.get(key, 0.0) if isinstance(forecasts, Mapping) else 0.0
-                if not isinstance(v, (int, float)) or not np.isfinite(v):
-                    v = 0.0
-                out[bd + j] = float(v)
+                v = f_proc.get(key, 0.0)
+                out[bd + j] = float(v if np.isfinite(v) else 0.0)
 
         low, high = spec['bounds']
         np.clip(out, low[:td], high[:td], out=out)
@@ -278,13 +387,15 @@ class EnhancedObservationValidator:
 # Observation Builder
 # =========================
 class MemoryOptimizedObservationBuilder:
-    """Builds total observations (base + forecasts) with validation & caching, in-place."""
-    def __init__(self, base_env, forecaster, debug=False):
+    """Builds total observations (base + normalized & horizon-aligned forecasts) with validation & caching, in-place."""
+    def __init__(self, base_env, forecaster, debug=False, normalize_forecasts=True, align_horizons=True):
         self.base_env = base_env
         self.forecaster = forecaster
         self.debug = debug
 
-        self.validator = EnhancedObservationValidator(base_env, forecaster, debug)
+        self.postproc = ForecastPostProcessor(base_env, normalize=normalize_forecasts, align_horizons=align_horizons)
+        self.validator = EnhancedObservationValidator(base_env, forecaster, debug, postproc=self.postproc)
+
         self._obs_out = {
             agent: np.zeros(self.validator.agent_observation_specs[agent]['total_dim'], dtype=np.float32)
             for agent in self.base_env.possible_agents
@@ -316,6 +427,8 @@ class MemoryOptimizedObservationBuilder:
                         fsrc = self._get_cached_forecasts_for_agent(agent, t)
                     else:
                         fsrc = self._get_cached_forecasts_global(t)
+
+                    # Build with normalization + horizon alignment
                     self.validator.build_total_observation(
                         agent, base_obs[agent], fsrc, out=self._obs_out[agent]
                     )
@@ -374,8 +487,9 @@ class MemoryOptimizedObservationBuilder:
 # Wrapper Env
 # =========================
 class MultiHorizonWrapperEnv(ParallelEnv):
-    """Wraps a BASE-only env and exposes TOTAL-dim observations (base + forecasts)."""
-    def __init__(self, base_env, multi_horizon_forecaster, log_path=None, max_memory_mb=1500):
+    """Wraps a BASE-only env and exposes TOTAL-dim observations (base + normalized & horizon-aligned forecasts)."""
+    def __init__(self, base_env, multi_horizon_forecaster, log_path=None, max_memory_mb=1500,
+                 normalize_forecasts=True, align_horizons=True):
         self.env = base_env
         self.forecaster = multi_horizon_forecaster
 
@@ -398,7 +512,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 pass
 
         # Builder / specs
-        self.obs_builder = MemoryOptimizedObservationBuilder(self.env, self.forecaster, debug=False)
+        self.obs_builder = MemoryOptimizedObservationBuilder(
+            self.env, self.forecaster, debug=False,
+            normalize_forecasts=normalize_forecasts, align_horizons=align_horizons
+        )
         self.memory_tracker.register_cache(self.obs_builder.forecast_cache)
         self.memory_tracker.register_cache(self.obs_builder.agent_forecast_cache)
         self.memory_tracker.register_cache(self.log_buffer)
@@ -420,9 +537,13 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_clip_counts = {"investor": 0, "battery": 0, "risk": 0, "meta": 0}
         self._last_clip_totals = {"investor": 1, "battery": 1, "risk": 1, "meta": 1}
 
+        # a couple of last-known values for logging
+        self._last_price_forecast_norm = 0.0
+        self._last_price_forecast_aligned = 0.0
+
         # logging
         self._initialize_logging_safe()
-        print("✅ Enhanced multi-horizon wrapper initialized (TOTAL-dim observations)")
+        print("✅ Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
 
     # ---- spaces ----
     def _build_wrapper_observation_spaces(self):
@@ -472,14 +593,18 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             # actions
             "meta_action_0", "meta_action_1", "inv_action_0", "inv_action_1", "inv_action_2",
             "batt_action_0", "risk_action_0",
-            # immediate forecasts
+            # immediate forecasts (raw keys, then normalized/aligned adds)
             "wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate",
+            # normalized/aligned extras
+            "price_forecast_norm", "price_forecast_aligned",
             # perf & quick risks
-            "portfolio_performance", "portfolio_value", "equity", "total_return_nav", "overall_risk", "market_risk",  # <-- PATCH: added value/equity + total return
+            "portfolio_performance", "portfolio_value", "equity", "total_return_nav", "overall_risk", "market_risk",
             # env snapshot
             "budget", "wind_cap", "solar_cap", "hydro_cap", "battery_energy",
             "price_actual", "load_actual", "wind_actual", "solar_actual", "hydro_actual",
             "market_stress", "market_volatility", "revenue_step",
+            # NEW economics fields
+            "generation_revenue", "mtm_pnl", "distributed_profits", "cumulative_returns", "investment_capital", "fund_performance",
             # episode markers
             "ep_meta_return", "step_in_episode", "episode_end",
             # 6D risk vector
@@ -491,7 +616,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             "episode_id", "seed", "step_time_ms", "mem_rss_mb",
             "action_clip_frac_investor", "action_clip_frac_battery", "action_clip_frac_risk", "action_clip_frac_meta",
             # MAE (1-step abs error vs previous logged forecast)
-            "mae_price_1", "mae_wind_1", "mae_solar_1", "mae_load_1", "mae_hydro_1"
+            "mae_price_1", "mae_wind_1", "mae_solar_1", "mae_load_1", "mae_hydro_1",
+            # forecast signal usefulness diagnostic
+            "forecast_alignment_score"
         ]
         with open(self.log_path, "w", newline="") as f:
             csv.writer(f).writerow(headers)
@@ -525,6 +652,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self.error_count = 0
         self._ep_meta_return = 0.0
         self._prev_forecasts_for_error = {}
+        self._last_price_forecast_norm = 0.0
+        self._last_price_forecast_aligned = 0.0
 
         # optional initial update
         try:
@@ -620,9 +749,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             a_in = actions.get(agent, None)
 
             # Normalize to ndarray/list for uniform handling
-            orig = None
             if isinstance(space, spaces.Discrete):
-                # Discrete → int
                 if isinstance(a_in, np.ndarray):
                     val = int(np.atleast_1d(a_in).flatten()[0])
                 elif np.isscalar(a_in):
@@ -732,6 +859,40 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         except Exception:
             return {}
 
+    def _get_price_forecast_norm_and_aligned(self, all_forecasts: Dict[str, float]) -> Tuple[float, float]:
+        """
+        Returns (price_forecast_norm, price_forecast_aligned_norm).
+        We compute aligned as the forecast with horizon closest to env.investment_freq.
+        """
+        pf_norm = 0.0
+        pf_aligned = 0.0
+        try:
+            # any key that looks like price_forecast_<h>
+            price_items = [(k, all_forecasts[k]) for k in all_forecasts.keys() if "price_forecast_" in str(k).lower()]
+            if price_items:
+                # normalize all candidates
+                cand = []
+                for k, v in price_items:
+                    n = self.obs_builder.postproc.normalize_value(k, v)
+                    cand.append((k, n))
+                    # store first seen normalized as "norm"
+                    if pf_norm == 0.0:
+                        pf_norm = float(n)
+
+                # choose aligned by horizon distance
+                invf = int(getattr(self.env, "investment_freq", 12))
+                def dist(k):
+                    try:
+                        h = int(str(k).split("_")[-1])
+                        return abs(h - invf)
+                    except Exception:
+                        return 10**9
+                k_best, v_best = min(cand, key=lambda kv: dist(kv[0]))
+                pf_aligned = float(v_best)
+        except Exception:
+            pass
+        return pf_norm, pf_aligned
+
     def _get_risk_vector6(self) -> List[float]:
         default = [0.5, 0.2, 0.25, 0.15, 0.35, 0.25]
         try:
@@ -763,14 +924,13 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 h_val = float(self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0))
                 portfolio_value = cash + w_val + s_val + h_val
 
-            # Don't clip performance to allow realistic returns (both positive and negative)
             perf = float(SafeDivision._safe_divide(portfolio_value, initial_budget, 1.0))
-            perf_clipped = float(np.clip(perf, 0.0, 10.0))  # Keep clipped version for observations
+            perf_clipped = float(np.clip(perf, 0.0, 10.0))  # Use clipped version for observations
             overall_risk = float(np.clip(getattr(self.env, "overall_risk_snapshot", 0.5), 0.0, 1.0))
             market_risk  = float(np.clip(getattr(self.env, "market_risk_snapshot", 0.5), 0.0, 1.0))
             # Keep portfolio_value on instance for logging reuse
             self._last_portfolio_value = portfolio_value
-            return [perf_clipped, overall_risk, market_risk]  # Use clipped version for observations
+            return [perf_clipped, overall_risk, market_risk]
         except Exception:
             self._last_portfolio_value = None
             return [1.0, 0.5, 0.3]
@@ -815,9 +975,14 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 batt_a0 = get_action_vec("battery_operator_0", 1)[0]
                 risk_a0 = get_action_vec("risk_controller_0", 1)[0]
 
-                # Forecasts logged (incl. hydro)
+                # Forecasts logged (raw immediate keys if present)
                 forecast_keys = ["wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate"]
                 forecasts_logged = [self._safe_float(all_forecasts.get(k, 0.0), 0.0) for k in forecast_keys]
+
+                # Normalized + aligned price forecasts (for quick sanity + diagnostic)
+                pf_norm, pf_aligned = self._get_price_forecast_norm_and_aligned(all_forecasts)
+                self._last_price_forecast_norm = pf_norm
+                self._last_price_forecast_aligned = pf_aligned
 
                 # perf & quick risks (perf based on true equity)
                 perf, overall_risk, market_risk = self._calc_perf_and_quick_risks()
@@ -826,7 +991,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 if hasattr(self, '_last_portfolio_value') and self._last_portfolio_value is not None:
                     portfolio_value_logged = float(self._last_portfolio_value)
                 else:
-                    # reconstruct if needed
                     cash  = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
                     w_val = self._safe_float(getattr(self.env, 'wind_instrument_value', 0.0), 0.0)
                     s_val = self._safe_float(getattr(self.env, 'solar_instrument_value', 0.0), 0.0)
@@ -835,8 +999,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 equity_logged = portfolio_value_logged  # same thing, explicit for analyzer
 
                 # Total return NAV (includes distributed profits)
-                distributed_profits = self._safe_float(getattr(self.env, 'distributed_profits', 0.0), 0.0)
-                total_return_nav = portfolio_value_logged + distributed_profits
+                distributed_profits_attr = self._safe_float(getattr(self.env, 'distributed_profits', 0.0), 0.0)
+                total_return_nav = portfolio_value_logged + distributed_profits_attr
 
                 # env snapshot
                 budget = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
@@ -857,6 +1021,14 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
                 # prefer last_revenue; fallback to revenue
                 revenue_step = self._safe_float(getattr(self.env, 'last_revenue', getattr(self.env, 'revenue', 0.0)), 0.0)
+
+                # NEW economics values (robust to missing attrs)
+                generation_revenue = self._safe_float(getattr(self.env, 'last_generation_revenue', 0.0), 0.0)
+                mtm_pnl = self._safe_float(getattr(self.env, 'last_mtm_pnl', 0.0), 0.0)
+                distributed_profits = distributed_profits_attr
+                cumulative_returns = self._safe_float(getattr(self.env, 'cumulative_returns', 0.0), 0.0)
+                investment_capital = self._safe_float(getattr(self.env, 'investment_capital', 0.0), 0.0)
+                fund_performance = self._safe_float(getattr(self.env, 'fund_performance', 0.0), 0.0)
 
                 # episode markers
                 step_in_ep = int(getattr(self.env, 'step_in_episode', self.step_count))
@@ -896,27 +1068,49 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 mae_solar = _mae(self._prev_forecasts_for_error.get("solar_forecast_immediate"), solar_act)
                 mae_load  = _mae(self._prev_forecasts_for_error.get("load_forecast_immediate"),  load_act)
                 mae_hydro = _mae(self._prev_forecasts_for_error.get("hydro_forecast_immediate"), hydro_act)
-                
                 # Update previous forecast cache for next MAE calculation
                 self._prev_forecasts_for_error = {k: v for k, v in zip(forecast_keys, forecasts_logged)}
+
+                # Forecast alignment score (diagnostic): sign(predicted ΔP) × realized return
+                # Use aligned normalized price forecast (pf_aligned) and compute realized price return since t-1
+                try:
+                    # realized price return
+                    if hasattr(self.env, "_price"):
+                        i = max(0, min(getattr(self.env, "t", 0) - 1, len(self.env._price) - 1))
+                        p_t = float(self.env._price[i])
+                        p_tm1 = float(self.env._price[i-1] if i > 0 else self.env._price[i])
+                        realized_ret = (p_t - p_tm1) / p_tm1 if abs(p_tm1) > 1e-9 else 0.0
+                    else:
+                        realized_ret = 0.0
+                    # we interpret pf_aligned (normalized by PRICE_SCALE) as level; use Δ vs current normalized price
+                    cur_price_norm = float(np.clip(self._safe_float(actuals['price'], 0.0) / PRICE_SCALE, -10.0, 10.0))
+                    forecast_alignment_score = float(np.sign(pf_aligned - cur_price_norm) * realized_ret)
+                except Exception:
+                    forecast_alignment_score = 0.0
 
                 row = [
                     ts_str, int(step_t), int(self.episode_count), meta_reward, inv_freq, cap_frac,
                     meta_a0, meta_a1, inv_a0, inv_a1, inv_a2, batt_a0, risk_a0,
                     *forecasts_logged,
-                    # perf & quick risks (PATCH: include true value/equity + total return)
+                    # normalized + aligned price forecast for quick sanity check
+                    self._last_price_forecast_norm, self._last_price_forecast_aligned,
+                    # perf & quick risks
                     perf, portfolio_value_logged, equity_logged, total_return_nav, overall_risk, market_risk,
                     # env snapshot
                     budget, wind_c, solar_c, hydro_c, batt_e,
                     price_act, load_act, wind_act, solar_act, hydro_act,
                     market_stress, market_vol, revenue_step,
+                    # NEW economics block
+                    generation_revenue, mtm_pnl, distributed_profits, cumulative_returns, investment_capital, fund_performance,
+                    # episode markers
                     self._ep_meta_return, step_in_ep, episode_end,
                     *r6,
                     r_fin, r_risk, r_sus, r_eff, r_div,
                     w_fin, w_rsk, w_sus, w_eff, w_div,
                     self.episode_count, seed, step_ms, mem_mb,
                     clip_inv, clip_bat, clip_rsk, clip_meta,
-                    mae_price, mae_wind, mae_solar, mae_load, mae_hydro
+                    mae_price, mae_wind, mae_solar, mae_load, mae_hydro,
+                    forecast_alignment_score
                 ]
 
                 self.log_buffer.append(row)
@@ -937,7 +1131,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         """
         if not self.log_path or not self.log_buffer:
             return
-        
+
         try:
             with self.log_lock, open(self.log_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)

@@ -1,13 +1,5 @@
 # metacontroller.py
 # -----------------------------------------------------------------------------
-# Enhanced multi-agent controller for SB3 with aggressive memory safety,
-# robust observation/action validation, and optional (lightweight) HPO.
-#
-# Exports:
-#   - MultiESGAgent: orchestrates 1-policy-per-agent training using SB3 (PPO/SAC/TD3)
-#   - HyperparameterOptimizer: minimal, safe random-search HPO that returns a dict
-# -----------------------------------------------------------------------------
-
 from copy import deepcopy
 from gymnasium import Env, spaces
 from gymnasium.spaces import Box, Discrete
@@ -32,9 +24,12 @@ import inspect
 import weakref
 import logging
 from datetime import datetime
-import inspect
 import random
 import json
+import pandas as pd
+import optuna
+from config import EnhancedConfig
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -768,18 +763,6 @@ class MultiESGAgent:
             return self._ensure_action_shape(raw_action, action_space)
 
     def _coerce_action_for_buffer(self, policy, agent_name: str, action):
-        """
-        Coerce an action to be compatible with the replay buffer requirements.
-        This method ensures actions are properly formatted before being stored in replay buffers.
-
-        Args:
-            policy: The policy object (contains action_space info)
-            agent_name: Name of the agent (for debugging)
-            action: The raw action to be coerced
-
-        Returns:
-            np.ndarray: Properly formatted action for buffer storage
-        """
         try:
             # Get the action space from policy or fallback to class-level spaces
             action_space = getattr(policy, "action_space", None)
@@ -1210,37 +1193,63 @@ class MultiESGAgent:
                     policy.num_timesteps += 1
             except Exception as e:
                 self.logger.warning(f"Experience addition error for {agent_name}: {e}")
-
+    
     def _add_ppo_experience(self, policy, data, reward, polid):
+        """
+        Add one transition to SB3's RolloutBuffer.
+
+        SB3 expects:
+          - obs:            np.ndarray (CPU, float32)   shape: (1, obs_dim)
+          - action:         np.ndarray (CPU, float32)   shape: (1, act_dim)
+          - reward:         np.ndarray (CPU, float32)   shape: (1,)
+          - episode_starts: np.ndarray (CPU, bool)      shape: (1,)
+          - value:          torch.Tensor on policy.device, shape: (1, 1)
+          - log_prob:       torch.Tensor on policy.device, shape: (1, 1)
+        """
+        # RolloutBuffer may not be initialized yet (e.g., during warmup)
         if not hasattr(policy, "rollout_buffer"):
             return
+
         try:
-            value_t = data["value_t"]
-            log_prob_t = data["log_prob_t"]
+            value_t = data.get("value_t", None)
+            log_prob_t = data.get("log_prob_t", None)
             if value_t is None or log_prob_t is None:
-                raise RuntimeError("Missing PPO tensors (value/log_prob).")
+                raise RuntimeError("Missing PPO tensors: value_t and/or log_prob_t are None.")
 
-            # ensure shapes are (1, 1) for SB3 buffer consumption
-            if hasattr(value_t, "shape") and value_t.shape != (1, 1):
+            # --- ensure value/log_prob shapes and device ---
+            if hasattr(value_t, "shape") and tuple(value_t.shape) != (1, 1):
                 value_t = value_t.reshape(1, 1)
-            if hasattr(log_prob_t, "shape") and log_prob_t.shape != (1, 1):
+            if hasattr(log_prob_t, "shape") and tuple(log_prob_t.shape) != (1, 1):
                 log_prob_t = log_prob_t.reshape(1, 1)
+            value_t = value_t.to(policy.device)
+            log_prob_t = log_prob_t.to(policy.device)
 
-            obs_np = data["obs"].reshape(1, -1).astype(np.float32)
-            obs_th = torch.as_tensor(obs_np, device=policy.device)
+            # --- obs -> numpy (CPU, float32, shape (1, -1)) ---
+            obs = data["obs"]
+            if "torch" in str(type(obs)):
+                obs = obs.detach().cpu().numpy()
+            elif not isinstance(obs, np.ndarray):
+                obs = np.asarray(obs)
+            obs_np = obs.astype(np.float32).reshape(1, -1)
 
+            # --- action -> numpy (CPU, float32, shape (1, -1)) ---
             action_space = getattr(policy, "action_space", None) or self.action_spaces.get(
                 getattr(policy, "agent_name", ""), None
             )
             action_fixed = self._ensure_action_shape(data["action"], action_space)
-            action_np = np.asarray(action_fixed, np.float32).reshape(1, -1)
-            action_th = torch.as_tensor(action_np, device=policy.device)
+            if "torch" in str(type(action_fixed)):
+                action_fixed = action_fixed.detach().cpu().numpy()
+            action_np = np.asarray(action_fixed, dtype=np.float32).reshape(1, -1)
 
-            rew_th = torch.as_tensor([reward], dtype=torch.float32, device=policy.device)
-            starts_th = torch.as_tensor([self._episode_starts[polid]], dtype=torch.bool, device=policy.device)
+            # --- reward/start flags -> numpy (CPU) ---
+            reward_np = np.array([reward], dtype=np.float32)
+            starts_np = np.array([self._episode_starts[polid]], dtype=bool)
 
-            policy.rollout_buffer.add(obs_th, action_th, rew_th, starts_th, value_t, log_prob_t)
+            # --- finally add to SB3 buffer ---
+            policy.rollout_buffer.add(obs_np, action_np, reward_np, starts_np, value_t, log_prob_t)
+
         except Exception as e:
+            # Keep message identical to your logs so it's easy to grep
             self.logger.warning(f"PPO buffer add error: {e}")
 
     def _add_offpolicy_experience(self, policy, data, reward, done, truncs, next_obs, agent_name):
@@ -1566,86 +1575,171 @@ class MultiESGAgent:
 
 
 # ========================= Lightweight HPO (Optional) =======================
-class HyperparameterOptimizer:
+# PATCH: Replaced the old heuristic-based optimizer with the new Optuna-based version.
+class OptunaHyperparameterOptimizer:
     """
-    Minimal, safe random-search HPO that returns a dict of best params.
-    Designed to be optional, fast to instantiate, and safe to skip.
+    A powerful hyperparameter optimizer using Optuna to maximize the Sharpe Ratio
+    from short training and evaluation episodes.
     """
 
     def __init__(
         self,
         env,
         device: str = "cpu",
-        n_trials: int = 10,
-        timeout: Optional[int] = None,
-        seed: int = 42,
-        agent_names: Optional[List[str]] = None,
+        n_trials: int = 50,
+        timeout: Optional[int] = 3600,
+        training_steps_per_trial: int = 5000,
+        eval_steps_per_trial: int = 1000,
     ):
+        """
+        Initializes the optimizer.
+
+        Args:
+            env: The environment instance to use for optimization.
+            device: The device to use for training ('cpu' or 'cuda').
+            n_trials: The maximum number of trials to run.
+            timeout: The maximum time in seconds for the optimization process.
+            training_steps_per_trial: Number of training steps for each trial.
+            eval_steps_per_trial: Number of evaluation steps for each trial.
+        """
         self.env = env
         self.device = device
-        self.n_trials = int(max(1, n_trials))
+        self.n_trials = n_trials
         self.timeout = timeout
-        self.seed = int(seed)
-        random.seed(self.seed)
-        np.random.seed(self.seed)
+        self.training_steps_per_trial = training_steps_per_trial
+        self.eval_steps_per_trial = eval_steps_per_trial
+        self.logger = logging.getLogger(__name__)
 
-        self.agent_names = agent_names or list(getattr(env, "possible_agents", [])) or [
-            "investor_0",
-            "battery_operator_0",
-            "risk_controller_0",
-            "meta_controller_0",
-        ]
+    def _calculate_performance_metric(self, portfolio_values: List[float]) -> float:
+        """
+        Calculates the Sharpe Ratio from a series of portfolio values.
+        Returns a very low number on failure to guide Optuna away from bad trials.
+        """
+        if not portfolio_values or len(portfolio_values) < 20:
+            return -10.0  # Penalize trials that fail to produce a meaningful series
 
-        # Very small search space on purpose (safe & quick)
-        self._modes = ["PPO", "SAC"]  # TD3 omitted by default for speed
-        self._net_arch_choices = [[64, 32], [128, 64], [64, 64]]
-        self._lr_range = (1e-4, 5e-4)
-        self._ent_choices = [0.0, 0.005, 0.01]
+        try:
+            pv_series = np.array(portfolio_values, dtype=np.float32)
+            # Use percentage change for returns; robust to starting value
+            returns = pd.Series(pv_series).pct_change().dropna().to_numpy()
+            
+            if returns.size < 10 or np.std(returns) < 1e-9:
+                return -10.0 # Not enough variance to calculate Sharpe
 
-    def _sample_trial(self) -> Dict[str, Any]:
-        cfg = {
-            "lr": float(10 ** np.random.uniform(np.log10(self._lr_range[0]), np.log10(self._lr_range[1]))),
-            "ent_coef": float(random.choice(self._ent_choices)),
-            "net_arch": random.choice(self._net_arch_choices),
-            "update_every": int(random.choice([128, 192, 256])),
-            "gamma": float(random.choice([0.98, 0.99])),
-            "gae_lambda": float(random.choice([0.9, 0.95])),
-            "batch_size": int(random.choice([64, 128])),
-            "n_epochs": int(random.choice([5, 8])),
-        }
-        # Per-agent modes
-        cfg["agent_policies"] = [{"mode": random.choice(self._modes)} for _ in self.agent_names]
-        return cfg
+            # Simplified Sharpe Ratio for comparison purposes
+            sharpe_ratio = np.mean(returns) / np.std(returns)
+            
+            # Annualize (assuming daily-like frequency for trial runs)
+            annualized_sharpe = sharpe_ratio * np.sqrt(252)
+            
+            return float(np.nan_to_num(annualized_sharpe, nan=-10.0))
+        except Exception:
+            return -10.0
+
+    def _objective(self, trial: optuna.trial.Trial) -> float:
+        """The core objective function that Optuna tries to maximize."""
+        try:
+            # 1. Sample Hyperparameters
+            params = {
+                'lr': trial.suggest_float('lr', 1e-5, 1e-3, log=True),
+                'ent_coef': trial.suggest_float('ent_coef', 0.0, 0.02),
+                'clip_range': trial.suggest_float('clip_range', 0.1, 0.4),
+                'vf_coef': trial.suggest_float('vf_coef', 0.3, 0.7),
+                'gae_lambda': trial.suggest_float('gae_lambda', 0.9, 0.99),
+                'net_arch_size': trial.suggest_categorical('net_arch_size', ['small', 'medium']),
+                'activation_fn': trial.suggest_categorical('activation_fn', ['tanh', 'relu']),
+                'update_every': trial.suggest_categorical('update_every', [128, 256, 512]),
+                'batch_size': trial.suggest_categorical('batch_size', [64, 128]),
+                # Suggest a single mode for all agents for simplicity, can be expanded
+                'agent_mode': trial.suggest_categorical('agent_mode', ['PPO', 'SAC'])
+            }
+            # Apply the same mode to all agents in this trial
+            params['agent_policies'] = [{"mode": params['agent_mode']}] * len(self.env.possible_agents)
+            
+            # 2. Configure and Initialize the Agent
+            config = EnhancedConfig(optimized_params=params)
+            agent_system = MultiESGAgent(config, self.env, self.device, training=True)
+
+            # 3. Short Training Run
+            agent_system.learn(total_timesteps=self.training_steps_per_trial)
+
+            # 4. Short Evaluation Run
+            obs, _ = self.env.reset()
+            portfolio_values = []
+            
+            for step in range(self.eval_steps_per_trial):
+                actions = {}
+                for i, agent_name in enumerate(self.env.possible_agents):
+                    agent_obs = obs[agent_name].reshape(1, -1)
+                    policy = agent_system.policies[i]
+                    action, _ = policy.predict(agent_obs, deterministic=True)
+                    actions[agent_name] = action
+
+                obs, _, _, _, _ = self.env.step(actions)
+                
+                # Correctly access the base environment's equity
+                base_env = getattr(self.env, 'env', self.env)
+                equity = getattr(base_env, 'equity', None)
+                if equity is not None:
+                    portfolio_values.append(equity)
+
+                # Optuna Pruning Hook
+                trial.report(np.mean(portfolio_values) if portfolio_values else 0, step)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+            # 5. Calculate and Return Final Metric
+            sharpe_ratio = self._calculate_performance_metric(portfolio_values)
+            return sharpe_ratio
+
+        except optuna.TrialPruned:
+            raise
+        except Exception as e:
+            self.logger.warning(f"Trial failed with exception: {e}")
+            return -10.0 # Return a very bad score for failed trials
 
     def optimize(self) -> Tuple[Dict[str, Any], Dict[str, float]]:
         """
-        Returns (best_params, performance_summary). The 'performance' is a
-        heuristic score computed from a very short dry-run using env info,
-        kept light to avoid long runs. This is intentionally conservative.
+        Runs the Optuna optimization study.
+
+        Returns:
+            A tuple of (best_parameters_dict, performance_summary_dict).
         """
-        best_params: Dict[str, Any] = {}
-        best_score = -1e9
+        study = optuna.create_study(
+            direction="maximize",
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=self.eval_steps_per_trial // 2)
+        )
 
-        # Heuristic baseline using obs/action sizes
-        base_score = 0.0
         try:
-            for a in self.agent_names:
-                osz = int(np.prod(self.env.observation_space(a).shape))
-                asz = int(np.prod(getattr(self.env.action_space(a), "shape", (1,))))
-                base_score += np.log1p(osz) + np.log1p(asz)
-        except Exception:
-            base_score = 1.0
+            print(f"🚀 Starting Optuna HPO for {self.n_trials} trials (timeout: {self.timeout}s)...")
+            study.optimize(
+                self._objective,
+                n_trials=self.n_trials,
+                timeout=self.timeout,
+                show_progress_bar=True
+            )
+        except KeyboardInterrupt:
+            print("\n🛑 HPO interrupted by user.")
+        
+        if not study.best_trial:
+             print("⚠️ HPO finished with no completed trials. Returning default parameters.")
+             return {}, {"best_sharpe_ratio": -10.0}
 
-        for _ in range(self.n_trials):
-            trial = self._sample_trial()
-            # tiny heuristic "score": prefer smaller nets, reasonable lr, PPO bias
-            size_penalty = sum(trial["net_arch"]) / 300.0
-            lr_term = -abs(np.log10(trial["lr"]) - np.log10(3e-4)) * 2.0
-            mode_bonus = sum(1.0 if p["mode"] == "PPO" else 0.6 for p in trial["agent_policies"])
-            score = base_score + lr_term + mode_bonus - size_penalty
-            if score > best_score:
-                best_score = score
-                best_params = deepcopy(trial)
+        best_params = study.best_params
+        best_value = study.best_value
+        
+        # Format the agent policies correctly for the config
+        best_params['agent_policies'] = [{"mode": best_params.get('agent_mode', 'PPO')}] * len(self.env.possible_agents)
 
-        perf = {"heuristic_score": float(best_score), "baseline": float(base_score)}
-        return best_params, perf
+        performance_summary = {"best_sharpe_ratio": best_value}
+        
+        print("\n🎉 HPO Finished!")
+        print(f"🏆 Best Sharpe Ratio: {best_value:.4f}")
+        print("📋 Best Hyperparameters:")
+        for key, value in best_params.items():
+            print(f"  - {key}: {value}")
+
+        return best_params, performance_summary
+
+# Keep this alias for backward compatibility with main.py
+HyperparameterOptimizer = OptunaHyperparameterOptimizer

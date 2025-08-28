@@ -1,6 +1,5 @@
 # environment.py
-# Clean, MTM-based environment with cash/equity separation and realistic frictions
-# Compatible with your wrapper, analyzer, metacontroller & risk controller
+# FINAL PATCHED VERSION - 28/08/2025
 
 from __future__ import annotations
 
@@ -65,18 +64,35 @@ class StabilizedObservationManager:
     def _build_specs(self) -> Dict[str, Dict[str, Any]]:
         specs: Dict[str, Dict[str, Any]] = {}
         # BASE dims are fixed; wrapper will add forecast features to reach model totals
-        specs["investor_0"] = {"base": 6}   # wind, solar, hydro, price_n, load, budget_n
-        specs["battery_operator_0"] = {"base": 4}  # price_n, batt_energy, batt_capacity, load
-        specs["risk_controller_0"] = {"base": 9}   # regime cues + positions + knobs
-        specs["meta_controller_0"] = {"base": 11}  # budget, positions, price_n, risks, perf, knobs
+        specs["investor_0"]         = {"base": 6}   # wind, solar, hydro, price_n, load, budget_n
+        specs["battery_operator_0"] = {"base": 4}   # price_n, batt_energy, batt_capacity, load
+        specs["risk_controller_0"]  = {"base": 9}   # regime cues + positions + knobs
+        specs["meta_controller_0"]  = {"base": 11}  # budget, positions, price_n, risks, perf, knobs
         return specs
 
     def _build_spaces(self) -> Dict[str, spaces.Box]:
         sp: Dict[str, spaces.Box] = {}
-        sp["investor_0"]         = spaces.Box(low=0.0, high=10.0, shape=(6,), dtype=np.float32)
-        sp["battery_operator_0"] = spaces.Box(low=0.0, high=10.0, shape=(4,), dtype=np.float32)
-        sp["risk_controller_0"]  = spaces.Box(low=0.0, high=10.0, shape=(9,), dtype=np.float32)
-        sp["meta_controller_0"]  = spaces.Box(low=0.0, high=10.0, shape=(11,), dtype=np.float32)
+
+        # Use per-dimension bounds to allow negative normalized price where applicable.
+        inv_low  = np.array([0.0, 0.0, 0.0, -10.0, 0.0, 0.0], dtype=np.float32)
+        inv_high = np.array([10.0, 10.0, 10.0,  10.0, 10.0, 10.0], dtype=np.float32)
+
+        bat_low  = np.array([-10.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        bat_high = np.array([ 10.0,10.0,10.0,10.0], dtype=np.float32)
+
+        # risk: [price_n, vol*10, stress*10, wind_pos_rel*10, solar_pos_rel*10, hydro_pos_rel*10,
+        #         cap_frac*10, equity_rel*10, risk_multiplier*5]
+        risk_low  = np.array([-10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        risk_high = np.array([ 10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0], dtype=np.float32)
+
+        # meta: idx4 is price_n which can be negative
+        meta_low  = np.array([0.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        meta_high = np.array([10.0]*11, dtype=np.float32)
+
+        sp["investor_0"]         = spaces.Box(low=inv_low,  high=inv_high,  shape=(6,),  dtype=np.float32)
+        sp["battery_operator_0"] = spaces.Box(low=bat_low,  high=bat_high,  shape=(4,),  dtype=np.float32)
+        sp["risk_controller_0"]  = spaces.Box(low=risk_low, high=risk_high, shape=(9,),  dtype=np.float32)
+        sp["meta_controller_0"]  = spaces.Box(low=meta_low, high=meta_high, shape=(11,), dtype=np.float32)
         return sp
 
     def obs_space(self, agent: str) -> spaces.Box:
@@ -100,6 +116,8 @@ class MultiObjectiveRewardCalculator:
             'efficiency': 0.10,
             'diversification': 0.15,
         }
+        # Tiny additive incentive to use forecasts correctly (dimensionless)
+        self.forecast_awareness_weight = 0.05  # tune 0.02–0.10
 
         # Risk constraint parameters
         self.max_leverage_ratio = 5.0  # Maximum 5x leverage
@@ -177,18 +195,23 @@ class MultiObjectiveRewardCalculator:
 
         # Adjusted reward weights to emphasize generation performance
         adjusted_weights = {
-            'financial': 0.40,      # Increased emphasis on financial returns
+            'financial': 0.40,       # Increased emphasis on financial returns
             'risk_management': 0.25, # Reduced slightly
             'sustainability': 0.20,  # Increased for renewable deployment
             'efficiency': 0.10,      # Maintained
             'diversification': 0.05, # Reduced slightly
         }
 
-        total = (adjusted_weights['financial']      * fin +
-                 adjusted_weights['risk_management']* risk_score +
-                 adjusted_weights['sustainability'] * sus +
-                 adjusted_weights['efficiency']     * eff +
-                 adjusted_weights['diversification']* div)
+        total = (adjusted_weights['financial']       * fin +
+                 adjusted_weights['risk_management'] * risk_score +
+                 adjusted_weights['sustainability']  * sus +
+                 adjusted_weights['efficiency']      * eff +
+                 adjusted_weights['diversification'] * div)
+
+        # --- PATCH: small additive incentive to act in the direction of aligned forecast ---
+        fs = float(np.clip(financial.get('forecast_signal_score', 0.0), -1.0, 1.0))
+        total += self.forecast_awareness_weight * fs
+        # -----------------------------------------------------------------------------------
 
         # track enhanced metrics
         self.performance_history['financial_scores'].append(fin)
@@ -196,6 +219,9 @@ class MultiObjectiveRewardCalculator:
         self.performance_history['sustainability_scores'].append(sus)
         self.performance_history['efficiency_scores'].append(eff)
         self.performance_history['diversification_scores'].append(div)
+
+        # Keep the externally visible weights in sync with what was actually used
+        self.reward_weights = dict(adjusted_weights)
 
         return float(total), {
             'total': float(total),
@@ -209,6 +235,8 @@ class MultiObjectiveRewardCalculator:
             'efficiency': eff,
             'diversification': div,
             'constraint_penalty': constraint_penalty,
+            # --- PATCH: expose for logging/analysis (not part of weighted mix) ---
+            'forecast_awareness': fs,
         }
 
     def _calculate_constraint_penalties(self, env_state: Dict[str, float], financial: Dict[str, float]) -> float:
@@ -285,13 +313,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
       - Cash (self.budget) vs Equity (cash + marked-to-market positions)
       - Positions (wind/solar/hydro) are currency notionals
       - MTM P&L from price returns; *no* payout × price multiplication
-      - Transaction costs on turnover; battery opex; optional generation revenue (disabled)
+      - Transaction costs on turnover; battery opex; generation revenue with floor/cap
     """
     metadata = {"name": "renewable_multi_agent:MTM-v1"}
 
     # ----- meta/risk knob ranges used by meta controller -----
-    META_FREQ_MIN = 6        # every hour if 10-min data
-    META_FREQ_MAX = 288      # daily
+    META_FREQ_MIN = 6       # every hour if 10-min data
+    META_FREQ_MAX = 288     # daily
     META_CAP_MIN  = 0.02
     META_CAP_MAX  = 0.50
     SAT_EPS       = 1e-3
@@ -313,6 +341,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.dl_adapter = dl_adapter
         self.investment_freq = max(1, int(investment_freq))
         self.init_budget = float(init_budget)
+
+        # ---- economics knobs (single source of truth) ----
+        self.ppa_floor = True        # floor generation revenue at 0 (PPA-floor style)
+        self.ppa_scale = 1e-9        # $ exposure -> MW equivalent, conservative
+        self.ppa_share = 0.01        # take 1% of theoretical revenue after scaling
+        self.ppa_cap_frac = 1e-4     # cap gen revenue at 0.01% of initial budget per step
+        self.distribution_rate = 0.30  # distribute 30% of POSITIVE realized cash to investors
 
         # vectorized series
         self._wind  = self.data.get('wind',  pd.Series(0.0, index=self.data.index)).astype(float).to_numpy()
@@ -403,6 +438,56 @@ class RenewableMultiAgentEnv(ParallelEnv):
         return self.obs_manager.base_dim(agent)
 
     # ------------------------------------------------------------------
+    # PATCH: aligned-horizon forecast helpers
+    # ------------------------------------------------------------------
+    def _aligned_horizon_steps(self) -> int:
+        """
+        Choose a horizon that matches how often the investor can act.
+        If you trade every K steps, the K-step-ahead price forecast is most relevant.
+        """
+        try:
+            k = int(max(1, getattr(self, "investment_freq", 6)))
+            if   k <= 6:  return 6
+            elif k <= 12: return 12
+            else:         return min(24, k)
+        except Exception:
+            return 6
+
+    def _get_aligned_price_forecast(self, t: int, default: float = None) -> Optional[float]:
+        """
+        Reads the forecaster (if present) and fetches price forecast at the aligned horizon.
+        Supports dict-returning forecasters (predict_all_horizons) or per-agent (predict_for_agent).
+        Expects keys like 'price_forecast_6', 'price_forecast_12', etc., with safe fallbacks.
+        """
+        if not hasattr(self, "forecast_generator") or self.forecast_generator is None:
+            return default
+        try:
+            h = self._aligned_horizon_steps()
+            # preferred: a flat dict of all forecasts
+            if hasattr(self.forecast_generator, "predict_all_horizons"):
+                d = self.forecast_generator.predict_all_horizons(timestep=t)
+                if isinstance(d, dict):
+                    for k in (f"price_forecast_{h}", f"price_forecast_h{h}", f"price_h{h}", "price_forecast_aligned"):
+                        if k in d and np.isfinite(d[k]):
+                            return float(d[k])
+                    for k in ("price_forecast_immediate", "price_forecast_1", "price_h1"):
+                        if k in d and np.isfinite(d[k]):
+                            return float(d[k])
+            # per-agent API
+            if hasattr(self.forecast_generator, "predict_for_agent"):
+                d = self.forecast_generator.predict_for_agent(agent="investor_0", timestep=t)
+                if isinstance(d, dict):
+                    for k in (f"price_forecast_{h}", f"price_forecast_h{h}", f"price_h{h}", "price_forecast_aligned"):
+                        if k in d and np.isfinite(d[k]):
+                            return float(d[k])
+                    for k in ("price_forecast_immediate", "price_forecast_1", "price_h1"):
+                        if k in d and np.isfinite(d[k]):
+                            return float(d[k])
+        except Exception:
+            pass
+        return default
+
+    # ------------------------------------------------------------------
     # PettingZoo API
     # ------------------------------------------------------------------
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -463,6 +548,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 mid = (space.low + space.high) / 2.0
                 out[agent] = np.array(mid, dtype=np.float32).reshape(space.shape)
                 continue
+            
+            # --- DEFENSIVE FIX: Ensure action is on CPU before converting to NumPy ---
+            if hasattr(a, 'is_cuda') and a.is_cuda:
+                a = a.cpu()
+            # --- END FIX ---
+            
             arr = np.array(a, dtype=np.float32).flatten()
             need = int(np.prod(space.shape))
             if arr.size != need:
@@ -604,7 +695,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             u = float(np.clip(bat_action.reshape(-1)[0], -1.0, 1.0))
             step_h = 10.0 / 60.0
             battery_cash_delta = 0.0
-            
+
             # init a small battery on-the-fly
             if self.battery_capacity <= 0.0 and self.budget > self.init_budget * 0.01:
                 capex_per_mwh = 400.0
@@ -630,7 +721,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # clamp
             self.battery_energy = float(np.clip(self.battery_energy, 0.0, self.battery_capacity))
             self.battery_capacity = float(np.clip(self.battery_capacity, 0.0, 1e6))
-            
+
             return float(battery_cash_delta)
         except Exception as e:
             logging.error(f"battery ops: {e}")
@@ -643,20 +734,26 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # price return for this step (allow negative prices for realism)
         price_t = float(np.clip(self._price[i], -1000.0, 1e9))  # Allow negative prices down to -$1000/MWh
         price_tm1 = float(np.clip(self._price[i-1] if i > 0 else self._price[i], -1000.0, 1e9))
-        price_ret = 0.0 if price_tm1 <= 0 else (price_t - price_tm1) / price_tm1
+        price_ret = (price_t - price_tm1) / price_tm1 if abs(price_tm1) > 1e-9 else 0.0
 
-        # Correct PPA model: All technologies respond identically to price changes
-        # since they all sell electricity at the same market price
+        # --- PATCH: compute a small forecast-alignment signal (dimensionless, bounded) ---
+        pf_aligned = self._get_aligned_price_forecast(i, default=None)
+        if pf_aligned is not None and np.isfinite(pf_aligned):
+            forecast_signal_score = float(np.sign(pf_aligned - price_t) * price_ret)
+        else:
+            forecast_signal_score = 0.0
+        # ----------------------------------------------------------------------------------
+
+        # Correct PPA model: all technologies respond identically to price changes
         pos_before = self.wind_instrument_value + self.solar_instrument_value + self.hydro_instrument_value
         pnl_mtm = pos_before * price_ret
 
-        # Update instrument values with uniform price sensitivity (PPA contract values)
-        # All renewable technologies sell at the same market price
+        # Update instrument values with uniform price sensitivity
         self.wind_instrument_value  = max(0.0, self.wind_instrument_value * (1.0 + price_ret))
         self.solar_instrument_value = max(0.0, self.solar_instrument_value * (1.0 + price_ret))
         self.hydro_instrument_value = max(0.0, self.hydro_instrument_value * (1.0 + price_ret))
 
-        # Physical revenue generation based on actual power delivery (PPA model)
+        # Physical generation revenue (parameterized; floor/cap applied)
         revenue_generation = self._calculate_generation_revenue(i, price_t)
 
         # costs: transaction, battery opex
@@ -667,24 +764,22 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # realized cash flow (battery + physical generation revenue) - costs
         realized = float(battery_cash_delta + revenue_generation - txn_costs - opex_battery)
 
-        # Investment fund economics: Separate profits from investment capital
+        # Investment fund economics: distributions from POSITIVE realized cash only
         if realized > 0:
-            # Positive returns: 70% distributed to investors, 30% retained for operations
-            distributed_amount = realized * 0.7
-            retained_amount = realized * 0.3
-
-            self.distributed_profits += distributed_amount
+            dist = realized * self.distribution_rate
+            retained = realized - dist
+            self.distributed_profits += dist
             self.cumulative_returns += realized
-            self.budget = max(0.0, self.budget + retained_amount)
+            self.budget = max(0.0, self.budget + retained)
         else:
-            # Losses come from budget
+            # Losses hit budget fully
             self.budget = max(0.0, self.budget + realized)
             self.cumulative_returns += realized
 
         # equity after MTM (for position valuation only)
         self.equity = float(self.budget + self.wind_instrument_value + self.solar_instrument_value + self.hydro_instrument_value)
 
-        # store last revenue for wrapper (now includes generation revenue)
+        # store last revenue for wrapper (net realized this step)
         self.last_revenue = float(realized)
 
         # Enhanced efficiency metrics including generation performance
@@ -710,43 +805,54 @@ class RenewableMultiAgentEnv(ParallelEnv):
             'investment_capital': self.investment_capital,
             'fund_performance': self.cumulative_returns / self.init_budget if self.init_budget > 0 else 0.0,
             'total_return_nav': self.equity + self.distributed_profits,  # Total return including distributions
+            # --- PATCH: expose aligned forecast & signal to rewards/logs ---
+            'aligned_price_forecast': float(pf_aligned) if (pf_aligned is not None and np.isfinite(pf_aligned)) else None,
+            'forecast_signal_score': float(np.clip(forecast_signal_score, -1.0, 1.0)),
         }
         # history for regime calc
         self.performance_history['revenue_history'].append(realized)
+        self.last_generation_revenue = float(revenue_generation)
+        self.last_mtm_pnl = float(pnl_mtm)
+
         return fin
 
     def _calculate_generation_revenue(self, i: int, price: float) -> float:
         """
-        Calculate revenue from actual power generation based on PPA contracts.
-        Revenue = Capacity * Capacity Factor * Price * Time Step * Scaling Factor
+        Parameterized generation revenue with floor/cap:
+        Revenue_raw = (Σ instrument_value * ppa_scale * CF_tech) * price * Δt
+        Revenue = clip( Revenue_raw * ppa_share, floor, cap )
+        Where:
+          - ppa_floor=True -> floor=0 (PPA-like); else floor=-cap (merchant-like)
+          - cap = init_budget * ppa_cap_frac
         """
         try:
             # Time step factor (10-minute intervals = 1/6 hour)
             time_step_hours = 10.0 / 60.0
 
-            # Conservative revenue scaling factor for realistic economics
-            # This represents a much smaller capacity per dollar to prevent exponential growth
-            revenue_scale = 1e-9  # $1M instrument value = 0.001 MW equivalent capacity
-
-            # Get normalized capacity factors (0-1 range)
-            wind_cf = self._get_wind_capacity_factor(i)
+            # Capacity factors (0..1)
+            wind_cf  = self._get_wind_capacity_factor(i)
             solar_cf = self._get_solar_capacity_factor(i)
             hydro_cf = self._get_hydro_capacity_factor(i)
 
-            # Calculate generation revenue for each technology
-            # Revenue = Instrument Value * Revenue Scale * Capacity Factor * Price * Time
-            wind_revenue = self.wind_instrument_value * revenue_scale * wind_cf * price * time_step_hours
-            solar_revenue = self.solar_instrument_value * revenue_scale * solar_cf * price * time_step_hours
-            hydro_revenue = self.hydro_instrument_value * revenue_scale * hydro_cf * price * time_step_hours
+            # Exposure ($) -> MW equivalent (conservative)
+            wind_mw  = self.wind_instrument_value  * self.ppa_scale
+            solar_mw = self.solar_instrument_value * self.ppa_scale
+            hydro_mw = self.hydro_instrument_value * self.ppa_scale
 
-            total_revenue = wind_revenue + solar_revenue + hydro_revenue
+            # Raw revenue from generation (before share / floor / cap)
+            raw = (wind_mw  * wind_cf  +
+                   solar_mw * solar_cf +
+                   hydro_mw * hydro_cf) * price * time_step_hours
 
-            # Apply conservative scaling to ensure economic balance
-            # This prevents revenue from overwhelming MTM returns while keeping it meaningful
-            balanced_revenue = total_revenue * 0.01  # 1% of theoretical full revenue (much more conservative)
-
-            return float(np.clip(balanced_revenue, 0.0, self.init_budget * 0.0001))  # Cap at 0.01% of initial budget per step
-
+            # Apply share and bounds
+            pre_cap = raw * self.ppa_share
+            cap = float(self.init_budget * self.ppa_cap_frac)
+            if self.ppa_floor:
+                lo = 0.0
+            else:
+                lo = -cap
+            rev = float(np.clip(pre_cap, lo, cap))
+            return rev
         except Exception as e:
             logging.warning(f"Generation revenue calculation failed at step {i}: {e}")
             return 0.0
@@ -779,7 +885,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         """Get actual wind generation in MW (using conservative scaling)"""
         try:
             cf = self._get_wind_capacity_factor(i)
-            capacity_mw = self.wind_instrument_value * 1e-9  # Convert $ to MW (conservative scaling)
+            capacity_mw = self.wind_instrument_value * self.ppa_scale
             return float(capacity_mw * cf)
         except Exception:
             return 0.0
@@ -788,7 +894,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         """Get actual solar generation in MW (using conservative scaling)"""
         try:
             cf = self._get_solar_capacity_factor(i)
-            capacity_mw = self.solar_instrument_value * 1e-9  # Convert $ to MW (conservative scaling)
+            capacity_mw = self.solar_instrument_value * self.ppa_scale
             return float(capacity_mw * cf)
         except Exception:
             return 0.0
@@ -797,7 +903,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         """Get actual hydro generation in MW (using conservative scaling)"""
         try:
             cf = self._get_hydro_capacity_factor(i)
-            capacity_mw = self.hydro_instrument_value * 1e-9  # Convert $ to MW (conservative scaling)
+            capacity_mw = self.hydro_instrument_value * self.ppa_scale
             return float(capacity_mw * cf)
         except Exception:
             return 0.0
@@ -872,6 +978,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 }
                 self.enhanced_risk_controller.update_risk_history(env_state)
                 comp = self.enhanced_risk_controller.calculate_comprehensive_risk(env_state)
+                
                 self.overall_risk_snapshot   = float(np.clip(comp.get('overall_risk', 0.5), 0.0, 1.0))
                 self.market_risk_snapshot    = float(np.clip(comp.get('market_risk', 0.3), 0.0, 1.0))
                 self.portfolio_risk_snapshot = float(np.clip(comp.get('portfolio_risk', 0.25), 0.0, 1.0))
@@ -879,13 +986,19 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 return
 
             # Fallback: quick 6D vector API
-            vec = self.enhanced_risk_controller.quick_risk_metrics(
+            vec_raw = self.enhanced_risk_controller.quick_risk_metrics(
                 equity=self.equity,
                 budget=self.budget,
                 exposures=(self.wind_instrument_value, self.solar_instrument_value, self.hydro_instrument_value),
                 price=float(self._price[i]),
                 load=float(self._load[i]),
             )
+            # Ensure the fallback vector is also a CPU numpy array before using it
+            if hasattr(vec_raw, 'is_cuda') and vec_raw.is_cuda:
+                vec = vec_raw.cpu().numpy()
+            else:
+                vec = np.array(vec_raw, dtype=np.float32)
+
             self.overall_risk_snapshot   = float(np.clip(vec[0], 0.0, 1.0))
             self.market_risk_snapshot    = float(np.clip(vec[1] if len(vec) > 1 else vec[0], 0.0, 1.0))
             self.portfolio_risk_snapshot = float(np.clip(vec[2] if len(vec) > 2 else vec[0], 0.0, 1.0))
@@ -916,11 +1029,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
             }
             total, breakdown = self.reward_calculator.calculate(env_state, financial, risk)
             # investor: emphasize financial; battery: efficiency; risk: risk; meta: total
-            self._rew_buf['investor_0'] = float(np.clip(0.7 * breakdown['financial'] + 0.3 * total, -10, 10))
-            self._rew_buf['battery_operator_0'] = float(np.clip(0.6 * breakdown['efficiency'] + 0.4 * total, -10, 10))
-            self._rew_buf['risk_controller_0'] = float(np.clip(0.7 * breakdown['risk_management'] + 0.3 * total, -10, 10))
-            self._rew_buf['meta_controller_0'] = float(np.clip(total, -10, 10))
+            self._rew_buf['investor_0']         = float(np.clip(0.7 * breakdown['financial']       + 0.3 * total, -10, 10))
+            self._rew_buf['battery_operator_0'] = float(np.clip(0.6 * breakdown['efficiency']      + 0.4 * total, -10, 10))
+            self._rew_buf['risk_controller_0']  = float(np.clip(0.7 * breakdown['risk_management'] + 0.3 * total, -10, 10))
+            self._rew_buf['meta_controller_0']  = float(np.clip(total, -10, 10))
             self.last_reward_breakdown = dict(breakdown)
+            # reflect the active weights actually used
             self.last_reward_weights = dict(self.reward_calculator.reward_weights)
         except Exception as e:
             logging.error(f"reward assignment: {e}")
@@ -932,13 +1046,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _fill_obs(self):
         i = min(self.t, self.max_steps - 1)
-        # scales (allow negative normalized prices)
+        # --- THIS IS THE PRIMARY FIX: Explicitly cast all values to float to sanitize them ---
         price_n = float(np.clip(SafeDivision.div(self._price[i], 10.0, 0.0), -10.0, 10.0))
         load_n  = float(np.clip(self._load[i], 0.0, 1.0))
         windf   = float(np.clip(SafeDivision.div(self._wind[i],  self.wind_scale, 0.0), 0.0, 1.0))
         solarf  = float(np.clip(SafeDivision.div(self._solar[i], self.solar_scale, 0.0), 0.0, 1.0))
         hydrof  = float(np.clip(SafeDivision.div(self._hydro[i], self.hydro_scale, 0.0), 0.0, 1.0))
-        # budget normalized by init/10 for dynamic range ~0..10
+        
         init_div = self.init_budget / 10.0 if self.init_budget > 0 else 1.0
         budget_n = float(np.clip(SafeDivision.div(self.budget, init_div, 0.0), 0.0, 10.0))
 
@@ -983,6 +1097,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             float(np.clip(self.market_stress, 0.0, 1.0)) * 10.0,
             float(np.clip(self.capital_allocation_fraction, 0.0, 1.0)) * 10.0,
         )
+        # --- END FIX ---
 
     # ------------------------------------------------------------------
     # Info & helpers
@@ -1014,6 +1129,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     'action_battery':  acts['battery_operator_0'].tolist(),
                     'action_risk':     acts['risk_controller_0'].tolist(),
                     'action_meta':     acts['meta_controller_0'].tolist(),
+                    # --- PATCH: expose for debugging/analysis
+                    'aligned_price_forecast': financial.get('aligned_price_forecast', None),
+                    'forecast_signal_score': float(financial.get('forecast_signal_score', 0.0)),
                 }
         except Exception as e:
             logging.error(f"info populate: {e}")
@@ -1068,7 +1186,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_revenue = 0.0
         self.last_reward_breakdown = {}
         self.last_reward_weights = dict(self.reward_calculator.reward_weights)
-        
+
         # comprehensive risk storage
         self.comprehensive_risk = {}
         self.portfolio_risk_snapshot = 0.25

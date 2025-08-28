@@ -44,7 +44,7 @@ tf = fix_tensorflow_gpu_setup()
 
 
 # =========================
-# Errors
+# Errors and Utilities
 # =========================
 
 class ModelLoadingError(Exception):
@@ -52,6 +52,17 @@ class ModelLoadingError(Exception):
 
 class ForecastGenerationError(Exception):
     pass
+
+class SafeDivision:
+    @staticmethod
+    def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+        """Robust division with protection against zero-division."""
+        if denominator is None or abs(denominator) < 1e-9:
+            return default
+        try:
+            return float(numerator) / float(denominator)
+        except (ValueError, TypeError, ZeroDivisionError):
+            return default
 
 
 # =========================
@@ -79,6 +90,8 @@ class MultiHorizonForecastGenerator:
       - Bounded caches to prevent memory growth.
       - Updated to provide raw, unnormalized forecasts.
       - Bug fix: corrected handling of non-finite values in `_constrain_target`.
+      - Corrected diagnostic helper name; added SafeDivision utility.
+      - NEW: Offline precompute cache for O(1) forecast lookups during training.
     """
 
     def __init__(
@@ -88,7 +101,8 @@ class MultiHorizonForecastGenerator:
         look_back: int = 6,
         verbose: bool = True,
         fallback_mode: bool = True,
-        agent_refresh_stride: int = 1,  # recompute every k steps per agent (1 = every step)
+        # PATCH: Changed the default value to 1 to disable throttling and ensure fresh forecasts.
+        agent_refresh_stride: int = 1,
     ):
         self.look_back = int(look_back)
         self.verbose = verbose
@@ -134,6 +148,9 @@ class MultiHorizonForecastGenerator:
         self._last_agent_step: Dict[str, int] = {}
         self._cache_limit_global = 5000
         self._cache_limit_agent = 2000
+
+        # NEW: offline precomputed forecasts (target, horizon) -> np.ndarray of shape (T,)
+        self._precomputed: Dict[Tuple[str, str], np.ndarray] = {}
 
         # stats
         self.loading_stats = {
@@ -258,14 +275,16 @@ class MultiHorizonForecastGenerator:
     # -------- bounded cache helpers --------
 
     def _bounded_put(self, d: Dict, key, value, limit: int):
-        try:
-            if len(d) >= limit:
-                drop = max(1, int(limit * 0.6))
-                for k in list(d.keys())[:drop]:
-                    del d[k]
-        except Exception:
-            # if something odd happens, just clear it
-            d.clear()
+        if len(d) >= limit:
+            try:
+                keys_to_drop = list(d.keys())[:max(1, int(limit * 0.6))]
+                for k in keys_to_drop:
+                    try:
+                        del d[k]
+                    except KeyError:
+                        continue
+            except Exception:
+                d.clear()
         d[key] = value
 
     # -------- public utils --------
@@ -282,7 +301,7 @@ class MultiHorizonForecastGenerator:
                     v = float(row[t])
                     if np.isfinite(v):
                         self.history[t].append(v)
-            except Exception:
+            except (ValueError, TypeError):
                 # ignore bad values
                 pass
 
@@ -368,6 +387,13 @@ class MultiHorizonForecastGenerator:
     # -------- internals --------
 
     def _predict_target_horizon(self, target: str, hname: str, t: int) -> float:
+        # 0) offline precomputed fast path (if available)
+        arr = self._precomputed.get((target, hname), None)
+        if arr is not None and 0 <= t < len(arr):
+            val = arr[t]
+            if np.isfinite(val):
+                return float(val)
+
         # 1) cache
         gkey = (target, hname, t)
         if gkey in self._global_cache:
@@ -466,13 +492,13 @@ class MultiHorizonForecastGenerator:
     def _constrain_target(self, target: str, val: float) -> float:
         """
         Do not apply any constraints or normalization; return raw value.
-        PATCHED: Ensures non-finite values are handled correctly.
+        Ensures non-finite values are handled correctly.
         """
         try:
             if not np.isfinite(val):
                 return self._default_for_target(target)
             return float(val)
-        except Exception:
+        except (ValueError, TypeError):
             return self._default_for_target(target)
 
     def _fallback_value(self, target: str) -> float:
@@ -481,6 +507,116 @@ class MultiHorizonForecastGenerator:
             v = float(np.mean(list(h)[-min(10, len(h)) :]))
             return self._constrain_target(target, v)
         return self._default_for_target(target)
+
+    # -------- NEW: offline precompute --------
+
+    def precompute_offline(self, df: pd.DataFrame, timestamp_col: str = "timestamp", batch_size: int = 4096) -> None:
+        """
+        Precompute forecasts for all targets/horizons across the entire dataframe.
+        Stores results in self._precomputed[(target, hname)] as float32 arrays of length T.
+        Assumes df has columns matching self.targets (e.g., 'wind','solar','hydro','price','load').
+
+        At runtime, _predict_target_horizon() will return arr[t] (O(1)) if present.
+        """
+        if df is None or len(df) == 0:
+            if self.verbose:
+                print("precompute_offline: empty dataframe; skipping.")
+            return
+
+        # validate columns
+        missing = [c for c in self.targets if c not in df.columns]
+        if missing:
+            raise ValueError(f"precompute_offline: missing columns in df: {missing}")
+
+        T = len(df)
+        look_back = int(self.look_back)
+
+        # build rolling windows per target (T x look_back), mean-padded on left
+        def make_windows(series: np.ndarray, lb: int) -> np.ndarray:
+            X = np.empty((T, lb), dtype=np.float32)
+            mean_val = float(np.nanmean(series)) if series.size else 0.0
+            for t in range(T):
+                if t + 1 < lb:
+                    need = lb - (t + 1)
+                    tail = series[: t + 1]
+                    if tail.size > 0:
+                        X[t, :need] = mean_val
+                        X[t, need:lb] = tail.astype(np.float32)
+                    else:
+                        X[t, :].fill(mean_val)
+                else:
+                    X[t, :] = series[t + 1 - lb : t + 1].astype(np.float32)
+            np.nan_to_num(X, copy=False, nan=mean_val, posinf=1e6, neginf=-1e6)
+            return X
+
+        target_series: Dict[str, np.ndarray] = {
+            t: df[t].to_numpy(dtype=np.float32, copy=False) for t in self.targets
+        }
+        target_windows: Dict[str, np.ndarray] = {
+            t: make_windows(target_series[t], look_back) for t in self.targets
+        }
+
+        # for each (target, horizon), run batched predict (or fast fallback)
+        for target in self.targets:
+            X_full = target_windows[target]
+            for hname in self.horizons.keys():
+                key = (target, hname)
+                model_key = f"{target}_{hname}"
+                use_model = bool(self._model_available.get(model_key, False))
+
+                if not use_model or tf is None or model_key not in self.models:
+                    # fallback: simple rolling-mean proxy (consistent with runtime fallback spirit)
+                    out = np.nanmean(X_full, axis=1).astype(np.float32)
+                    for i in range(T):
+                        out[i] = self._constrain_target(target, out[i])
+                    self._precomputed[key] = out
+                    continue
+
+                scaler_X = self.scalers.get(model_key, {}).get("scaler_X", None)
+                scaler_y = self.scalers.get(model_key, {}).get("scaler_y", None)
+                model = self.models.get(model_key, None)
+
+                if model is None:
+                    out = np.nanmean(X_full, axis=1).astype(np.float32)
+                    for i in range(T):
+                        out[i] = self._constrain_target(target, out[i])
+                    self._precomputed[key] = out
+                    continue
+
+                X_scaled = X_full if scaler_X is None else scaler_X.transform(X_full)
+
+                bs = max(1, int(batch_size))
+                preds_scaled = np.empty(T, dtype=np.float32)
+                i = 0
+                while i < T:
+                    j = min(T, i + bs)
+                    yb = model.predict(X_scaled[i:j, :], verbose=0)
+                    # flatten to 1D
+                    if isinstance(yb, np.ndarray):
+                        if yb.ndim == 2 and yb.shape[1] == 1:
+                            yb = yb[:, 0]
+                        else:
+                            yb = np.ravel(yb)
+                    preds_scaled[i:j] = np.asarray(yb, dtype=np.float32)
+                    i = j
+
+                if scaler_y is not None:
+                    try:
+                        preds = scaler_y.inverse_transform(preds_scaled.reshape(-1, 1))[:, 0].astype(np.float32)
+                    except Exception:
+                        preds = preds_scaled
+                else:
+                    preds = preds_scaled
+
+                # constrain/clean
+                for i in range(T):
+                    preds[i] = self._constrain_target(target, preds[i])
+
+                self._precomputed[key] = preds
+
+        if self.verbose:
+            total_series = len(self.targets) * len(self.horizons)
+            print(f"✅ Precompute complete: cached {total_series} series for T={T} timesteps.")
 
     # -------- diagnostics & metadata --------
 
@@ -539,7 +675,7 @@ class MultiHorizonForecastGenerator:
             for t, d in cs.items():
                 tot = max(1, d.get("total", 0))
                 hi = SafeDivision._safe_divide(d.get("high", 0) * 100.0, tot)
-                lo = SafeDivision._safe_safe_divide(d.get("low", 0) * 100.0, tot)
+                lo = SafeDivision._safe_divide(d.get("low", 0) * 100.0, tot)
                 print(f"  {t:6s}: total={tot}, high@1.0={hi:.1f}%, low@0.0={lo:.1f}%")
 
         print("=" * 60 + "\n")
