@@ -28,7 +28,15 @@ import numpy as np
 import csv, os, threading, gc, psutil, logging, pandas as pd, time
 from typing import Dict, Any, Tuple, Optional, List, Mapping
 from datetime import datetime
-from collections import deque
+from collections import deque, OrderedDict
+
+# Import enhanced monitoring
+try:
+    from enhanced_monitoring import EnhancedMetricsMonitor
+    _HAS_ENHANCED_MONITORING = True
+except ImportError:
+    _HAS_ENHANCED_MONITORING = False
+    EnhancedMetricsMonitor = None
 from contextlib import nullcontext
 
 PRICE_SCALE = 10.0  # keep aligned with base env (env price_n = price/10 clipped to [-10,10])
@@ -45,6 +53,69 @@ class SafeDivision:
             return float(numerator) / float(denominator)
         except Exception:
             return default
+
+# =========================
+# Enhanced Cache Management
+# =========================
+
+class EnhancedLRUCache:
+    """Enhanced LRU cache with memory-aware eviction."""
+
+    def __init__(self, max_size: int = 2000, memory_limit_mb: float = 50.0):
+        self.max_size = max_size
+        self.memory_limit_mb = memory_limit_mb
+        self.cache = OrderedDict()
+        self.access_count = 0
+
+    def get(self, key):
+        """Get value and move to end (most recently used)."""
+        if key in self.cache:
+            # Move to end
+            value = self.cache.pop(key)
+            self.cache[key] = value
+            self.access_count += 1
+            return value
+        return None
+
+    def put(self, key, value):
+        """Put value, evicting LRU if necessary."""
+        if key in self.cache:
+            # Update existing
+            self.cache.pop(key)
+        elif len(self.cache) >= self.max_size:
+            # Evict LRU (first item)
+            self.cache.popitem(last=False)
+
+        self.cache[key] = value
+        self.access_count += 1
+
+        # Memory-based cleanup every 100 accesses
+        if self.access_count % 100 == 0:
+            self._memory_cleanup()
+
+    def _memory_cleanup(self):
+        """Clean up cache if memory usage is high."""
+        try:
+            current_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+            if current_memory > self.memory_limit_mb and len(self.cache) > 100:
+                # Remove 30% of oldest entries
+                items_to_remove = max(1, len(self.cache) // 3)
+                for _ in range(items_to_remove):
+                    if self.cache:
+                        self.cache.popitem(last=False)
+        except Exception:
+            pass
+
+    def __contains__(self, key):
+        return key in self.cache
+
+    def __len__(self):
+        return len(self.cache)
+
+    def clear(self):
+        self.cache.clear()
+        self.access_count = 0
+
 
 # =========================
 # Forecast Post-Processing
@@ -77,9 +148,13 @@ class ForecastPostProcessor:
         if "price" in k:
             return float(np.clip(v / PRICE_SCALE, -10.0, 10.0))
 
-        # Load
+        # Load (now with proper scaling)
         if "load" in k:
-            return float(np.clip(v, 0.0, 1.0))
+            try:
+                scale = max(float(getattr(self.env, "load_scale", 1.0)), 1e-6)
+                return float(np.clip(v / scale, 0.0, 1.0))
+            except Exception:
+                return float(np.clip(v, 0.0, 1.0))
 
         # Renewables (use env p95 scales computed in env __init__)
         try:
@@ -401,9 +476,8 @@ class MemoryOptimizedObservationBuilder:
             for agent in self.base_env.possible_agents
         }
 
-        self.forecast_cache: Dict[str, Dict[str, float]] = {}
-        self.agent_forecast_cache: Dict[Tuple[str, int], Dict[str, float]] = {}
-        self.cache_size_limit = 500
+        self.forecast_cache = EnhancedLRUCache(max_size=1000, memory_limit_mb=100.0)
+        self.agent_forecast_cache = EnhancedLRUCache(max_size=2000, memory_limit_mb=150.0)
 
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=300)
         self.memory_tracker.register_cache(self.forecast_cache)
@@ -441,21 +515,23 @@ class MemoryOptimizedObservationBuilder:
     # ---- forecast caching ----
     def _get_cached_forecasts_global(self, timestep: int) -> Dict[str, float]:
         key = f"forecasts_{timestep}"
-        if key in self.forecast_cache:
-            return self.forecast_cache[key]
+        cached_result = self.forecast_cache.get(key)
+        if cached_result is not None:
+            return cached_result
         try:
             all_forecasts = self.forecaster.predict_all_horizons(timestep=timestep)
             if not isinstance(all_forecasts, dict):
                 all_forecasts = {}
         except Exception:
             all_forecasts = {}
-        self._bounded_put(self.forecast_cache, key, all_forecasts)
+        self.forecast_cache.put(key, all_forecasts)
         return all_forecasts
 
     def _get_cached_forecasts_for_agent(self, agent: str, timestep: int) -> Dict[str, float]:
         key = (agent, timestep)
-        if key in self.agent_forecast_cache:
-            return self.agent_forecast_cache[key]
+        cached_result = self.agent_forecast_cache.get(key)
+        if cached_result is not None:
+            return cached_result
         try:
             if hasattr(self.forecaster, 'predict_for_agent'):
                 f = self.forecaster.predict_for_agent(agent=agent, timestep=timestep)
@@ -465,15 +541,10 @@ class MemoryOptimizedObservationBuilder:
                 f = self._get_cached_forecasts_global(timestep)
         except Exception:
             f = {}
-        self._bounded_put(self.agent_forecast_cache, key, f)
+        self.agent_forecast_cache.put(key, f)
         return f
 
-    def _bounded_put(self, d: Dict, key, value):
-        if len(d) >= self.cache_size_limit:
-            drop = int(len(d) * 0.6)
-            for k in list(d.keys())[:drop]:
-                del d[k]
-        d[key] = value
+    # Removed _bounded_put - now using EnhancedLRUCache
 
     def get_diagnostic_info(self) -> Dict:
         return {
@@ -503,6 +574,14 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self.log_buffer = deque(maxlen=256)
         self.log_lock = threading.RLock() if threading else nullcontext()
         self._flush_every_rows = 1000
+
+        # Enhanced monitoring
+        self.enhanced_monitor = None
+        if _HAS_ENHANCED_MONITORING:
+            self.enhanced_monitor = EnhancedMetricsMonitor(
+                window_size=1000,
+                log_frequency=100
+            )
 
         # Inject forecaster reference into env if empty
         if hasattr(self.env, 'forecast_generator') and getattr(self.env, 'forecast_generator') is None:
@@ -655,10 +734,15 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_price_forecast_norm = 0.0
         self._last_price_forecast_aligned = 0.0
 
-        # optional initial update
+        # Initialize forecaster history with sufficient data for predictions
         try:
-            if hasattr(self.env, "data") and len(self.env.data) > 0 and hasattr(self.forecaster, "update"):
-                self.forecaster.update(self.env.data.iloc[0])
+            if hasattr(self.env, "data") and len(self.env.data) > 0:
+                if hasattr(self.forecaster, "initialize_history"):
+                    # Use new initialization method for proper history building
+                    self.forecaster.initialize_history(self.env.data, start_idx=0)
+                elif hasattr(self.forecaster, "update"):
+                    # Fallback: single update (old behavior)
+                    self.forecaster.update(self.env.data.iloc[0])
         except Exception:
             pass
         enhanced = self.obs_builder.enhance_observations(obs)
@@ -684,7 +768,24 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         validated = self._validate_observations_safe(enhanced)
 
         self.step_count += 1
-        self._last_step_wall_ms = (time.perf_counter() - t0) * 1000.0
+        step_time = (time.perf_counter() - t0)
+        self._last_step_wall_ms = step_time * 1000.0
+
+        # Enhanced monitoring
+        if self.enhanced_monitor:
+            # Update system metrics
+            self.enhanced_monitor.update_system_metrics(step_time)
+
+            # Update training metrics
+            for agent, reward in rewards.items():
+                self.enhanced_monitor.update_training_metrics(agent, reward)
+
+            # Update portfolio metrics if available
+            if hasattr(self, '_last_portfolio_value') and self._last_portfolio_value is not None:
+                self.enhanced_monitor.update_portfolio_metrics(self._last_portfolio_value)
+
+            # Log summary periodically
+            self.enhanced_monitor.log_summary()
 
         # periodic logging
         if self.log_path and (self.step_count % self._log_interval == 0 or self._last_episode_end_flag):
@@ -724,12 +825,11 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             cleanup_level, _ = self.memory_tracker.should_cleanup(force=force)
             if cleanup_level or force:
                 self.memory_tracker.cleanup(cleanup_level or 'medium')
-                if hasattr(self.obs_builder, 'forecast_cache') and len(self.obs_builder.forecast_cache) > 100:
-                    for k in list(self.obs_builder.forecast_cache.keys())[: int(len(self.obs_builder.forecast_cache)*0.7)]:
-                        del self.obs_builder.forecast_cache[k]
-                if hasattr(self.obs_builder, 'agent_forecast_cache') and len(self.obs_builder.agent_forecast_cache) > 100:
-                    for k in list(self.obs_builder.agent_forecast_cache.keys())[: int(len(self.obs_builder.agent_forecast_cache)*0.7)]:
-                        del self.obs_builder.agent_forecast_cache[k]
+                # Enhanced cache cleanup with LRU
+                if hasattr(self.obs_builder, 'forecast_cache') and len(self.obs_builder.forecast_cache) > 500:
+                    self.obs_builder.forecast_cache._memory_cleanup()
+                if hasattr(self.obs_builder, 'agent_forecast_cache') and len(self.obs_builder.agent_forecast_cache) > 1000:
+                    self.obs_builder.agent_forecast_cache._memory_cleanup()
                 self._flush_log_buffer()
                 if hasattr(self.obs_builder.validator, 'validation_cache'):
                     self.obs_builder.validator.validation_cache.clear()
@@ -809,9 +909,11 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         return validated, clip_counts, clip_totals
 
     def _update_forecaster_safe(self):
+        """Update forecaster with current timestep data to avoid forecast lag."""
         try:
-            if hasattr(self.env, "data") and 0 < self.env.t < len(self.env.data):
-                row = self.env.data.iloc[self.env.t - 1]
+            if hasattr(self.env, "data") and self.env.t < len(self.env.data):
+                # FIXED: Use current timestep data instead of t-1 to avoid forecast lag
+                row = self.env.data.iloc[self.env.t]
                 if hasattr(self.forecaster, "update"):
                     self.forecaster.update(row)
         except Exception:

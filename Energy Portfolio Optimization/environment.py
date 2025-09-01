@@ -357,15 +357,19 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self._load  = self.data.get('load',  pd.Series(0.0, index=self.data.index)).astype(float).to_numpy()
         self._riskS = self.data.get('risk',  pd.Series(0.3, index=self.data.index)).astype(float).to_numpy()
 
-        # normalization scales (95th)
-        def p95(x):
+        # normalization scales (95th percentile with minimum thresholds)
+        def p95_robust(x, min_scale=0.1):
             try:
-                return float(np.nanpercentile(np.asarray(x, dtype=float), 95)) or 1.0
+                p95_val = float(np.nanpercentile(np.asarray(x, dtype=float), 95))
+                # Ensure minimum scale to prevent division by very small numbers
+                return max(p95_val, min_scale) if p95_val > 0 else 1.0
             except Exception:
                 return 1.0
-        self.wind_scale  = p95(self._wind)
-        self.solar_scale = p95(self._solar)
-        self.hydro_scale = p95(self._hydro)
+
+        self.wind_scale  = p95_robust(self._wind, min_scale=0.1)
+        self.solar_scale = p95_robust(self._solar, min_scale=0.1)
+        self.hydro_scale = p95_robust(self._hydro, min_scale=0.1)
+        self.load_scale  = p95_robust(self._load, min_scale=0.1)  # Added load scaling
 
         # agents
         self.possible_agents = ["investor_0", "battery_operator_0", "risk_controller_0", "meta_controller_0"]
@@ -393,6 +397,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         # memory manager
         self.memory_manager = LightweightMemoryManager(max_memory_mb=max_memory_mb)
+
+        # Forecast accuracy tracking
+        from collections import defaultdict, deque
+        self._forecast_errors = defaultdict(lambda: deque(maxlen=100))
+        self._forecast_history = defaultdict(lambda: deque(maxlen=10))
+        self._forecast_accuracy_window = 50
 
         # buffers
         self._obs_buf: Dict[str, np.ndarray] = {a: np.zeros(self.observation_spaces[a].shape, np.float32) for a in self.possible_agents}
@@ -436,6 +446,64 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # Wrapper helper for base dims
     def _get_base_observation_dim(self, agent: str) -> int:
         return self.obs_manager.base_dim(agent)
+
+    # ------------------------------------------------------------------
+    # Forecast Accuracy Tracking
+    # ------------------------------------------------------------------
+    def _track_forecast_accuracy(self, forecasts: Dict[str, float]):
+        """Track forecast accuracy against realized values in consistent normalized units."""
+        if self.t == 0:
+            return  # No previous forecasts to compare
+
+        try:
+            # Compare previous forecasts with current actuals in NORMALIZED units
+            for target in ['wind', 'solar', 'hydro', 'price', 'load']:
+                forecast_key = f"{target}_forecast_immediate"
+                if forecast_key in forecasts:
+                    # Get current actual value (raw)
+                    actual_raw = getattr(self, f"_{target}")[self.t] if hasattr(self, f"_{target}") else 0.0
+
+                    # NORMALIZE actual value to match forecast units (this is the key fix!)
+                    if target == "price":
+                        actual_normalized = actual_raw / 10.0  # Same as price normalization in wrapper
+                    elif target in ["wind", "solar", "hydro"]:
+                        scale = getattr(self, f"{target}_scale", 1.0)
+                        actual_normalized = actual_raw / scale  # Same as renewable normalization
+                    elif target == "load":
+                        scale = getattr(self, "load_scale", 1.0)
+                        actual_normalized = actual_raw / scale  # Same as load normalization
+                    else:
+                        actual_normalized = actual_raw
+
+                    # Get previous forecast for this timestep (already normalized)
+                    if target in self._forecast_history and len(self._forecast_history[target]) > 0:
+                        forecast_normalized = self._forecast_history[target][-1]
+
+                        # Calculate MAPE in consistent normalized units
+                        error = abs(actual_normalized - forecast_normalized) / (abs(actual_normalized) + 1e-6)
+                        self._forecast_errors[target].append(error)
+
+                # Store current forecast for next comparison (keep normalized)
+                if forecast_key in forecasts:
+                    self._forecast_history[target].append(forecasts[forecast_key])
+
+        except Exception as e:
+            # Don't let forecast tracking break the environment
+            pass
+
+    def get_forecast_accuracy_stats(self) -> Dict[str, Dict[str, float]]:
+        """Get forecast accuracy statistics for monitoring."""
+        stats = {}
+        for target, errors in self._forecast_errors.items():
+            if len(errors) > 0:
+                errors_list = list(errors)
+                stats[target] = {
+                    'mean_mape': float(np.mean(errors_list)),
+                    'std_mape': float(np.std(errors_list)),
+                    'recent_mape': float(np.mean(errors_list[-10:])) if len(errors_list) >= 10 else float(np.mean(errors_list)),
+                    'samples': len(errors_list)
+                }
+        return stats
 
     # ------------------------------------------------------------------
     # PATCH: aligned-horizon forecast helpers
@@ -523,6 +591,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # regime updates & rewards
             self._update_market_conditions(i)
             self._update_risk_snapshots(i)
+
+            # Track forecast accuracy if forecaster is available
+            if self.forecast_generator and hasattr(self.forecast_generator, 'predict_all_horizons'):
+                try:
+                    current_forecasts = self.forecast_generator.predict_all_horizons(timestep=self.t)
+                    if isinstance(current_forecasts, dict):
+                        self._track_forecast_accuracy(current_forecasts)
+                except Exception:
+                    pass  # Don't break environment if forecast tracking fails
+
             self._assign_rewards(financial)
 
             # step forward

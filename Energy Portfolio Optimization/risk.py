@@ -29,6 +29,32 @@ def _clip01(x: float) -> float:
     except Exception:
         return 0.5
 
+def _adaptive_scale(x: float, min_val: float = 0.0, max_val: float = 1.0,
+                   saturation_threshold: float = 0.95) -> float:
+    """Adaptive scaling to prevent saturation at boundaries."""
+    try:
+        x = float(x)
+        if x <= min_val:
+            return min_val + 0.01  # Small offset from minimum
+        elif x >= max_val:
+            return max_val - 0.01  # Small offset from maximum
+        elif x >= max_val * saturation_threshold:
+            # Compress values near maximum to prevent saturation
+            excess = x - max_val * saturation_threshold
+            range_remaining = max_val * (1 - saturation_threshold)
+            compressed = max_val * saturation_threshold + range_remaining * (1 - np.exp(-excess * 5))
+            return min(compressed, max_val - 0.01)
+        elif x <= min_val + (max_val - min_val) * (1 - saturation_threshold):
+            # Expand values near minimum
+            deficit = (min_val + (max_val - min_val) * (1 - saturation_threshold)) - x
+            range_available = (max_val - min_val) * (1 - saturation_threshold)
+            expanded = min_val + range_available * (1 - np.exp(-deficit * 5))
+            return max(expanded, min_val + 0.01)
+        else:
+            return x
+    except Exception:
+        return (min_val + max_val) / 2
+
 class SafeDivision:
     @staticmethod
     def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -61,6 +87,16 @@ class EnhancedRiskController:
             'portfolio': 0.25,
             'liquidity': 0.15,
             'regulatory': 0.15
+        }
+
+        # Adaptive thresholds to prevent saturation
+        self.adaptive_thresholds = {
+            'market_stress_high': 0.85,      # Reduced from 1.0
+            'market_stress_medium': 0.65,    # Reduced from 0.8
+            'volatility_high': 0.80,         # Reduced from 1.0
+            'volatility_medium': 0.50,       # Reduced from 0.6
+            'portfolio_concentration_high': 0.75,  # Reduced from 0.9
+            'liquidity_stress_high': 0.80,   # Reduced from 1.0
         }
 
         # Default metrics for cold start (6 values for obs head)
@@ -165,7 +201,7 @@ class EnhancedRiskController:
                 capital = 0.50
 
             prisk = 0.6 * conc + 0.4 * capital
-            return _clip01(prisk)
+            return _adaptive_scale(prisk, 0.0, 1.0)
         except Exception as e:
             self.logger.warning(f"Portfolio risk calculation failed: {e}")
             return 0.25
@@ -192,7 +228,7 @@ class EnhancedRiskController:
                     cf_vol = min(cf_vol, 1.0)
 
             lrisk = 0.6 * buffer_risk + 0.4 * cf_vol
-            return _clip01(lrisk)
+            return _adaptive_scale(lrisk, 0.0, 1.0)
         except Exception as e:
             self.logger.warning(f"Liquidity risk calculation failed: {e}")
             return 0.15
@@ -253,6 +289,9 @@ class EnhancedRiskController:
                 self.risk_weights['regulatory']  * comp['regulatory_risk']
             )
 
+            # Apply adaptive scaling to prevent saturation
+            overall = _adaptive_scale(overall, 0.0, 1.0)
+
             comp['overall_risk'] = _clip01(overall)
 
             # Final sanitize (finite & in range)
@@ -288,9 +327,9 @@ class EnhancedRiskController:
                 'risk_multiplier':      float(np.clip(0.5 + 1.5 * overall, 0.5, 2.0)),
                 'max_single_investment': float(np.clip(0.5 - portfolio, 0.1, 0.5)),
                 'cash_reserve_target':   float(np.clip(0.05 + 0.25 * liquidity, 0.05, 0.30)),
-                'hedge_recommendation':  _clip01(2.0 * market),
-                'rebalance_urgency':     _clip01(portfolio),
-                'risk_tolerance':        float(np.clip(1.0 - overall, 0.1, 1.0)),
+                'hedge_recommendation':  _adaptive_scale(2.0 * market, 0.0, 1.0),
+                'rebalance_urgency':     _adaptive_scale(portfolio, 0.0, 1.0),
+                'risk_tolerance':        _adaptive_scale(1.0 - overall, 0.1, 1.0),
             }
             return actions
         except Exception as e:

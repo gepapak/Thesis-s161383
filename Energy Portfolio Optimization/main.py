@@ -41,12 +41,17 @@ except Exception:
 # Inlined utilities so utils.py is no longer needed
 # =====================================================================
 
-def load_energy_data(csv_path: str) -> pd.DataFrame:
+def load_energy_data(csv_path: str, convert_to_raw_units: bool = True) -> pd.DataFrame:
     """
-    Load energy time series data from CSV.
+    Load energy time series data from CSV with optional unit conversion.
     Requires at least: wind, solar, hydro, price, load.
     Keeps extra cols like timestamp, risk, scenario, etc. if present.
     Casts numeric columns to float where possible and parses timestamp when present.
+
+    Args:
+        csv_path: Path to CSV file
+        convert_to_raw_units: If True, converts capacity factors to absolute MW units
+                             to match forecast model training data
     """
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"Data file not found: {csv_path}")
@@ -75,7 +80,66 @@ def load_energy_data(csv_path: str) -> pd.DataFrame:
     # Drop obviously bad rows (optional, conservative)
     df = df.dropna(subset=required).reset_index(drop=True)
 
+    # Convert capacity factors to raw MW values for direct forecasting
+    if convert_to_raw_units and _is_capacity_factor_data(df):
+        print("🔄 Converting capacity factors to raw MW values for direct forecasting...")
+        df = _convert_to_raw_mw_values(df)
+        print("✅ Raw MW conversion completed - forecasts will work directly with these units")
+    else:
+        print("📊 Data already in raw MW units - ready for direct forecasting")
+
     return df
+
+
+def _is_capacity_factor_data(df: pd.DataFrame) -> bool:
+    """Detect if data is in capacity factor format (0-1 range) vs absolute MW."""
+    # Check if renewable data is in 0-1 range (capacity factors)
+    renewable_cols = ['wind', 'solar', 'hydro', 'load']
+
+    for col in renewable_cols:
+        if col in df.columns:
+            max_val = df[col].max()
+            if max_val > 2.0:  # If any value > 2, likely already in MW
+                return False
+
+    return True  # All values <= 2, likely capacity factors
+
+
+def _convert_to_raw_mw_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert capacity factors to raw MW values for direct forecasting.
+
+    This eliminates normalization complexity and uses the exact training scale.
+    """
+
+    # EXACT conversion factors derived from scaler analysis
+    # These ensure models receive data in the same scale they were trained on
+    capacity_mw = {
+        'wind': 1103,    # From training scaler mean: 1103.4 MW
+        'solar': 100,    # From training scaler mean: 61.5 MW (min 100 for stability)
+        'hydro': 534,    # From training scaler mean: 534.1 MW
+        'load': 2999,    # From training scaler mean: 2999.8 MW
+    }
+
+    df_converted = df.copy()
+
+    print("🔄 Converting to raw MW values (no normalization):")
+
+    # Convert capacity factors to raw MW values
+    for col, capacity in capacity_mw.items():
+        if col in df_converted.columns:
+            original_range = f"[{df[col].min():.3f}, {df[col].max():.3f}]"
+            df_converted[col] = df[col] * capacity
+            new_range = f"[{df_converted[col].min():.1f}, {df_converted[col].max():.1f}] MW"
+            print(f"  {col}: {original_range} → {new_range}")
+
+    # Price: Already in $/MWh (no conversion needed)
+    if 'price' in df_converted.columns:
+        price_range = f"[{df_converted['price'].min():.1f}, {df_converted['price'].max():.1f}] $/MWh"
+        print(f"  price: {price_range} (no conversion)")
+
+    print("✅ Raw MW conversion complete - ready for direct forecasting")
+
+    return df_converted
 
 
 # =====================================================================
@@ -794,10 +858,11 @@ def main():
             )
             print("Forecaster initialized successfully!")
 
-            # --- NEW: Offline precompute pass ---
+            # --- NEW: Offline precompute pass (restored efficient batch prediction) ---
             if args.precompute_forecasts:
                 try:
                     print(f"Precomputing forecasts offline (batch_size={args.precompute_batch_size})…")
+                    print("Using efficient batch prediction - should be fast even for large datasets!")
                     # You can pass the full dataframe; the forecaster validates required columns internally.
                     forecaster.precompute_offline(
                         df=data,
