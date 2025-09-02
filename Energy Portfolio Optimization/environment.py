@@ -148,18 +148,21 @@ class MultiObjectiveRewardCalculator:
         # Check for risk constraint violations first
         constraint_penalty = self._calculate_constraint_penalties(env_state, financial)
 
-        # Enhanced financial score incorporating both MTM and generation revenue
+        # FIXED: Portfolio value-focused financial score
+        portfolio_value = financial.get('portfolio_value', self.initial_budget)
         net_profit = financial.get('net_profit', 0.0)
         generation_revenue = financial.get('generation_revenue', 0.0)
-        mtm_pnl = financial.get('mtm_pnl', 0.0)
 
-        # Separate scoring for different revenue sources
-        fin_total = float(np.clip(SafeDivision.div(net_profit, self.initial_budget * 0.01, 0.0), -1.0, 1.0))
-        fin_generation = float(np.clip(SafeDivision.div(generation_revenue, self.initial_budget * 0.005, 0.0), 0.0, 1.0))
-        fin_trading = float(np.clip(SafeDivision.div(mtm_pnl, self.initial_budget * 0.01, 0.0), -1.0, 1.0))
+        # Primary metric: Portfolio value change (most important)
+        portfolio_return = float(SafeDivision.div(portfolio_value - self.initial_budget, self.initial_budget, 0.0))
+        portfolio_score = float(np.clip(portfolio_return * 10.0, -2.0, 2.0))  # Scale for reward range
 
-        # Combined financial score with emphasis on generation revenue (PPA economics)
-        fin = 0.5 * fin_total + 0.3 * fin_generation + 0.2 * fin_trading
+        # Secondary metrics: Profitability and revenue quality
+        profit_score = float(np.clip(SafeDivision.div(net_profit, self.initial_budget * 0.01, 0.0), -1.0, 1.0))
+        revenue_quality = float(np.clip(SafeDivision.div(generation_revenue, self.initial_budget * 0.005, 0.0), 0.0, 0.5))
+
+        # PRIORITIZE PORTFOLIO VALUE: 70% portfolio value, 20% profit, 10% revenue quality
+        fin = 0.70 * portfolio_score + 0.20 * profit_score + 0.10 * revenue_quality
 
         # Apply constraint penalty to financial score
         fin = fin * (1.0 - constraint_penalty)
@@ -193,13 +196,13 @@ class MultiObjectiveRewardCalculator:
         # Diversification with technology-specific weighting
         div = self._diversification_score(env_state.get('wind_pos',0.0), env_state.get('solar_pos',0.0), env_state.get('hydro_pos',0.0))
 
-        # Adjusted reward weights to emphasize generation performance
+        # FIXED: Prioritize portfolio value and profitability
         adjusted_weights = {
-            'financial': 0.40,       # Increased emphasis on financial returns
-            'risk_management': 0.25, # Reduced slightly
-            'sustainability': 0.20,  # Increased for renewable deployment
-            'efficiency': 0.10,      # Maintained
-            'diversification': 0.05, # Reduced slightly
+            'financial': 0.60,       # INCREASED: Portfolio value is primary goal
+            'risk_management': 0.20, # Reduced: Still important for capital preservation
+            'sustainability': 0.10,  # Reduced: Secondary to profitability
+            'efficiency': 0.05,      # Reduced: Operational efficiency less critical
+            'diversification': 0.05, # Maintained: Still need some diversification
         }
 
         total = (adjusted_weights['financial']       * fin +
@@ -842,17 +845,22 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # realized cash flow (battery + physical generation revenue) - costs
         realized = float(battery_cash_delta + revenue_generation - txn_costs - opex_battery)
 
-        # Investment fund economics: distributions from POSITIVE realized cash only
-        if realized > 0:
-            dist = realized * self.distribution_rate
-            retained = realized - dist
+        # FIXED: Investment fund economics - track actual portfolio returns, not just revenue
+        # Update budget with realized cash flow
+        self.budget = max(0.0, self.budget + realized)
+
+        # Calculate TRUE portfolio return (change in total equity)
+        current_equity = self.budget + self.wind_instrument_value + self.solar_instrument_value + self.hydro_instrument_value
+        portfolio_return_this_step = current_equity - getattr(self, '_last_equity', self.init_budget)
+        self._last_equity = current_equity
+
+        # Track cumulative returns based on actual portfolio performance
+        self.cumulative_returns += portfolio_return_this_step
+
+        # Only distribute profits if portfolio is actually profitable
+        if self.cumulative_returns > 0 and realized > 0:
+            dist = min(realized * self.distribution_rate, self.cumulative_returns * 0.1)  # Conservative distribution
             self.distributed_profits += dist
-            self.cumulative_returns += realized
-            self.budget = max(0.0, self.budget + retained)
-        else:
-            # Losses hit budget fully
-            self.budget = max(0.0, self.budget + realized)
-            self.cumulative_returns += realized
 
         # equity after MTM (for position valuation only)
         self.equity = float(self.budget + self.wind_instrument_value + self.solar_instrument_value + self.hydro_instrument_value)
@@ -1106,11 +1114,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 'liquidity_risk': getattr(self, 'liquidity_risk_snapshot', 0.15),
             }
             total, breakdown = self.reward_calculator.calculate(env_state, financial, risk)
-            # investor: emphasize financial; battery: efficiency; risk: risk; meta: total
-            self._rew_buf['investor_0']         = float(np.clip(0.7 * breakdown['financial']       + 0.3 * total, -10, 10))
-            self._rew_buf['battery_operator_0'] = float(np.clip(0.6 * breakdown['efficiency']      + 0.4 * total, -10, 10))
-            self._rew_buf['risk_controller_0']  = float(np.clip(0.7 * breakdown['risk_management'] + 0.3 * total, -10, 10))
-            self._rew_buf['meta_controller_0']  = float(np.clip(total, -10, 10))
+            # FIXED: All agents prioritize portfolio value (financial performance)
+            self._rew_buf['investor_0']         = float(np.clip(0.9 * breakdown['financial']       + 0.1 * total, -10, 10))
+            self._rew_buf['battery_operator_0'] = float(np.clip(0.7 * breakdown['financial']       + 0.3 * breakdown['efficiency'], -10, 10))
+            self._rew_buf['risk_controller_0']  = float(np.clip(0.6 * breakdown['financial']       + 0.4 * breakdown['risk_management'], -10, 10))
+            self._rew_buf['meta_controller_0']  = float(np.clip(0.8 * breakdown['financial']       + 0.2 * total, -10, 10))
             self.last_reward_breakdown = dict(breakdown)
             # reflect the active weights actually used
             self.last_reward_weights = dict(self.reward_calculator.reward_weights)
@@ -1251,6 +1259,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.distributed_profits = 0.0  # Profits distributed to investors (not reinvested)
         self.cumulative_returns = 0.0   # Total returns generated
         self.max_leverage = 1.5         # Maximum 1.5x leverage allowed
+        self._last_equity = float(self.init_budget)  # Track equity changes for true returns
 
         # battery
         self.battery_capacity = 0.0
