@@ -253,6 +253,34 @@ class EnhancedRiskController:
             self.logger.warning(f"Regulatory risk calculation failed: {e}")
             return 0.35
 
+    def calculate_forecast_uncertainty_risk(self, env_state: Dict) -> float:
+        """
+        ENHANCEMENT: Calculate risk from forecast uncertainty (spread of quantiles).
+        Returns a value in [0, 1].
+        """
+        try:
+            # Extract forecast quantiles if available
+            price_forecasts = env_state.get('price_forecasts', [])
+            if isinstance(price_forecasts, (list, tuple)) and len(price_forecasts) >= 3:
+                # Assume forecasts are [q10, q50, q90] or similar
+                forecasts = np.array(price_forecasts, dtype=np.float64)
+                if len(forecasts) >= 3:
+                    q10, q50, q90 = forecasts[0], forecasts[1], forecasts[2]
+                    if q50 > 0:
+                        uncertainty = (q90 - q10) / q50  # Relative spread
+                        return float(np.clip(uncertainty * 0.5, 0.0, 1.0))  # Scale to [0,1]
+
+            # Fallback: use price volatility as proxy for forecast uncertainty
+            if len(self.price_history) >= 5:
+                prices = np.array(list(self.price_history)[-5:], dtype=np.float64)
+                volatility = np.std(prices) / max(np.mean(prices), 1.0)
+                return float(np.clip(volatility * 2.0, 0.0, 1.0))
+
+            return 0.15  # Default moderate uncertainty
+        except Exception as e:
+            self.logger.warning(f"Forecast uncertainty risk calculation failed: {e}")
+            return 0.15
+
     # ----------------------------- Aggregation & API -----------------------------
 
     def calculate_comprehensive_risk(self, env_state: Dict) -> Dict[str, float]:
@@ -267,11 +295,14 @@ class EnhancedRiskController:
             timestep = int(env_state.get('timestep', 0))
 
             capacities = {
-                'wind': float(env_state.get('wind_capacity', 0.0)),
-                'solar': float(env_state.get('solar_capacity', 0.0)),
-                'hydro': float(env_state.get('hydro_capacity', 0.0)),
-                'battery': float(env_state.get('battery_capacity', 0.0)),
+                'wind': float(env_state.get('wind_capacity_mw', 0.0)),
+                'solar': float(env_state.get('solar_capacity_mw', 0.0)),
+                'hydro': float(env_state.get('hydro_capacity_mw', 0.0)),
+                'battery': float(env_state.get('battery_capacity_mwh', 0.0)),
             }
+
+            # ENHANCEMENT: Add forecast uncertainty risk
+            forecast_uncertainty_risk = self.calculate_forecast_uncertainty_risk(env_state)
 
             comp = {
                 'market_risk':      self.calculate_market_risk(price),
@@ -279,6 +310,7 @@ class EnhancedRiskController:
                 'portfolio_risk':   self.calculate_portfolio_risk(capacities, budget, initial_budget),
                 'liquidity_risk':   self.calculate_liquidity_risk(budget, initial_budget),
                 'regulatory_risk':  self.calculate_regulatory_risk(timestep),
+                'forecast_uncertainty_risk': forecast_uncertainty_risk,
             }
 
             overall = (
@@ -286,7 +318,8 @@ class EnhancedRiskController:
                 self.risk_weights['operational'] * comp['operational_risk'] +
                 self.risk_weights['portfolio']   * comp['portfolio_risk'] +
                 self.risk_weights['liquidity']   * comp['liquidity_risk'] +
-                self.risk_weights['regulatory']  * comp['regulatory_risk']
+                self.risk_weights['regulatory']  * comp['regulatory_risk'] +
+                0.10 * comp['forecast_uncertainty_risk']  # 10% weight for forecast uncertainty
             )
 
             # Apply adaptive scaling to prevent saturation
@@ -402,9 +435,9 @@ class EnhancedRiskController:
 
             # Portfolio value (budget + simple mark of capacities)
             budget = env_state.get('budget', 0.0)
-            wind_c = env_state.get('wind_capacity', 0.0)
-            solar_c = env_state.get('solar_capacity', 0.0)
-            hydro_c = env_state.get('hydro_capacity', 0.0)
+            wind_c = env_state.get('wind_capacity_mw', 0.0)
+            solar_c = env_state.get('solar_capacity_mw', 0.0)
+            hydro_c = env_state.get('hydro_capacity_mw', 0.0)
 
             if all(isinstance(x, (int, float)) for x in (budget, wind_c, solar_c, hydro_c)):
                 total_value = float(budget) + 100.0 * float(max(0.0, wind_c)) \

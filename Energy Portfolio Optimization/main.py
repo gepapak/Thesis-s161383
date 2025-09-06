@@ -429,9 +429,23 @@ class PortfolioAdapter:
       - Push (features, target_weights) into a small buffer.
       - Every 'train_every' steps, fit the DL model on a random minibatch from the buffer (few epochs).
     """
-    def __init__(self, base_env, feature_dim=15, buffer_size=2048, label_every=12, train_every=60,
+    def __init__(self, base_env, feature_dim=None, buffer_size=2048, label_every=12, train_every=60,
                  window=24, lam=5.0, batch_size=128, epochs=1):
         self.e = base_env
+
+        # Determine feature_dim dynamically if not provided
+        if feature_dim is None:
+            if base_env is not None:
+                # Try to get from environment observation space if available
+                try:
+                    # This will be set after wrapper is created
+                    feature_dim = 15  # Default fallback
+                except Exception:
+                    feature_dim = 15
+            else:
+                feature_dim = 15  # Default when env not yet available
+
+        self.feature_dim = feature_dim
         self.model = DeepPortfolioOptimizer(num_assets=3, market_dim=feature_dim)
 
         # Online training hyperparams
@@ -465,6 +479,35 @@ class PortfolioAdapter:
             )
         except Exception as e:
             logging.warning(f"Model compilation failed: {e}")
+
+    def update_feature_dimensions(self, new_feature_dim: int):
+        """Update feature dimensions after wrapper is created and observation space is known"""
+        if new_feature_dim != self.feature_dim:
+            logging.info(f"Updating PortfolioAdapter feature dimensions from {self.feature_dim} to {new_feature_dim}")
+            self.feature_dim = new_feature_dim
+            # Recreate model with correct dimensions
+            self.model = DeepPortfolioOptimizer(num_assets=3, market_dim=new_feature_dim)
+            try:
+                self.model.compile(
+                    optimizer="adam",
+                    loss={
+                        "weights": "mse",
+                        "expected_returns": "mse",
+                        "portfolio_risk": "mse"
+                    },
+                    loss_weights={
+                        "weights": 1.0,
+                        "expected_returns": 0.0,
+                        "portfolio_risk": 0.0
+                    },
+                    metrics={
+                        "weights": ["mae"],
+                        "expected_returns": ["mae"],
+                        "portfolio_risk": ["mae"]
+                    }
+                )
+            except Exception as e:
+                logging.warning(f"Model recompilation failed: {e}")
 
         # Optional: try load previous online-trained weights to warm-start
         for candidate in ["dl_allocator_online.h5", "dl_allocator_weights.h5"]:
@@ -521,12 +564,22 @@ class PortfolioAdapter:
         except Exception:
             wind_cf = solar_cf = hydro_cf = 0.0
 
-        # Generation efficiency and portfolio performance metrics
+        # True physical capacity utilization (generation/capacity)
         try:
-            total_capacity = float(getattr(e, "wind_instrument_value", 0.0) +
-                                 getattr(e, "solar_instrument_value", 0.0) +
-                                 getattr(e, "hydro_instrument_value", 0.0))
-            capacity_utilization = float(np.clip(total_capacity / max(e.init_budget, 1e-6), 0.0, 1.0))
+            # Get current generation levels (capacity factors)
+            current_generation = wind_cf + solar_cf + hydro_cf  # Sum of capacity factors
+
+            # Get total physical capacity in MW
+            total_physical_mw = (getattr(e, "wind_capacity_mw", 0.0) +
+                               getattr(e, "solar_capacity_mw", 0.0) +
+                               getattr(e, "hydro_capacity_mw", 0.0))
+
+            # Calculate true utilization: if we have 100MW total and generating at 30% average = 0.3
+            if total_physical_mw > 0:
+                avg_capacity_factor = current_generation / 3.0  # Average across 3 technologies
+                capacity_utilization = float(np.clip(avg_capacity_factor, 0.0, 1.0))
+            else:
+                capacity_utilization = 0.0  # No physical assets deployed
         except Exception:
             capacity_utilization = 0.0
 
@@ -548,7 +601,7 @@ class PortfolioAdapter:
             budget_ratio,            # 5: cash position
             cap_frac,                # 6: capital allocation
             freq_norm,               # 7: investment frequency
-            capacity_utilization,    # 8: portfolio capacity utilization
+            capacity_utilization,    # 8: true physical capacity utilization (avg CF)
             market_vol,              # 9: market volatility
             market_stress,           # 10: market stress indicator
             wind_cf * price / PRICE_SCALE,  # 11: wind revenue potential
@@ -561,9 +614,9 @@ class PortfolioAdapter:
     # ---------- position snapshot ----------
     def _positions(self) -> np.ndarray:
         e = self.e
-        w = float(getattr(e, "wind_capacity", 0.0))
-        s = float(getattr(e, "solar_capacity", 0.0))
-        h = float(getattr(e, "hydro_capacity", 0.0))
+        w = float(getattr(e, "wind_capacity_mw", 0.0))
+        s = float(getattr(e, "solar_capacity_mw", 0.0))
+        h = float(getattr(e, "hydro_capacity_mw", 0.0))
         return np.array([[w, s, h]], dtype=np.float32)
 
     # ---------- labeler ----------
@@ -696,9 +749,9 @@ class PortfolioAdapter:
     # ---------- map to env action ----------
     def weights_to_action(self, w: np.ndarray) -> np.ndarray:
         e = self.e
-        wcap = float(getattr(e, "wind_capacity", 0.0))
-        scap = float(getattr(e, "solar_capacity", 0.0))
-        hcap = float(getattr(e, "hydro_capacity", 0.0))
+        wcap = float(getattr(e, "wind_capacity_mw", 0.0))
+        scap = float(getattr(e, "solar_capacity_mw", 0.0))
+        hcap = float(getattr(e, "hydro_capacity_mw", 0.0))
         total = max(1e-6, wcap + scap + hcap)
         cur = np.array([wcap, scap, hcap], dtype=np.float32) / total
         delta = np.clip(w - cur, -0.2, 0.2) * 5.0  # -> roughly [-1,1]
@@ -897,6 +950,19 @@ def main():
             dl_adapter.e = base_env  # Now set the environment on the adapter
 
         env = MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
+
+        # Update DL adapter feature dimensions based on actual observation space
+        if dl_adapter and hasattr(env, 'observation_spaces'):
+            try:
+                # Get the actual observation space size for investor_0 (which the DL adapter uses)
+                obs_space = env.observation_spaces.get("investor_0")
+                if obs_space is not None and hasattr(obs_space, 'shape'):
+                    actual_feature_dim = obs_space.shape[0]
+                    dl_adapter.update_feature_dimensions(actual_feature_dim)
+                    print(f"   DL adapter updated to use {actual_feature_dim} features")
+            except Exception as e:
+                print(f"   Warning: Could not update DL adapter dimensions: {e}")
+
         print("Enhanced environment created successfully!")
         print("   Multi-objective rewards: enabled")
         print("   Enhanced risk management: enabled")

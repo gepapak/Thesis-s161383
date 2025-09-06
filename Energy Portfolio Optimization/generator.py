@@ -444,10 +444,15 @@ class MultiHorizonForecastGenerator:
                     if self.verbose:
                         print(f"⚠️ model missing: {key}")
 
-                # scalers (if present)
+                # scalers (if present) - try both naming conventions
                 self.loading_stats["scalers_attempted"] += 1
-                sx = os.path.join(scaler_dir, f"{key}_scaler_X.pkl")
-                sy = os.path.join(scaler_dir, f"{key}_scaler_y.pkl")
+                # Try TestForecast naming convention first
+                sx = os.path.join(scaler_dir, f"{key}_sc_X.pkl")
+                sy = os.path.join(scaler_dir, f"{key}_sc_y.pkl")
+                # Fallback to original naming convention
+                if not (os.path.exists(sx) and os.path.exists(sy)):
+                    sx = os.path.join(scaler_dir, f"{key}_scaler_X.pkl")
+                    sy = os.path.join(scaler_dir, f"{key}_scaler_y.pkl")
                 if os.path.exists(sx) and os.path.exists(sy):
                     try:
                         scaler_X = joblib.load(sx)
@@ -779,11 +784,11 @@ class MultiHorizonForecastGenerator:
 
             result = float(val)
 
-            # Apply realistic bounds based on capacity
+            # Apply realistic bounds based on actual data range
             bounds = {
-                "wind": (0.0, 1200.0),    # 0 to 110% of capacity
-                "solar": (0.0, 110.0),    # 0 to 110% of capacity
-                "hydro": (0.0, 600.0),    # 0 to 112% of capacity
+                "wind": (0.0, 1600.0),    # 0 to max observed (1500) + buffer
+                "solar": (0.0, 1100.0),   # 0 to max observed (1000) + buffer
+                "hydro": (0.0, 1100.0),   # 0 to max observed (1000) + buffer
                 "price": (-50.0, 500.0),  # Reasonable price range
                 "load": (500.0, 3500.0),  # Reasonable load range
             }

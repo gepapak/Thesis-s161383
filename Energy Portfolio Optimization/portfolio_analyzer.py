@@ -2,7 +2,7 @@
 # Log-consistent analyzer that prefers equity over budget, fixes drawdown math,
 # and stays compatible with your wrapper/evaluation outputs. (Fully Amended)
 
-from __future-past-exports import annotations
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -16,8 +16,8 @@ class AnalyzerConfig:
     risk_free_annual: float = 0.02
     min_annualization: int = 252           # Min trading days for annualization
     max_annualization: int = 52560         # Max steps (e.g., 10-min intervals) per year
-    equity_cols: Tuple[str, ...] = ("total_return_nav", "equity", "portfolio_value", "portfolio_performance")
-    budget_cols: Tuple[str, ...] = ("budget",)
+    equity_cols: Tuple[str, ...] = ("portfolio_value", "equity", "total_return_nav", "portfolio_performance", "fund_performance")
+    budget_cols: Tuple[str, ...] = ("budget", "investment_capital")
     log_prefer: bool = True                # Prefer log returns for calculations if possible
     plot_title: str = "Portfolio Performance Analysis"
 
@@ -83,9 +83,17 @@ class PortfolioAnalyzer:
                 self.results["roi_total"] = SafeDivision.div(series.iloc[-1] - series.iloc[0], series.iloc[0])
 
         # Add mean values of key diagnostic columns if they exist
-        for col in ("overall_risk", "generation_revenue", "mtm_pnl", "meta_reward"):
+        diagnostic_cols = [
+            "overall_risk", "generation_revenue", "mtm_pnl", "meta_reward",
+            "revenue_step", "cumulative_returns", "fund_performance",
+            "wind_cap", "solar_cap", "hydro_cap", "battery_energy"
+        ]
+        for col in diagnostic_cols:
             if col in self.df.columns:
-                self.results[f"mean_{col}"] = float(pd.to_numeric(self.df[col], errors="coerce").mean())
+                series = pd.to_numeric(self.df[col], errors="coerce")
+                if not series.isna().all():
+                    self.results[f"mean_{col}"] = float(series.mean())
+                    self.results[f"final_{col}"] = float(series.iloc[-1]) if len(series) > 0 else 0.0
 
         if make_plots:
             self.create_comprehensive_plots(curve, simple_returns, rt_data["series_name"], path_prefix=plot_path_prefix)
@@ -218,7 +226,11 @@ class PortfolioAnalyzer:
     # ---------------------------------------------------------------------
     def create_comprehensive_plots(self, curve: np.ndarray, simple_returns: np.ndarray, series_name: str, path_prefix: Optional[str] = None):
         """Generates a comprehensive multi-panel plot of performance."""
-        plt.style.use('seaborn-v0_8-darkgrid')
+        try:
+            plt.style.use('seaborn-v0_8-darkgrid')
+        except OSError:
+            # Fallback to default style if seaborn style not available
+            plt.style.use('default')
         fig, axes = plt.subplots(3, 1, figsize=(12, 15), gridspec_kw={'height_ratios': [3, 1, 1]})
         fig.suptitle(f"{self.cfg.plot_title} (Source: {series_name})", fontsize=16)
 

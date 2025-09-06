@@ -12,6 +12,18 @@ from collections import deque
 import random
 import logging
 
+# Check TensorFlow version for compatibility
+try:
+    TF_VERSION = tuple(map(int, tf.__version__.split('.')[:2]))
+    # Test if tf.diff actually works (some versions have issues)
+    test_tensor = tf.constant([[1.0, 2.0, 3.0]])
+    _ = tf.diff(test_tensor, axis=-1)
+    HAS_TF_DIFF = True
+    logging.info(f"TensorFlow {tf.__version__}: tf.diff available")
+except Exception:
+    HAS_TF_DIFF = False
+    logging.info(f"TensorFlow {tf.__version__}: tf.diff not available, using manual diff")
+
 # Check if CVXPY is available, otherwise use a fallback
 try:
     import cvxpy as cp
@@ -86,9 +98,32 @@ class DeepPortfolioOptimizer(tf.keras.Model):
         # Predict returns from the market state
         expected_returns = self.return_predictor(market_encoded, training=training)
 
-        # Generate optimal weights using both market state and current positions
-        combined_input = tf.concat([market_encoded, current_positions], axis=-1)
+        # ENHANCEMENT: Extract forecast signals for active decision making
+        # Assume market_encoded includes forecast features - extract them for explicit use
+        forecast_features = market_encoded[:, -5:]  # Last 5 features assumed to be forecasts
+
+        # COMPATIBILITY FIX: Use tf.diff if available, otherwise manual calculation
+        if HAS_TF_DIFF:
+            forecast_momentum = tf.reduce_mean(tf.diff(forecast_features, axis=-1), axis=-1, keepdims=True)
+        else:
+            # Manual diff calculation for older TensorFlow versions
+            forecast_diff = forecast_features[:, 1:] - forecast_features[:, :-1]
+            forecast_momentum = tf.reduce_mean(forecast_diff, axis=-1, keepdims=True)
+        forecast_volatility = tf.math.reduce_std(forecast_features, axis=-1, keepdims=True)
+
+        # Create enhanced input with explicit forecast signals
+        forecast_signals = tf.concat([forecast_momentum, forecast_volatility], axis=-1)
+
+        # Generate optimal weights using market state, forecasts, and current positions
+        combined_input = tf.concat([market_encoded, forecast_signals, current_positions], axis=-1)
         weights = self.weight_generator(combined_input, training=training)
+
+        # ENHANCEMENT: Add transaction cost penalty for large position changes
+        position_changes = tf.abs(weights - current_positions)
+        transaction_cost_penalty = tf.reduce_mean(position_changes, axis=-1, keepdims=True) * 0.001  # 0.1% penalty
+
+        # Apply penalty to weights (reduce extreme changes)
+        weights = weights * (1.0 - transaction_cost_penalty)
 
         # Estimate portfolio risk based on the generated portfolio and market state
         portfolio_input = tf.concat([weights, expected_returns, market_encoded], axis=-1)
