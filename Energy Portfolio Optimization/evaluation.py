@@ -162,7 +162,8 @@ def evaluate_trained_agents(
     model_dir: str,
     scaler_dir: str,
     evaluation_steps: int | None = None,
-    log_path: str | None = None
+    log_path: str | None = None,
+    no_forecast: bool = False
 ) -> Dict[str, Any] | None:
     """
     Evaluate pre-trained agents on new data.
@@ -173,17 +174,21 @@ def evaluate_trained_agents(
     print(f"📊 Evaluation data shape: {data.shape}")
 
     # ---- Forecaster ----
-    print("🔮 Loading forecaster.")
-    try:
-        forecaster = MultiHorizonForecastGenerator(
-            model_dir=model_dir,
-            scaler_dir=scaler_dir,
-            look_back=6,
-            verbose=False
-        )
-    except Exception as e:
-        print(f"❌ Failed to load forecaster: {e}")
-        return None
+    forecaster = None
+    if not no_forecast:
+        print("🔮 Loading forecaster.")
+        try:
+            forecaster = MultiHorizonForecastGenerator(
+                model_dir=model_dir,
+                scaler_dir=scaler_dir,
+                look_back=6,
+                verbose=False
+            )
+        except Exception as e:
+            print(f"❌ Failed to load forecaster: {e}")
+            return None
+    else:
+        print("🚫 Forecasting disabled (baseline evaluation)")
 
     # ---- Base env ----
     print("🏗️ Setting up evaluation environment.")
@@ -199,11 +204,9 @@ def evaluate_trained_agents(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = f"evaluation_logs/evaluation_metrics_{timestamp}.csv"
 
-    eval_env = MultiHorizonWrapperEnv(
-        base_env,
-        forecaster,
-        log_path=log_path
-    )
+    # CRITICAL FIX: Only wrap when forecasts are enabled for fair baseline comparison
+    eval_env = base_env if (forecaster is None or no_forecast) \
+               else MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
 
     # ---- Agent system (loads from disk) ----
     print(f"🤖 Initializing agent system.")
@@ -334,6 +337,7 @@ def main():
     parser.add_argument("--scaler_dir", default="saved_scalers", help="Forecast scaler directory")
     parser.add_argument("--eval_steps", type=int, default=None, help="Number of timesteps to evaluate")
     parser.add_argument("--output_dir", default="evaluation_logs", help="Where to save logs and summary")
+    parser.add_argument("--no_forecast", action="store_true", help="Disable forecasting for baseline comparison")
     args = parser.parse_args()
 
     print(f"📦 Loading evaluation data from: {args.eval_data}")
@@ -362,7 +366,8 @@ def main():
         model_dir=args.model_dir,
         scaler_dir=args.scaler_dir,
         evaluation_steps=args.eval_steps,
-        log_path=log_path
+        log_path=log_path,
+        no_forecast=args.no_forecast
     )
 
     if not results:

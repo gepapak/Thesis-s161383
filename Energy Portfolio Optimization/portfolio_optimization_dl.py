@@ -34,6 +34,19 @@ except ImportError:
 
 
 # =====================================================================
+# Helper Functions
+# =====================================================================
+
+def _get_config_value(attr_name, default_value):
+    """Helper to get config values with fallback."""
+    try:
+        from config import EnhancedConfig
+        config = EnhancedConfig()
+        return getattr(config, attr_name, default_value)
+    except Exception:
+        return default_value
+
+# =====================================================================
 # DL Models
 # =====================================================================
 
@@ -56,7 +69,7 @@ class DeepPortfolioOptimizer(tf.keras.Model):
         self.market_encoder = tf.keras.Sequential([
             Dense(128, activation='relu'),
             BatchNormalization(),
-            Dropout(0.2),
+            Dropout(_get_config_value('portfolio_dropout_rate_1', 0.2)),
             Dense(64, activation='relu'),
             BatchNormalization(),
         ])
@@ -120,7 +133,7 @@ class DeepPortfolioOptimizer(tf.keras.Model):
 
         # ENHANCEMENT: Add transaction cost penalty for large position changes
         position_changes = tf.abs(weights - current_positions)
-        transaction_cost_penalty = tf.reduce_mean(position_changes, axis=-1, keepdims=True) * 0.001  # 0.1% penalty
+        transaction_cost_penalty = tf.reduce_mean(position_changes, axis=-1, keepdims=True) * _get_config_value('portfolio_transaction_cost_penalty', 0.001)
 
         # Apply penalty to weights (reduce extreme changes)
         weights = weights * (1.0 - transaction_cost_penalty)
@@ -300,10 +313,10 @@ class AdaptiveAssetAllocation(tf.keras.Model):
         self.allocation_network = tf.keras.Sequential([
             Dense(256, activation='relu'),
             BatchNormalization(),
-            Dropout(0.3),
+            Dropout(_get_config_value('portfolio_dropout_rate_2', 0.3)),
             Dense(128, activation='relu'),
             BatchNormalization(),
-            Dropout(0.2),
+            Dropout(_get_config_value('portfolio_dropout_rate_1', 0.2)),
             Dense(num_assets, activation='softmax')  # Portfolio weights
         ])
 
@@ -459,7 +472,14 @@ class PortfolioOptimizationTrainer:
     Training system for the portfolio optimization networks.
     """
 
-    def __init__(self, num_assets=5, learning_rate=0.001):
+    def __init__(self, num_assets=None, learning_rate=None, config=None):
+        # Get values from config if available
+        if config:
+            num_assets = num_assets or getattr(config, 'portfolio_num_assets', 5)
+            learning_rate = learning_rate or getattr(config, 'portfolio_learning_rate', 0.001)
+        else:
+            num_assets = num_assets or 5
+            learning_rate = learning_rate or 0.001
         # PATCHED: Storing num_assets and learning_rate as instance attributes
         self.num_assets = num_assets
         self.learning_rate = learning_rate
@@ -502,12 +522,12 @@ class PortfolioOptimizationTrainer:
         # 5. Penalize concentration to encourage diversification (lower HHI is better)
         concentration_penalty = tf.reduce_mean(tf.reduce_sum(tf.square(predicted_weights), axis=-1))
 
-        # Combine all loss components with weights
+        # Combine all loss components with weights from config
         total_loss = (return_loss +
-                      0.5 * risk_loss +
-                      10.0 * weight_sum_loss +
-                      5.0 * negative_weight_penalty +
-                      0.1 * concentration_penalty)
+                      _get_config_value('portfolio_risk_loss_weight', 0.5) * risk_loss +
+                      _get_config_value('portfolio_weight_sum_loss_weight', 10.0) * weight_sum_loss +
+                      _get_config_value('portfolio_negative_weight_penalty_weight', 5.0) * negative_weight_penalty +
+                      _get_config_value('portfolio_concentration_penalty_weight', 0.1) * concentration_penalty)
 
         return total_loss
 

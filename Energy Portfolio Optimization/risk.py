@@ -69,8 +69,22 @@ class EnhancedRiskController:
     Lightweight, robust risk controller with bounded history and consistent outputs.
     """
 
-    def __init__(self, lookback_window: int = 144):
-        self.lookback_window = int(max(1, min(lookback_window, 200)))  # guard + cap
+    def __init__(self, lookback_window: int = None, config=None):
+        # Import config if not provided
+        if config is None:
+            try:
+                from config import EnhancedConfig
+                config = EnhancedConfig()
+            except Exception:
+                config = None
+
+        # Use config values with fallbacks
+        if config and hasattr(config, 'risk_lookback_window'):
+            default_lookback = config.risk_lookback_window
+        else:
+            default_lookback = 144
+
+        self.lookback_window = int(max(1, min(lookback_window or default_lookback, 200)))  # guard + cap
         self.logger = logging.getLogger(__name__)
 
         # Bounded histories to prevent memory growth
@@ -80,24 +94,30 @@ class EnhancedRiskController:
         self.cash_flow_history = deque(maxlen=self.lookback_window)    # floats (revenue)
         self.market_stress_history = deque(maxlen=self.lookback_window)
 
-        # Risk weights (sum ~ 1.0)
-        self.risk_weights = {
-            'market': 0.25,
-            'operational': 0.20,
-            'portfolio': 0.25,
-            'liquidity': 0.15,
-            'regulatory': 0.15
-        }
+        # Risk weights from config (sum ~ 1.0)
+        if config and hasattr(config, 'risk_weights'):
+            self.risk_weights = config.risk_weights.copy()
+        else:
+            self.risk_weights = {
+                'market': 0.25,
+                'operational': 0.20,
+                'portfolio': 0.25,
+                'liquidity': 0.15,
+                'regulatory': 0.15
+            }
 
-        # Adaptive thresholds to prevent saturation
-        self.adaptive_thresholds = {
-            'market_stress_high': 0.85,      # Reduced from 1.0
-            'market_stress_medium': 0.65,    # Reduced from 0.8
-            'volatility_high': 0.80,         # Reduced from 1.0
-            'volatility_medium': 0.50,       # Reduced from 0.6
-            'portfolio_concentration_high': 0.75,  # Reduced from 0.9
-            'liquidity_stress_high': 0.80,   # Reduced from 1.0
-        }
+        # Adaptive thresholds from config
+        if config and hasattr(config, 'risk_thresholds'):
+            self.adaptive_thresholds = config.risk_thresholds.copy()
+        else:
+            self.adaptive_thresholds = {
+                'market_stress_high': 0.85,      # Reduced from 1.0
+                'market_stress_medium': 0.65,    # Reduced from 0.8
+                'volatility_high': 0.80,         # Reduced from 1.0
+                'volatility_medium': 0.50,       # Reduced from 0.6
+                'portfolio_concentration_high': 0.75,  # Reduced from 0.9
+                'liquidity_stress_high': 0.80,   # Reduced from 1.0
+            }
 
         # Default metrics for cold start (6 values for obs head)
         self._default_obs_metrics = np.array([0.30, 0.20, 0.25, 0.15, 0.35, 0.25], dtype=np.float32)

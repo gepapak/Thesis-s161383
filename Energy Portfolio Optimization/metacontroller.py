@@ -42,7 +42,12 @@ __all__ = ["MultiESGAgent", "HyperparameterOptimizer"]
 class EnhancedMemoryTracker:
     """Enhanced memory tracker with SB3-specific cleanup."""
 
-    def __init__(self, max_memory_mb=6000):
+    def __init__(self, max_memory_mb=None, config=None):
+        # Get memory limit from config if available
+        if config and hasattr(config, 'metacontroller_memory_mb'):
+            max_memory_mb = max_memory_mb or config.metacontroller_memory_mb
+        else:
+            max_memory_mb = max_memory_mb or 6000
         self.max_memory_mb = max_memory_mb
         self.cleanup_counter = 0
         self.memory_history = deque(maxlen=200)
@@ -361,11 +366,17 @@ class EnhancedObservationValidator:
         return specs
 
     def _estimate_agent_dimension(self, agent: str) -> int:
+        # FIXED: Correct total dimensions (base + forecast)
+        # Based on actual agent forecast allocations from generator.py:
+        # - investor_0: 6 base + 12 forecast (4 targets × 3 horizons) = 18
+        # - battery_operator_0: 4 base + 12 forecast (3 targets × 4 horizons) = 16
+        # - risk_controller_0: 9 base + 12 forecast (4 targets × 3 horizons) = 21
+        # - meta_controller_0: 11 base + 20 forecast (5 targets × 4 horizons) = 31
         estimates = {
-            "investor_0": 18,
-            "battery_operator_0": 12,
-            "risk_controller_0": 15,
-            "meta_controller_0": 27,
+            "investor_0": 18,           # ✅ Correct
+            "battery_operator_0": 16,   # FIXED: was 12, now 16
+            "risk_controller_0": 21,    # FIXED: was 15, now 21
+            "meta_controller_0": 31,    # FIXED: was 27, now 31
         }
         return int(estimates.get(agent, 20))
 
@@ -640,7 +651,7 @@ class MultiESGAgent:
                     {
                         "ent_coef": getattr(config, "ent_coef", 0.01),
                         "n_steps": int(min(self.n_steps, 512)),
-                        "batch_size": int(min(getattr(config, "batch_size", 64), self.n_steps)),
+                        "batch_size": 128,  # FIXED: Standardized batch size for all agents
                         "gae_lambda": float(getattr(config, "gae_lambda", 0.95)),
                         "clip_range": float(getattr(config, "clip_range", 0.2)),
                         "normalize_advantage": True,
@@ -655,7 +666,7 @@ class MultiESGAgent:
                     {
                         "buffer_size": int(min(getattr(config, "buffer_size", 50000), 100000)),
                         "learning_starts": int(getattr(config, "learning_starts", 100)),
-                        "batch_size": int(min(getattr(config, "batch_size", 64), 256)),
+                        "batch_size": 128,  # FIXED: Standardized batch size for SAC/TD3 agents
                         "tau": float(getattr(config, "tau", 0.005)),
                         "gamma": float(getattr(config, "gamma", 0.99)),
                         "train_freq": getattr(config, "train_freq", 1),
@@ -693,7 +704,7 @@ class MultiESGAgent:
             act_space = self.action_spaces[agent]
             dummy_env = DummyVecEnv([partial(DummyGymEnv, obs_space, act_space)])
             fallback = PPO(
-                "MlpPolicy", dummy_env, verbose=0, device=device, n_steps=64, batch_size=32, learning_rate=1e-4
+                "MlpPolicy", dummy_env, verbose=0, device=device, n_steps=128, batch_size=128, learning_rate=3e-4  # FIXED: Standardized parameters
             )
             fallback.mode = "PPO"
             fallback.agent_name = agent
@@ -964,8 +975,8 @@ class MultiESGAgent:
             return
         try:
             buffer_size = self._rb_size(policy.replay_buffer)
-            if buffer_size >= int(getattr(policy, "batch_size", 64)):
-                max_grad_steps = min(32, buffer_size // int(getattr(policy, "batch_size", 64)))
+            if buffer_size >= 128:  # FIXED: Use standardized batch size
+                max_grad_steps = min(32, buffer_size // 128)
                 if self.memory_tracker.get_memory_usage() > self.memory_tracker.max_memory_mb * 0.8:
                     max_grad_steps = min(max_grad_steps, 8)
                 policy.train(gradient_steps=max_grad_steps)
@@ -1649,7 +1660,7 @@ class OptunaHyperparameterOptimizer:
                 'net_arch_size': trial.suggest_categorical('net_arch_size', ['small', 'medium']),
                 'activation_fn': trial.suggest_categorical('activation_fn', ['tanh', 'relu']),
                 'update_every': trial.suggest_categorical('update_every', [128, 256, 512]),
-                'batch_size': trial.suggest_categorical('batch_size', [64, 128]),
+                'batch_size': 128,  # FIXED: Standardized batch size (no longer a hyperparameter)
                 # Suggest a single mode for all agents for simplicity, can be expanded
                 'agent_mode': trial.suggest_categorical('agent_mode', ['PPO', 'SAC'])
             }

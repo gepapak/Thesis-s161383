@@ -39,7 +39,7 @@ except Exception:
     _HAS_ENHANCED_MONITORING = False
     EnhancedMetricsMonitor = None
 
-PRICE_SCALE = 10.0  # keep aligned with base env (env price_n = price/10 clipped to [-10,10])
+# PRICE_SCALE moved to config - will be imported from environment's config
 
 
 # =========================
@@ -171,7 +171,12 @@ class ForecastPostProcessor:
         k = (key or "").lower()
 
         if "price" in k:
-            return float(np.clip(v / PRICE_SCALE, -10.0, 10.0))
+            price_scale = getattr(self.env, 'config', None)
+            if price_scale and hasattr(price_scale, 'price_scale'):
+                scale = price_scale.price_scale
+            else:
+                scale = 10.0  # fallback
+            return float(np.clip(v / scale, -10.0, 10.0))
 
         if "load" in k:
             try:
@@ -372,9 +377,15 @@ class EnhancedObservationValidator:
                 targets = self.forecaster.agent_targets.get(agent, [])
                 horizons = self.forecaster.agent_horizons.get(agent, [])
                 return int(len(targets) * len(horizons))
-            return {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
+            # FIXED: Correct forecast dimensions based on actual agent allocations
+            # investor_0: 4 targets × 3 horizons = 12
+            # battery_operator_0: 3 targets × 4 horizons = 12
+            # risk_controller_0: 4 targets × 3 horizons = 12
+            # meta_controller_0: 5 targets × 4 horizons = 20
+            return {'investor_0': 12, 'battery_operator_0': 12, 'risk_controller_0': 12, 'meta_controller_0': 20}.get(agent, 0)
         except Exception:
-            return {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
+            # FIXED: Correct forecast dimensions based on actual agent allocations
+            return {'investor_0': 12, 'battery_operator_0': 12, 'risk_controller_0': 12, 'meta_controller_0': 20}.get(agent, 0)
 
     def _get_agent_forecast_keys(self, agent: str, expected_count: int) -> List[str]:
         try:
@@ -397,7 +408,8 @@ class EnhancedObservationValidator:
 
     def _create_fallback_spec(self, agent: str):
         base_dim = {'investor_0': 6, 'battery_operator_0': 4, 'risk_controller_0': 9, 'meta_controller_0': 11}.get(agent, 8)
-        forecast_dim = {'investor_0': 8, 'battery_operator_0': 4, 'risk_controller_0': 0, 'meta_controller_0': 15}.get(agent, 0)
+        # FIXED: Correct forecast dimensions based on actual agent allocations
+        forecast_dim = {'investor_0': 12, 'battery_operator_0': 12, 'risk_controller_0': 12, 'meta_controller_0': 20}.get(agent, 0)
         total_dim = base_dim + forecast_dim
         self.agent_observation_specs[agent] = {
             'base_dim': base_dim,
@@ -496,10 +508,22 @@ class MemoryOptimizedObservationBuilder:
             for agent in self.base_env.possible_agents
         }
 
-        self.forecast_cache = EnhancedLRUCache(max_size=1000, memory_limit_mb=500.0)
-        self.agent_forecast_cache = EnhancedLRUCache(max_size=2000, memory_limit_mb=750.0)
+        # Get cache settings from environment config
+        env_config = getattr(self.base_env, 'config', None)
+        if env_config:
+            forecast_cache_size = env_config.forecast_cache_size
+            agent_cache_size = env_config.agent_forecast_cache_size
+            memory_limit = env_config.wrapper_memory_mb
+        else:
+            # Fallback values
+            forecast_cache_size = 1000
+            agent_cache_size = 2000
+            memory_limit = 500.0
 
-        self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=500)
+        self.forecast_cache = EnhancedLRUCache(max_size=forecast_cache_size, memory_limit_mb=memory_limit)
+        self.agent_forecast_cache = EnhancedLRUCache(max_size=agent_cache_size, memory_limit_mb=memory_limit * 1.5)
+
+        self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=memory_limit)
         self.memory_tracker.register_cache(self.forecast_cache)
         self.memory_tracker.register_cache(self.agent_forecast_cache)
 
@@ -583,7 +607,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     metadata = {"name": "multi_horizon_wrapper:normalized-aligned-v1"}
 
     def __init__(self, base_env, multi_horizon_forecaster, log_path=None, max_memory_mb=1500,
-                 normalize_forecasts=True, align_horizons=True):
+                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000, log_last_n=100):
         self.env = base_env
         self.forecaster = multi_horizon_forecaster
 
@@ -591,9 +615,15 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._possible_agents = self.env.possible_agents[:]
         self._agents = self.env.agents[:]
 
+        # Logging control - always use normal mode (full logging)
+        self.total_timesteps = total_timesteps
+        self.log_last_n = log_last_n
+        self.log_start_step = 0
+        self.logging_enabled = True  # Always start with logging enabled
+
         # Memory & logging infra
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=max_memory_mb)
-        self.log_path = self._setup_logging_path(log_path)
+        self.log_path = self._setup_logging_path(log_path) if log_path else None
         self.log_buffer = deque(maxlen=256)
         self.log_lock = threading.RLock() if threading else nullcontext()
         self._flush_every_rows = 1000
@@ -645,8 +675,12 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_price_forecast_norm = 0.0
         self._last_price_forecast_aligned = 0.0
 
-        # logging
-        self._initialize_logging_safe()
+        # logging - initialize
+        if self.log_path:
+            print(f"📊 Full logging every 20 timesteps from start")
+            self._initialize_logging_safe()
+        else:
+            print("⚡ No logging configured - maximum speed mode")
         print("✅ Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
 
     # ---- spaces ----
@@ -674,9 +708,19 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             log_path = f"fallback_metrics_{ts}.csv"
         return log_path
 
+    def _should_log_this_step(self) -> bool:
+        """Determine if we should log this timestep."""
+        # Always log (normal mode only)
+        return True
+
     def _initialize_logging_safe(self):
+        # Initialize logging based on mode
+        if not self.log_path:
+            return
+
+        # Create log file immediately (normal mode)
         try:
-            if self.log_path and not os.path.isfile(self.log_path):
+            if not os.path.isfile(self.log_path):
                 self._create_log_header()
             print(f"✅ Logging initialized: {self.log_path}")
         except Exception as e:
@@ -835,13 +879,15 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # update forecaster
         self._update_forecaster_safe()
 
-        # build enhanced obs
+        # build enhanced obs with full forecasting
         enhanced = self.obs_builder.enhance_observations(obs)
         validated = self._validate_observations_safe(enhanced)
 
         self.step_count += 1
         step_time = (time.perf_counter() - t0)
         self._last_step_wall_ms = step_time * 1000.0
+
+        # No fast mode progress display - removed
 
         # Enhanced monitoring (optional)
         if self.enhanced_monitor:
@@ -853,9 +899,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             self.enhanced_monitor.log_summary()
 
         # periodic logging
-        if self.log_path and (self.step_count % self._log_interval == 0 or self._last_episode_end_flag):
-            log_forecasts = self._get_forecasts_for_logging()
-            self._log_metrics_efficient(actions, rewards, log_forecasts)
+        if self.log_path and self._should_log_this_step():
+            if (self.step_count % self._log_interval == 0 or self._last_episode_end_flag):
+                log_forecasts = self._get_forecasts_for_logging()
+                self._log_metrics_efficient(actions, rewards, log_forecasts)
 
         if self._last_episode_end_flag:
             self._prev_forecasts_for_error = {}
@@ -1223,10 +1270,17 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 market_stress = self._safe_float(getattr(self.env, 'market_stress', 0.0), 0.0)
                 market_vol = self._safe_float(getattr(self.env, 'market_volatility', 0.0), 0.0)
 
-                revenue_step = self._safe_float(getattr(self.env, 'last_revenue', getattr(self.env, 'revenue', 0.0)), 0.0)
+                # NEW economics values - CONVERT DKK TO USD FOR REPORTING
+                dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
 
-                # NEW economics values
-                generation_revenue = self._safe_float(getattr(self.env, 'last_generation_revenue', 0.0), 0.0)
+                # Convert DKK financial metrics to USD for final reporting
+                generation_revenue_dkk = self._safe_float(getattr(self.env, 'last_generation_revenue', 0.0), 0.0)
+                generation_revenue = generation_revenue_dkk * dkk_to_usd_rate  # Convert to USD
+
+                revenue_step_dkk = self._safe_float(getattr(self.env, 'last_revenue', getattr(self.env, 'revenue', 0.0)), 0.0)
+                revenue_step = revenue_step_dkk * dkk_to_usd_rate  # Convert to USD
+
+                # MTM and other financial metrics (already in USD)
                 mtm_pnl = self._safe_float(getattr(self.env, 'last_mtm_pnl', 0.0), 0.0)
                 distributed_profits = distributed_profits_attr
                 cumulative_returns = self._safe_float(getattr(self.env, 'cumulative_returns', 0.0), 0.0)
@@ -1374,3 +1428,75 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 return self.env.state()
         except Exception:
             return None
+
+
+class UltraFastProgressWrapper(ParallelEnv):
+    """Ultra-fast wrapper that only adds progress tracking without any forecasting overhead."""
+
+    def __init__(self, base_env, total_timesteps):
+        self.env = base_env
+        self.total_timesteps = total_timesteps
+        self.step_count = 0
+        self.progress_interval = max(1000, total_timesteps // 50)  # Show progress every 2%
+        self.last_progress_step = 0
+
+        # Mark the base environment as being in ultra fast mode
+        self.env.ultra_fast_mode = True
+
+        # IMPORTANT: Adjust reward weights for ultra fast mode (no forecasting)
+        if hasattr(self.env, 'reward_calculator') and hasattr(self.env.reward_calculator, 'reward_weights'):
+            weights = self.env.reward_calculator.reward_weights
+            if weights.get('forecast', 0) > 0:
+                # Redistribute forecast weight to profitability components
+                forecast_weight = weights['forecast']
+                weights['nav_growth'] += forecast_weight * 0.6  # 60% to NAV growth
+                weights['cash_flow'] += forecast_weight * 0.4   # 40% to cash flow
+                weights['forecast'] = 0.0  # No forecast rewards in ultra fast mode
+                print(f"🚀 Ultra fast mode: Forecast weight ({forecast_weight:.3f}) redistributed to profitability")
+
+        # Delegate all attributes to base environment
+        self.possible_agents = base_env.possible_agents
+        self.agents = base_env.agents
+        self.observation_spaces = base_env.observation_spaces
+        self.action_spaces = base_env.action_spaces
+        self.metadata = base_env.metadata
+
+        print(f"🚀 Ultra fast mode: Progress updates every {self.progress_interval:,} steps (~2% intervals)")
+        print(f"🚀 Ultra fast mode: Trading enabled regardless of forecast confidence")
+
+    def reset(self, seed=None, options=None):
+        self.step_count = 0
+        self.last_progress_step = 0
+        return self.env.reset(seed=seed, options=options)
+
+    def step(self, actions):
+        obs, rewards, dones, truncs, infos = self.env.step(actions)
+
+        self.step_count += 1
+
+        # Show progress every interval with financial breakdown
+        if self.step_count - self.last_progress_step >= self.progress_interval:
+            progress_pct = (self.step_count / self.total_timesteps) * 100
+            portfolio_value = getattr(self.env, 'equity', 0) / 1e6  # Convert to millions
+
+            # Get financial breakdown with DKK to USD conversion
+            dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
+            ops_revenue_dkk = getattr(self.env, 'last_generation_revenue', 0.0)
+            ops_revenue_usd = ops_revenue_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
+            trading_pnl_usd = getattr(self.env, 'last_mtm_pnl', 0.0) / 1e3  # Convert to thousands USD
+
+            # Format the breakdown
+            ops_str = f"Ops: ${ops_revenue_usd:+.1f}k"
+            trading_str = f"Trading: ${trading_pnl_usd:+.1f}k" if trading_pnl_usd != 0 else "Trading: $0.0k"
+
+            print(f"🚀 Ultra fast progress: {self.step_count:,}/{self.total_timesteps:,} ({progress_pct:.1f}%) | Portfolio: ${portfolio_value:.1f}M | {ops_str} | {trading_str}")
+            self.last_progress_step = self.step_count
+
+        return obs, rewards, dones, truncs, infos
+
+    def close(self):
+        return self.env.close()
+
+    def __getattr__(self, name):
+        # Delegate any other attribute access to the base environment
+        return getattr(self.env, name)

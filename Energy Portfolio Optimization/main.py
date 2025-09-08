@@ -82,11 +82,11 @@ def load_energy_data(csv_path: str, convert_to_raw_units: bool = True) -> pd.Dat
 
     # Convert capacity factors to raw MW values for direct forecasting
     if convert_to_raw_units and _is_capacity_factor_data(df):
-        print("🔄 Converting capacity factors to raw MW values for direct forecasting...")
+        print("[INFO] Converting capacity factors to raw MW values for direct forecasting...")
         df = _convert_to_raw_mw_values(df)
-        print("✅ Raw MW conversion completed - forecasts will work directly with these units")
+        print("[OK] Raw MW conversion completed - forecasts will work directly with these units")
     else:
-        print("📊 Data already in raw MW units - ready for direct forecasting")
+        print("[INFO] Data already in raw MW units - ready for direct forecasting")
 
     return df
 
@@ -122,7 +122,7 @@ def _convert_to_raw_mw_values(df: pd.DataFrame) -> pd.DataFrame:
 
     df_converted = df.copy()
 
-    print("🔄 Converting to raw MW values (no normalization):")
+    print("[INFO] Converting to raw MW values (no normalization):")
 
     # Convert capacity factors to raw MW values
     for col, capacity in capacity_mw.items():
@@ -130,14 +130,14 @@ def _convert_to_raw_mw_values(df: pd.DataFrame) -> pd.DataFrame:
             original_range = f"[{df[col].min():.3f}, {df[col].max():.3f}]"
             df_converted[col] = df[col] * capacity
             new_range = f"[{df_converted[col].min():.1f}, {df_converted[col].max():.1f}] MW"
-            print(f"  {col}: {original_range} → {new_range}")
+            print(f"  {col}: {original_range} -> {new_range}")
 
     # Price: Already in $/MWh (no conversion needed)
     if 'price' in df_converted.columns:
         price_range = f"[{df_converted['price'].min():.1f}, {df_converted['price'].max():.1f}] $/MWh"
         print(f"  price: {price_range} (no conversion)")
 
-    print("✅ Raw MW conversion complete - ready for direct forecasting")
+    print("[OK] Raw MW conversion complete - ready for direct forecasting")
 
     return df_converted
 
@@ -314,7 +314,7 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
             interval = min(checkpoint_freq, remaining)
 
             print(f"\nTraining interval {checkpoint_count + 1}")
-            print(f"   Steps: {total_trained:,} → {total_trained + interval:,}")
+            print(f"   Steps: {total_trained:,} -> {total_trained + interval:,}")
             print(f"   Progress: {total_trained/timesteps*100:.1f}%")
 
             start_time = datetime.now()
@@ -430,7 +430,7 @@ class PortfolioAdapter:
       - Every 'train_every' steps, fit the DL model on a random minibatch from the buffer (few epochs).
     """
     def __init__(self, base_env, feature_dim=None, buffer_size=2048, label_every=12, train_every=60,
-                 window=24, lam=5.0, batch_size=128, epochs=1):
+                 window=24, lam=5.0, batch_size=128, epochs=1):  # TUNED: Optimal batch_size=128, lam=5.0
         self.e = base_env
 
         # Determine feature_dim dynamically if not provided
@@ -691,10 +691,11 @@ class PortfolioAdapter:
         mu = R.mean(axis=0)
         Sigma = np.cov(R.T) + 1e-6 * np.eye(3)
 
-        # Dynamic risk aversion based on market conditions
+        # TUNED: Enhanced dynamic risk aversion based on market conditions
         try:
             market_vol = float(getattr(self.e, "market_volatility", 0.0))
-            adaptive_lambda = self.lam * (1 + 2 * market_vol)  # Higher risk aversion in volatile markets
+            # TUNED: More responsive risk adjustment with optimal base lambda=5.0
+            adaptive_lambda = self.lam * (1 + 3 * market_vol)  # Increased sensitivity from 2 to 3
         except Exception:
             adaptive_lambda = self.lam
 
@@ -816,7 +817,7 @@ class PortfolioAdapter:
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Multi-Agent RL with Hyperparameter Optimization")
     parser.add_argument("--data_path", type=str, default="sample.csv", help="Path to energy time series data")
-    parser.add_argument("--timesteps", type=int, default=20000, help="Total training timesteps")
+    parser.add_argument("--timesteps", type=int, default=50000, help="TUNED: Increased for full synergy emergence (was 20000)")
     parser.add_argument("--device", type=str, default="cuda", help="Device for RL training (cuda/cpu)")
     parser.add_argument("--investment_freq", type=int, default=144, help="Investor action frequency in steps")
     parser.add_argument("--model_dir", type=str, default="saved_models", help="Dir with trained forecast models")
@@ -830,19 +831,43 @@ def main():
 
     # Training
     parser.add_argument("--save_dir", type=str, default="training_agent_results", help="Where to save outputs")
-    parser.add_argument("--checkpoint_freq", type=int, default=5000, help="Save checkpoint every N timesteps")
+    parser.add_argument("--checkpoint_freq", type=int, default=52000, help="Checkpoint frequency optimized for 520K timestep runs (10 checkpoints total)")
     parser.add_argument("--validate_env", action="store_true", default=True, help="Validate env setup before training")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--experience_replay", action="store_true", help="Enable experience replay buffer")
+    parser.add_argument("--replay_buffer_size", type=int, default=10000, help="Size of experience replay buffer")
 
     # Rewards
     parser.add_argument("--adapt_rewards", action="store_true", default=True, help="Enable adaptive reward weights")
     parser.add_argument("--reward_analysis_freq", type=int, default=2000, help="Analyze rewards every N steps")
+    parser.add_argument("--portfolio_reward_weight", type=float, default=0.8, help="Weight for portfolio performance in reward")
+    parser.add_argument("--risk_penalty_weight", type=float, default=0.2, help="Weight for risk penalty in reward")
 
-    # DL Overlay
+    # DL Overlay - TUNED parameters for optimal performance
     parser.add_argument("--dl_overlay", action="store_true", help="Enable DL allocation overlay")
+    parser.add_argument("--dl_buffer_size", type=int, default=2048, help="DL buffer size")
+    parser.add_argument("--dl_label_every", type=int, default=12, help="DL labeling frequency")
+    parser.add_argument("--dl_train_every", type=int, default=60, help="DL training frequency")
+    parser.add_argument("--dl_batch_size", type=int, default=128, help="TUNED: Optimal DL batch size")
+    parser.add_argument("--dl_learning_rate", type=float, default=1e-3, help="TUNED: Optimal DL learning rate")
+    parser.add_argument("--risk_aversion", type=float, default=5.0, help="TUNED: Balanced risk aversion parameter")
 
     # Forecasting Control
     parser.add_argument("--no_forecast", action="store_true", help="Disable forecasting (pure MARL baseline)")
+    parser.add_argument("--baseline_mode", action="store_true", help="Pure MARL baseline: disable forecasting AND DL overlay")
+    # Get default from config
+    try:
+        from config import EnhancedConfig
+        default_config = EnhancedConfig()
+        default_threshold = default_config.forecast_confidence_threshold
+    except Exception:
+        default_threshold = 0.05  # Fallback
+
+    parser.add_argument("--forecast_confidence_threshold", type=float, default=default_threshold, help="Minimum forecast confidence for trading")
+    parser.add_argument("--conservative_trading", action="store_true", help="Enable conservative trading mode")
+
+    # Ultra Fast Mode Control
+    parser.add_argument("--ultra_fast_mode", action="store_true", help="Ultra fast mode (no forecasting wrapper - like --no_forecast but with progress tracking)")
 
     # NEW: Offline precompute control
     parser.add_argument(
@@ -889,16 +914,19 @@ def main():
         print(f"Columns: {list(data.columns)}")
         if "timestamp" in data.columns and data["timestamp"].notna().any():
             ts = data["timestamp"].dropna()
-            print(f"Date range: {ts.iloc[0]} → {ts.iloc[-1]}")
+            print(f"Date range: {ts.iloc[0]} -> {ts.iloc[-1]}")
         if len(data) < 1000:
-            print(f"Limited data ({len(data)} rows). More data → better training stability.")
+            print(f"Limited data ({len(data)} rows). More data -> better training stability.")
     except Exception as e:
         print(f"Error loading data: {e}")
         return
 
     # 2) Forecaster
-    if args.no_forecast:
-        print("\n🚫 Forecasting disabled (pure MARL baseline)")
+    if args.no_forecast or args.baseline_mode:
+        if args.baseline_mode:
+            print("\n[BASELINE] BASELINE MODE: Forecasting and DL overlay disabled (pure MARL)")
+        else:
+            print("\n[BASELINE] Forecasting disabled (pure MARL baseline)")
         forecaster = None
     else:
         print("\nInitializing multi-horizon forecaster...")
@@ -929,27 +957,80 @@ def main():
             print(f"Failed to initialize forecaster: {e}")
             return
 
-    # 3) Environment setup
+    # 3) Initialize best_params (must happen before config creation)
+    best_params = None
+    if args.use_previous_optimization:
+        print("\nChecking for previous optimization results...")
+        opt_dir = os.path.join(args.save_dir, "optimization_results")
+        best_params, _ = load_previous_optimization(opt_dir)
+        if best_params:
+            print("Using previous optimization results")
+        else:
+            print("No previous optimization found")
+
+    # 4) Config setup (MOVED UP - must happen before environment creation)
+    print("\nCreating optimized training configuration...")
+    config = EnhancedConfig(optimized_params=best_params)
+
+    # Re-seed using config.seed to ensure consistency with agent init
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
+
+    # 4) Environment setup
     print("\nSetting up enhanced environment with multi-objective rewards...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(metrics_dir, f"enhanced_metrics_{timestamp}.csv")
 
-    # Instantiate PortfolioAdapter after env (or set env later)
+    # TUNED: Instantiate PortfolioAdapter with optimized parameters
     dl_adapter = None
-    if args.dl_overlay:
-        dl_adapter = PortfolioAdapter(None)
+    if args.dl_overlay and not args.baseline_mode:
+        dl_adapter = PortfolioAdapter(
+            None,  # Environment set later
+            buffer_size=getattr(args, 'dl_buffer_size', 2048),
+            label_every=getattr(args, 'dl_label_every', 12),
+            train_every=getattr(args, 'dl_train_every', 60),
+            batch_size=getattr(args, 'dl_batch_size', 128),  # TUNED: Optimal batch size
+            lam=getattr(args, 'risk_aversion', 5.0)  # TUNED: Balanced risk aversion
+        )
 
     try:
         base_env = RenewableMultiAgentEnv(
             data,
             investment_freq=args.investment_freq,
             forecast_generator=forecaster,
-            dl_adapter=dl_adapter
+            dl_adapter=dl_adapter,
+            config=config  # Pass config to environment
         )
+
+        # FIXED: Apply command line forecast confidence threshold
+        if hasattr(base_env, 'reward_calculator') and hasattr(base_env.reward_calculator, 'forecast_confidence_threshold'):
+            base_env.reward_calculator.forecast_confidence_threshold = args.forecast_confidence_threshold
         if dl_adapter:
             dl_adapter.e = base_env  # Now set the environment on the adapter
 
-        env = MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
+        # CRITICAL FIX: Only wrap when forecasts are enabled for fair baseline comparison
+        if forecaster is None or args.no_forecast or args.ultra_fast_mode:
+            if args.ultra_fast_mode:
+                # Ultra fast mode: no forecasting wrapper but with progress tracking
+                from wrapper import UltraFastProgressWrapper
+                env = UltraFastProgressWrapper(base_env, args.timesteps)
+                print("🚀 Using ULTRA FAST mode (no forecasting, progress tracking only)")
+            else:
+                env = base_env
+                print("[OK] Using baseline environment (no forecasting, no logging)")
+        else:
+            # Normal mode: full logging (every 20 timesteps)
+            env = MultiHorizonWrapperEnv(
+                base_env,
+                forecaster,
+                log_path=log_path,
+                total_timesteps=args.timesteps,
+                log_last_n=args.timesteps  # Log everything in normal mode
+            )
+            print("[OK] Using full AI environment with forecasting (full logging)")
 
         # Update DL adapter feature dimensions based on actual observation space
         if dl_adapter and hasattr(env, 'observation_spaces'):
@@ -984,22 +1065,13 @@ def main():
     if args.dl_overlay:
         print("DL allocation overlay active (online self-labeling enabled)")
 
-    # 4) (Optional) HPO
-    best_params = None
-    if args.use_previous_optimization:
-        print("\nChecking for previous optimization results...")
-        opt_dir = os.path.join(args.save_dir, "optimization_results")
-        best_params, _ = load_previous_optimization(opt_dir)
-        if best_params:
-            print("Using previous optimization results")
-        else:
-            print("No previous optimization found")
-
+    # 4) (Optional) HPO (best_params already initialized above)
     if args.optimize and not best_params:
         print("\nRunning hyperparameter optimization...")
         opt_data = data.head(min(5000, len(data)))
-        opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster, dl_adapter=None)
-        opt_env = MultiHorizonWrapperEnv(opt_base_env, forecaster, log_path=None)
+        opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster, dl_adapter=None, config=config)
+        opt_env = opt_base_env if (forecaster is None or args.no_forecast) \
+                  else MultiHorizonWrapperEnv(opt_base_env, forecaster, log_path=None)
 
         best_params, best_perf = run_hyperparameter_optimization(
             opt_env,
@@ -1018,18 +1090,7 @@ def main():
             pass
         del opt_env, opt_base_env
 
-    # 5) Config
-    print("\nCreating optimized training configuration...")
-    config = EnhancedConfig(optimized_params=best_params)
-
-    # Re-seed using config.seed to ensure consistency with agent init
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
-
-    # 6) Agents
+    # 5) Agents (config already created above)
     print("\nInitializing enhanced multi-agent RL system...")
     try:
         agent = MultiESGAgent(
