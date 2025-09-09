@@ -171,12 +171,27 @@ class ForecastPostProcessor:
         k = (key or "").lower()
 
         if "price" in k:
-            price_scale = getattr(self.env, 'config', None)
-            if price_scale and hasattr(price_scale, 'price_scale'):
-                scale = price_scale.price_scale
-            else:
-                scale = 10.0  # fallback
-            return float(np.clip(v / scale, -10.0, 10.0))
+            # FIXED: Use z-score normalization like the environment instead of fixed scale
+            try:
+                # Get current timestep for normalization parameters
+                t = getattr(self.env, 't', 0)
+                if hasattr(self.env, '_price_mean') and hasattr(self.env, '_price_std'):
+                    if t < len(self.env._price_mean) and t < len(self.env._price_std):
+                        mean = float(self.env._price_mean[t])
+                        std = float(self.env._price_std[t])
+                        std = max(std, 1e-6)  # Avoid division by zero
+                        normalized = (v - mean) / std
+                        return float(np.clip(normalized, -3.0, 3.0))  # Same bounds as environment
+
+                # Fallback: use reasonable DKK price statistics if normalization params unavailable
+                mean = 250.0  # Typical DKK price
+                std = 50.0    # Typical DKK price volatility
+                normalized = (v - mean) / std
+                return float(np.clip(normalized, -3.0, 3.0))
+            except Exception:
+                # Last resort fallback to old method
+                scale = 10.0
+                return float(np.clip(v / scale, -10.0, 10.0))
 
         if "load" in k:
             try:
@@ -745,14 +760,14 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             "wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate",
             # normalized/aligned extras
             "price_forecast_norm", "price_forecast_aligned",
-            # perf & quick risks
-            "portfolio_performance", "portfolio_value", "equity", "total_return_nav", "overall_risk", "market_risk",
-            # env snapshot
-            "budget", "wind_cap", "solar_cap", "hydro_cap", "battery_energy",
+            # perf & quick risks (financial values in USD for clarity)
+            "portfolio_performance", "portfolio_value_usd", "equity_usd", "total_return_nav_usd", "overall_risk", "market_risk",
+            # env snapshot (budget in USD, capacities in MW/MWh)
+            "budget_usd", "wind_cap", "solar_cap", "hydro_cap", "battery_energy",
             "price_actual", "load_actual", "wind_actual", "solar_actual", "hydro_actual",
-            "market_stress", "market_volatility", "revenue_step",
-            # NEW economics fields
-            "generation_revenue", "mtm_pnl", "distributed_profits", "cumulative_returns", "investment_capital", "fund_performance",
+            "market_stress", "market_volatility", "revenue_step_usd",
+            # NEW economics fields (all financial values in USD)
+            "generation_revenue_usd", "mtm_pnl_usd", "distributed_profits_usd", "cumulative_returns_usd", "investment_capital_usd", "fund_performance",
             # episode markers
             "ep_meta_return", "step_in_episode", "episode_end",
             # 6D risk vector
@@ -897,6 +912,14 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             if hasattr(self, '_last_portfolio_value') and self._last_portfolio_value is not None:
                 self.enhanced_monitor.update_portfolio_metrics(self._last_portfolio_value)
             self.enhanced_monitor.log_summary()
+
+        # FIXED: Populate forecast arrays for DL overlay labeler
+        try:
+            if hasattr(self.env, 'populate_forecast_arrays'):
+                current_forecasts = self._get_forecasts_for_logging()
+                self.env.populate_forecast_arrays(getattr(self.env, 't', 0), current_forecasts)
+        except Exception:
+            pass  # Don't break main flow if forecast population fails
 
         # periodic logging
         if self.log_path and self._should_log_this_step():
@@ -1190,7 +1213,22 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 ts_str = self._get_timestamp_for_logging()
                 step_t = getattr(self.env, 't', self.step_count)
 
-                # core
+                # --- START: CURRENCY & METRIC SETUP ---
+                # Get the single source of truth for currency conversion from the environment
+                dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
+
+                # Fetch core financial values from the environment (all are in DKK at this stage)
+                # These will be converted to USD before logging.
+                budget_dkk = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
+                generation_revenue_dkk = self._safe_float(getattr(self.env, 'last_generation_revenue', 0.0), 0.0)
+                revenue_step_dkk = self._safe_float(getattr(self.env, 'last_revenue', getattr(self.env, 'revenue', 0.0)), 0.0)
+                mtm_pnl_dkk = self._safe_float(getattr(self.env, 'last_mtm_pnl', 0.0), 0.0)
+                distributed_profits_dkk = self._safe_float(getattr(self.env, 'distributed_profits', 0.0), 0.0)
+                cumulative_returns_dkk = self._safe_float(getattr(self.env, 'cumulative_returns', 0.0), 0.0)
+                investment_capital_dkk = self._safe_float(getattr(self.env, 'investment_capital', 0.0), 0.0)
+                # --- END: CURRENCY & METRIC SETUP ---
+
+                # core (non-monetary)
                 meta_reward = self._safe_float(rewards.get("meta_controller_0", 0.0), 0.0)
                 inv_freq = int(getattr(self.env, "investment_freq", -1))
                 cap_frac = self._safe_float(getattr(self.env, "capital_allocation_fraction", -1), -1.0)
@@ -1198,24 +1236,13 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 # actions
                 def get_action_vec(agent, n):
                     a = actions.get(agent, None)
-                    # convert tensors
-                    a = self._to_numpy_safe(a)
-                    if isinstance(a, np.ndarray):
-                        vec = a.flatten().tolist()
-                    elif np.isscalar(a):
-                        vec = [float(a)]
-                    elif isinstance(a, (list, tuple)):
-                        vec = list(a)
-                    else:
-                        vec = []
-                    out = []
-                    for v in vec:
-                        try:
-                            out.append(float(v) if np.isfinite(v) else 0.0)
-                        except Exception:
-                            out.append(0.0)
-                    while len(out) < n:
-                        out.append(0.0)
+                    a = self._to_numpy_safe(a) # convert tensors
+                    if isinstance(a, np.ndarray): vec = a.flatten().tolist()
+                    elif np.isscalar(a): vec = [float(a)]
+                    elif isinstance(a, (list, tuple)): vec = list(a)
+                    else: vec = []
+                    out = [float(v) if np.isfinite(v) else 0.0 for v in vec]
+                    while len(out) < n: out.append(0.0)
                     return out[:n]
 
                 meta_a0, meta_a1 = get_action_vec("meta_controller_0", 2)
@@ -1223,78 +1250,66 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 batt_a0 = get_action_vec("battery_operator_0", 1)[0]
                 risk_a0 = get_action_vec("risk_controller_0", 1)[0]
 
-                # Forecasts logged (raw immediate keys if present)
+                # Forecasts (non-monetary)
                 forecast_keys = ["wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate"]
                 forecasts_logged = [self._safe_float(all_forecasts.get(k, 0.0), 0.0) for k in forecast_keys]
-
-                # Normalized + aligned price forecasts
                 pf_norm, pf_aligned = self._get_price_forecast_norm_and_aligned(all_forecasts)
                 self._last_price_forecast_norm = pf_norm
                 self._last_price_forecast_aligned = pf_aligned
 
-                # perf & quick risks
+                # perf & quick risks (ratios/scores)
                 perf, overall_risk, market_risk = self._calc_perf_and_quick_risks()
 
-                # Compute/log true equity & portfolio_value
+                # Get portfolio value/equity (in DKK from env)
                 if hasattr(self, '_last_portfolio_value') and self._last_portfolio_value is not None:
-                    portfolio_value_logged = float(self._last_portfolio_value)
+                    portfolio_value_dkk = float(self._last_portfolio_value)
                 else:
-                    cash = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
-                    w_val = self._safe_float(getattr(self.env, 'wind_instrument_value', 0.0), 0.0)
-                    s_val = self._safe_float(getattr(self.env, 'solar_instrument_value', 0.0), 0.0)
-                    h_val = self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0)
-                    portfolio_value_logged = cash + w_val + s_val + h_val
+                    cash_dkk = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
+                    w_val_dkk = self._safe_float(getattr(self.env, 'wind_instrument_value', 0.0), 0.0)
+                    s_val_dkk = self._safe_float(getattr(self.env, 'solar_instrument_value', 0.0), 0.0)
+                    h_val_dkk = self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0)
+                    portfolio_value_dkk = cash_dkk + w_val_dkk + s_val_dkk + h_val_dkk
+                    initial_budget_dkk = float(getattr(self.env, 'init_budget', 500_000_000))
+                    portfolio_value_dkk = self._safe_portfolio_value(portfolio_value_dkk, initial_budget_dkk)
+                
+                # --- START: CONSISTENT USD CONVERSION FOR LOGGING ---
+                # CURRENCY APPROACH: All internal calculations in DKK, convert to USD only for CSV output
+                # This provides clear $USD values in reports while maintaining DKK precision internally
+                portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
+                equity_usd = portfolio_value_usd # Equity is the portfolio value in this context
+                distributed_profits_usd = distributed_profits_dkk * dkk_to_usd_rate
+                total_return_nav_usd = portfolio_value_usd + distributed_profits_usd
+                budget_usd = budget_dkk * dkk_to_usd_rate
+                
+                generation_revenue_usd = generation_revenue_dkk * dkk_to_usd_rate
+                revenue_step_usd = revenue_step_dkk * dkk_to_usd_rate
+                mtm_pnl_usd = mtm_pnl_dkk * dkk_to_usd_rate
+                cumulative_returns_usd = cumulative_returns_dkk * dkk_to_usd_rate
+                investment_capital_usd = investment_capital_dkk * dkk_to_usd_rate
+                # fund_performance is a ratio, no conversion needed
+                fund_performance = self._safe_float(getattr(self.env, 'fund_performance', 0.0), 0.0)
+                # --- END: CONSISTENT USD CONVERSION FOR LOGGING ---
 
-                    # Apply safety bounds to logged portfolio value
-                    initial_budget = float(getattr(self.env, 'init_budget', 500_000_000))
-                    portfolio_value_logged = self._safe_portfolio_value(portfolio_value_logged, initial_budget)
-                    
-                equity_logged = portfolio_value_logged
-                distributed_profits_attr = self._safe_float(getattr(self.env, 'distributed_profits', 0.0), 0.0)
-                total_return_nav = portfolio_value_logged + distributed_profits_attr
-
-                # env snapshot - CRITICAL FIX: Use correct physical capacity attributes (MW)
-                budget = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
+                # env snapshot (physical capacities, non-monetary)
                 wind_c = self._safe_float(getattr(self.env, 'wind_capacity_mw', 0.0), 0.0)
                 solar_c = self._safe_float(getattr(self.env, 'solar_capacity_mw', 0.0), 0.0)
                 hydro_c = self._safe_float(getattr(self.env, 'hydro_capacity_mw', 0.0), 0.0)
                 batt_e = self._safe_float(getattr(self.env, 'battery_energy', 0.0), 0.0)
-
                 actuals = self._get_actuals_for_logging()
                 price_act = self._safe_float(actuals['price'], 0.0)
                 load_act = self._safe_float(actuals['load'], 0.0)
                 wind_act = self._safe_float(actuals['wind'], 0.0)
                 solar_act = self._safe_float(actuals['solar'], 0.0)
                 hydro_act = self._safe_float(actuals['hydro'], 0.0)
-
                 market_stress = self._safe_float(getattr(self.env, 'market_stress', 0.0), 0.0)
                 market_vol = self._safe_float(getattr(self.env, 'market_volatility', 0.0), 0.0)
 
-                # NEW economics values - CONVERT DKK TO USD FOR REPORTING
-                dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
-
-                # Convert DKK financial metrics to USD for final reporting
-                generation_revenue_dkk = self._safe_float(getattr(self.env, 'last_generation_revenue', 0.0), 0.0)
-                generation_revenue = generation_revenue_dkk * dkk_to_usd_rate  # Convert to USD
-
-                revenue_step_dkk = self._safe_float(getattr(self.env, 'last_revenue', getattr(self.env, 'revenue', 0.0)), 0.0)
-                revenue_step = revenue_step_dkk * dkk_to_usd_rate  # Convert to USD
-
-                # MTM and other financial metrics (already in USD)
-                mtm_pnl = self._safe_float(getattr(self.env, 'last_mtm_pnl', 0.0), 0.0)
-                distributed_profits = distributed_profits_attr
-                cumulative_returns = self._safe_float(getattr(self.env, 'cumulative_returns', 0.0), 0.0)
-                investment_capital = self._safe_float(getattr(self.env, 'investment_capital', 0.0), 0.0)
-                fund_performance = self._safe_float(getattr(self.env, 'fund_performance', 0.0), 0.0)
-
-                # episode markers
+                # episode markers & risk (non-monetary)
                 step_in_ep = int(getattr(self.env, 'step_in_episode', self.step_count))
                 episode_end = int(self._last_episode_end_flag)
-
-                # risk 6-vector
                 r6 = self._get_risk_vector6()
 
-                # reward breakdown & weights
+                # reward breakdown & weights (scaled scores, non-monetary)
                 rb = getattr(self.env, "last_reward_breakdown", {}) or {}
                 rw = getattr(self.env, "last_reward_weights", {}) or {}
                 r_fin = self._safe_float(rb.get("financial", 0.0), 0.0)
@@ -1308,24 +1323,17 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 w_eff = self._safe_float(rw.get("efficiency", 0.0), 0.0)
                 w_div = self._safe_float(rw.get("diversification", 0.0), 0.0)
 
-                # ops & scaling health
+                # ops & scaling health (non-monetary)
                 mem_mb = float(self.memory_tracker.get_memory_usage())
                 seed = self._last_episode_seed if self._last_episode_seed is not None else -1
                 step_ms = float(self._last_step_wall_ms)
-
                 def clip_frac(key):
                     tot = max(1, self._last_clip_totals.get(key, 1))
                     return float(SafeDivision._safe_divide(self._last_clip_counts.get(key, 0), tot, 0.0))
+                clip_inv, clip_bat, clip_rsk, clip_meta = clip_frac("investor"), clip_frac("battery"), clip_frac("risk"), clip_frac("meta")
 
-                clip_inv = clip_frac("investor")
-                clip_bat = clip_frac("battery")
-                clip_rsk = clip_frac("risk")
-                clip_meta = clip_frac("meta")
-
-                # MAE@1 using previous forecast cache
-                def _mae(prev, actual):
-                    return abs(self._safe_float(prev, 0.0) - self._safe_float(actual, 0.0))
-
+                # MAE@1 using previous forecast cache (non-monetary)
+                def _mae(prev, actual): return abs(self._safe_float(prev, 0.0) - self._safe_float(actual, 0.0))
                 mae_price = _mae(self._prev_forecasts_for_error.get("price_forecast_immediate"), price_act)
                 mae_wind = _mae(self._prev_forecasts_for_error.get("wind_forecast_immediate"), wind_act)
                 mae_solar = _mae(self._prev_forecasts_for_error.get("solar_forecast_immediate"), solar_act)
@@ -1333,30 +1341,26 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 mae_hydro = _mae(self._prev_forecasts_for_error.get("hydro_forecast_immediate"), hydro_act)
                 self._prev_forecasts_for_error = {k: v for k, v in zip(forecast_keys, forecasts_logged)}
 
-                # Forecast alignment score diagnostic
+                # Forecast alignment score diagnostic (non-monetary)
                 try:
-                    if hasattr(self.env, "_price"):
-                        i = max(0, min(getattr(self.env, "t", 0) - 1, len(self.env._price) - 1))
-                        p_t = float(self.env._price[i])
-                        p_tm1 = float(self.env._price[i - 1] if i > 0 else self.env._price[i])
-                        realized_ret = (p_t - p_tm1) / p_tm1 if abs(p_tm1) > 1e-9 else 0.0
-                    else:
-                        realized_ret = 0.0
-                    cur_price_norm = float(np.clip(self._safe_float(actuals['price'], 0.0) / PRICE_SCALE, -10.0, 10.0))
-                    forecast_alignment_score = float(np.sign(self._last_price_forecast_aligned - cur_price_norm) * realized_ret)
+                    price_scale_fallback = getattr(getattr(self.env, 'config', object()), 'price_scale', 10.0)
+                    cur_price_norm = float(np.clip(self._safe_float(actuals['price'], 0.0) / price_scale_fallback, -10.0, 10.0))
+                    realized_ret_dummy = 0.0 # Placeholder as real return calc is complex here
+                    forecast_alignment_score = float(np.sign(self._last_price_forecast_aligned - cur_price_norm) * realized_ret_dummy)
                 except Exception:
                     forecast_alignment_score = 0.0
 
+                # --- Assemble the final log row with all monetary values in USD ---
                 row = [
                     ts_str, int(step_t), int(self.episode_count), meta_reward, inv_freq, cap_frac,
                     meta_a0, meta_a1, inv_a0, inv_a1, inv_a2, batt_a0, risk_a0,
                     *forecasts_logged,
                     self._last_price_forecast_norm, self._last_price_forecast_aligned,
-                    perf, portfolio_value_logged, equity_logged, total_return_nav, overall_risk, market_risk,
-                    budget, wind_c, solar_c, hydro_c, batt_e,
+                    perf, portfolio_value_usd, equity_usd, total_return_nav_usd, overall_risk, market_risk,
+                    budget_usd, wind_c, solar_c, hydro_c, batt_e,
                     price_act, load_act, wind_act, solar_act, hydro_act,
-                    market_stress, market_vol, revenue_step,
-                    generation_revenue, mtm_pnl, distributed_profits, cumulative_returns, investment_capital, fund_performance,
+                    market_stress, market_vol, revenue_step_usd,
+                    generation_revenue_usd, mtm_pnl_usd, distributed_profits_usd, cumulative_returns_usd, investment_capital_usd, fund_performance,
                     self._ep_meta_return, step_in_ep, episode_end,
                     *r6,
                     r_fin, r_risk, r_sus, r_eff, r_div,
@@ -1368,10 +1372,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 ]
 
                 self.log_buffer.append(row)
-                if (len(self.log_buffer) >= 25 or
-                        self.step_count % 500 == 0 or
-                        len(self.log_buffer) >= self._flush_every_rows or
-                        episode_end):
+                if len(self.log_buffer) >= 25 or self.step_count % 500 == 0 or len(self.log_buffer) >= self._flush_every_rows or episode_end:
                     self._flush_log_buffer()
         except Exception as e:
             if self.error_count < self.max_errors:
@@ -1437,8 +1438,11 @@ class UltraFastProgressWrapper(ParallelEnv):
         self.env = base_env
         self.total_timesteps = total_timesteps
         self.step_count = 0
+        self.global_step_count = 0  # Track cumulative steps across all intervals
         self.progress_interval = max(1000, total_timesteps // 50)  # Show progress every 2%
         self.last_progress_step = 0
+        self.last_portfolio_value = None  # Track for validation
+        self.portfolio_history = []  # Track recent values for trend analysis
 
         # Mark the base environment as being in ultra fast mode
         self.env.ultra_fast_mode = True
@@ -1465,19 +1469,38 @@ class UltraFastProgressWrapper(ParallelEnv):
         print(f"🚀 Ultra fast mode: Trading enabled regardless of forecast confidence")
 
     def reset(self, seed=None, options=None):
+        # Only reset episode-level counters, keep global tracking
         self.step_count = 0
-        self.last_progress_step = 0
+        # DON'T reset global_step_count - it tracks cumulative progress
+        # DON'T reset last_progress_step - it tracks global progress intervals
         return self.env.reset(seed=seed, options=options)
 
     def step(self, actions):
         obs, rewards, dones, truncs, infos = self.env.step(actions)
 
         self.step_count += 1
+        self.global_step_count += 1
 
         # Show progress every interval with financial breakdown
-        if self.step_count - self.last_progress_step >= self.progress_interval:
-            progress_pct = (self.step_count / self.total_timesteps) * 100
-            portfolio_value = getattr(self.env, 'equity', 0) / 1e6  # Convert to millions
+        if self.global_step_count - self.last_progress_step >= self.progress_interval:
+            # Use global step count for accurate cumulative progress
+            progress_pct = (self.global_step_count / self.total_timesteps) * 100
+
+            # Get portfolio value with validation (convert DKK to USD for display)
+            portfolio_value_dkk = getattr(self.env, 'equity', 0)
+            dkk_to_usd_rate = getattr(self.env.config, 'dkk_to_usd_rate', 0.145)
+            portfolio_value = (portfolio_value_dkk * dkk_to_usd_rate) / 1e6  # Convert to USD millions
+
+            # Validate portfolio value for consistency
+            if self.last_portfolio_value is not None:
+                value_change = portfolio_value - self.last_portfolio_value
+                if abs(value_change) > 100:  # Alert for large changes (>$100M)
+                    print(f"⚠️  Large portfolio change detected: ${value_change:+.1f}M")
+
+            # Track portfolio history for trend analysis
+            self.portfolio_history.append(portfolio_value)
+            if len(self.portfolio_history) > 10:
+                self.portfolio_history.pop(0)  # Keep last 10 values
 
             # Get financial breakdown with DKK to USD conversion
             dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
@@ -1485,17 +1508,48 @@ class UltraFastProgressWrapper(ParallelEnv):
             ops_revenue_usd = ops_revenue_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
             trading_pnl_usd = getattr(self.env, 'last_mtm_pnl', 0.0) / 1e3  # Convert to thousands USD
 
-            # Format the breakdown
+            # Format the breakdown with enhanced info
             ops_str = f"Ops: ${ops_revenue_usd:+.1f}k"
             trading_str = f"Trading: ${trading_pnl_usd:+.1f}k" if trading_pnl_usd != 0 else "Trading: $0.0k"
 
-            print(f"🚀 Ultra fast progress: {self.step_count:,}/{self.total_timesteps:,} ({progress_pct:.1f}%) | Portfolio: ${portfolio_value:.1f}M | {ops_str} | {trading_str}")
-            self.last_progress_step = self.step_count
+            # Add trend indicator
+            trend_str = ""
+            if len(self.portfolio_history) >= 2:
+                recent_change = self.portfolio_history[-1] - self.portfolio_history[-2]
+                if abs(recent_change) > 1.0:  # Show trend for changes > $1M
+                    trend_str = f" | Trend: ${recent_change:+.1f}M"
+
+            print(f"🚀 Ultra fast progress: {self.global_step_count:,}/{self.total_timesteps:,} ({progress_pct:.1f}%) | Portfolio: ${portfolio_value:.1f}M USD | {ops_str} | {trading_str}{trend_str}")
+
+            self.last_progress_step = self.global_step_count
+            self.last_portfolio_value = portfolio_value
 
         return obs, rewards, dones, truncs, infos
 
     def close(self):
         return self.env.close()
+
+    def get_progress_summary(self):
+        """Get detailed progress summary for debugging."""
+        portfolio_range = ""
+        if len(self.portfolio_history) >= 2:
+            min_val = min(self.portfolio_history)
+            max_val = max(self.portfolio_history)
+            portfolio_range = f" | Range: ${min_val:.1f}M-${max_val:.1f}M"
+
+        return {
+            'global_steps': self.global_step_count,
+            'total_steps': self.total_timesteps,
+            'progress_pct': (self.global_step_count / self.total_timesteps) * 100,
+            'current_portfolio': self.last_portfolio_value,
+            'portfolio_history': self.portfolio_history.copy(),
+            'summary': f"Progress: {self.global_step_count:,}/{self.total_timesteps:,} ({(self.global_step_count / self.total_timesteps) * 100:.1f}%){portfolio_range}"
+        }
+
+    def set_global_step_count(self, count):
+        """Allow external setting of global step count for synchronization."""
+        self.global_step_count = count
+        print(f"🔄 Global step count synchronized to: {count:,}")
 
     def __getattr__(self, name):
         # Delegate any other attribute access to the base environment

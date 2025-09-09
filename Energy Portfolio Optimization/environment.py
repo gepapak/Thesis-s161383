@@ -525,6 +525,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
         price_rolling_mean = price_dkk_filtered.rolling(window=window_size, min_periods=1).mean()
         price_rolling_std = price_dkk_filtered.rolling(window=window_size, min_periods=1).std()
 
+        # FIXED: Handle NaN values in rolling statistics
+        price_rolling_mean = price_rolling_mean.fillna(price_dkk_filtered.mean())
+        price_rolling_std = price_rolling_std.fillna(price_dkk_filtered.std())
+        price_rolling_std = price_rolling_std.replace(0.0, price_dkk_filtered.std())  # Avoid zero std
+
         # Normalize prices for agent observations (z-score with bounds)
         price_normalized = (price_dkk_filtered - price_rolling_mean) / (price_rolling_std + 1e-6)
         price_normalized_clipped = np.clip(price_normalized, -3.0, 3.0)  # ±3 sigma bounds
@@ -535,14 +540,21 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self._price_mean = price_rolling_mean.to_numpy()
         self._price_std = price_rolling_std.to_numpy()
 
-        # IMPORTANT: Prices are now in USD, so currency_conversion = 1.0 in revenue calc
-        # This prevents double conversion in _calculate_generation_revenue()
+        # FIXED: Prices remain in DKK throughout system for consistency
+        # Raw prices in _price_raw are DKK, normalized prices in _price are z-scores
 
         # Initialize conversion logging flag
         self._conversion_logged = False
 
         self._load  = self.data.get('load',  pd.Series(0.0, index=self.data.index)).astype(float).to_numpy()
         self._riskS = self.data.get('risk',  pd.Series(0.3, index=self.data.index)).astype(float).to_numpy()
+
+        # FIXED: Pre-allocate forecast arrays for DL overlay labeler
+        self._price_forecast_immediate = np.full(self.max_steps, np.nan, dtype=float)
+        self._wind_forecast_immediate = np.full(self.max_steps, np.nan, dtype=float)
+        self._solar_forecast_immediate = np.full(self.max_steps, np.nan, dtype=float)
+        self._hydro_forecast_immediate = np.full(self.max_steps, np.nan, dtype=float)
+        self._load_forecast_immediate = np.full(self.max_steps, np.nan, dtype=float)
 
         # normalization scales (95th percentile with minimum thresholds)
         def p95_robust(x, min_scale=0.1):
@@ -974,6 +986,26 @@ class RenewableMultiAgentEnv(ParallelEnv):
             pass
         return default
 
+    def populate_forecast_arrays(self, t: int, forecasts: Dict[str, float]):
+        """
+        FIXED: Populate forecast arrays for DL overlay labeler access.
+        Called from wrapper after computing forecasts.
+        """
+        try:
+            if 0 <= t < self.max_steps:
+                if 'price_forecast_immediate' in forecasts:
+                    self._price_forecast_immediate[t] = float(forecasts['price_forecast_immediate'])
+                if 'wind_forecast_immediate' in forecasts:
+                    self._wind_forecast_immediate[t] = float(forecasts['wind_forecast_immediate'])
+                if 'solar_forecast_immediate' in forecasts:
+                    self._solar_forecast_immediate[t] = float(forecasts['solar_forecast_immediate'])
+                if 'hydro_forecast_immediate' in forecasts:
+                    self._hydro_forecast_immediate[t] = float(forecasts['hydro_forecast_immediate'])
+                if 'load_forecast_immediate' in forecasts:
+                    self._load_forecast_immediate[t] = float(forecasts['load_forecast_immediate'])
+        except Exception:
+            pass  # Silently ignore errors to avoid breaking main flow
+
     # ------------------------------------------------------------------
     # PettingZoo API
     # ------------------------------------------------------------------
@@ -1327,25 +1359,38 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ----------------------
     def _battery_dispatch_policy(self, i: int) -> Tuple[str, float]:
         """
-        Decide ('charge'/'discharge'/'idle', intensity 0..1) from price now vs. aligned forecast.
-        Uses aligned horizon to match investment_freq.
+        FIXED: Decide ('charge'/'discharge'/'idle', intensity 0..1) from price now vs. aligned forecast.
+        Uses consistent z-score normalization for both current price and forecast.
         """
         try:
+            # Current price (already z-score normalized)
             p_now = float(np.clip(self._price[i], -1000.0, 1e9))
-            p_fut = self._get_aligned_price_forecast(i, default=None)
-            if p_fut is None or not np.isfinite(p_fut):
+
+            # Get raw forecast and normalize it to match current price scale
+            p_fut_raw = self._get_aligned_price_forecast(i, default=None)
+            if p_fut_raw is None or not np.isfinite(p_fut_raw):
                 return ("idle", 0.0)
 
+            # FIXED: Normalize forecast using same z-score parameters as current price
+            mean = float(self._price_mean[i]) if hasattr(self, '_price_mean') and i < len(self._price_mean) else 250.0
+            std = float(self._price_std[i]) if hasattr(self, '_price_std') and i < len(self._price_std) else 50.0
+            std = max(std, 1e-6)  # Avoid division by zero
+            p_fut = (p_fut_raw - mean) / std
+            p_fut = float(np.clip(p_fut, -3.0, 3.0))  # Same bounds as environment
+
+            # Now both prices are in z-score units, spread calculation is meaningful
             spread = (p_fut - p_now)
-            needed = max(0.005 * abs(p_now), 0.5)  # ≥ $0.5/MWh or ~0.5% (more aggressive)
-            rt_loss = (1.0/(max(self.batt_eta_charge*self.batt_eta_discharge, 1e-6)) - 1.0) * abs(p_now)
-            hurdle = needed + 0.3 * rt_loss  # reduced hurdle for more trading
+
+            # Adjust thresholds for z-score scale (typical range ±3)
+            needed = max(0.1, 0.05 * abs(p_now))  # Minimum threshold in z-score units
+            rt_loss = (1.0/(max(self.batt_eta_charge*self.batt_eta_discharge, 1e-6)) - 1.0) * 0.1  # Fixed loss in z-score units
+            hurdle = needed + 0.3 * rt_loss
 
             if spread > hurdle:
-                inten = float(np.clip(spread / (abs(p_now) + 1e-6), 0.0, 1.0))
+                inten = float(np.clip(spread / (abs(p_now) + 0.1), 0.0, 1.0))
                 return ("charge", inten)
             elif spread < -hurdle:
-                inten = float(np.clip((-spread) / (abs(p_now) + 1e-6), 0.0, 1.0))
+                inten = float(np.clip((-spread) / (abs(p_now) + 0.1), 0.0, 1.0))
                 return ("discharge", inten)
             else:
                 return ("idle", 0.0)

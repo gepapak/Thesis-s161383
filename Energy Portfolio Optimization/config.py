@@ -7,8 +7,14 @@ class EnhancedConfig:
         # FUND STRUCTURE AND ECONOMICS
         # =============================================================================
 
+        # Currency conversion (DKK to USD) - SINGLE SOURCE OF TRUTH
+        self.dkk_to_usd_rate = 0.145  # 1 USD = ~6.9 DKK (2024 rate)
+        self.currency_conversion = 1.0  # Keep at 1.0 - all calculations in DKK, convert only for final reporting
+
         # Fund size and allocation
-        self.init_budget = 5e8  # $500M fund size
+        # FIXED: Convert USD budget to DKK since system operates in DKK
+        self.init_budget_usd = 5e8  # $500M fund size in USD
+        self.init_budget = self.init_budget_usd / self.dkk_to_usd_rate  # Convert to DKK (~3.45B DKK)
 
         # Calculate actual allocations based on CAPEX deployment
         # Physical CAPEX: $259M, Remaining cash: $241M
@@ -47,16 +53,14 @@ class EnhancedConfig:
         self.distribution_rate = 0.30  # 30% of positive cash distributed
 
         # Financial parameters
-        self.max_leverage = 1.5
+        self.max_leverage = 2.0  # Increased from 1.5 for higher profit potential
         self.electricity_markup = 1.0  # Fund sells at market price
 
         # Mark-to-market volatility controls
         self.mtm_price_return_cap_min = -0.02  # Max -2% price return per timestep
         self.mtm_price_return_cap_max = 0.02   # Max +2% price return per timestep
 
-        # Currency conversion (DKK to USD) - SINGLE SOURCE OF TRUTH
-        self.dkk_to_usd_rate = 0.145  # 1 USD = ~6.9 DKK (2024 rate)
-        self.currency_conversion = 1.0  # Keep at 1.0 - all calculations in DKK, convert only for final reporting
+
 
         # =============================================================================
         # ENVIRONMENT AND SIMULATION PARAMETERS
@@ -65,13 +69,13 @@ class EnhancedConfig:
         # Meta controller ranges
         self.meta_freq_min = 6  # Every hour if 10-min data
         self.meta_freq_max = 288  # Daily
-        self.meta_cap_min = 0.02
-        self.meta_cap_max = 0.50
+        self.meta_cap_min = 0.05  # Increased from 0.02 for more aggressive trading
+        self.meta_cap_max = 0.75  # Increased from 0.50 for higher profit potential
         self.sat_eps = 1e-3
 
         # Investment and operational parameters
         self.investment_freq = 12  # Default investment frequency
-        self.capital_allocation_fraction = 0.10
+        self.capital_allocation_fraction = 0.20  # Increased from 0.10 for more aggressive starting position
         self.risk_multiplier = 1.0
 
         # Battery operational parameters
@@ -129,12 +133,12 @@ class EnhancedConfig:
         self.price_clip_min = -1000.0  # Minimum price for clipping
         self.price_clip_max = 1e9  # Maximum price for clipping
 
-        # Default forecast values (MW or $/MWh)
+        # Default forecast values (MW or DKK/MWh) - FIXED: Standardized on DKK
         self.default_forecasts = {
             "wind": 330.0,    # ~30% of capacity
             "solar": 20.0,    # ~20% of capacity
             "hydro": 267.0,   # ~50% of capacity
-            "price": 50.0,    # $/MWh
+            "price": 345.0,   # DKK/MWh (consistent with environment)
             "load": 1800.0,   # ~60% of capacity
         }
 
@@ -167,9 +171,9 @@ class EnhancedConfig:
         self.ultra_fast_mode_trading_enabled = True  # Enable trading in ultra fast mode regardless of forecasts
 
         # Reward calculation parameters
-        self.base_reward_scale = 1.0  # Base scaling for all rewards
-        self.profit_reward_weight = 1.0  # Weight for profit-based rewards
-        self.risk_penalty_weight = 0.1  # Weight for risk penalties
+        self.base_reward_scale = 1.5  # Increased from 1.0 for stronger learning signals
+        self.profit_reward_weight = 2.0  # Increased from 1.0 to prioritize profitability
+        self.risk_penalty_weight = 0.05  # Reduced from 0.1 to allow more aggressive strategies
         self.forecast_accuracy_reward_weight = 0.05  # Weight for forecast accuracy rewards
 
         # Reward normalization and clipping
@@ -188,9 +192,9 @@ class EnhancedConfig:
         # =============================================================================
 
         # Training defaults
-        self.update_every = 128
-        self.lr = 3e-4
-        self.ent_coef = 0.01
+        self.update_every = 64  # Reduced from 128 for more frequent updates
+        self.lr = 5e-4  # Increased from 3e-4 for faster learning
+        self.ent_coef = 0.02  # Increased from 0.01 for more exploration
         self.verbose = 1
         self.seed = 42
         self.multithreading = True
@@ -204,8 +208,8 @@ class EnhancedConfig:
         self.max_grad_norm = 0.5
 
         # Network architecture
-        self.net_arch = [128, 64]
-        self.activation_fn = "tanh"
+        self.net_arch = [256, 128, 64]  # Deeper network for better pattern recognition
+        self.activation_fn = "relu"  # Changed from tanh for better gradient flow
 
         # Agent policies
         self.agent_policies = [
