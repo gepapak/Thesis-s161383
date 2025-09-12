@@ -4,18 +4,18 @@
 """
 Multi-agent renewable energy investment environment with hybrid economic model.
 
-HYBRID FUND STRUCTURE ($500M Total Capital):
+HYBRID FUND STRUCTURE ($700M Total Capital):
 ==============================================================================
 ECONOMIC MODEL: Clear separation between physical ownership and financial trading
 
-1) PHYSICAL OWNERSHIP ($250M deployed - 50% allocation):
-   - Wind farms: 75 MW ($125M) - Fractional ownership: 5% of 1,500MW wind farm (5 WTGs of 15MW each)
-   - Solar farms: 50 MW ($60M) - Fractional ownership: 5% of 1,000MW solar farm
+1) PHYSICAL OWNERSHIP ($589M deployed - 84.1% allocation):
+   - Wind farms: 225 MW ($405M) - Fractional ownership: 15% of 1,500MW wind farm
+   - Solar farms: 100 MW ($120M) - Fractional ownership: 10% of 1,000MW solar farm
    - Hydro plants: 20 MW ($60M) - Fractional ownership: 2% of 1,000MW hydro plant
-   - Battery storage: 10 MWh / 5MW ($6M) - Direct ownership matching PyPSA specifications
-   - Total: 145 MW physical capacity generating real electricity
+   - Battery storage: 10 MWh ($4M) - Direct ownership
+   - Total: 345 MW physical capacity generating real electricity
 
-2) FINANCIAL TRADING ($250M allocated - 50% allocation):
+2) FINANCIAL TRADING ($111M allocated - 15.9% allocation):
    - Renewable energy index derivatives
    - Wind/solar/hydro futures contracts
    - Energy storage arbitrage instruments
@@ -154,6 +154,7 @@ class ProfitFocusedRewardCalculator:
     def __init__(self, initial_budget: float, target_annual_return: float = 0.05, config=None):
         self.initial_budget = float(max(1.0, initial_budget))
         self.target_annual_return = target_annual_return  # REALISTIC: 5% target for institutional fund
+        self.config = config  # Store config for access to parameters
 
         # FIXED: Separate tracking for different value sources
         self.portfolio_history = deque(maxlen=252)  # Fund NAV history
@@ -176,33 +177,36 @@ class ProfitFocusedRewardCalculator:
         self.operational_vols = {'wind': 0.03, 'solar': 0.025, 'hydro': 0.015}
         self.operational_correlations = {'wind_solar': 0.4, 'wind_hydro': 0.2, 'solar_hydro': 0.3}
 
-        # ENHANCED: Reward weights from config (centralized configuration)
+        # OPERATIONAL EXCELLENCE FOCUSED: Reward weights for renewable energy fund management
         if config and hasattr(config, 'forecast_accuracy_reward_weight'):
             self.reward_weights = {
-                'nav_growth': 0.65,      # Primary: Fund NAV appreciation (65% - slightly reduced for forecast)
-                'cash_flow': 0.20,       # Secondary: Actual cash generation (20% - stable)
-                'risk_adjusted': getattr(config, 'risk_penalty_weight', 0.10),   # Risk penalty from config
-                'efficiency': 0.0,       # Disabled to focus on performance
-                'forecast': getattr(config, 'forecast_accuracy_reward_weight', 0.05),  # From config
+                'operational_revenue': 0.20,    # REDUCED: Renewable energy revenue
+                'risk_management': 0.15,        # REDUCED: Volatility and drawdowns
+                'hedging_effectiveness': 0.15,  # MAINTAINED: Price exposure management
+                'nav_stability': 0.50,          # INCREASED: Fund growth is PRIMARY goal
+                'cash_flow': 0.0,               # Merged into operational_revenue
+                'forecast': 0.0,                # Disabled - focus on fundamentals
             }
             # Trading controls from config
-            self.forecast_confidence_threshold = getattr(config, 'forecast_confidence_threshold', 0.7)
-            self.max_drawdown_threshold = 0.10       # More conservative drawdown limit (10%)
+            self.forecast_confidence_threshold = getattr(config, 'forecast_confidence_threshold', 0.70)  # 70% confidence threshold
+            self.max_drawdown_threshold = 0.60       # USER SPECIFIED: 60% drawdown threshold (learning mode)
         else:
-            # Fallback to hardcoded values if no config
+            # Fallback to operational excellence focused values if no config
             self.reward_weights = {
-                'nav_growth': 0.65,      # Primary: Fund NAV appreciation (65% - slightly reduced for forecast)
-                'cash_flow': 0.20,       # Secondary: Actual cash generation (20% - stable)
-                'risk_adjusted': 0.10,   # Risk penalty (10% - stable)
-                'efficiency': 0.0,       # Disabled to focus on performance
-                'forecast': 0.05,        # ENABLED: Forecast accuracy bonus (5% - demonstrates AI value)
+                'operational_revenue': 0.50,    # PRIMARY: Maximize renewable energy revenue
+                'risk_management': 0.25,        # SECONDARY: Minimize volatility and drawdowns
+                'hedging_effectiveness': 0.15,  # TERTIARY: Reduce price exposure (not profit)
+                'nav_stability': 0.10,          # QUATERNARY: Stable fund value
+                'cash_flow': 0.0,               # Merged into operational_revenue
+                'forecast': 0.0,                # Disabled - focus on fundamentals
             }
             # REALISTIC: Conservative trading controls for institutional fund
-            self.forecast_confidence_threshold = 0.7  # Higher confidence threshold (70%)
-            self.max_drawdown_threshold = 0.10       # More conservative drawdown limit (10%)
+            self.forecast_confidence_threshold = 0.70  # 70% confidence threshold for full trading
+            self.max_drawdown_threshold = 0.60       # USER SPECIFIED: 60% drawdown threshold (learning mode)
         self.current_drawdown = 0.0
-        self.peak_nav = 0.0
+        self.peak_nav = float(self.initial_budget)  # FIXED: Initialize to initial budget, not 0
         self.trading_enabled = True
+        self.position_size_multiplier = 1.0  # Full position size initially
 
     def calculate_reward(self, fund_nav: float, cash_flow: float,
                         risk_level: float, efficiency: float,
@@ -226,38 +230,71 @@ class ProfitFocusedRewardCalculator:
 
         self.current_drawdown = (self.peak_nav - fund_nav) / self.peak_nav if self.peak_nav > 0 else 0.0
 
-        # Disable trading if drawdown exceeds threshold
-        if self.current_drawdown > self.max_drawdown_threshold:
+        # Gradual trading restrictions based on drawdown (LEARNING MODE: More permissive)
+        if self.current_drawdown > self.max_drawdown_threshold:  # >60%: Disable trading
             self.trading_enabled = False
-        elif self.current_drawdown < 0.05:  # Re-enable when drawdown < 5%
+        elif self.current_drawdown > 0.45:  # 45-60%: Allow limited trading for recovery
             self.trading_enabled = True
+            self.position_size_multiplier = 0.3  # 30% of normal position size
+        elif self.current_drawdown > 0.30:  # 30-45%: Reduced trading
+            self.trading_enabled = True
+            self.position_size_multiplier = 0.6  # 60% of normal position size
+        else:  # <30%: Full trading
+            self.trading_enabled = True
+            self.position_size_multiplier = 1.0  # 100% of normal position size
 
         if len(self.portfolio_history) < 2:
             return 0.0
 
-        # 1) NAV growth component (ENHANCED for better learning signals)
-        nav_return = (fund_nav - self.portfolio_history[-2]) / max(self.portfolio_history[-2], 1.0)
-        # ENHANCED: Stronger scaling for better learning signals in RL training
-        nav_score = float(np.clip(nav_return * 200.0, -5.0, 5.0))  # Increased scaling for stronger learning signals
+        # 1) OPERATIONAL REVENUE COMPONENT (50% weight) - Maximize renewable energy revenue
+        recent_cash_flows = list(self.cash_flow_history)[-10:]  # Last 10 steps
+        avg_operational_revenue = np.mean(recent_cash_flows) if recent_cash_flows else 0.0
+        # Scale to realistic target from config
+        # Target from config: operational_revenue_target DKK per 10-min step
+        operational_target = getattr(self.config, 'operational_revenue_target', 1200.0) if self.config else 1200.0
+        operational_score = float(np.clip(avg_operational_revenue / operational_target, -2.0, 3.0))
 
-        # 2) Cash flow component (STABILITY - 30% weight)
-        recent_cash_flows = list(self.cash_flow_history)[-20:]
-        avg_cash_flow = np.mean(recent_cash_flows) if recent_cash_flows else 0.0
-        # REALISTIC: Scale cash flow rewards to institutional fund size
-        cash_flow_score = float(np.clip(avg_cash_flow / (self.initial_budget * 0.0005), -1.5, 1.5))
+        # 2) RISK MANAGEMENT COMPONENT (25% weight) - Minimize volatility and drawdowns
+        # Portfolio volatility (last 20 steps)
+        if len(self.portfolio_history) >= 20:
+            recent_navs_list = list(self.portfolio_history)[-20:]
+            recent_navs = np.array(recent_navs_list, dtype=np.float64)
 
-        # 3) Risk penalty (REDUCED for better learning signals)
-        risk_penalty = float(np.clip(risk_level * 1.0, 0.0, 1.0))  # Further reduced penalty for learning
-        drawdown_penalty = float(np.clip(self.current_drawdown * 5.0, 0.0, 1.5))  # Further reduced penalty for learning
-        total_risk_penalty = risk_penalty + drawdown_penalty
+            # FIXED: Ensure proper array slicing
+            nav_diff = np.diff(recent_navs)
+            nav_base = recent_navs[:-1]
+            nav_returns = nav_diff / np.maximum(nav_base, 1.0)
+            portfolio_volatility = np.std(nav_returns) if len(nav_returns) > 1 else 0.0
+        else:
+            portfolio_volatility = 0.0
 
-        # ENHANCED: Reward calculation with forecast signal for AI value demonstration
+        # Risk management score: reward low volatility and low drawdowns
+        volatility_penalty = float(np.clip(portfolio_volatility * 100.0, 0.0, 2.0))  # Scale volatility
+        drawdown_penalty = float(np.clip(self.current_drawdown * 10.0, 0.0, 3.0))   # Penalize drawdowns
+        risk_management_score = -(volatility_penalty + drawdown_penalty)  # Negative because we want to minimize
+
+        # 3) HEDGING EFFECTIVENESS COMPONENT (15% weight) - Reduce price exposure, not profit
+        hedging_score = self._calculate_hedging_effectiveness()
+
+        # 4) NAV STABILITY COMPONENT (10% weight) - Stable fund value
+        if len(self.portfolio_history) >= 2:
+            prev_nav = float(self.portfolio_history[-2])
+            nav_return = (fund_nav - prev_nav) / max(prev_nav, 1.0)
+            # Reward small, positive returns; penalize large swings
+            if abs(nav_return) < 0.01:  # Less than 1% change is good
+                nav_stability_score = 1.0
+            else:
+                nav_stability_score = float(np.clip(1.0 - abs(nav_return) * 50.0, -2.0, 1.0))
+        else:
+            nav_stability_score = 1.0  # No previous NAV to compare
+
+        # OPERATIONAL EXCELLENCE FOCUSED: New reward calculation
         rw = self.reward_weights
         reward = (
-            rw['nav_growth'] * nav_score +
-            rw['cash_flow'] * cash_flow_score -
-            rw['risk_adjusted'] * total_risk_penalty +
-            rw['forecast'] * forecast_signal_score  # ENABLED: Reward accurate forecasting
+            rw['operational_revenue'] * operational_score +
+            rw['risk_management'] * risk_management_score +
+            rw['hedging_effectiveness'] * hedging_score +
+            rw['nav_stability'] * nav_stability_score
         )
 
         # CONSERVATIVE: Stricter penalties for institutional fund
@@ -276,6 +313,115 @@ class ProfitFocusedRewardCalculator:
             clip_min, clip_max = -10.0, 10.0  # Fallback values
 
         return float(np.clip(reward, clip_min, clip_max))  # Configurable clipping
+
+    def _calculate_hedging_effectiveness(self) -> float:
+        """
+        Calculate hedging effectiveness based on correlation between operational and trading cash flows
+        Good hedging: Trading losses offset operational revenue volatility
+        """
+        if not hasattr(self, 'financial_positions') or len(self.cash_flow_history) < 10:
+            return 0.0
+
+        try:
+            # Get recent operational cash flows and trading PnL
+            recent_ops_list = list(self.cash_flow_history)[-10:]
+            if len(recent_ops_list) < 2:
+                return 0.0
+
+            recent_ops = np.array(recent_ops_list, dtype=np.float64)
+
+            # Calculate operational revenue volatility
+            if len(recent_ops) < 2:
+                return 0.0
+
+            # FIXED: Ensure proper array slicing
+            ops_diff = np.diff(recent_ops)
+            ops_base = recent_ops[:-1]
+            ops_returns = ops_diff / np.maximum(ops_base, 1.0)
+            ops_volatility = np.std(ops_returns)
+
+            # Get trading positions value changes
+            current_trading_value = (
+                self.financial_positions.get('wind_instrument_value', 0) +
+                self.financial_positions.get('solar_instrument_value', 0) +
+                self.financial_positions.get('hydro_instrument_value', 0)
+            )
+
+            # Store trading history for correlation calculation
+            if not hasattr(self, 'trading_value_history'):
+                self.trading_value_history = []
+            self.trading_value_history.append(current_trading_value)
+
+            # Keep only recent history
+            if len(self.trading_value_history) > 20:
+                self.trading_value_history = self.trading_value_history[-20:]
+
+            if len(self.trading_value_history) < 10:
+                return 0.0
+
+            # Calculate trading returns
+            trading_values_list = list(self.trading_value_history)[-10:]
+            if len(trading_values_list) < 2:
+                return 0.0
+
+            trading_values = np.array(trading_values_list, dtype=np.float64)
+
+            # FIXED: Use signed base to preserve correlation meaning
+            trading_diff = np.diff(trading_values)
+            trading_base = np.where(np.abs(trading_values[:-1]) < 1.0, 1.0, trading_values[:-1])
+            trading_returns = trading_diff / trading_base
+
+            # Calculate correlation between operational and trading returns
+            if len(ops_returns) == len(trading_returns) and len(ops_returns) > 2:
+                correlation = np.corrcoef(ops_returns, trading_returns)[0, 1]
+
+                # ENHANCED: Good hedging = negative correlation + actual risk reduction
+                if np.isfinite(correlation):
+                    # Reward negative correlation, penalize positive correlation
+                    correlation_score = -correlation  # Negative correlation is good
+
+                    # Calculate actual volatility reduction achieved
+                    combined_returns = ops_returns + trading_returns
+                    combined_volatility = np.std(combined_returns)
+                    volatility_reduction = max(0, ops_volatility - combined_volatility) / max(ops_volatility, 1e-6)
+
+                    # Calculate downside protection (hedge performance during operational losses)
+                    downside_protection = 0.0
+                    if len(ops_returns) > 0:
+                        negative_ops_mask = ops_returns < 0
+                        if np.any(negative_ops_mask):
+                            # When operational returns are negative, trading should be positive (hedging)
+                            hedge_performance = np.mean(trading_returns[negative_ops_mask])
+                            downside_protection = max(0, hedge_performance) * 2.0  # Reward positive hedge during losses
+
+                    # Combined hedging effectiveness score
+                    hedging_effectiveness = (
+                        correlation_score * 0.4 +           # 40% correlation
+                        volatility_reduction * 0.4 +        # 40% volatility reduction
+                        downside_protection * 0.2           # 20% downside protection
+                    )
+
+                    # Bonus for consistent hedging performance
+                    if volatility_reduction > 0.1 and correlation_score > 0.3:
+                        consistency_bonus = 0.3
+                    else:
+                        consistency_bonus = 0.0
+
+                    # Final hedging score
+                    hedging_score = hedging_effectiveness + consistency_bonus
+                    return float(np.clip(hedging_score, -2.0, 3.0))
+
+            return 0.0
+
+        except Exception as e:
+            # Fallback for any calculation errors
+            return 0.0
+
+
+
+
+
+
 
     # Keep remaining methods for compatibility
     def _calculate_diversification_benefit(self, positions: Dict[str, float]) -> float:
@@ -360,9 +506,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ----- meta/risk knob ranges used by meta controller -----
     # NOTE: These will be moved to config in the constructor
     META_FREQ_MIN = 6       # every hour if 10-min data
-    META_FREQ_MAX = 288     # daily
-    META_CAP_MIN  = 0.02
-    META_CAP_MAX  = 0.50
+    META_FREQ_MAX = 24      # FIXED: Max 4 hours (was daily=288) to ensure active trading
+    META_CAP_MIN  = 0.10    # USER SPECIFIED: 10% minimum capital allocation
+    META_CAP_MAX  = 0.75    # USER SPECIFIED: 75% maximum capital allocation
     SAT_EPS       = 1e-3
 
     def __init__(
@@ -459,30 +605,40 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # self.regulatory_compliance_rate = 0.0002  # Removed to match PrototypeTestTuned
         # self.audit_legal_rate = 0.0001           # Removed to match PrototypeTestTuned
         # self.custody_fee_rate = 0.0001           # Removed to match PrototypeTestTuned
-        self.administration_fee_rate = 0.0001    # 0.01% of fund value annually (basic admin)
+        self.administration_fee_rate = self.config.administration_fee_rate  # From config
 
-        # OPERATIONAL costs (apply only after asset deployment)
-        self.performance_fee_rate = 0.20         # 20% of profits above benchmark (institutional standard)
-        self.trading_cost_rate = 0.001           # 0.1% of transaction value (trading costs)
-        self.grid_connection_fee_mwh = 0.5       # $0.5/MWh grid connection fees
-        self.transmission_fee_mwh = 1.2          # $1.2/MWh transmission fees
+        # OPERATIONAL costs (apply only after asset deployment) - FIXED: Use DKK values from config
+        self.performance_fee_rate = self.config.performance_fee_rate        # From config
+        self.trading_cost_rate = self.config.trading_cost_rate              # From config
+        self.grid_connection_fee_mwh = self.config.grid_connection_fee_mwh  # From config
+        self.transmission_fee_mwh = self.config.transmission_fee_mwh        # From config
 
-        # Battery physics/economics (PyPSA specifications: 10 MWh / 5 MW) - FROM CONFIG
-        self.batt_eta_charge = 0.90     # charge efficiency (PyPSA: 90%)
-        self.batt_eta_discharge = 0.90  # discharge efficiency (PyPSA: 90%)
-        self.batt_degradation_cost = 1.0  # $ per MWh energy THROUGHPUT (reduced cost)
-        self.batt_power_c_rate = 0.5    # max power: 5MW for 10MWh = 0.5 C-rate (PyPSA specifications)
+        # Battery physics/economics (PyPSA specifications: 10 MWh / 5 MW) - FIXED: Use DKK from config
+        self.batt_eta_charge = self.config.batt_eta_charge        # From config
+        self.batt_eta_discharge = self.config.batt_eta_discharge  # From config
+        self.batt_degradation_cost = self.config.battery_degradation_cost_mwh  # ~6.9 DKK/MWh (from config)
+        self.batt_power_c_rate = self.config.batt_power_c_rate    # From config
         self.batt_soc_min = self.config.batt_soc_min
         self.batt_soc_max = self.config.batt_soc_max
 
-        # CAPEX tables from config (override via asset_capex parameter)
-        self.asset_capex = self.config.get_asset_capex()
+        # CAPEX tables from config (get DKK values for internal calculations)
+        self.asset_capex = self.config.get_asset_capex(currency='DKK')
         if isinstance(asset_capex, dict):
-            try: self.asset_capex.update(asset_capex)
+            try:
+                # If override provided, assume it's in USD and convert to DKK
+                for key, value_usd in asset_capex.items():
+                    self.asset_capex[key] = value_usd / self.config.dkk_to_usd_rate
             except Exception: pass
 
-        # Initialize fund
-        self.budget = float(self.init_budget)
+        # Initialize fund with proper allocation structure
+        self.total_fund_value = float(self.init_budget)  # Total fund: 5.52B DKK
+
+        # Calculate physical and trading allocations
+        self.physical_allocation_budget = self.total_fund_value * self.config.physical_allocation  # 88% for assets
+        self.trading_allocation_budget = self.total_fund_value * self.config.financial_allocation   # 12% for trading
+
+        # Budget represents available trading capital (starts as trading allocation)
+        self.budget = float(self.trading_allocation_budget)  # ~662M DKK for trading
         self.equity = float(self.init_budget)
         
         # Legacy compatibility
@@ -504,8 +660,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # CLEAN APPROACH: Keep everything in DKK throughout the system
         price_dkk = self.data.get('price', pd.Series(250.0, index=self.data.index)).astype(float)
 
-        # Step 1: Filter extreme outliers (keep realistic DKK range)
-        price_dkk_filtered = np.clip(price_dkk, 10.0, 2000.0)  # Realistic DKK range
+        # Step 1: Filter extreme outliers (keep realistic DKK range) - from config
+        price_dkk_filtered = np.clip(price_dkk, self.config.minimum_price_filter, self.config.maximum_price_cap)
 
         # Step 2: Keep DKK throughout system - NO EARLY CONVERSION
         # Store conversion rate for final reporting only
@@ -623,6 +779,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # Fund performance tracking
         self.cumulative_battery_revenue = 0.0
         self.cumulative_generation_revenue = 0.0
+        self.accumulated_operational_revenue = 0.0  # CRITICAL: Initialize operational revenue tracking
 
         # runtime vars
         self.t = 0
@@ -650,6 +807,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.investment_capital = float(self.init_budget)
         self.distributed_profits = 0.0
         self.cumulative_returns = 0.0
+        self._previous_nav = 0.0  # CRITICAL: Track previous NAV for return calculation
         self.max_leverage = self.config.max_leverage
         self.risk_multiplier = self.config.risk_multiplier
 
@@ -657,6 +815,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_revenue = 0.0
         self.last_generation_revenue = 0.0
         self.last_mtm_pnl = 0.0
+        self.cumulative_mtm_pnl = 0.0  # ENHANCED: Track cumulative trading performance
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
 
@@ -699,32 +858,35 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     continue
                 total_capex += capex
             
-            # Check budget sufficiency
-            if total_capex > self.budget:
-                logging.warning(f"Insufficient budget: ${total_capex:,.0f} required, ${self.budget:,.0f} available")
+            # FIXED: Check physical allocation budget sufficiency (not trading budget)
+            if total_capex > self.physical_allocation_budget:
+                logging.warning(f"Insufficient physical allocation: {total_capex:,.0f} DKK required, {self.physical_allocation_budget:,.0f} DKK available")
                 # Scale down proportionally
-                scale_factor = (self.budget * 0.9) / total_capex  # Use 90% of budget
+                scale_factor = (self.physical_allocation_budget * 0.95) / total_capex  # Use 95% of physical allocation
                 logging.info(f"Scaling asset plan by {scale_factor:.2f}")
             else:
                 scale_factor = 1.0
+                logging.info(f"Physical allocation sufficient: {total_capex:,.0f} DKK required, {self.physical_allocation_budget:,.0f} DKK available")
             
-            # Deploy physical assets
+            # Deploy physical assets (using physical allocation, not trading budget)
+            total_physical_capex_used = 0.0
+
             for asset_type, specs in plan.items():
                 if asset_type == 'wind':
                     capacity = specs['capacity_mw'] * scale_factor
                     self.physical_assets['wind_capacity_mw'] = capacity
                     capex_used = capacity * self.asset_capex['wind_mw']
-                    
+
                 elif asset_type == 'solar':
-                    capacity = specs['capacity_mw'] * scale_factor  
+                    capacity = specs['capacity_mw'] * scale_factor
                     self.physical_assets['solar_capacity_mw'] = capacity
                     capex_used = capacity * self.asset_capex['solar_mw']
-                    
+
                 elif asset_type == 'hydro':
                     capacity = specs['capacity_mw'] * scale_factor
-                    self.physical_assets['hydro_capacity_mw'] = capacity  
+                    self.physical_assets['hydro_capacity_mw'] = capacity
                     capex_used = capacity * self.asset_capex['hydro_mw']
-                    
+
                 elif asset_type == 'battery':
                     capacity = specs['capacity_mwh'] * scale_factor
                     self.physical_assets['battery_capacity_mwh'] = capacity
@@ -732,13 +894,18 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     capex_used = capacity * self.asset_capex['battery_mwh']
                 else:
                     continue
-                    
-                # Deduct from budget
-                self.budget -= capex_used
-                
+
+                # Track physical CAPEX spending (don't deduct from trading budget)
+                total_physical_capex_used += capex_used
+
+            # Store physical CAPEX for NAV calculation
+            self.physical_capex_deployed = total_physical_capex_used
+
             # Mark as deployed (PERMANENT)
             self.assets_deployed = True
-            self.budget = max(0.0, self.budget)  # Ensure non-negative
+
+            # Trading budget remains unchanged (it's separate from physical allocation)
+            # self.budget stays as trading_allocation_budget (~662M DKK)
             
             # Update equity
             self._calculate_fund_nav()
@@ -748,8 +915,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
             logging.info(f"  Solar: {self.physical_assets['solar_capacity_mw']:.1f} MW")
             logging.info(f"  Hydro: {self.physical_assets['hydro_capacity_mw']:.1f} MW")
             logging.info(f"  Battery: {self.physical_assets['battery_capacity_mwh']:.1f} MWh")
-            logging.info(f"  Total CAPEX: ${total_capex * scale_factor:,.0f}")
-            logging.info(f"  Remaining cash: ${self.budget:,.0f}")
+            logging.info(f"  Total CAPEX: {total_capex * scale_factor:,.0f} DKK (${total_capex * scale_factor * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
+            logging.info(f"  Remaining cash: {self.budget:,.0f} DKK (${self.budget * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
 
             # SANITY ASSERTS: Verify deployment using config values
             expected_values = self.config.get_expected_physical_values()
@@ -778,7 +945,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             assert self.budget >= expected_cash_min, \
                 f"Insufficient cash for trading: ${self.budget:,.0f} vs minimum ${expected_cash_min:,.0f}"
 
-            logging.info("✅ Option 1 deployment verified successfully")
+            logging.info("[OK] Option 1 deployment verified successfully")
             
         except Exception as e:
             logging.error(f"Asset deployment failed: {e}")
@@ -804,30 +971,30 @@ class RenewableMultiAgentEnv(ParallelEnv):
                          self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh'])
 
         logging.info("1. PHYSICAL ASSETS (Owned Infrastructure - Generate Real Electricity):")
-        logging.info(f"   Wind farms: {self.physical_assets['wind_capacity_mw']:.1f} MW (${self.physical_assets['wind_capacity_mw'] * self.asset_capex['wind_mw']:,.0f})")
-        logging.info(f"   Solar farms: {self.physical_assets['solar_capacity_mw']:.1f} MW (${self.physical_assets['solar_capacity_mw'] * self.asset_capex['solar_mw']:,.0f})")
-        logging.info(f"   Hydro plants: {self.physical_assets['hydro_capacity_mw']:.1f} MW (${self.physical_assets['hydro_capacity_mw'] * self.asset_capex['hydro_mw']:,.0f})")
-        logging.info(f"   Battery storage: {self.physical_assets['battery_capacity_mwh']:.1f} MWh (${self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh']:,.0f})")
-        logging.info(f"   Total Physical: {total_physical_mw:.1f} MW (${physical_value:,.0f} book value)")
+        logging.info(f"   Wind farms: {self.physical_assets['wind_capacity_mw']:.1f} MW ({self.physical_assets['wind_capacity_mw'] * self.asset_capex['wind_mw']:,.0f} DKK)")
+        logging.info(f"   Solar farms: {self.physical_assets['solar_capacity_mw']:.1f} MW ({self.physical_assets['solar_capacity_mw'] * self.asset_capex['solar_mw']:,.0f} DKK)")
+        logging.info(f"   Hydro plants: {self.physical_assets['hydro_capacity_mw']:.1f} MW ({self.physical_assets['hydro_capacity_mw'] * self.asset_capex['hydro_mw']:,.0f} DKK)")
+        logging.info(f"   Battery storage: {self.physical_assets['battery_capacity_mwh']:.1f} MWh ({self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh']:,.0f} DKK)")
+        logging.info(f"   Total Physical: {total_physical_mw:.1f} MW ({physical_value:,.0f} DKK book value, ${physical_value * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
         logging.info("")
 
         # Financial instruments (derivatives trading)
         total_financial = sum(abs(v) for v in self.financial_positions.values())
         logging.info("2. FINANCIAL INSTRUMENTS (Derivatives Trading - Mark-to-Market):")
-        logging.info(f"   Wind index exposure: ${self.financial_positions['wind_instrument_value']:,.0f}")
-        logging.info(f"   Solar index exposure: ${self.financial_positions['solar_instrument_value']:,.0f}")
-        logging.info(f"   Hydro index exposure: ${self.financial_positions['hydro_instrument_value']:,.0f}")
-        logging.info(f"   Total Financial Exposure: ${total_financial:,.0f}")
+        logging.info(f"   Wind index exposure: {self.financial_positions['wind_instrument_value']:,.0f} DKK")
+        logging.info(f"   Solar index exposure: {self.financial_positions['solar_instrument_value']:,.0f} DKK")
+        logging.info(f"   Hydro index exposure: {self.financial_positions['hydro_instrument_value']:,.0f} DKK")
+        logging.info(f"   Total Financial Exposure: {total_financial:,.0f} DKK")
         logging.info("")
 
         # Fund summary
         fund_nav = self._calculate_fund_nav()
         logging.info("3. FUND SUMMARY:")
-        logging.info(f"   Cash position: ${self.budget:,.0f}")
-        logging.info(f"   Physical assets (book): ${physical_value:,.0f}")
-        logging.info(f"   Financial positions (MTM): ${total_financial:,.0f}")
-        logging.info(f"   Total Fund NAV: ${fund_nav:,.0f}")
-        logging.info(f"   Initial capital: ${self.init_budget:,.0f}")
+        logging.info(f"   Cash position: {self.budget:,.0f} DKK (${self.budget * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
+        logging.info(f"   Physical assets (book): {physical_value:,.0f} DKK (${physical_value * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
+        logging.info(f"   Financial positions (MTM): {total_financial:,.0f} DKK")
+        logging.info(f"   Total Fund NAV: {fund_nav:,.0f} DKK (${fund_nav * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
+        logging.info(f"   Initial capital: {self.init_budget:,.0f} DKK (${self.init_budget * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
         logging.info(f"   Total return: {((fund_nav - self.init_budget) / self.init_budget * 100):+.2f}%")
         logging.info("=" * 60)
 
@@ -838,42 +1005,63 @@ class RenewableMultiAgentEnv(ParallelEnv):
     def _calculate_fund_nav(self) -> float:
         """
         FIXED: Calculate true fund NAV with proper separation:
-        NAV = Cash + Physical Asset Book Value + Financial Instrument MTM
+        NAV = Trading Cash + Physical Asset Book Value + Accumulated Operational Revenue + Financial Instrument MTM
         """
         try:
-            # 1) Cash position
-            cash_value = max(0.0, self.budget)
-            
-            # 2) Physical assets at book value (cost basis)
+            # 1) Trading cash position (separate from operational revenue)
+            trading_cash_value = max(0.0, self.budget)
+
+            # 2) Physical assets with realistic depreciation
+            # Infrastructure assets depreciate over time (typical 20-30 year life)
+            years_elapsed = self.t / (365.25 * 24 * 6)  # Convert timesteps to years (10-min intervals)
+
+            # Apply 2% annual straight-line depreciation (realistic for renewable infrastructure)
+            annual_depreciation_rate = 0.02  # 2% per year
+            total_depreciation = min(years_elapsed * annual_depreciation_rate, 0.75)  # Max 75% over asset life
+
+            # Apply uniform 2% annual depreciation to all physical assets
+            wind_depreciation = total_depreciation
+            solar_depreciation = total_depreciation
+            hydro_depreciation = total_depreciation
+            battery_depreciation = total_depreciation
+
             physical_book_value = (
-                self.physical_assets['wind_capacity_mw'] * self.asset_capex['wind_mw'] +
-                self.physical_assets['solar_capacity_mw'] * self.asset_capex['solar_mw'] +
-                self.physical_assets['hydro_capacity_mw'] * self.asset_capex['hydro_mw'] +
-                self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh']
+                self.physical_assets['wind_capacity_mw'] * self.asset_capex['wind_mw'] * (1.0 - wind_depreciation) +
+                self.physical_assets['solar_capacity_mw'] * self.asset_capex['solar_mw'] * (1.0 - solar_depreciation) +
+                self.physical_assets['hydro_capacity_mw'] * self.asset_capex['hydro_mw'] * (1.0 - hydro_depreciation) +
+                self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh'] * (1.0 - battery_depreciation)
             )
-            
-            # 3) Financial instruments at mark-to-market
+
+            # 3) Accumulated operational revenue (separate from trading cash)
+            operational_revenue_value = getattr(self, 'accumulated_operational_revenue', 0.0)
+
+            # 3.5) Add back distributed cash (represents investor value)
+            distributed_value = getattr(self, 'total_distributions', 0.0)
+
+            # 4) Financial instruments at mark-to-market
             financial_mtm_value = (
                 self.financial_positions['wind_instrument_value'] +
                 self.financial_positions['solar_instrument_value'] +
                 self.financial_positions['hydro_instrument_value']
             )
-            
-            # 4) Total NAV
-            total_nav = cash_value + physical_book_value + financial_mtm_value
-            
-            # FIXED: Apply realistic bounds to prevent currency-induced explosions
-            min_nav = self.init_budget * 0.1   # Minimum 10% of initial (more realistic)
-            max_nav = self.init_budget * 3.0   # Maximum 300% of initial (more conservative)
 
-            # Additional safety check for financial instrument values
-            if abs(financial_mtm_value) > self.init_budget * 2.0:
+            # 5) Total NAV (including distributed value for total return calculation)
+            total_nav = trading_cash_value + physical_book_value + operational_revenue_value + financial_mtm_value + distributed_value
+            
+            # THESIS MODE: No artificial NAV bounds - let the system show natural behavior
+            # Keep financial instrument bounds for realism (based on allocated trading capital)
+            trading_limits = self.config.get_trading_capital_limits()
+            max_financial_exposure = trading_limits['max_financial_exposure_dkk']
+
+            if abs(financial_mtm_value) > max_financial_exposure:
+                # Clip financial instruments to allocated trading capital × leverage
                 financial_mtm_value = float(np.clip(financial_mtm_value,
-                                                  -self.init_budget * 0.5,
-                                                   self.init_budget * 0.5))
-                total_nav = cash_value + physical_book_value + financial_mtm_value
+                                                  -max_financial_exposure,
+                                                   max_financial_exposure))
+                total_nav = trading_cash_value + physical_book_value + operational_revenue_value + financial_mtm_value + distributed_value
 
-            self.equity = float(np.clip(total_nav, min_nav, max_nav))
+            # THESIS: Use unconstrained NAV to show natural fund behavior
+            self.equity = float(max(total_nav, 0.0))  # Only prevent negative NAV
             return self.equity
             
         except Exception as e:
@@ -899,6 +1087,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _track_forecast_accuracy(self, forecasts: Dict[str, float]):
         """Track forecast accuracy against realized values in consistent normalized units."""
+        # Skip forecast tracking if no forecast generator (disabled by default)
+        if not hasattr(self, "forecast_generator") or self.forecast_generator is None:
+            return
         if self.t == 0:
             return
         try:
@@ -991,6 +1182,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
         FIXED: Populate forecast arrays for DL overlay labeler access.
         Called from wrapper after computing forecasts.
         """
+        # Skip forecast array population if no forecast generator
+        if not hasattr(self, "forecast_generator") or self.forecast_generator is None:
+            return
         try:
             if 0 <= t < self.max_steps:
                 if 'price_forecast_immediate' in forecasts:
@@ -1019,13 +1213,27 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self._rng = np.random.default_rng()
                 self._last_seed = None
 
-        self.t = 0
+        # Check if this is a true episode reset (end of data) or just PPO buffer reset
+        is_true_episode_end = (self.t >= self.max_steps)
+
+        # Only reset time if true episode end
+        if is_true_episode_end:
+            self.t = 0
+            print(f"[RESET] TRUE EPISODE RESET: End of data reached, resetting to start")
+        else:
+            print(f"[PPO] PPO BUFFER RESET: Preserving financial state at step {self.t}")
+
         self.step_in_episode = 0
         self.agents = self.possible_agents[:]
-        
-        # FIXED: Reset financial state but keep physical assets
-        self._reset_financial_state()
-        
+
+        # CRITICAL FIX: Only reset financial state on true episode end
+        if is_true_episode_end:
+            # Full reset at end of data
+            self._reset_financial_state_full()
+        else:
+            # Preserve gains for PPO buffer resets
+            self._reset_financial_state()
+
         for a in self.possible_agents:
             self._rew_buf[a] = 0.0
             self._done_buf[a] = False
@@ -1035,43 +1243,76 @@ class RenewableMultiAgentEnv(ParallelEnv):
         return self._obs_buf, {}
 
     def _reset_financial_state(self):
-        """FIXED: Reset financial state while preserving physical assets"""
-        # Keep physical assets (they are permanent)
+        """CRITICAL FIX: Only reset episode tracking, PRESERVE financial gains"""
+        # PRESERVE physical assets (they are permanent)
+        # PRESERVE financial positions (gains should accumulate)
+        # PRESERVE operational revenue (gains should accumulate)
+        # PRESERVE cumulative performance (gains should accumulate)
+
+        # Only reset operational state for new episode
+        self.operational_state = {
+            'battery_energy': 0.0,
+            'battery_discharge_power': 0.0,
+        }
+
+        # CRITICAL: DO NOT reset budget - let gains/losses accumulate
+        # CRITICAL: DO NOT reset financial_positions - let trading gains accumulate
+        # CRITICAL: DO NOT reset accumulated_operational_revenue - let operational gains accumulate
+        # CRITICAL: DO NOT reset cumulative_mtm_pnl - let trading performance accumulate
+        # CRITICAL: DO NOT reset cumulative_returns - let return performance accumulate
+        # CRITICAL: DO NOT reset distributed_profits - let profit distributions accumulate
+        # CRITICAL: DO NOT reset investment_capital - let capital changes accumulate
+
+        # Only reset per-step tracking (not cumulative)
+        self.last_revenue = 0.0
+        self.last_generation_revenue = 0.0
+        self.last_mtm_pnl = 0.0
+        self.last_reward_breakdown = {}
+        self.last_reward_weights = {}
+
+        # Recalculate NAV with current state (don't reset to initial)
+        self._calculate_fund_nav()
+
+    def _reset_financial_state_full(self):
+        """FULL RESET: Only used at true episode end (end of data)"""
+        print(f"💰 FULL FINANCIAL RESET: Resetting all gains to initial state")
+
+        # Reset physical assets (they are permanent)
         # Reset financial instruments to zero
         self.financial_positions = {
             'wind_instrument_value': 0.0,
             'solar_instrument_value': 0.0,
             'hydro_instrument_value': 0.0,
         }
-        
+
         # Reset operational state
         self.operational_state = {
             'battery_energy': 0.0,
             'battery_discharge_power': 0.0,
         }
-        
-        # Reset cash to remaining amount after CAPEX
-        if self.assets_deployed:
-            total_capex = (
-                self.physical_assets['wind_capacity_mw'] * self.asset_capex['wind_mw'] +
-                self.physical_assets['solar_capacity_mw'] * self.asset_capex['solar_mw'] +
-                self.physical_assets['hydro_capacity_mw'] * self.asset_capex['hydro_mw'] +
-                self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh']
-            )
-            self.budget = max(0.0, self.init_budget - total_capex)
+
+        # Reset cash to trading allocation (not remaining after CAPEX)
+        if hasattr(self, 'trading_allocation_budget'):
+            self.budget = float(self.trading_allocation_budget)  # Reset to full trading allocation
         else:
-            self.budget = self.init_budget
-        
+            # Fallback calculation if trading allocation not set
+            self.budget = float(self.total_fund_value * self.config.financial_allocation)
+
         # Reset performance tracking
         self.investment_capital = float(self.init_budget)
         self.distributed_profits = 0.0
         self.cumulative_returns = 0.0
+        self._previous_nav = 0.0  # Reset NAV tracking for return calculation
         self.last_revenue = 0.0
         self.last_generation_revenue = 0.0
         self.last_mtm_pnl = 0.0
+        self.cumulative_mtm_pnl = 0.0  # Reset cumulative trading performance
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
-        
+
+        # Reset accumulated operational revenue
+        self.accumulated_operational_revenue = 0.0
+
         # Calculate initial NAV
         self._calculate_fund_nav()
 
@@ -1201,94 +1442,433 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.investment_freq = int(np.clip(freq, self.META_FREQ_MIN, self.META_FREQ_MAX))
 
     # ------------------------------------------------------------------
+    # REMOVED: Old asset-specific hedging logic (conflicted with single-price approach)
+    # Now using portfolio-level _calculate_portfolio_hedge_intensity() instead
+    # ------------------------------------------------------------------
+
+
+
+    def _get_generation_exposure_weights(self) -> np.ndarray:
+        """
+        Calculate exposure weights based on expected generation (MWh)
+        Used for portfolio-level hedge intensity calculation
+        """
+        try:
+            # Get expected generation for each asset
+            wind_capacity = self.physical_assets.get('wind_capacity_mw', 0)
+            solar_capacity = self.physical_assets.get('solar_capacity_mw', 0)
+            hydro_capacity = self.physical_assets.get('hydro_capacity_mw', 0)
+
+            # Estimate annual generation (capacity factor assumptions)
+            wind_cf = 0.35  # 35% capacity factor for wind
+            solar_cf = 0.20  # 20% capacity factor for solar
+            hydro_cf = 0.45  # 45% capacity factor for hydro
+
+            wind_generation = wind_capacity * wind_cf * 8760  # MWh/year
+            solar_generation = solar_capacity * solar_cf * 8760
+            hydro_generation = hydro_capacity * hydro_cf * 8760
+
+            total_generation = wind_generation + solar_generation + hydro_generation
+
+            if total_generation > 0:
+                return np.array([
+                    wind_generation / total_generation,
+                    solar_generation / total_generation,
+                    hydro_generation / total_generation
+                ])
+            else:
+                # Fallback to equal weights
+                return np.array([1/3, 1/3, 1/3])
+
+        except Exception as e:
+            # Fallback to equal weights
+            return np.array([1/3, 1/3, 1/3])
+
+    def _get_risk_budget_allocation(self) -> np.ndarray:
+        """
+        Get risk budget allocation for hedge distribution across sleeves
+        Based on config risk budgets, not separate price bets
+        """
+        try:
+            if hasattr(self.config, 'risk_budget_allocation') and isinstance(self.config.risk_budget_allocation, dict):
+                # Use config-defined risk budgets (new dict format)
+                allocation = self.config.risk_budget_allocation
+                return np.array([
+                    allocation.get('wind', 0.40),
+                    allocation.get('solar', 0.35),
+                    allocation.get('hydro', 0.25)
+                ])
+            else:
+                # Default risk budgets based on capacity and volatility
+                return np.array([0.40, 0.35, 0.25])  # 40% wind, 35% solar, 25% hydro
+
+        except Exception as e:
+            # Fallback to equal allocation
+            return np.array([1/3, 1/3, 1/3])
+
+    def _calculate_portfolio_hedge_intensity(self) -> float:
+        """
+        Calculate portfolio-level hedge intensity based on market conditions
+        Single-price logic: one intensity for the entire portfolio
+        """
+        try:
+            # Get current market data
+            current_data = self.data.iloc[min(self.t, len(self.data) - 1)]
+            current_price = float(current_data.get('price', 250.0))
+
+            # Calculate price volatility (last 20 steps)
+            lookback = min(20, self.t)
+            if lookback < 5:
+                return 1.0  # Default intensity
+
+            start_idx = max(0, self.t - lookback)
+            end_idx = min(self.t + 1, len(self.data))
+            recent_prices = self.data.iloc[start_idx:end_idx]['price'].values
+
+            price_volatility = float(np.std(recent_prices)) / max(float(np.mean(recent_prices)), 1.0)
+
+            # Total portfolio generation vs expected
+            total_current_gen = (float(current_data.get('wind', 0)) +
+                               float(current_data.get('solar', 0)) +
+                               float(current_data.get('hydro', 0))) / 1000.0
+
+            wind_cap = self.physical_assets.get('wind_capacity_mw', 225)
+            solar_cap = self.physical_assets.get('solar_capacity_mw', 100)
+            hydro_cap = self.physical_assets.get('hydro_capacity_mw', 40)
+            expected_total_gen = (wind_cap * 0.35 + solar_cap * 0.20 + hydro_cap * 0.45) / 1000.0
+
+            generation_shortfall = max(0, (expected_total_gen - total_current_gen) / expected_total_gen)
+
+            # Base intensity: higher when generation is low or prices are volatile
+            base_intensity = 1.0 + generation_shortfall * 0.5  # Up to 1.5x for major shortfall
+            volatility_multiplier = 1.0 + min(price_volatility, 0.5)  # Up to 1.5x for high volatility
+
+            portfolio_intensity = base_intensity * volatility_multiplier
+
+            # Cap intensity to reasonable bounds
+            return float(np.clip(portfolio_intensity, 0.5, 2.0))
+
+        except Exception as e:
+            return 1.0  # Default intensity
+
+    # ------------------------------------------------------------------
     # FIXED: Financial Instrument Trading (Separate from Physical Assets)
     # ------------------------------------------------------------------
-    
+
     def _execute_investor_trades(self, inv_action: np.ndarray) -> float:
         """
-        IMPROVED: Execute trades with forecast confidence and volatility controls
+        SINGLE-PRICE HEDGING: Portfolio protection against electricity price risk
+
+        Key Insight: All assets (wind/solar/hydro) sell at the SAME wholesale price
+        Therefore: Need ONE net hedge, not three separate price bets
+
+        Strategy:
+        1. Calculate total portfolio exposure to price risk
+        2. Determine single hedge direction and intensity
+        3. Allocate hedge across sleeves using risk budgets
+        4. Prevent internal cancellation between sleeves
+
         Returns total traded notional for transaction costs
         """
-        if self.t % self.investment_freq != 0:
+        # FIXED: Enhanced trading frequency logic with debug output
+        # CRITICAL FIX: Prevent trading on step 0 to avoid overwriting existing positions
+        trading_allowed = (self.t > 0 and self.t % self.investment_freq == 0)
+
+        # Debug output for trading decisions (only in ultra fast mode to avoid spam)
+        if hasattr(self, 'ultra_fast_mode') and self.ultra_fast_mode and self.t % 100 == 0:
+            steps_to_next_trade = self.investment_freq - (self.t % self.investment_freq)
+            print(f"[TRADING DEBUG] Step {self.t}: freq={self.investment_freq}, allowed={trading_allowed}, next_in={steps_to_next_trade}")
+
+        if not trading_allowed:
             return 0.0  # No trading outside frequency
 
         # Check if trading is disabled due to drawdown
         if not self.reward_calculator.trading_enabled:
+            if hasattr(self, 'ultra_fast_mode') and self.ultra_fast_mode:
+                print(f"[TRADING DEBUG] Step {self.t}: Trading disabled due to drawdown ({self.reward_calculator.current_drawdown:.1%})")
             return 0.0  # No trading during high drawdown periods
 
         try:
-            # Check if we're in ultra fast mode
-            ultra_fast_mode = getattr(self, 'ultra_fast_mode', False)
-
-            if ultra_fast_mode:
-                # Ultra fast mode: enable trading regardless of forecast confidence
-                forecast_confidence = 1.0  # Override confidence for ultra fast mode
-            else:
-                # Normal mode: get actual forecast confidence
+            # Check if forecasting is enabled
+            if hasattr(self, "forecast_generator") and self.forecast_generator is not None:
+                # Forecasting enabled: use confidence-based trading logic
                 forecast_confidence = self._get_forecast_confidence()
 
-                # Only trade if forecast confidence exceeds threshold
-                if forecast_confidence < self.reward_calculator.forecast_confidence_threshold:
-                    return 0.0  # Skip trading on low confidence forecasts
+                # ENHANCED: Confidence-based nonlinearity with curved ramp
+                if forecast_confidence < 0.40:
+                    # Very low confidence: no trading (capital preservation)
+                    forecast_confidence = 0.0
+                elif forecast_confidence < self.reward_calculator.forecast_confidence_threshold:
+                    # Medium confidence: quadratic ramp for smoother scaling
+                    # Map [0.4, threshold] to [0, 1] with quadratic curve
+                    normalized = (forecast_confidence - 0.40) / (self.reward_calculator.forecast_confidence_threshold - 0.40)
+                    forecast_confidence = normalized ** 2  # Quadratic ramp: slower start, faster finish
+                else:
+                    # High confidence: full trading
+                    forecast_confidence = 1.0
+            else:
+                # No forecasting: use full trading confidence (baseline behavior)
+                forecast_confidence = 1.0
 
-            # Convert action to target weights
-            action_array = np.array(inv_action, dtype=np.float32).reshape(-1)[:3]
-            weights = (action_array + 1.0) / 2.0  # [-1,1] -> [0,1]
-            weights = weights / max(np.sum(weights), 1e-6)  # Normalize
+            # STEP 1: Calculate portfolio-level hedge intensity and direction
+            # SINGLE-PRICE LOGIC: Use portfolio-level conditions only (no asset-specific signals)
 
-            # Volatility-based position sizing
+            # DL HEDGE OVERLAY: Use trained model predictions if available
+            dl_hedge_params = None
+            if self.dl_adapter is not None:
+                try:
+                    # Train the model periodically
+                    self.dl_adapter.maybe_learn(self.t)
+
+                    # Create consistent feature set for DL overlay (independent of forecasting add-on)
+                    # Core features that are always available
+                    state_feats = np.array([
+                        self.budget / self.init_budget,
+                        self.equity / self.init_budget,
+                        self.market_volatility,
+                        self.market_stress
+                    ])
+
+                    position_feats = np.array([
+                        self.financial_positions['wind_instrument_value'] / self.init_budget,
+                        self.financial_positions['solar_instrument_value'] / self.init_budget,
+                        self.financial_positions['hydro_instrument_value'] / self.init_budget
+                    ])
+
+                    # Optional forecast features (add-on)
+                    if hasattr(self, 'forecast_generator') and self.forecast_generator is not None:
+                        try:
+                            forecasts = self.forecast_generator.predict_all_horizons(timestep=self.t)
+                            if isinstance(forecasts, dict):
+                                gen_forecast = np.array([
+                                    forecasts.get('wind_immediate', 0.0),
+                                    forecasts.get('solar_immediate', 0.0),
+                                    forecasts.get('hydro_immediate', 0.0)
+                                ])
+                            else:
+                                gen_forecast = np.array([0.0, 0.0, 0.0])
+                        except Exception:
+                            gen_forecast = np.array([0.0, 0.0, 0.0])
+                    else:
+                        # No forecasting add-on - use zeros
+                        gen_forecast = np.array([0.0, 0.0, 0.0])
+
+                    # Portfolio metrics
+                    portfolio_metrics = np.array([
+                        self.capital_allocation_fraction,
+                        self.investment_freq / 100.0,
+                        forecast_confidence
+                    ])
+
+                    # Always create 13-feature vector (4+3+3+3) regardless of add-ons
+                    features = np.concatenate([state_feats, position_feats, gen_forecast, portfolio_metrics], axis=0)[None, :]
+
+                    # Get DL predictions
+                    pred = self.dl_adapter.model(features, training=False)
+                    dl_hedge_params = {
+                        'hedge_intensity': float(pred['hedge_intensity'].numpy().squeeze()),
+                        'hedge_direction': float(pred['hedge_direction'].numpy().squeeze()),
+                        'risk_allocation': pred['risk_allocation'].numpy().squeeze()
+                    }
+                except Exception as e:
+                    logging.warning(f"DL hedge overlay failed: {e}")
+                    dl_hedge_params = None
+
+            # Calculate portfolio-level hedge intensity based on market conditions (fallback/baseline)
+            generation_weights = self._get_generation_exposure_weights()
+            portfolio_hedge_intensity = self._calculate_portfolio_hedge_intensity()
+
+            # Calculate net hedge direction based on PORTFOLIO-LEVEL conditions
+            # Single-price logic: direction should be based on total portfolio exposure, not individual assets
+            current_data = self.data.iloc[min(self.t, len(self.data) - 1)]
+
+            # Total current generation (normalized)
+            total_current_gen = (float(current_data.get('wind', 0)) +
+                               float(current_data.get('solar', 0)) +
+                               float(current_data.get('hydro', 0))) / 1000.0
+
+            # Expected total generation (based on capacity factors)
+            wind_cap = self.physical_assets.get('wind_capacity_mw', 225)
+            solar_cap = self.physical_assets.get('solar_capacity_mw', 100)
+            hydro_cap = self.physical_assets.get('hydro_capacity_mw', 40)
+            expected_total_gen = (wind_cap * 0.35 + solar_cap * 0.20 + hydro_cap * 0.45) / 1000.0
+
+            # Portfolio-level hedge direction (use DL prediction if available, otherwise heuristic)
+            if dl_hedge_params is not None:
+                # Use DL model predictions with blending
+                dl_intensity = np.clip(dl_hedge_params['hedge_intensity'], 0.5, 2.0)
+                dl_direction = np.clip(dl_hedge_params['hedge_direction'], 0.0, 1.0)
+
+                # Convert direction from [0,1] to [-1,1] range
+                net_hedge_direction = (dl_direction - 0.5) * 2.0  # [0,1] -> [-1,1]
+
+                # Blend DL intensity with heuristic (80% DL, 20% heuristic for stability)
+                portfolio_hedge_intensity = 0.8 * dl_intensity + 0.2 * portfolio_hedge_intensity
+            else:
+                # Fallback to heuristic hedge direction
+                if total_current_gen < expected_total_gen * 0.8:
+                    net_hedge_direction = 1.0   # LONG: hedge against high prices during low generation
+                elif total_current_gen > expected_total_gen * 1.2:
+                    net_hedge_direction = -1.0  # SHORT: hedge against low prices during high generation
+                else:
+                    net_hedge_direction = 0.5   # Mild LONG bias: default portfolio protection
+
+            # STEP 2: Calculate total hedge size based on allocated trading capital
+            # Get proper trading capital limits from config
+            trading_limits = self.config.get_trading_capital_limits()
+            allocated_trading_capital = trading_limits['trading_capital_dkk']
+            max_financial_exposure = trading_limits['max_financial_exposure_dkk']
+
+            # Available capital for financial instruments (from allocated trading capital)
+            available_capital = min(self.budget * self.capital_allocation_fraction, allocated_trading_capital)
+
+            # Combined position sizing: volatility + drawdown + portfolio intensity
             volatility_factor = self._get_volatility_factor()
-            position_size_multiplier = self._calculate_position_size_multiplier(volatility_factor)
+            volatility_multiplier = self._calculate_position_size_multiplier(volatility_factor)
+            drawdown_multiplier = getattr(self.reward_calculator, 'position_size_multiplier', 1.0)
+            position_size_multiplier = volatility_multiplier * drawdown_multiplier
 
-            # Available capital for financial instruments (separate from physical assets)
-            available_capital = self.budget * self.capital_allocation_fraction
-            base_target_gross = available_capital * 0.8  # Use 80% max
+            # Base hedge size (conservative for risk management)
+            # ENHANCED: Cap by allocated trading capital with leverage, not total NAV
+            capital_based_limit = available_capital * 0.8  # 80% of allocated trading capital
+            leverage_based_limit = max_financial_exposure * 0.8  # 80% of max allowed exposure
+            base_target_gross = min(capital_based_limit, leverage_based_limit)  # Take the more conservative limit
 
-            # Adjust target gross based on volatility and confidence
-            target_gross = base_target_gross * position_size_multiplier * forecast_confidence
+            # ENHANCED: Apply hedge effectiveness multiplier
+            effectiveness_multiplier = getattr(self, 'hedge_effectiveness_tracker', {}).get('effectiveness_multiplier', 1.0)
+
+            # Scale by portfolio hedge intensity, forecast confidence, and effectiveness
+            target_gross = (base_target_gross *
+                          portfolio_hedge_intensity *
+                          position_size_multiplier *
+                          forecast_confidence *
+                          effectiveness_multiplier)
+
+            # STEP 3: Allocate hedge across sleeves using risk budgets
+            # Use DL risk allocation if available, otherwise use risk budget allocation
+            if dl_hedge_params is not None and 'risk_allocation' in dl_hedge_params:
+                dl_allocation = dl_hedge_params['risk_allocation']
+                # Normalize to ensure sum = 1
+                dl_allocation = dl_allocation / (dl_allocation.sum() + 1e-9)
+                # Blend DL allocation with heuristic (70% DL, 30% heuristic for stability)
+                heuristic_allocation = self._get_risk_budget_allocation()
+                risk_budget_allocation = 0.7 * dl_allocation + 0.3 * np.array(heuristic_allocation)
+                # Ensure it's a proper allocation
+                risk_budget_allocation = risk_budget_allocation / risk_budget_allocation.sum()
+            else:
+                # Use risk budget allocation (not separate price bets)
+                risk_budget_allocation = self._get_risk_budget_allocation()
 
             # Current financial positions
             current_wind = self.financial_positions['wind_instrument_value']
             current_solar = self.financial_positions['solar_instrument_value']
             current_hydro = self.financial_positions['hydro_instrument_value']
 
-            # Target positions
-            target_wind = target_gross * weights[0]
-            target_solar = target_gross * weights[1]
-            target_hydro = target_gross * weights[2]
+            # Target positions: ALL sleeves have SAME direction (single hedge)
+            # Positive = Long position (benefits from price increases)
+            # Negative = Short position (benefits from price decreases)
+            target_wind = target_gross * risk_budget_allocation[0] * net_hedge_direction
+            target_solar = target_gross * risk_budget_allocation[1] * net_hedge_direction
+            target_hydro = target_gross * risk_budget_allocation[2] * net_hedge_direction
 
-            # Calculate trades needed
+            # STEP 4: Apply position limits before trading (based on trading capital, not total NAV)
+            max_position_size = allocated_trading_capital * getattr(self.config, 'max_position_size', 0.05)
+            target_wind = np.clip(target_wind, -max_position_size, max_position_size)
+            target_solar = np.clip(target_solar, -max_position_size, max_position_size)
+            target_hydro = np.clip(target_hydro, -max_position_size, max_position_size)
+
+            # STEP 5: Calculate trades needed
             trade_wind = target_wind - current_wind
             trade_solar = target_solar - current_solar
             trade_hydro = target_hydro - current_hydro
 
-            # Check budget constraints for net purchases
-            total_purchases = max(0, trade_wind) + max(0, trade_solar) + max(0, trade_hydro)
-            total_sales = max(0, -trade_wind) + max(0, -trade_solar) + max(0, -trade_hydro)
-            net_cash_needed = total_purchases - total_sales
+            # STEP 6: Apply gross and net position limits based on trading capital allocation
+            # Gross limit: total absolute exposure (consistent with base_target_gross scaling)
+            gross_exposure = abs(target_wind) + abs(target_solar) + abs(target_hydro)
+            # ENHANCED: Use trading capital allocation limits, not total NAV
+            gross_limit = min(capital_based_limit, leverage_based_limit)  # Consistent with base calculation
 
-            if net_cash_needed > self.budget:
-                # Scale down trades
-                scale = self.budget / max(net_cash_needed, 1e-6)
-                trade_wind *= scale
-                trade_solar *= scale
-                trade_hydro *= scale
+            if gross_exposure > gross_limit:
+                scale_factor = gross_limit / max(gross_exposure, 1e-6)
+                target_wind *= scale_factor
+                target_solar *= scale_factor
+                target_hydro *= scale_factor
+                # Recalculate trades after scaling
+                trade_wind = target_wind - current_wind
+                trade_solar = target_solar - current_solar
+                trade_hydro = target_hydro - current_hydro
 
-            # Execute trades (update financial positions)
+            # ENHANCED: Apply no-trade band to reduce churn
+            no_trade_threshold = 0.02  # 2% of sleeve target
+            if abs(target_wind) > 0 and abs(trade_wind) < abs(target_wind) * no_trade_threshold:
+                trade_wind = 0.0
+            if abs(target_solar) > 0 and abs(trade_solar) < abs(target_solar) * no_trade_threshold:
+                trade_solar = 0.0
+            if abs(target_hydro) > 0 and abs(trade_hydro) < abs(target_hydro) * no_trade_threshold:
+                trade_hydro = 0.0
+
+            # FIXED: Remove cash instrument logic - these are derivatives (futures/swaps)
+            # No upfront cash needed for derivatives, only margin/collateral requirements
+            # Position sizing is controlled by risk limits, not cash constraints
+
+            # STEP 7: Calculate transaction costs (OPTIMIZED for cash efficiency) - FIXED: Use DKK from config
+            total_traded_notional = abs(trade_wind) + abs(trade_solar) + abs(trade_hydro)
+            transaction_cost_bps = self.config.transaction_cost_bps  # From config: institutional rates
+            fixed_cost = self.config.transaction_fixed_cost  # From config
+            total_transaction_costs = (total_traded_notional * transaction_cost_bps / 10000.0 +
+                                     (fixed_cost if total_traded_notional > 0 else 0))
+
+            # STEP 8: Execute trades (update financial positions)
             self.financial_positions['wind_instrument_value'] += trade_wind
             self.financial_positions['solar_instrument_value'] += trade_solar
             self.financial_positions['hydro_instrument_value'] += trade_hydro
 
-            # RESTORED: Unlimited financial exposure like PrototypeTestTuned for maximum profitability
-            # Removed 50% cap to allow aggressive trading strategies
-
-            # Update cash (cash decreases for purchases, increases for sales)
-            cash_flow = -(max(0, trade_wind) + max(0, trade_solar) + max(0, trade_hydro)) + \
-                        (max(0, -trade_wind) + max(0, -trade_solar) + max(0, -trade_hydro))
+            # FIXED: Trading should only affect cash through transaction costs (positions are marked-to-market)
+            # Financial instruments are derivatives - no upfront cash payment, only margin/collateral
+            cash_flow = -total_transaction_costs  # Only transaction costs affect cash
             self.budget += cash_flow
             self.budget = max(0.0, self.budget)
 
-            return abs(trade_wind) + abs(trade_solar) + abs(trade_hydro)
+            # Track transaction costs for PnL attribution
+            if not hasattr(self, 'cumulative_transaction_costs'):
+                self.cumulative_transaction_costs = 0.0
+            self.cumulative_transaction_costs += total_transaction_costs
+
+            # ENHANCED: Track cash efficiency metrics
+            if not hasattr(self, 'cash_efficiency_tracker'):
+                self.cash_efficiency_tracker = {
+                    'total_cash_used': 0.0,
+                    'total_trading_gains': 0.0,
+                    'efficiency_ratio': 0.0
+                }
+
+            # Update cash efficiency tracking
+            cash_used_this_trade = abs(cash_flow) if cash_flow < 0 else 0.0
+            self.cash_efficiency_tracker['total_cash_used'] += cash_used_this_trade
+
+            # ENHANCED: Track hedge effectiveness with rolling correlation
+            if not hasattr(self, 'hedge_hit_rate_tracker'):
+                self.hedge_hit_rate_tracker = {'hits': 0, 'total': 0}
+
+            if not hasattr(self, 'hedge_effectiveness_tracker'):
+                from collections import deque
+                self.hedge_effectiveness_tracker = {
+                    'ops_returns': deque(maxlen=100),  # Last 100 steps
+                    'trading_returns': deque(maxlen=100),
+                    'correlation': 0.0,
+                    'effectiveness_multiplier': 1.0
+                }
+
+            # Calculate hedge effectiveness for this step
+            ops_return = getattr(self, 'last_generation_revenue', 0.0)
+            trading_return = getattr(self, 'last_mtm_pnl', 0.0)
+
+            # Count hedge hits: ops_return < 0 & trading_return > 0 (or symmetric case)
+            if (ops_return < 0 and trading_return > 0) or (ops_return > 0 and trading_return < 0):
+                self.hedge_hit_rate_tracker['hits'] += 1
+            self.hedge_hit_rate_tracker['total'] += 1
+
+            return total_traded_notional
 
         except Exception as e:
             logging.error(f"Trading execution error: {e}")
@@ -1298,8 +1878,18 @@ class RenewableMultiAgentEnv(ParallelEnv):
         """Get forecast confidence score [0,1]"""
         try:
             if not hasattr(self, "forecast_generator") or self.forecast_generator is None:
-                return 0.5  # Default confidence when no forecaster
+                return 1.0  # FIXED: Full confidence for baseline hedging when no forecasting
 
+            # Use the generator's confidence calculation for the primary trading agent
+            if hasattr(self.forecast_generator, "calculate_forecast_confidence"):
+                # Get confidence for the main trading agent (assuming first agent is primary)
+                agent_names = getattr(self.forecast_generator, 'agent_targets', {}).keys()
+                if agent_names:
+                    primary_agent = next(iter(agent_names))  # Get first agent
+                    confidence = self.forecast_generator.calculate_forecast_confidence(primary_agent, self.t)
+                    return float(np.clip(confidence, 0.0, 1.0))
+
+            # Fallback: check for confidence in forecast output
             if hasattr(self.forecast_generator, "predict_all_horizons"):
                 forecasts = self.forecast_generator.predict_all_horizons(timestep=self.t)
                 if isinstance(forecasts, dict):
@@ -1307,21 +1897,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     for key in ['confidence', 'forecast_confidence', 'price_confidence']:
                         if key in forecasts and np.isfinite(forecasts[key]):
                             return float(np.clip(forecasts[key], 0.0, 1.0))
-
-                    # Calculate confidence based on forecast consistency
-                    price_forecasts = []
-                    for key in forecasts:
-                        if 'price' in key and np.isfinite(forecasts[key]):
-                            price_forecasts.append(forecasts[key])
-
-                    if len(price_forecasts) > 1:
-                        # Higher consistency = higher confidence
-                        std_dev = np.std(price_forecasts)
-                        mean_val = np.mean(np.abs(price_forecasts))
-                        if mean_val > 0:
-                            cv = std_dev / mean_val  # Coefficient of variation
-                            confidence = max(0.0, 1.0 - cv)  # Lower CV = higher confidence
-                            return float(np.clip(confidence, 0.0, 1.0))
 
             return 0.5  # Default confidence
 
@@ -1363,27 +1938,22 @@ class RenewableMultiAgentEnv(ParallelEnv):
         Uses consistent z-score normalization for both current price and forecast.
         """
         try:
-            # Current price (already z-score normalized)
-            p_now = float(np.clip(self._price[i], -1000.0, 1e9))
+            # Current price (use raw DKK price for consistent units)
+            p_now = float(np.clip(self._price_raw[i], self.config.minimum_price_filter, self.config.maximum_price_cap))
 
             # Get raw forecast and normalize it to match current price scale
             p_fut_raw = self._get_aligned_price_forecast(i, default=None)
             if p_fut_raw is None or not np.isfinite(p_fut_raw):
                 return ("idle", 0.0)
 
-            # FIXED: Normalize forecast using same z-score parameters as current price
-            mean = float(self._price_mean[i]) if hasattr(self, '_price_mean') and i < len(self._price_mean) else 250.0
-            std = float(self._price_std[i]) if hasattr(self, '_price_std') and i < len(self._price_std) else 50.0
-            std = max(std, 1e-6)  # Avoid division by zero
-            p_fut = (p_fut_raw - mean) / std
-            p_fut = float(np.clip(p_fut, -3.0, 3.0))  # Same bounds as environment
+            # Use raw DKK prices for both current and forecast (no normalization needed)
+            p_fut = float(np.clip(p_fut_raw, self.config.minimum_price_filter, self.config.maximum_price_cap))
 
-            # Now both prices are in z-score units, spread calculation is meaningful
-            spread = (p_fut - p_now)
+            spread = p_fut - p_now
 
-            # Adjust thresholds for z-score scale (typical range ±3)
-            needed = max(0.1, 0.05 * abs(p_now))  # Minimum threshold in z-score units
-            rt_loss = (1.0/(max(self.batt_eta_charge*self.batt_eta_discharge, 1e-6)) - 1.0) * 0.1  # Fixed loss in z-score units
+            # Adjust thresholds for DKK scale (typical range 50-500 DKK/MWh)
+            needed = max(5.0, 0.02 * abs(p_now))  # Minimum threshold in DKK/MWh
+            rt_loss = (1.0/(max(self.batt_eta_charge*self.batt_eta_discharge, 1e-6)) - 1.0) * 10.0  # Round-trip loss in DKK/MWh
             hurdle = needed + 0.3 * rt_loss
 
             if spread > hurdle:
@@ -1424,7 +1994,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             soc_min_e = self.batt_soc_min * self.physical_assets['battery_capacity_mwh']
             soc_max_e = self.batt_soc_max * self.physical_assets['battery_capacity_mwh']
 
-            price = float(np.clip(self._price[i], -1000.0, 1e9))
+            price = float(np.clip(self._price_raw[i], self.config.minimum_price_filter, self.config.maximum_price_cap))
             cash_delta = 0.0
             throughput_mwh = 0.0
 
@@ -1494,27 +2064,54 @@ class RenewableMultiAgentEnv(ParallelEnv):
             )
 
             # Cap price returns to realistic energy market volatility (from config)
-            cap_min = getattr(self.config, 'mtm_price_return_cap_min', -0.02)
-            cap_max = getattr(self.config, 'mtm_price_return_cap_max', 0.02)
+            cap_min = getattr(self.config, 'mtm_price_return_cap_min', -0.015)  # FIXED: Use config values
+            cap_max = getattr(self.config, 'mtm_price_return_cap_max', 0.015)   # FIXED: Use config values
             capped_price_return = float(np.clip(price_return, cap_min, cap_max))
             mtm_pnl = total_financial_exposure * capped_price_return
 
-            # Apply MTM to financial positions with capped returns
-            self.financial_positions['wind_instrument_value'] *= (1.0 + capped_price_return)
-            self.financial_positions['solar_instrument_value'] *= (1.0 + capped_price_return)
-            self.financial_positions['hydro_instrument_value'] *= (1.0 + capped_price_return)
+            # FIXED: Apply MTM to position values for consistent market-value approach
+            # Update position values to reflect current market value
+            if abs(mtm_pnl) > getattr(self.config, 'mtm_update_threshold', 1e-9):
+                # Apply MTM proportionally to each position based on exposure
+                if abs(total_financial_exposure) > 1e-9:
+                    wind_mtm = self.financial_positions['wind_instrument_value'] * capped_price_return
+                    solar_mtm = self.financial_positions['solar_instrument_value'] * capped_price_return
+                    hydro_mtm = self.financial_positions['hydro_instrument_value'] * capped_price_return
+
+                    # Update position values with MTM (market-value approach)
+                    self.financial_positions['wind_instrument_value'] += wind_mtm
+                    self.financial_positions['solar_instrument_value'] += solar_mtm
+                    self.financial_positions['hydro_instrument_value'] += hydro_mtm
             
-            # 3) Transaction costs (CASH FLOW)
-            txn_costs = 0.0005 * trade_amount
+            # 3) Transaction costs (CASH FLOW) - FIXED: Already deducted in _execute_investor_trades
+            txn_costs = 0.0  # Costs already handled in trading execution
             
-            # 4) Battery operational costs (CASH FLOW)
-            battery_opex = 0.0002 * self.physical_assets['battery_capacity_mwh']
+            # 4) Battery operational costs (CASH FLOW) - from config
+            battery_opex = self.config.battery_opex_rate * self.physical_assets['battery_capacity_mwh']
             
             # 5) Net cash flow this step (REMOVED admin costs for better agent learning)
             net_cash_flow = generation_revenue + battery_cash_delta - txn_costs - battery_opex
 
-            # 7) Update cash position
-            self.budget = max(0.0, self.budget + net_cash_flow)
+            # FIXED: Separate operational revenue from trading cash
+            # Only battery arbitrage affects trading cash (since it uses trading capital)
+            # Generation revenue increases fund value but not trading cash allocation
+            operational_revenue = generation_revenue - battery_opex  # Pure operational revenue
+            trading_cash_flow = battery_cash_delta - txn_costs      # Only trading-related cash flows
+
+            # 7) Update cash position (only trading-related cash flows)
+            self.budget = max(0.0, self.budget + trading_cash_flow)
+
+            # 7.5) INFRASTRUCTURE FUND: Distribute excess cash to maintain realistic cash levels
+            self._distribute_excess_cash()
+
+            # 8) Track operational revenue separately (for NAV calculation)
+            if not hasattr(self, 'accumulated_operational_revenue'):
+                self.accumulated_operational_revenue = 0.0
+            self.accumulated_operational_revenue += operational_revenue
+
+            # 9) ENHANCED: Check for emergency reallocation from operational gains to trading capital
+            if self.config.allow_operational_reallocation:
+                self._check_emergency_reallocation(operational_revenue)
             
             # 8) Calculate fund NAV
             fund_nav = self._calculate_fund_nav()
@@ -1532,6 +2129,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # 11) Update cumulative tracking
             self.cumulative_generation_revenue += generation_revenue
             self.cumulative_battery_revenue += battery_cash_delta
+            self.cumulative_mtm_pnl += mtm_pnl  # ENHANCED: Track cumulative trading performance
+
+            # CRITICAL FIX: Update cumulative returns (total fund return)
+            current_nav = fund_nav
+            if hasattr(self, '_previous_nav') and self._previous_nav > 0:
+                nav_return = (current_nav - self._previous_nav) / self._previous_nav
+                self.cumulative_returns += nav_return
+            self._previous_nav = current_nav
             
             # 11) Calculate forecast signal if available
             pf_aligned = self._get_aligned_price_forecast(i, default=None)
@@ -1539,6 +2144,29 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 forecast_signal_score = float(np.sign(pf_aligned - current_price) * price_return)
             else:
                 forecast_signal_score = 0.0
+
+            # ENHANCED: Update hedge effectiveness tracking
+            if hasattr(self, 'hedge_effectiveness_tracker'):
+                tracker = self.hedge_effectiveness_tracker
+                tracker['ops_returns'].append(generation_revenue)
+                tracker['trading_returns'].append(mtm_pnl)
+
+                # Calculate rolling correlation if we have enough data
+                if len(tracker['ops_returns']) >= 20:  # Need at least 20 points
+                    ops_array = np.array(tracker['ops_returns'])
+                    trading_array = np.array(tracker['trading_returns'])
+
+                    # Calculate correlation (should be negative for effective hedging)
+                    if np.std(ops_array) > 1e-6 and np.std(trading_array) > 1e-6:
+                        correlation = np.corrcoef(ops_array, trading_array)[0, 1]
+                        tracker['correlation'] = correlation if np.isfinite(correlation) else 0.0
+
+                        # Update effectiveness multiplier based on correlation
+                        if tracker['correlation'] > -0.1:  # Poor hedging effectiveness
+                            tracker['effectiveness_multiplier'] = max(0.5, tracker['effectiveness_multiplier'] * 0.95)
+                        elif tracker['correlation'] < -0.3:  # Good hedging effectiveness
+                            tracker['effectiveness_multiplier'] = min(1.0, tracker['effectiveness_multiplier'] * 1.02)
+                        # Else: maintain current multiplier
             
             return {
                 'revenue': net_cash_flow,
@@ -1578,7 +2206,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         try:
             # FIXED: Restore immediate revenue generation for profitable agent learning
             # Removed asset deployment check that was preventing early revenue
-            time_step_hours = 10.0 / 60.0  # 10-minute timesteps
+            time_step_hours = self.config.time_step_hours  # From config: 10-minute timesteps
 
             # Get capacity factors from physical assets
             # No capacity factor calculation needed - use training data directly
@@ -1596,10 +2224,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
             full_hydro_generation_mwh = full_hydro_generation_mw * time_step_hours
             full_total_generation_mwh = full_wind_generation_mwh + full_solar_generation_mwh + full_hydro_generation_mwh
 
-            # Fractional ownership percentages (applied only to revenue)
-            wind_ownership_pct = 0.05   # 5% ownership of wind farm
-            solar_ownership_pct = 0.05  # 5% ownership of solar farm
-            hydro_ownership_pct = 0.02  # 2% ownership of hydro plant
+            # Fractional ownership percentages (applied only to revenue) - FULLY CONFIG-DRIVEN
+            if not self.config:
+                raise ValueError("Config object required for ownership fraction calculations")
+
+            wind_ownership_pct = self.config.wind_ownership_fraction
+            solar_ownership_pct = self.config.solar_ownership_fraction
+            hydro_ownership_pct = self.config.hydro_ownership_fraction
 
             # Fund's revenue share (fractional ownership applied here only)
             fund_wind_generation_mwh = full_wind_generation_mwh * wind_ownership_pct
@@ -1612,15 +2243,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 return 0.0
 
             # Revenue from electricity sales (based on fund's fractional ownership)
-            # NOTE: price is already in USD (converted once during data loading)
-            # currency_conversion = 1.0 to prevent double conversion
-            gross_revenue = fund_total_generation_mwh * price * self.electricity_markup * self.currency_conversion
+            # NOTE: price is in DKK/MWh (all calculations in DKK, converted to USD only for reporting)
+            # FIXED: Apply minimum price floor to prevent negative revenue during training (from config)
+            effective_price = max(price, self.config.minimum_price_floor)  # From config: minimum price floor
+            gross_revenue = fund_total_generation_mwh * effective_price * self.electricity_markup * self.currency_conversion
 
             # Operating costs (based on fund's actual generation)
             variable_costs = gross_revenue * self.operating_cost_rate
             maintenance_costs = fund_total_generation_mwh * self.maintenance_cost_mwh
-            # REMOVED: grid_connection_costs = fund_total_generation_mwh * self.grid_connection_fee_mwh
-            # REMOVED: transmission_costs = fund_total_generation_mwh * self.transmission_fee_mwh
+            grid_connection_costs = fund_total_generation_mwh * self.grid_connection_fee_mwh  # RESTORED: Essential grid costs
+            transmission_costs = fund_total_generation_mwh * self.transmission_fee_mwh        # RESTORED: Essential transmission costs
 
             # Annual costs prorated to timestep
             # CORRECTED: Only pay costs on fund's actual investment in physical assets
@@ -1634,10 +2266,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             annual_to_timestep = time_step_hours / 8760
             # CORRECTED: Asset-based costs only on fund's actual physical investment
             insurance_costs = fund_physical_investment * self.insurance_rate * annual_to_timestep
-            # REMOVED: property_taxes = fund_physical_investment * self.property_tax_rate * annual_to_timestep
-            # REMOVED: debt_service = fund_physical_investment * self.debt_service_rate * annual_to_timestep
+            property_taxes = fund_physical_investment * self.property_tax_rate * annual_to_timestep  # RESTORED: Property taxes
+            debt_service = fund_physical_investment * self.debt_service_rate * annual_to_timestep    # RESTORED: Debt service
 
-            # RESTORED: Management fees on total fund like PrototypeTestBaseline/Tuned for consistent behavior
+            # REALISTIC: Management fees at contractual rate (no artificial reduction)
             management_fees = self.init_budget * self.management_fee_rate * annual_to_timestep
 
             # REMOVED: All admin costs for better agent learning environment
@@ -1649,7 +2281,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # REMOVED: Trading costs for better agent learning
             # trading_costs = abs(gross_revenue) * self.trading_cost_rate * 0.1  # 10% of revenue involves trading
 
-            total_operating_costs = (variable_costs + maintenance_costs + insurance_costs + management_fees)
+            total_operating_costs = (variable_costs + maintenance_costs + grid_connection_costs +
+                                    transmission_costs + insurance_costs + property_taxes +
+                                    debt_service + management_fees)
 
             net_revenue = max(0.0, gross_revenue - total_operating_costs)
             return float(net_revenue)
@@ -1657,6 +2291,81 @@ class RenewableMultiAgentEnv(ParallelEnv):
         except Exception as e:
             logging.warning(f"Generation revenue calculation failed: {e}")
             return 0.0
+
+    def _distribute_excess_cash(self):
+        """
+        INFRASTRUCTURE FUND: Distribute excess cash to maintain realistic cash levels.
+        Infrastructure funds typically maintain 5-15% cash and distribute excess to investors.
+        """
+        try:
+            # Calculate target cash level (10% of fund value for infrastructure)
+            target_cash_ratio = 0.10  # 10% target cash level
+            current_fund_value = self._calculate_fund_nav()
+            target_cash_level = current_fund_value * target_cash_ratio
+
+            # Calculate excess cash above target
+            excess_cash = self.budget - target_cash_level
+
+            # Distribute excess if above threshold (quarterly distributions)
+            distribution_threshold = self.init_budget * 0.02  # 2% of initial fund
+
+            if excess_cash > distribution_threshold:
+                # Distribute 80% of excess (keep some buffer)
+                distribution_amount = excess_cash * 0.80
+
+                # Execute distribution
+                self.budget -= distribution_amount
+
+                # Track distributions for reporting
+                if not hasattr(self, 'total_distributions'):
+                    self.total_distributions = 0.0
+                self.total_distributions += distribution_amount
+
+                # Log significant distributions
+                if distribution_amount > self.init_budget * 0.01:  # >1% of fund
+                    logging.info(f"Cash distribution: {distribution_amount:,.0f} DKK (${distribution_amount * self.config.dkk_to_usd_rate / 1e6:.1f}M USD)")
+
+        except Exception as e:
+            logging.warning(f"Cash distribution failed: {e}")
+
+    def _check_emergency_reallocation(self, operational_revenue: float):
+        """
+        ENHANCED: Emergency reallocation from operational gains to trading capital
+        Allows operational revenue to replenish trading capital under strict controls
+        """
+        try:
+            # Initialize tracking if needed
+            if not hasattr(self, 'total_reallocated'):
+                self.total_reallocated = 0.0
+
+            # Check if trading capital is below emergency threshold
+            original_trading_allocation = self.trading_allocation_budget
+            current_trading_ratio = self.budget / original_trading_allocation if original_trading_allocation > 0 else 0
+
+            # Emergency conditions
+            below_threshold = current_trading_ratio < self.config.trading_capital_emergency_threshold
+            has_operational_gains = operational_revenue > 0
+            under_total_limit = self.total_reallocated < (self.total_fund_value * self.config.max_total_reallocation)
+
+            if below_threshold and has_operational_gains and under_total_limit:
+                # Calculate reallocation amount
+                max_from_operational = operational_revenue * self.config.max_reallocation_rate
+                max_remaining_total = (self.total_fund_value * self.config.max_total_reallocation) - self.total_reallocated
+
+                reallocation_amount = min(max_from_operational, max_remaining_total)
+
+                if reallocation_amount > 1000:  # Minimum 1000 DKK threshold
+                    # Execute reallocation
+                    self.budget += reallocation_amount
+                    self.accumulated_operational_revenue -= reallocation_amount
+                    self.total_reallocated += reallocation_amount
+
+                    logging.info(f"Emergency reallocation: {reallocation_amount:,.0f} DKK from operational to trading")
+                    logging.info(f"Trading capital ratio: {current_trading_ratio:.1%} → {(self.budget / original_trading_allocation):.1%}")
+                    logging.info(f"Total reallocated: {self.total_reallocated:,.0f} DKK ({self.total_reallocated / self.total_fund_value:.1%} of fund)")
+
+        except Exception as e:
+            logging.error(f"Emergency reallocation check failed: {e}")
 
     def _calculate_fund_administration_costs(self) -> float:
         """
@@ -1684,10 +2393,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
         try:
             raw_wind = float(self._wind[i]) if i < len(self._wind) else 0.0
             # FIXED: Realistic capacity factor calculation
-            # Scale to realistic wind CF range (10-35%) - more conservative
+            # Scale to realistic wind CF range (15-45%) - industry standard
             normalized = raw_wind / max(self.wind_scale, 1e-6)  # 0-1 from data range
-            realistic_cf = 0.10 + (normalized * 0.25)  # Map to 10-35% range
-            return float(np.clip(realistic_cf, 0.0, 0.35))
+            realistic_cf = 0.15 + (normalized * 0.30)  # Map to 15-45% range
+            return float(np.clip(realistic_cf, 0.0, 0.45))
         except Exception:
             return 0.25  # Typical wind CF
 
@@ -1695,10 +2404,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
         try:
             raw_solar = float(self._solar[i]) if i < len(self._solar) else 0.0
             # FIXED: Realistic capacity factor calculation
-            # Scale to realistic solar CF range (0-25%) - more conservative
+            # Scale to realistic solar CF range (5-30%) - industry standard
             normalized = raw_solar / max(self.solar_scale, 1e-6)  # 0-1 from data range
-            realistic_cf = normalized * 0.25  # Map to 0-25% range
-            return float(np.clip(realistic_cf, 0.0, 0.25))
+            realistic_cf = 0.05 + (normalized * 0.25)  # Map to 5-30% range
+            return float(np.clip(realistic_cf, 0.0, 0.30))
         except Exception:
             return 0.15  # Typical solar CF
 
@@ -1706,10 +2415,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
         try:
             raw_hydro = float(self._hydro[i]) if i < len(self._hydro) else 0.0
             # FIXED: Realistic capacity factor calculation
-            # Scale to realistic hydro CF range (25-55%) - more conservative
+            # Scale to realistic hydro CF range (35-65%) - industry standard
             normalized = raw_hydro / max(self.hydro_scale, 1e-6)  # 0-1 from data range
-            realistic_cf = 0.25 + (normalized * 0.30)  # Map to 25-55% range
-            return float(np.clip(realistic_cf, 0.25, 0.55))
+            realistic_cf = 0.35 + (normalized * 0.30)  # Map to 35-65% range
+            return float(np.clip(realistic_cf, 0.35, 0.65))
         except Exception:
             return 0.50  # Typical hydro CF
 
@@ -1770,17 +2479,28 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Calculate reward using FIXED calculator
             reward = self.reward_calculator.calculate_reward(
                 fund_nav=fund_nav,
-                cash_flow=cash_flow, 
+                cash_flow=cash_flow,
                 risk_level=risk_level,
                 efficiency=efficiency,
                 forecast_signal_score=forecast_signal_score
             )
-            
-            # FIXED: Less aggressive reward clipping for better learning signals
+
+            # FIXED: Robust reward processing with safety checks
+            if not np.isfinite(reward):
+                reward = 0.0
+
             clipped_reward = float(np.clip(reward, -20.0, 20.0))
-            
-            for agent in self.possible_agents:
-                self._rew_buf[agent] = clipped_reward
+
+            # FIXED: Safe reward assignment with type checking
+            if isinstance(self.possible_agents, (list, tuple)):
+                for agent in self.possible_agents:
+                    if isinstance(agent, str) and agent in self._rew_buf:
+                        self._rew_buf[agent] = clipped_reward
+            else:
+                # Fallback for unexpected agent structure
+                for agent in ["investor_0", "battery_operator_0", "risk_controller_0", "meta_controller_0"]:
+                    if agent in self._rew_buf:
+                        self._rew_buf[agent] = clipped_reward
             
             # Store reward breakdown for logging
             self.last_reward_breakdown = {
@@ -1796,8 +2516,21 @@ class RenewableMultiAgentEnv(ParallelEnv):
             
         except Exception as e:
             logging.error(f"Reward assignment error: {e}")
-            for agent in self.possible_agents:
-                self._rew_buf[agent] = 0.0
+            # FIXED: Safe error handling with fallback
+            try:
+                if isinstance(self.possible_agents, (list, tuple)):
+                    for agent in self.possible_agents:
+                        if isinstance(agent, str) and agent in self._rew_buf:
+                            self._rew_buf[agent] = 0.0
+                else:
+                    # Fallback for unexpected agent structure
+                    for agent in ["investor_0", "battery_operator_0", "risk_controller_0", "meta_controller_0"]:
+                        if agent in self._rew_buf:
+                            self._rew_buf[agent] = 0.0
+            except Exception as e2:
+                logging.error(f"Error in reward error handling: {e2}")
+                # Last resort: direct assignment
+                self._rew_buf = {a: 0.0 for a in ["investor_0", "battery_operator_0", "risk_controller_0", "meta_controller_0"]}
 
     def _update_market_conditions(self, i: int):
         try:
@@ -2046,14 +2779,24 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if capacity < 0:
                 issues.append(f"Negative physical capacity: {asset} = {capacity}")
         
-        # Check financial positions are within reasonable bounds
+        # Check financial positions are within allocated trading capital limits
         total_financial = sum(abs(v) for v in self.financial_positions.values())
-        if total_financial > self.init_budget * 2:  # Allow 2x leverage
-            issues.append(f"Excessive financial exposure: {total_financial:.0f}")
-        
-        # Check fund NAV is reasonable
+
+        # Get proper trading capital limits from config
+        trading_limits = self.config.get_trading_capital_limits()
+        max_financial_exposure = trading_limits['max_financial_exposure_dkk']
+
+        if total_financial > max_financial_exposure:
+            trading_capital = trading_limits['trading_capital_dkk']
+            leverage = trading_limits['max_leverage']
+            issues.append(f"Excessive financial exposure: {total_financial:.0f} DKK exceeds limit of {max_financial_exposure:.0f} DKK (trading capital {trading_capital:.0f} DKK × {leverage}x leverage)")
+
+        # Check fund NAV is reasonable - more conservative bounds
         nav = self._calculate_fund_nav()
-        if nav < self.init_budget * 0.01 or nav > self.init_budget * 10:
+        # Allow reasonable growth but prevent excessive portfolio inflation
+        min_nav = self.init_budget * 0.1   # Minimum 10% of initial
+        max_nav = self.init_budget * 2.0   # Maximum 200% of initial (reduced from 10x)
+        if nav < min_nav or nav > max_nav:
             issues.append(f"Unrealistic NAV: {nav:.0f}")
         
         # Check battery state consistency

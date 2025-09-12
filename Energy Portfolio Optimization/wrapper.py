@@ -387,20 +387,24 @@ class EnhancedObservationValidator:
         try:
             if hasattr(self.forecaster, 'get_agent_forecast_dims'):
                 dims = self.forecaster.get_agent_forecast_dims()
-                return int(dims.get(agent, 0))
+                base_dims = int(dims.get(agent, 0))
+                # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
+                return base_dims + (1 if agent != "risk_controller_0" else 0)
             if hasattr(self.forecaster, 'agent_horizons') and hasattr(self.forecaster, 'agent_targets'):
                 targets = self.forecaster.agent_targets.get(agent, [])
                 horizons = self.forecaster.agent_horizons.get(agent, [])
-                return int(len(targets) * len(horizons))
-            # FIXED: Correct forecast dimensions based on actual agent allocations
-            # investor_0: 4 targets × 3 horizons = 12
-            # battery_operator_0: 3 targets × 4 horizons = 12
-            # risk_controller_0: 4 targets × 3 horizons = 12
-            # meta_controller_0: 5 targets × 4 horizons = 20
-            return {'investor_0': 12, 'battery_operator_0': 12, 'risk_controller_0': 12, 'meta_controller_0': 20}.get(agent, 0)
+                base_dims = int(len(targets) * len(horizons))
+                # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
+                return base_dims + (1 if agent != "risk_controller_0" else 0)
+            # FIXED: Correct forecast dimensions based on actual agent allocations + confidence
+            # investor_0: 4 targets × 3 horizons + 1 confidence = 13
+            # battery_operator_0: 3 targets × 4 horizons + 1 confidence = 13
+            # risk_controller_0: 4 targets × 3 horizons (no confidence) = 12
+            # meta_controller_0: 5 targets × 4 horizons + 1 confidence = 21
+            return {'investor_0': 13, 'battery_operator_0': 13, 'risk_controller_0': 12, 'meta_controller_0': 21}.get(agent, 0)
         except Exception:
-            # FIXED: Correct forecast dimensions based on actual agent allocations
-            return {'investor_0': 12, 'battery_operator_0': 12, 'risk_controller_0': 12, 'meta_controller_0': 20}.get(agent, 0)
+            # FIXED: Correct forecast dimensions based on actual agent allocations + confidence
+            return {'investor_0': 13, 'battery_operator_0': 13, 'risk_controller_0': 12, 'meta_controller_0': 21}.get(agent, 0)
 
     def _get_agent_forecast_keys(self, agent: str, expected_count: int) -> List[str]:
         try:
@@ -423,8 +427,8 @@ class EnhancedObservationValidator:
 
     def _create_fallback_spec(self, agent: str):
         base_dim = {'investor_0': 6, 'battery_operator_0': 4, 'risk_controller_0': 9, 'meta_controller_0': 11}.get(agent, 8)
-        # FIXED: Correct forecast dimensions based on actual agent allocations
-        forecast_dim = {'investor_0': 12, 'battery_operator_0': 12, 'risk_controller_0': 12, 'meta_controller_0': 20}.get(agent, 0)
+        # FIXED: Correct forecast dimensions based on actual agent allocations + confidence
+        forecast_dim = {'investor_0': 13, 'battery_operator_0': 13, 'risk_controller_0': 12, 'meta_controller_0': 21}.get(agent, 0)
         total_dim = base_dim + forecast_dim
         self.agent_observation_specs[agent] = {
             'base_dim': base_dim,
@@ -622,7 +626,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     metadata = {"name": "multi_horizon_wrapper:normalized-aligned-v1"}
 
     def __init__(self, base_env, multi_horizon_forecaster, log_path=None, max_memory_mb=1500,
-                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000, log_last_n=100):
+                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000, log_last_n=100,
+                 disable_csv_logging=False):
         self.env = base_env
         self.forecaster = multi_horizon_forecaster
 
@@ -630,11 +635,12 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._possible_agents = self.env.possible_agents[:]
         self._agents = self.env.agents[:]
 
-        # Logging control - always use normal mode (full logging)
+        # Logging control - configurable based on disable_csv_logging
         self.total_timesteps = total_timesteps
-        self.log_last_n = log_last_n
+        self.log_last_n = log_last_n if not disable_csv_logging else 0
         self.log_start_step = 0
-        self.logging_enabled = True  # Always start with logging enabled
+        self.logging_enabled = not disable_csv_logging  # Disable logging if requested
+        self.disable_csv_logging = disable_csv_logging
 
         # Memory & logging infra
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=max_memory_mb)
@@ -691,9 +697,11 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_price_forecast_aligned = 0.0
 
         # logging - initialize
-        if self.log_path:
+        if self.log_path and not self.disable_csv_logging:
             print(f"📊 Full logging every 20 timesteps from start")
             self._initialize_logging_safe()
+        elif self.disable_csv_logging:
+            print("⚡ CSV logging disabled - maximum speed mode")
         else:
             print("⚡ No logging configured - maximum speed mode")
         print("✅ Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
@@ -725,6 +733,15 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
     def _should_log_this_step(self) -> bool:
         """Determine if we should log this timestep."""
+        # Check if CSV logging is disabled
+        if self.disable_csv_logging:
+            return False
+
+        # Check if only final results should be logged
+        if self.log_last_n == 1:  # final_results_only mode
+            # Only log on the very last step
+            return self.step_count >= (self.total_timesteps - 1)
+
         # Always log (normal mode only)
         return True
 
@@ -922,7 +939,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             pass  # Don't break main flow if forecast population fails
 
         # periodic logging
-        if self.log_path and self._should_log_this_step():
+        if self.log_path and self._should_log_this_step() and not self.disable_csv_logging:
             if (self.step_count % self._log_interval == 0 or self._last_episode_end_flag):
                 log_forecasts = self._get_forecasts_for_logging()
                 self._log_metrics_efficient(actions, rewards, log_forecasts)
@@ -1414,13 +1431,39 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
     def close(self):
         try:
-            self._flush_log_buffer()
+            # Save final results if CSV logging was disabled but final results are requested
+            if self.disable_csv_logging and hasattr(self, 'log_path') and self.log_path:
+                self._save_final_results_only()
+            else:
+                self._flush_log_buffer()
         finally:
             try:
                 if hasattr(self.env, "close"):
                     self.env.close()
             except Exception:
                 pass
+
+    def _save_final_results_only(self):
+        """Save only the final timestep results to CSV when disable_csv_logging=True."""
+        if not self.log_path:
+            return
+
+        try:
+            # Create header if file doesn't exist
+            if not os.path.isfile(self.log_path):
+                self._create_log_header()
+
+            # Get final state and log it
+            final_actions = {}  # Empty actions for final state
+            final_rewards = {}  # Empty rewards for final state
+            final_forecasts = self._get_forecasts_for_logging()
+
+            print(f"💾 Saving final results to: {self.log_path}")
+            self._log_metrics_efficient(final_actions, final_rewards, final_forecasts)
+            self._flush_log_buffer()
+
+        except Exception as e:
+            print(f"⚠️ Failed to save final results: {e}")
 
     # alias PettingZoo naming if needed
     def state(self):
@@ -1429,6 +1472,180 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 return self.env.state()
         except Exception:
             return None
+
+
+class BaselineCSVWrapper(ParallelEnv):
+    """Baseline wrapper that adds CSV logging without forecasting overhead."""
+
+    def __init__(self, base_env, log_path=None, total_timesteps=50000, log_last_n=100):
+        self.env = base_env
+        self.total_timesteps = total_timesteps
+        self.log_last_n = log_last_n
+
+        # CSV logging setup
+        self.log_path = log_path
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_lock = threading.Lock()
+        self.csv_buffer = []
+        self.buffer_size = 50
+        self.step_count = 0
+
+        # Initialize CSV file
+        if self.log_path:
+            self._init_csv()
+
+        # Copy attributes from base environment
+        self.metadata = getattr(base_env, 'metadata', {})
+        self.possible_agents = base_env.possible_agents
+        self.agents = base_env.agents
+        self.observation_spaces = base_env.observation_spaces
+        self.action_spaces = base_env.action_spaces
+
+    def _init_csv(self):
+        """Initialize CSV file with headers."""
+        try:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            self.csv_file = open(self.log_path, 'w', newline='', encoding='utf-8')
+
+            # Define CSV headers for baseline mode
+            headers = [
+                'timestep', 'timestamp', 'step_in_episode',
+                'Total_Portfolio_Value_USD', 'Investment_Capital_USD', 'Distributed_Profits_USD',
+                'Cumulative_Returns_USD', 'Generation_Revenue_USD', 'MTM_Value_USD',
+                'Operational_Revenue_USD', 'Battery_Revenue_USD', 'MTM_PnL_USD',
+                'Battery_Energy_MWh', 'Battery_Capacity_MW',
+                'Wind_Generation_MW', 'Solar_Generation_MW', 'Hydro_Generation_MW',
+                'Load_MW', 'Price_DKK_MWh', 'Price_USD_MWh',
+                'Capital_Allocation_Fraction', 'Investment_Frequency',
+                'Market_Volatility', 'Market_Stress', 'Overall_Risk',
+                'Reward_Total', 'Reward_NAV_Growth', 'Reward_Risk_Adjusted',
+                'step_time_ms', 'mem_rss_mb'
+            ]
+
+            self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=headers)
+            self.csv_writer.writeheader()
+            self.csv_file.flush()
+
+        except Exception as e:
+            print(f"Warning: Could not initialize CSV logging: {e}")
+            self.csv_file = None
+            self.csv_writer = None
+
+    def _log_step(self, obs, rewards, dones, truncs, infos):
+        """Log step data to CSV."""
+        if not self.csv_writer:
+            return
+
+        try:
+            # Get environment data
+            env = self.env
+
+            # Calculate portfolio value in USD using config rate
+            fund_nav = getattr(env, 'fund_nav', 500_000_000)
+            dkk_to_usd = getattr(env, '_dkk_to_usd_rate', 0.145)  # From config: 0.145
+            portfolio_value_usd = fund_nav * dkk_to_usd
+
+            # Get current data point
+            i = getattr(env, 't', 0)
+            if i < len(env.data):
+                # Access data from the DataFrame
+                row = env.data.iloc[i]
+                timestamp = row.get('timestamp', f"step_{i}")
+                price_dkk = row.get('price', 0)
+                wind = row.get('wind', 0)
+                solar = row.get('solar', 0)
+                hydro = row.get('hydro', 0)
+                load = row.get('load', 0)
+            else:
+                timestamp = f"step_{i}"
+                price_dkk = 0
+                wind = solar = hydro = load = 0
+
+            # Prepare row data
+            row = {
+                'timestep': i,
+                'timestamp': str(timestamp),
+                'step_in_episode': getattr(env, 'step_in_episode', i),
+                'Total_Portfolio_Value_USD': portfolio_value_usd,
+                'Investment_Capital_USD': getattr(env, 'investment_capital', 500_000_000) * dkk_to_usd,
+                'Distributed_Profits_USD': getattr(env, 'distributed_profits', 0) * dkk_to_usd,
+                'Cumulative_Returns_USD': getattr(env, 'cumulative_returns', 0) * dkk_to_usd,
+                'Generation_Revenue_USD': getattr(env, 'last_generation_revenue', 0) * dkk_to_usd,
+                'MTM_Value_USD': getattr(env, 'mtm_portfolio_value', 0) * dkk_to_usd,
+                'Operational_Revenue_USD': getattr(env, 'last_revenue', 0) * dkk_to_usd,
+                'Battery_Revenue_USD': getattr(env, 'last_battery_revenue', 0) * dkk_to_usd,
+                'MTM_PnL_USD': getattr(env, 'last_mtm_pnl', 0) * dkk_to_usd,
+                'Battery_Energy_MWh': getattr(env, 'battery_energy', 0),
+                'Battery_Capacity_MW': getattr(env, 'battery_capacity', 100),
+                'Wind_Generation_MW': wind,
+                'Solar_Generation_MW': solar,
+                'Hydro_Generation_MW': hydro,
+                'Load_MW': load,
+                'Price_DKK_MWh': price_dkk,
+                'Price_USD_MWh': price_dkk * dkk_to_usd,
+                'Capital_Allocation_Fraction': getattr(env, 'capital_allocation_fraction', 0.1),
+                'Investment_Frequency': getattr(env, 'investment_freq', 6),
+                'Market_Volatility': getattr(env, 'market_volatility', 0),
+                'Market_Stress': getattr(env, 'market_stress', 0.5),
+                'Overall_Risk': getattr(env, 'overall_risk_snapshot', 0.5),
+                'Reward_Total': sum(rewards.values()) if rewards else 0,
+                'Reward_NAV_Growth': 0,  # Would need reward breakdown
+                'Reward_Risk_Adjusted': 0,  # Would need reward breakdown
+                'step_time_ms': 0,  # Could add timing if needed
+                'mem_rss_mb': psutil.Process().memory_info().rss / 1024 / 1024 if psutil else 0
+            }
+
+            # Add to buffer
+            self.csv_buffer.append(row)
+
+            # Flush buffer if needed
+            if len(self.csv_buffer) >= self.buffer_size:
+                self._flush_csv_buffer()
+
+        except Exception as e:
+            print(f"Warning: CSV logging error: {e}")
+
+    def _flush_csv_buffer(self):
+        """Flush CSV buffer to file."""
+        if not self.csv_writer or not self.csv_buffer:
+            return
+
+        try:
+            with self.csv_lock:
+                for row in self.csv_buffer:
+                    self.csv_writer.writerow(row)
+                self.csv_file.flush()
+                self.csv_buffer.clear()
+        except Exception as e:
+            print(f"Warning: CSV flush error: {e}")
+
+    def reset(self, seed=None, options=None):
+        """Reset environment and initialize logging."""
+        obs, infos = self.env.reset(seed=seed, options=options)
+        self.step_count = 0
+        return obs, infos
+
+    def step(self, actions):
+        """Step environment and log data."""
+        start_time = time.time()
+        obs, rewards, dones, truncs, infos = self.env.step(actions)
+
+        self.step_count += 1
+
+        # Log if within logging window
+        if self.log_last_n == 0 or self.step_count > (self.total_timesteps - self.log_last_n):
+            self._log_step(obs, rewards, dones, truncs, infos)
+
+        return obs, rewards, dones, truncs, infos
+
+    def close(self):
+        """Close environment and CSV file."""
+        if self.csv_file:
+            self._flush_csv_buffer()
+            self.csv_file.close()
+        if hasattr(self.env, 'close'):
+            self.env.close()
 
 
 class UltraFastProgressWrapper(ParallelEnv):
@@ -1444,19 +1661,8 @@ class UltraFastProgressWrapper(ParallelEnv):
         self.last_portfolio_value = None  # Track for validation
         self.portfolio_history = []  # Track recent values for trend analysis
 
-        # Mark the base environment as being in ultra fast mode
+        # Mark the base environment as being in ultra fast mode (for progress display only)
         self.env.ultra_fast_mode = True
-
-        # IMPORTANT: Adjust reward weights for ultra fast mode (no forecasting)
-        if hasattr(self.env, 'reward_calculator') and hasattr(self.env.reward_calculator, 'reward_weights'):
-            weights = self.env.reward_calculator.reward_weights
-            if weights.get('forecast', 0) > 0:
-                # Redistribute forecast weight to profitability components
-                forecast_weight = weights['forecast']
-                weights['nav_growth'] += forecast_weight * 0.6  # 60% to NAV growth
-                weights['cash_flow'] += forecast_weight * 0.4   # 40% to cash flow
-                weights['forecast'] = 0.0  # No forecast rewards in ultra fast mode
-                print(f"🚀 Ultra fast mode: Forecast weight ({forecast_weight:.3f}) redistributed to profitability")
 
         # Delegate all attributes to base environment
         self.possible_agents = base_env.possible_agents
@@ -1465,8 +1671,7 @@ class UltraFastProgressWrapper(ParallelEnv):
         self.action_spaces = base_env.action_spaces
         self.metadata = base_env.metadata
 
-        print(f"🚀 Ultra fast mode: Progress updates every {self.progress_interval:,} steps (~2% intervals)")
-        print(f"🚀 Ultra fast mode: Trading enabled regardless of forecast confidence")
+        print(f"[ULTRA FAST] Progress updates every {self.progress_interval:,} steps (~2% intervals)")
 
     def reset(self, seed=None, options=None):
         # Only reset episode-level counters, keep global tracking
@@ -1487,7 +1692,24 @@ class UltraFastProgressWrapper(ParallelEnv):
             progress_pct = (self.global_step_count / self.total_timesteps) * 100
 
             # Get portfolio value with validation (convert DKK to USD for display)
-            portfolio_value_dkk = getattr(self.env, 'equity', 0)
+            # Try multiple sources for portfolio value in DKK
+            portfolio_value_dkk = getattr(self.env, 'equity', None)
+            if portfolio_value_dkk is None or portfolio_value_dkk == 0:
+                # Fallback to fund_nav calculation
+                portfolio_value_dkk = getattr(self.env, 'fund_nav', None)
+                if portfolio_value_dkk is None:
+                    # Calculate NAV if available
+                    if hasattr(self.env, '_calculate_fund_nav'):
+                        try:
+                            portfolio_value_dkk = self.env._calculate_fund_nav()
+                        except:
+                            # Use correct DKK equivalent of 500M USD
+                            portfolio_value_dkk = getattr(self.env, 'init_budget', 3_448_275_862)  # 500M USD in DKK
+                    else:
+                        # Use correct DKK equivalent of 500M USD
+                        portfolio_value_dkk = getattr(self.env, 'init_budget', 3_448_275_862)  # 500M USD in DKK
+
+            # Convert DKK to USD for display
             dkk_to_usd_rate = getattr(self.env.config, 'dkk_to_usd_rate', 0.145)
             portfolio_value = (portfolio_value_dkk * dkk_to_usd_rate) / 1e6  # Convert to USD millions
 
@@ -1506,7 +1728,52 @@ class UltraFastProgressWrapper(ParallelEnv):
             dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
             ops_revenue_dkk = getattr(self.env, 'last_generation_revenue', 0.0)
             ops_revenue_usd = ops_revenue_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
-            trading_pnl_usd = getattr(self.env, 'last_mtm_pnl', 0.0) / 1e3  # Convert to thousands USD
+
+            # Get trading PnL - use cumulative performance instead of step-by-step change
+            trading_pnl_dkk = getattr(self.env, 'cumulative_mtm_pnl', getattr(self.env, 'last_mtm_pnl', 0.0))
+            trading_pnl_usd = trading_pnl_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
+
+            # ENHANCED DEBUG OUTPUT - Show detailed trading info at progress intervals
+            if self.global_step_count % self.progress_interval == 0:
+                investment_freq = getattr(self.env, 'investment_freq', 1)
+                trading_enabled = getattr(self.env.reward_calculator, 'trading_enabled', True) if hasattr(self.env, 'reward_calculator') else True
+                financial_positions = getattr(self.env, 'financial_positions', {})
+                total_financial = sum(abs(v) for v in financial_positions.values()) if financial_positions else 0
+                current_step = getattr(self.env, 't', 0)
+                steps_since_trade = current_step % investment_freq
+
+                # ENHANCED: Show individual position values for better debugging
+                wind_pos = financial_positions.get('wind_instrument_value', 0.0)
+                solar_pos = financial_positions.get('solar_instrument_value', 0.0)
+                hydro_pos = financial_positions.get('hydro_instrument_value', 0.0)
+
+                # Enhanced debug info for trading issues
+                ultra_fast_mode = getattr(self.env, 'ultra_fast_mode', False)
+                current_drawdown = getattr(self.env.reward_calculator, 'current_drawdown', 0.0) if hasattr(self.env, 'reward_calculator') else 0.0
+                max_drawdown_threshold = getattr(self.env.reward_calculator, 'max_drawdown_threshold', 0.0) if hasattr(self.env, 'reward_calculator') else 0.0
+                ultra_fast_override = getattr(self.env.reward_calculator, 'ultra_fast_mode_trading_enabled', False) if hasattr(self.env, 'reward_calculator') else False
+
+                print(f"[TRADING DEBUG] Step {self.global_step_count} (env.t={current_step})")
+                print(f"  Investment freq: {investment_freq} (next trade in {investment_freq - steps_since_trade} steps)")
+                print(f"  Trading enabled: {trading_enabled}")
+                print(f"  Financial positions: {total_financial:.0f} DKK")
+                print(f"    Wind: {wind_pos:.0f} DKK | Solar: {solar_pos:.0f} DKK | Hydro: {hydro_pos:.0f} DKK")
+
+                # Show both step and cumulative MTM PnL
+                step_mtm = getattr(self.env, 'last_mtm_pnl', 0.0)
+                cumulative_mtm = getattr(self.env, 'cumulative_mtm_pnl', 0.0)
+                print(f"  MTM PnL (step): {step_mtm:.2f} DKK")
+                print(f"  MTM PnL (cumulative): {cumulative_mtm:.2f} DKK")
+                print(f"  Ultra fast mode: {ultra_fast_mode}")
+                print(f"  Current drawdown: {current_drawdown:.1%}")
+                print(f"  Max drawdown threshold: {max_drawdown_threshold:.1%}")
+                print(f"  Ultra fast override enabled: {ultra_fast_override}")
+
+                # ENHANCED: Show if trading should occur at this step
+                should_trade = (current_step % investment_freq == 0)
+                print(f"  Should trade at current step: {should_trade}")
+                if not should_trade:
+                    print(f"  Next trading step: {current_step + (investment_freq - steps_since_trade)}")
 
             # Format the breakdown with enhanced info
             ops_str = f"Ops: ${ops_revenue_usd:+.1f}k"
@@ -1519,7 +1786,7 @@ class UltraFastProgressWrapper(ParallelEnv):
                 if abs(recent_change) > 1.0:  # Show trend for changes > $1M
                     trend_str = f" | Trend: ${recent_change:+.1f}M"
 
-            print(f"🚀 Ultra fast progress: {self.global_step_count:,}/{self.total_timesteps:,} ({progress_pct:.1f}%) | Portfolio: ${portfolio_value:.1f}M USD | {ops_str} | {trading_str}{trend_str}")
+            print(f"[ULTRA FAST] Progress: {self.global_step_count:,}/{self.total_timesteps:,} ({progress_pct:.1f}%) | Portfolio: ${portfolio_value:.1f}M USD | {ops_str} | {trading_str}{trend_str}")
 
             self.last_progress_step = self.global_step_count
             self.last_portfolio_value = portfolio_value

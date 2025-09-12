@@ -366,17 +366,17 @@ class EnhancedObservationValidator:
         return specs
 
     def _estimate_agent_dimension(self, agent: str) -> int:
-        # FIXED: Correct total dimensions (base + forecast)
+        # FIXED: Correct total dimensions (base + forecast + confidence)
         # Based on actual agent forecast allocations from generator.py:
-        # - investor_0: 6 base + 12 forecast (4 targets × 3 horizons) = 18
-        # - battery_operator_0: 4 base + 12 forecast (3 targets × 4 horizons) = 16
-        # - risk_controller_0: 9 base + 12 forecast (4 targets × 3 horizons) = 21
-        # - meta_controller_0: 11 base + 20 forecast (5 targets × 4 horizons) = 31
+        # - investor_0: 6 base + 12 forecast + 1 confidence = 19
+        # - battery_operator_0: 4 base + 12 forecast + 1 confidence = 17
+        # - risk_controller_0: 9 base + 12 forecast (no confidence) = 21
+        # - meta_controller_0: 11 base + 20 forecast + 1 confidence = 32
         estimates = {
-            "investor_0": 18,           # ✅ Correct
-            "battery_operator_0": 16,   # FIXED: was 12, now 16
-            "risk_controller_0": 21,    # FIXED: was 15, now 21
-            "meta_controller_0": 31,    # FIXED: was 27, now 31
+            "investor_0": 19,           # UPDATED: +1 for confidence
+            "battery_operator_0": 17,   # UPDATED: +1 for confidence
+            "risk_controller_0": 21,    # No change (no confidence)
+            "meta_controller_0": 32,    # UPDATED: +1 for confidence
         }
         return int(estimates.get(agent, 20))
 

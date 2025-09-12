@@ -34,29 +34,55 @@ class AnalyzerConfig:
     log_prefer: bool = True                # Prefer log returns for calculations if possible
     plot_title: str = "Hybrid Renewable Energy Fund - AI Performance Analysis"
 
-    # Enhanced analysis parameters
-    initial_fund_size: float = 500_000_000  # $500M fund
+    # Enhanced analysis parameters - UPDATED to match config
+    initial_fund_size: float = 800_000_000  # $800M fund (from config)
     target_baseline_return: float = 0.0376   # 3.76% baseline
     target_ai_return: float = 0.0544         # 5.44% AI-enhanced
 
-    # Get currency conversion from config
+    # Get currency conversion and fund parameters from config
     def __post_init__(self):
         try:
             from config import EnhancedConfig
             config = EnhancedConfig()
             self.currency_conversion = config.dkk_to_usd_rate  # DKK to USD from config
+            # FIXED: Get actual fund parameters from config
+            self.initial_fund_size = config.init_budget_usd
+            self.physical_allocation = config.physical_allocation
+            self.financial_allocation = config.financial_allocation
         except Exception:
             self.currency_conversion = 0.145  # Fallback value
 
-    # Economic model parameters
-    physical_allocation: float = 0.518       # 51.8% physical assets
-    financial_allocation: float = 0.482      # 48.2% financial instruments
+    # Economic model parameters - UPDATED to match config
+    physical_allocation: float = 0.88        # 88% physical assets (from config)
+    financial_allocation: float = 0.12       # 12% financial instruments (from config)
 
-    # Asset specifications (fractional ownership)
-    wind_ownership: float = 0.05            # 5% of 1,500MW wind farm
-    solar_ownership: float = 0.05           # 5% of 1,000MW solar farm
-    hydro_ownership: float = 0.02           # 2% of 1,000MW hydro plant
-    battery_capacity: float = 10.0          # 10MWh direct ownership
+    # Asset specifications (fractional ownership) - GET FROM CONFIG
+    def get_ownership_fractions(self):
+        """Get ownership fractions from config to avoid hardcoding"""
+        try:
+            from config import EnhancedConfig
+            config = EnhancedConfig()
+            return {
+                'wind_ownership': config.wind_ownership_fraction,
+                'solar_ownership': config.solar_ownership_fraction,
+                'hydro_ownership': config.hydro_ownership_fraction
+            }
+        except Exception:
+            # Fallback values only if config fails
+            return {
+                'wind_ownership': 0.15,  # 15% of 1,500MW wind farm
+                'solar_ownership': 0.10, # 10% of 1,000MW solar farm
+                'hydro_ownership': 0.02  # 2% of 1,000MW hydro plant
+            }
+
+    def get_battery_capacity(self):
+        """Get battery capacity from config"""
+        try:
+            from config import EnhancedConfig
+            config = EnhancedConfig()
+            return config.owned_battery_capacity_mwh
+        except Exception:
+            return 10.0  # Fallback value
 
     # Performance thresholds
     confidence_threshold_90: int = 12960    # 90 days for 90% confidence
@@ -320,14 +346,29 @@ class EnhancedPortfolioAnalyzer:
 
     def _analyze_asset_allocation(self) -> Dict[str, Any]:
         """Analyze actual vs target asset allocation"""
-        allocation = {
-            'target_assets': {
-                'wind_capacity_mw': 75.0,  # 5% of 1,500MW
-                'solar_capacity_mw': 50.0,  # 5% of 1,000MW
-                'hydro_capacity_mw': 20.0,  # 2% of 1,000MW
-                'battery_capacity_mwh': 10.0
+        # Get target assets directly from config
+        try:
+            from config import EnhancedConfig
+            config = EnhancedConfig()
+            allocation = {
+                'target_assets': {
+                    'wind_capacity_mw': config.owned_wind_capacity_mw,      # 270MW from config
+                    'solar_capacity_mw': config.owned_solar_capacity_mw,   # 100MW from config
+                    'hydro_capacity_mw': config.owned_hydro_capacity_mw,   # 40MW from config
+                    'battery_capacity_mwh': config.owned_battery_capacity_mwh  # 10MWh from config
+                }
             }
-        }
+        except Exception:
+            # Fallback to ownership fractions if config fails
+            ownership = self.cfg.get_ownership_fractions()
+            allocation = {
+                'target_assets': {
+                    'wind_capacity_mw': ownership['wind_ownership'] * 1500.0,  # % of 1,500MW
+                    'solar_capacity_mw': ownership['solar_ownership'] * 1000.0,  # % of 1,000MW
+                    'hydro_capacity_mw': ownership['hydro_ownership'] * 1000.0,  # % of 1,000MW
+                    'battery_capacity_mwh': 10.0  # Direct ownership
+                }
+            }
 
         # Check actual allocations if available
         actual_assets = {}
@@ -605,13 +646,24 @@ class EnhancedPortfolioAnalyzer:
         """Calculate allocation efficiency metrics"""
         efficiency = {}
 
-        # Calculate utilization rates
-        targets = {
-            'wind_cap': 75.0,
-            'solar_cap': 50.0,
-            'hydro_cap': 20.0,
-            'battery_energy': 10.0
-        }
+        # Get targets from config instead of hardcoding
+        try:
+            from config import EnhancedConfig
+            config = EnhancedConfig()
+            targets = {
+                'wind_cap': config.owned_wind_capacity_mw,      # 270MW from config
+                'solar_cap': config.owned_solar_capacity_mw,   # 100MW from config
+                'hydro_cap': config.owned_hydro_capacity_mw,   # 40MW from config
+                'battery_energy': config.owned_battery_capacity_mwh  # 10MWh from config
+            }
+        except Exception:
+            # Fallback to old hardcoded values if config fails
+            targets = {
+                'wind_cap': 75.0,
+                'solar_cap': 50.0,
+                'hydro_cap': 20.0,
+                'battery_energy': 10.0
+            }
 
         for asset, target in targets.items():
             if asset in actual_assets:
@@ -873,12 +925,14 @@ class EnhancedPortfolioAnalyzer:
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
         fig.suptitle('Economic Model Analysis', fontsize=16, fontweight='bold')
 
-        # Asset allocation pie chart
+        # Asset allocation pie chart - use config values
+        ownership = self.cfg.get_ownership_fractions()
+        battery_capacity = self.cfg.get_battery_capacity()
         asset_values = [
-            self.cfg.wind_ownership * 1500 * 2000,  # Wind value estimate
-            self.cfg.solar_ownership * 1000 * 1500,  # Solar value estimate
-            self.cfg.hydro_ownership * 1000 * 3000,  # Hydro value estimate
-            self.cfg.battery_capacity * 500000       # Battery value estimate
+            ownership['wind_ownership'] * 1500 * 2000,  # Wind value estimate
+            ownership['solar_ownership'] * 1000 * 1500,  # Solar value estimate
+            ownership['hydro_ownership'] * 1000 * 3000,  # Hydro value estimate
+            battery_capacity * 500000       # Battery value estimate
         ]
         asset_labels = ['Wind (5%)', 'Solar (5%)', 'Hydro (2%)', 'Battery (100%)']
 
