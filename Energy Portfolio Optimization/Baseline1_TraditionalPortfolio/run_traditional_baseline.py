@@ -4,33 +4,60 @@ Baseline 1 Runner: Traditional Portfolio Optimization
 
 Runs the traditional portfolio optimization baseline for IEEE benchmarking.
 Implements classical financial optimization techniques for comparison with MARL.
+
+This baseline focuses exclusively on classical financial portfolio optimization methods:
+- Modern Portfolio Theory (Markowitz optimization)
+- Black-Litterman model
+- Risk parity allocation
+- Traditional financial metrics
+
+NO machine learning or heuristic components - pure classical finance approach.
 """
 
 import numpy as np
 import pandas as pd
 import os
+import sys
 import json
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
-from traditional_portfolio_optimizer import TraditionalPortfolioOptimizer, TraditionalBatteryOptimizer
+
+# Add parent directory to path for importing main project modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import from main project
+from config import EnhancedConfig
+
+# Import local baseline optimizer
+from traditional_portfolio_optimizer import ClassicalPortfolioOptimizer
 
 class TraditionalBaselineRunner:
     """Runner for traditional portfolio optimization baseline."""
     
-    def __init__(self, data_path, output_dir="baseline1_results"):
+    def __init__(self, data_path=None, output_dir="baseline1_results"):
+        # Use shared data from root directory if no specific path provided
+        if data_path is None:
+            data_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trainingdata.csv")
+
         self.data_path = data_path
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
-        
+
+        # Load main project configuration for consistency
+        self.config = EnhancedConfig()
+
         # Load and prepare data
         self.data = self.load_data()
-        
-        # Initialize optimizers
-        self.portfolio_optimizer = TraditionalPortfolioOptimizer()
-        self.battery_optimizer = TraditionalBatteryOptimizer()
-        
+
+        # Initialize classical portfolio optimizer
+        self.portfolio_optimizer = ClassicalPortfolioOptimizer(
+            initial_budget=self.config.init_budget,
+            lookback_window=252,  # 1 year of trading days
+            rebalance_freq=30     # Monthly rebalancing
+        )
+
         # Results storage
         self.results = []
         self.metrics_log = []
@@ -69,20 +96,18 @@ class TraditionalBaselineRunner:
             # Portfolio optimization step
             portfolio_result = self.portfolio_optimizer.step(self.data, t)
             
-            # Battery optimization step
-            current_price = self.data.iloc[t]['price']
-            battery_revenue = self.battery_optimizer.optimize_battery(current_price)
-            
-            # Combine results
+            # Cycle through optimization methods periodically
+            if t > 0 and t % 5000 == 0:  # Change method every 5000 steps
+                self.portfolio_optimizer.cycle_optimization_method()
+
+            # Store results
             result = {
                 'timestep': t,
                 'portfolio_value': portfolio_result['portfolio_value'],
-                'battery_revenue': battery_revenue,
-                'battery_soc': self.battery_optimizer.soc,
-                'total_value': portfolio_result['portfolio_value'] + battery_revenue,
                 'weights': portfolio_result['weights'],
                 'returns': portfolio_result['returns'],
-                'price': current_price
+                'price': self.data.iloc[t]['price'],
+                'optimization_method': self.portfolio_optimizer.current_method
             }
             
             # Add portfolio metrics
@@ -94,10 +119,14 @@ class TraditionalBaselineRunner:
             if t % 10000 == 0 or t == max_timesteps - 1:
                 elapsed = time.time() - start_time
                 progress = (t + 1) / max_timesteps * 100
-                portfolio_return = (portfolio_result['portfolio_value'] - 5e8) / 5e8 * 100
+                initial_budget = 8e8 / 0.145  # $800M USD in DKK
+                portfolio_return = (portfolio_result['portfolio_value'] - initial_budget) / initial_budget * 100
                 
+                # Convert to USD for display
+                portfolio_value_usd = portfolio_result['portfolio_value'] * 0.145  # DKK to USD
                 print(f"Progress: {progress:5.1f}% | Step: {t:6,} | "
-                      f"Portfolio: ${portfolio_result['portfolio_value']/1e6:.1f}M | "
+                      f"Method: {self.portfolio_optimizer.current_method:20s} | "
+                      f"Portfolio: ${portfolio_value_usd/1e6:.1f}M USD | "
                       f"Return: {portfolio_return:+5.1f}% | "
                       f"Elapsed: {elapsed:.0f}s")
         
@@ -123,8 +152,10 @@ class TraditionalBaselineRunner:
         
         # Save summary metrics
         summary = self.portfolio_optimizer.get_summary()
-        summary['battery_total_revenue'] = sum(r['battery_revenue'] for r in self.results)
-        summary['final_battery_soc'] = self.battery_optimizer.soc
+        # Calculate battery revenue if available, otherwise set to 0
+        battery_revenue = sum(r.get('battery_revenue', 0) for r in self.results)
+        summary['battery_total_revenue'] = battery_revenue
+        summary['final_battery_soc'] = getattr(self, 'battery_optimizer', {}).get('soc', 0)
         
         summary_path = os.path.join(self.output_dir, "summary_metrics.json")
         with open(summary_path, 'w') as f:
@@ -139,11 +170,12 @@ class TraditionalBaselineRunner:
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle('Traditional Portfolio Optimization - Performance Report', fontsize=16)
         
-        # Portfolio value over time
-        axes[0, 0].plot(df['timestep'], df['portfolio_value'] / 1e6)
+        # Portfolio value over time (convert to USD)
+        portfolio_values_usd = df['portfolio_value'] * 0.145  # Convert DKK to USD
+        axes[0, 0].plot(df['timestep'], portfolio_values_usd / 1e6)
         axes[0, 0].set_title('Portfolio Value Over Time')
         axes[0, 0].set_xlabel('Timestep')
-        axes[0, 0].set_ylabel('Portfolio Value (Million DKK)')
+        axes[0, 0].set_ylabel('Portfolio Value (Million USD)')
         axes[0, 0].grid(True)
         
         # Asset allocation over time
@@ -159,9 +191,14 @@ class TraditionalBaselineRunner:
         axes[0, 1].legend()
         axes[0, 1].grid(True)
         
-        # Battery state of charge
-        axes[1, 0].plot(df['timestep'], df['battery_soc'])
-        axes[1, 0].set_title('Battery State of Charge')
+        # Battery state of charge (if available)
+        if 'battery_soc' in df.columns:
+            axes[1, 0].plot(df['timestep'], df['battery_soc'])
+            axes[1, 0].set_title('Battery State of Charge')
+        else:
+            axes[1, 0].text(0.5, 0.5, 'Battery SOC\nNot Available',
+                           ha='center', va='center', transform=axes[1, 0].transAxes)
+            axes[1, 0].set_title('Battery State of Charge (N/A)')
         axes[1, 0].set_xlabel('Timestep')
         axes[1, 0].set_ylabel('SOC')
         axes[1, 0].grid(True)
@@ -186,8 +223,8 @@ class TraditionalBaselineRunner:
         """Get final performance metrics for benchmarking."""
         summary = self.portfolio_optimizer.get_summary()
         
-        # Add battery metrics
-        battery_revenue = sum(r['battery_revenue'] for r in self.results)
+        # Add battery metrics (if available)
+        battery_revenue = sum(r.get('battery_revenue', 0) for r in self.results)
         summary['battery_total_revenue'] = battery_revenue
         summary['battery_contribution'] = battery_revenue / summary['final_value'] if summary['final_value'] > 0 else 0
         
@@ -237,13 +274,14 @@ def main():
     print("\n" + "="*60)
     print("FINAL RESULTS - Traditional Portfolio Optimization")
     print("="*60)
-    print(f"Final Portfolio Value: ${final_metrics['final_value']/1e6:.2f}M")
+    print(f"Final Portfolio Value: ${final_metrics['final_value_usd']/1e6:.2f}M USD")
+    print(f"Initial Portfolio Value: ${final_metrics['initial_value_usd']/1e6:.2f}M USD")
     print(f"Total Return: {final_metrics['total_return']*100:.2f}%")
     print(f"Sharpe Ratio: {final_metrics['sharpe_ratio']:.3f}")
     print(f"Maximum Drawdown: {final_metrics['max_drawdown']*100:.2f}%")
     print(f"Volatility: {final_metrics['volatility']*100:.2f}%")
     print(f"Calmar Ratio: {final_metrics['calmar_ratio']:.3f}")
-    print(f"Battery Revenue: ${final_metrics['battery_total_revenue']/1e6:.2f}M")
+    print(f"Battery Revenue: ${final_metrics['battery_total_revenue']/1e6:.2f}M USD")
     print("="*60)
 
 

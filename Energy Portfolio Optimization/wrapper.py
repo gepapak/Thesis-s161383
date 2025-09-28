@@ -39,54 +39,20 @@ except Exception:
     _HAS_ENHANCED_MONITORING = False
     EnhancedMetricsMonitor = None
 
-# PRICE_SCALE moved to config - will be imported from environment's config
+# Price normalization: Uses z-score ±3σ scale consistent with environment observations
 
 
 # =========================
 # Memory + Validation Utils
 # =========================
-class SafeDivision:
-    @staticmethod
-    def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
-        if denominator is None or abs(denominator) < 1e-9:
-            return default
-        try:
-            return float(numerator) / float(denominator)
-        except Exception:
-            return default
-
-    @staticmethod
-    def _safe_volatility(values, default=0.0):
-        """Calculate volatility safely, handling edge cases."""
-        try:
-            if len(values) < 2:
-                return default
-
-            # Convert to numpy array and remove NaN/inf values
-            arr = np.array(values, dtype=float)
-            arr = arr[np.isfinite(arr)]
-
-            if len(arr) < 2:
-                return default
-
-            # Calculate returns
-            returns = np.diff(arr) / arr[:-1]
-            returns = returns[np.isfinite(returns)]
-
-            if len(returns) < 1:
-                return default
-
-            # Calculate standard deviation
-            volatility = np.std(returns)
-
-            if not np.isfinite(volatility):
-                return default
-
-            # Cap volatility at reasonable bounds
-            return float(np.clip(volatility, 0.0, 10.0))
-
-        except Exception:
-            return default
+def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Safe division utility to avoid duplication with environment.py"""
+    if denominator is None or abs(denominator) < 1e-9:
+        return default
+    try:
+        return float(numerator) / float(denominator)
+    except Exception:
+        return default
 
 
 # =========================
@@ -149,7 +115,7 @@ class EnhancedLRUCache:
 class ForecastPostProcessor:
     """
     - Normalizes forecasts to match env observation scales:
-        price -> price/PRICE_SCALE clipped [-10,10] (same dynamic range as env price_n)
+        price -> z-score normalization using env's rolling mean/std, mapped to [-1,1] (same as env price_n)
         wind/solar/hydro -> divide by env's p95 scales, clipped [0,1]
         load -> divide by env.load_scale, clipped [0,1]
       Unknown targets are passed through unchanged.
@@ -162,6 +128,31 @@ class ForecastPostProcessor:
         self.env = env
         self.normalize = bool(normalize)
         self.align_horizons = bool(align_horizons)
+
+    def _normalize_price_zscore(self, value: float, mean: float, std: float) -> float:
+        """FIXED: Single implementation of z-score price normalization to eliminate duplication"""
+        try:
+            config = getattr(self.env, 'config', None)
+            if not config:
+                raise ValueError("Cannot normalize price: env.config missing. Fix config initialization to maintain single source of truth.")
+
+            # Require all normalization parameters from config (no hardcoded defaults)
+            if not hasattr(config, 'price_z_score_clip'):
+                raise ValueError("config.price_z_score_clip missing. Add to config to maintain single source of truth.")
+            if not hasattr(config, 'price_normalization_divisor'):
+                raise ValueError("config.price_normalization_divisor missing. Add to config to maintain single source of truth.")
+
+            z_clip = config.price_z_score_clip
+            divisor = config.price_normalization_divisor
+
+            # Step 1: Z-score with provided stats, then clip
+            z_score = (value - mean) / max(std, 1e-6)
+            clipped_z = np.clip(z_score, -z_clip, z_clip)
+            # Step 2: Divide by normalization divisor to map to [-1,1]
+            return float(clipped_z / divisor)
+        except Exception:
+            # FAIL-FAST: Maintain consistency over silent single-step fallback
+            raise ValueError("Cannot normalize price consistently: config parameters missing or invalid")
 
     def normalize_value(self, key: str, val: float) -> float:
         if not self.normalize:
@@ -179,35 +170,56 @@ class ForecastPostProcessor:
                     if t < len(self.env._price_mean) and t < len(self.env._price_std):
                         mean = float(self.env._price_mean[t])
                         std = float(self.env._price_std[t])
-                        std = max(std, 1e-6)  # Avoid division by zero
-                        normalized = (v - mean) / std
-                        return float(np.clip(normalized, -3.0, 3.0))  # Same bounds as environment
+                        return self._normalize_price_zscore(v, mean, std)
 
-                # Fallback: use reasonable DKK price statistics if normalization params unavailable
-                mean = 250.0  # Typical DKK price
-                std = 50.0    # Typical DKK price volatility
-                normalized = (v - mean) / std
-                return float(np.clip(normalized, -3.0, 3.0))
+                # Fallback: use config fallback statistics
+                config = getattr(self.env, 'config', None)
+                if not config:
+                    raise ValueError("Cannot normalize price: env.config missing. Fix config initialization to maintain single source of truth.")
+
+                if not hasattr(config, 'price_fallback_mean'):
+                    raise ValueError("config.price_fallback_mean missing. Add to config to maintain single source of truth.")
+                if not hasattr(config, 'price_fallback_std'):
+                    raise ValueError("config.price_fallback_std missing. Add to config to maintain single source of truth.")
+
+                fallback_mean = config.price_fallback_mean
+                fallback_std = config.price_fallback_std
+                return self._normalize_price_zscore(v, fallback_mean, fallback_std)
             except Exception:
-                # Last resort fallback to old method
-                scale = 10.0
-                return float(np.clip(v / scale, -10.0, 10.0))
+                # FAIL-FAST: Maintain consistency over silent single-step fallback
+                raise ValueError("Cannot normalize price consistently: config parameters missing or invalid")
 
+        # CONSISTENT: Use config-driven normalization for all energy sources
         if "load" in k:
             try:
-                scale = max(float(getattr(self.env, "load_scale", 1.0)), 1e-6)
-                return float(np.clip(v / scale, 0.0, 1.0))
+                # Use config parameters for consistent normalization
+                config = getattr(self.env, 'config', None)
+                if config and hasattr(config, 'load_normalization_divisor'):
+                    divisor = config.load_normalization_divisor
+                    return float(np.clip(v / divisor, 0.0, 1.0))
+                else:
+                    # Fallback with environment scale
+                    scale = max(float(getattr(self.env, "load_scale", 1.0)), 1e-6)
+                    return float(np.clip(v / scale, 0.0, 1.0))
             except Exception:
                 return float(np.clip(v, 0.0, 1.0))
 
+        # CONSISTENT: Use config-driven normalization for renewable sources
         try:
+            config = getattr(self.env, 'config', None)
             if "wind" in k:
+                if config and hasattr(config, 'wind_normalization_divisor'):
+                    return float(np.clip(v / config.wind_normalization_divisor, 0.0, 1.0))
                 scale = max(float(getattr(self.env, "wind_scale", 1.0)), 1e-6)
                 return float(np.clip(v / scale, 0.0, 1.0))
             if "solar" in k:
+                if config and hasattr(config, 'solar_normalization_divisor'):
+                    return float(np.clip(v / config.solar_normalization_divisor, 0.0, 1.0))
                 scale = max(float(getattr(self.env, "solar_scale", 1.0)), 1e-6)
                 return float(np.clip(v / scale, 0.0, 1.0))
             if "hydro" in k:
+                if config and hasattr(config, 'hydro_normalization_divisor'):
+                    return float(np.clip(v / config.hydro_normalization_divisor, 0.0, 1.0))
                 scale = max(float(getattr(self.env, "hydro_scale", 1.0)), 1e-6)
                 return float(np.clip(v / scale, 0.0, 1.0))
         except Exception:
@@ -218,8 +230,8 @@ class ForecastPostProcessor:
     def order_keys_by_horizon_alignment(self, agent: str, keys: List[str]) -> List[str]:
         """
         Reorders forecast keys so those whose horizon is closest to env.investment_freq
-        appear first. We expect keys like "..._forecast_<h>" where <h> is an integer.
-        If parsing fails, returns keys unchanged.
+        appear first. We expect keys like "..._forecast_<horizon_name>" where horizon_name
+        is a string like "immediate", "short", "medium", etc.
         """
         if not self.align_horizons or not isinstance(keys, list) or len(keys) == 0:
             return keys
@@ -227,12 +239,35 @@ class ForecastPostProcessor:
         try:
             inv_freq = int(getattr(self.env, "investment_freq", 12))
 
+            # Get horizons map from forecaster if available
+            forecaster = getattr(self.env, "forecast_generator", None)
+            if forecaster is None:
+                return keys
+
+            hmap = getattr(forecaster, "horizons", {})
+            if not hmap:
+                # CANONICAL: Use cached config source of truth for horizon fallback
+                try:
+                    hmap = getattr(getattr(self.env, 'config', None), 'forecast_horizons', {}).copy()
+                    if not hmap:
+                        raise ValueError("No forecast_horizons in config")
+                except Exception:
+                    # FAIL-FAST: No hardcoded horizon fallbacks allowed for production safety
+                    raise ValueError("Cannot access forecast_horizons from env.config: "
+                                   "config missing or malformed. Fix config initialization.")
+
             def parse_h(k):
                 try:
-                    suf = str(k).split("_")[-1]
-                    return abs(int(suf) - inv_freq), int(suf)
-                except Exception:
-                    return (10**9, 10**9)
+                    # Extract horizon name from key (e.g., "price_forecast_short" -> "short")
+                    horizon_name = str(k).split("_")[-1]
+                    if horizon_name not in hmap:
+                        raise ValueError(f"Horizon '{horizon_name}' not found in config.forecast_horizons. "
+                                       f"Available horizons: {list(hmap.keys())}. Fix config to maintain single source of truth.")
+                    horizon_steps = int(hmap[horizon_name])
+                    return abs(horizon_steps - inv_freq), horizon_steps
+                except Exception as e:
+                    raise ValueError(f"Failed to parse horizon from key '{k}': {str(e)}. "
+                                   f"Ensure all forecast keys follow pattern 'target_forecast_horizon' with valid horizons from config.")
 
             return sorted(keys, key=parse_h)
         except Exception:
@@ -331,9 +366,139 @@ class EnhancedMemoryTracker:
 
 
 # =========================
-# Observation Validator
+# Observation Validator (Merged from observation_validator.py)
 # =========================
-class EnhancedObservationValidator:
+
+class BaseObservationValidator:
+    """
+    Base class for observation validation with common functionality.
+    Prevents duplication between wrapper and metacontroller validators.
+    """
+
+    def __init__(self, env, debug=False):
+        self.env = env
+        self.debug = debug
+        self.logger = logging.getLogger(__name__)
+        self.validation_errors = deque(maxlen=100)
+        self.validation_cache: Dict[Any, bool] = {}
+
+    def _estimate_agent_dimension(self, agent: str) -> int:
+        """
+        FAIL-FAST: No static dimension estimates allowed.
+        Use dynamic calculation from forecaster metadata instead.
+        """
+        raise ValueError(f"Cannot estimate dimensions for agent '{agent}': "
+                        "static dimension estimates removed for production safety. "
+                        "Use dynamic calculation from forecaster.agent_targets/agent_horizons.")
+
+    def _get_safe_bounds(self, dim: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Get safe bounds for observation dimensions."""
+        low = np.full(dim, -100.0, dtype=np.float32)
+        high = np.full(dim, 1000.0, dtype=np.float32)
+        return low, high
+
+    def _obs_signature(self, agent: str, obs: Any):
+        """Create a signature for observation caching."""
+        if isinstance(obs, np.ndarray):
+            try:
+                return (agent, obs.shape, obs.dtype, hash(obs.tobytes()))
+            except Exception:
+                return (agent, obs.shape, obs.dtype, None)
+        return (agent, type(obs), str(obs)[:64])
+
+    def _sanitize_observation(self, obs: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
+        """Sanitize observation by handling NaN/inf and clipping to bounds."""
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+        return np.clip(obs, low, high)
+
+    def _validate_observation_basic(self, agent: str, obs: Any, expected_dim: int,
+                                   low: np.ndarray, high: np.ndarray) -> Tuple[bool, list]:
+        """Basic observation validation logic."""
+        problems = []
+        ok = True
+
+        if not isinstance(obs, np.ndarray):
+            problems.append(f"type={type(obs)} expected np.ndarray")
+            ok = False
+        else:
+            if obs.ndim != 1:
+                problems.append(f"ndim={obs.ndim} expected 1D")
+                ok = False
+            elif obs.shape[0] != expected_dim:
+                problems.append(f"dim={obs.shape[0]} expected {expected_dim}")
+                ok = False
+            if obs.dtype != np.float32:
+                problems.append(f"dtype={obs.dtype} expected float32")
+            if np.any(~np.isfinite(obs)):
+                nbad = int(np.sum(~np.isfinite(obs)))
+                problems.append(f"{nbad} non-finite")
+                ok = False
+            if np.any(obs < low) or np.any(obs > high):
+                out = int(np.sum((obs < low) | (obs > high)))
+                problems.append(f"{out} out-of-bounds")
+
+        return ok, problems
+
+    def _log_validation_issues(self, agent: str, problems: list):
+        """Log validation issues if debug is enabled."""
+        if problems and self.debug:
+            msg = f"Validation issues for {agent}: " + "; ".join(problems)
+            self.validation_errors.append(msg)
+            self.logger.warning(msg)
+
+    def _cleanup_cache(self, max_size: int = 2000, cleanup_size: int = 500):
+        """Clean up validation cache when it gets too large."""
+        if len(self.validation_cache) > max_size:
+            for k in list(self.validation_cache.keys())[:cleanup_size]:
+                del self.validation_cache[k]
+
+    def get_validation_stats(self) -> Dict[str, Any]:
+        """Get validation statistics."""
+        return {
+            'cache_size': len(self.validation_cache),
+            'recent_errors': list(self.validation_errors)[-10:],
+            'total_errors': len(self.validation_errors)
+        }
+
+
+class ObservationValidatorMixin:
+    """
+    Mixin class providing common validation methods.
+    Can be used by both wrapper and metacontroller validators.
+    """
+
+    def fix_observation_shape(self, obs: Any, expected_dim: int) -> np.ndarray:
+        """Fix observation to expected shape and type."""
+        if not isinstance(obs, np.ndarray):
+            if obs is None:
+                obs = np.zeros(expected_dim, dtype=np.float32)
+            elif isinstance(obs, (list, tuple)):
+                obs = np.array(obs, dtype=np.float32)
+            else:
+                obs = np.full(expected_dim, float(obs), dtype=np.float32)
+        else:
+            obs = obs.astype(np.float32)
+
+        if obs.ndim != 1:
+            obs = obs.flatten()
+
+        if obs.size < expected_dim:
+            obs = np.pad(obs, (0, expected_dim - obs.size))
+        elif obs.size > expected_dim:
+            obs = obs[:expected_dim]
+
+        return obs
+
+    def create_fallback_observation(self, expected_dim: int,
+                                   low: Optional[np.ndarray] = None,
+                                   high: Optional[np.ndarray] = None) -> np.ndarray:
+        """Create a safe fallback observation."""
+        if low is not None and high is not None:
+            return ((low[:expected_dim] + high[:expected_dim]) / 2.0).astype(np.float32)
+        return np.zeros(expected_dim, dtype=np.float32)
+
+
+class EnhancedObservationValidator(BaseObservationValidator, ObservationValidatorMixin):
     """
     Validates base obs from the ENV and appends forecast features to build TOTAL obs.
 
@@ -343,15 +508,14 @@ class EnhancedObservationValidator:
     Forecasts are normalized AND keys are prioritized to align horizons (closest to env.investment_freq first).
     """
     def __init__(self, base_env, forecaster, debug=False, postproc: Optional[ForecastPostProcessor] = None):
+        # Initialize base class
+        super().__init__(base_env, debug)
+
         self.base_env = base_env
         self.forecaster = forecaster
-        self.debug = debug
         self.postproc = postproc or ForecastPostProcessor(base_env, normalize=True, align_horizons=True)
 
         self.agent_observation_specs = {}
-        self.validation_errors = deque(maxlen=50)
-        self.validation_cache = {}
-
         self._initialize_observation_specs()
 
     def _initialize_observation_specs(self):
@@ -375,13 +539,45 @@ class EnhancedObservationValidator:
                 self._create_fallback_spec(agent)
 
     def _get_validated_base_dim(self, agent: str) -> int:
+        """
+        FAIL-FAST: Get base observation dimension from environment with strict validation.
+        No static fallbacks allowed - any failure indicates configuration/environment issues.
+        """
         try:
+            # Method 1: Use environment's explicit dimension method
             if hasattr(self.base_env, '_get_base_observation_dim'):
-                return int(self.base_env._get_base_observation_dim(agent))
-            space = self.base_env.observation_space(agent)
-            return int(space.shape[0])
-        except Exception:
-            return {'investor_0': 6, 'battery_operator_0': 4, 'risk_controller_0': 9, 'meta_controller_0': 11}.get(agent, 8)
+                dim = int(self.base_env._get_base_observation_dim(agent))
+                if dim <= 0:
+                    raise ValueError(f"Invalid base dimension {dim} from env._get_base_observation_dim({agent})")
+                return dim
+
+            # Method 2: Use observation space shape
+            if hasattr(self.base_env, 'observation_space'):
+                if callable(self.base_env.observation_space):
+                    space = self.base_env.observation_space(agent)
+                else:
+                    space = self.base_env.observation_space.get(agent)
+
+                if space is None:
+                    raise ValueError(f"No observation space found for agent '{agent}' in base_env.observation_space")
+
+                if not hasattr(space, 'shape'):
+                    raise ValueError(f"Observation space for agent '{agent}' has no shape attribute: {type(space)}")
+
+                dim = int(space.shape[0])
+                if dim <= 0:
+                    raise ValueError(f"Invalid base dimension {dim} from observation_space({agent}).shape")
+                return dim
+
+            # No valid method found
+            raise ValueError(f"Cannot determine base observation dimension for agent '{agent}': "
+                           f"base_env missing both '_get_base_observation_dim' method and 'observation_space' attribute")
+
+        except Exception as e:
+            # FAIL-FAST: No fallbacks allowed for production safety
+            raise ValueError(f"Failed to get validated base dimension for agent '{agent}': {str(e)}. "
+                           f"This indicates environment/wrapper configuration issues that must be fixed. "
+                           f"Static dimension fallbacks removed for production safety.")
 
     def _calculate_forecast_dimension(self, agent: str) -> int:
         try:
@@ -396,15 +592,32 @@ class EnhancedObservationValidator:
                 base_dims = int(len(targets) * len(horizons))
                 # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
                 return base_dims + (1 if agent != "risk_controller_0" else 0)
-            # FIXED: Correct forecast dimensions based on actual agent allocations + confidence
-            # investor_0: 4 targets × 3 horizons + 1 confidence = 13
-            # battery_operator_0: 3 targets × 4 horizons + 1 confidence = 13
-            # risk_controller_0: 4 targets × 3 horizons (no confidence) = 12
-            # meta_controller_0: 5 targets × 4 horizons + 1 confidence = 21
-            return {'investor_0': 13, 'battery_operator_0': 13, 'risk_controller_0': 12, 'meta_controller_0': 21}.get(agent, 0)
+            # DYNAMIC: Calculate forecast dimensions from actual forecaster configuration
+            try:
+                if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
+                    targets = self.forecaster.agent_targets.get(agent, [])
+                    horizons = self.forecaster.agent_horizons.get(agent, [])
+                    base_dims = len(targets) * len(horizons)
+                    # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
+                    confidence_dim = 1 if agent != "risk_controller_0" else 0
+                    return base_dims + confidence_dim
+            except Exception:
+                pass
+            # FAIL-FAST: No static fallbacks - fail fast to maintain single source of truth
+            raise ValueError(f"Cannot calculate forecast dimensions for agent '{agent}': forecaster missing agent_targets or agent_horizons metadata")
         except Exception:
-            # FIXED: Correct forecast dimensions based on actual agent allocations + confidence
-            return {'investor_0': 13, 'battery_operator_0': 13, 'risk_controller_0': 12, 'meta_controller_0': 21}.get(agent, 0)
+            # DYNAMIC: Try to calculate from forecaster, fallback to hardcoded if needed
+            try:
+                if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
+                    targets = self.forecaster.agent_targets.get(agent, [])
+                    horizons = self.forecaster.agent_horizons.get(agent, [])
+                    base_dims = len(targets) * len(horizons)
+                    confidence_dim = 1 if agent != "risk_controller_0" else 0
+                    return base_dims + confidence_dim
+            except Exception:
+                pass
+            # FAIL-FAST: No static fallbacks - fail fast to maintain single source of truth
+            raise ValueError(f"Cannot calculate forecast dimensions for agent '{agent}': forecaster missing agent_targets or agent_horizons metadata")
 
     def _get_agent_forecast_keys(self, agent: str, expected_count: int) -> List[str]:
         try:
@@ -426,9 +639,35 @@ class EnhancedObservationValidator:
         return low, high
 
     def _create_fallback_spec(self, agent: str):
-        base_dim = {'investor_0': 6, 'battery_operator_0': 4, 'risk_controller_0': 9, 'meta_controller_0': 11}.get(agent, 8)
-        # FIXED: Correct forecast dimensions based on actual agent allocations + confidence
-        forecast_dim = {'investor_0': 13, 'battery_operator_0': 13, 'risk_controller_0': 12, 'meta_controller_0': 21}.get(agent, 0)
+        # FAIL-FAST: No static dimension estimates allowed for production safety
+        # Base dimensions must be calculated dynamically from environment configuration
+        try:
+            # Get base observation dimension from environment's observation space
+            if hasattr(self.base_env, 'observation_space') and agent in self.base_env.observation_space:
+                base_dim = self.base_env.observation_space[agent].shape[0]
+            elif hasattr(self.base_env, '_get_base_observation_dimension'):
+                base_dim = self.base_env._get_base_observation_dimension(agent)
+            else:
+                raise ValueError(f"Cannot determine base observation dimension for agent '{agent}': "
+                               f"environment missing observation_space or _get_base_observation_dimension method")
+        except Exception as e:
+            raise ValueError(f"Cannot create fallback spec for agent '{agent}': "
+                           f"failed to get base dimension dynamically. {str(e)}. "
+                           f"Static dimension estimates removed for production safety.")
+        # DYNAMIC: Calculate forecast dimensions from actual forecaster configuration
+        try:
+            if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
+                targets = self.forecaster.agent_targets.get(agent, [])
+                horizons = self.forecaster.agent_horizons.get(agent, [])
+                base_forecast_dims = len(targets) * len(horizons)
+                confidence_dim = 1 if agent != "risk_controller_0" else 0
+                forecast_dim = base_forecast_dims + confidence_dim
+            else:
+                # ENFORCE: No static fallbacks - fail fast to maintain single source of truth
+                raise ValueError(f"Cannot create fallback spec for agent '{agent}': forecaster missing agent_targets or agent_horizons metadata")
+        except Exception as e:
+            # ENFORCE: No static fallbacks - fail fast to maintain single source of truth
+            raise ValueError(f"Cannot create fallback spec for agent '{agent}': {str(e)}")
         total_dim = base_dim + forecast_dim
         self.agent_observation_specs[agent] = {
             'base_dim': base_dim,
@@ -493,7 +732,9 @@ class EnhancedObservationValidator:
             expected = spec['total_dim']
             low, high = spec['bounds']
             return ((low[:expected] + high[:expected]) / 2.0).astype(np.float32)
-        return np.zeros(20, dtype=np.float32)
+        # FAIL-FAST: No static fallbacks allowed for production safety
+        raise ValueError(f"Cannot create safe observation for agent '{agent}': "
+                        "agent not in observation specs. Build spec first using dynamic calculation.")
 
     def get_validation_stats(self) -> Dict:
         return {
@@ -626,7 +867,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     metadata = {"name": "multi_horizon_wrapper:normalized-aligned-v1"}
 
     def __init__(self, base_env, multi_horizon_forecaster, log_path=None, max_memory_mb=1500,
-                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000, log_last_n=100,
+                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000, log_interval=20,
                  disable_csv_logging=False):
         self.env = base_env
         self.forecaster = multi_horizon_forecaster
@@ -637,7 +878,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         # Logging control - configurable based on disable_csv_logging
         self.total_timesteps = total_timesteps
-        self.log_last_n = log_last_n if not disable_csv_logging else 0
+        self.log_interval = log_interval if not disable_csv_logging else 0
         self.log_start_step = 0
         self.logging_enabled = not disable_csv_logging  # Disable logging if requested
         self.disable_csv_logging = disable_csv_logging
@@ -645,9 +886,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # Memory & logging infra
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=max_memory_mb)
         self.log_path = self._setup_logging_path(log_path) if log_path else None
-        self.log_buffer = deque(maxlen=256)
+        self.log_buffer = deque(maxlen=128)  # Reduced from 256 to prevent memory accumulation
         self.log_lock = threading.RLock() if threading else nullcontext()
-        self._flush_every_rows = 1000
+        self._flush_every_rows = 500  # Reduced from 1000 for more frequent flushing
 
         # Enhanced monitoring
         self.enhanced_monitor = None
@@ -685,7 +926,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         self._ep_meta_return = 0.0
         self._prev_forecasts_for_error: Dict[str, float] = {}
-        self._log_interval = 20
+        # Use the configurable log_interval instead of hardcoded 20
+        self._log_interval = self.log_interval
         self._last_episode_seed = None
         self._last_episode_end_flag = 0
         self._last_step_wall_ms = 0.0
@@ -698,13 +940,26 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         # logging - initialize
         if self.log_path and not self.disable_csv_logging:
-            print(f"📊 Full logging every 20 timesteps from start")
+            print(f"📊 Full logging every {self.log_interval} timesteps from start")
             self._initialize_logging_safe()
         elif self.disable_csv_logging:
             print("⚡ CSV logging disabled - maximum speed mode")
         else:
             print("⚡ No logging configured - maximum speed mode")
         print("✅ Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
+
+    def _get_currency_rate(self) -> float:
+        """Get currency conversion rate from single source of truth."""
+        # Priority: env._dkk_to_usd_rate > env.config.dkk_to_usd_rate > fallback
+        rate = getattr(self.env, '_dkk_to_usd_rate', None)
+        if rate is not None:
+            return float(rate)
+
+        config = getattr(self.env, 'config', None)
+        if config and hasattr(config, 'dkk_to_usd_rate'):
+            return float(config.dkk_to_usd_rate)
+
+        return 0.145  # Fallback rate
 
     # ---- spaces ----
     def _build_wrapper_observation_spaces(self):
@@ -737,13 +992,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         if self.disable_csv_logging:
             return False
 
-        # Check if only final results should be logged
-        if self.log_last_n == 1:  # final_results_only mode
-            # Only log on the very last step
-            return self.step_count >= (self.total_timesteps - 1)
-
-        # Always log (normal mode only)
-        return True
+        # Log every N timesteps based on log_interval
+        return (self.step_count % self.log_interval == 0)
 
     def _initialize_logging_safe(self):
         # Initialize logging based on mode
@@ -977,15 +1227,48 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             cleanup_level, _ = self.memory_tracker.should_cleanup(force=force)
             if cleanup_level or force:
                 self.memory_tracker.cleanup(cleanup_level or 'medium')
-                # Enhanced cache cleanup with LRU
-                if hasattr(self.obs_builder, 'forecast_cache') and len(self.obs_builder.forecast_cache) > 500:
+
+                # Enhanced cache cleanup with LRU - more aggressive thresholds
+                if hasattr(self.obs_builder, 'forecast_cache') and len(self.obs_builder.forecast_cache) > 300:  # Reduced from 500
                     self.obs_builder.forecast_cache._memory_cleanup()
-                if hasattr(self.obs_builder, 'agent_forecast_cache') and len(self.obs_builder.agent_forecast_cache) > 1000:
+                if hasattr(self.obs_builder, 'agent_forecast_cache') and len(self.obs_builder.agent_forecast_cache) > 600:  # Reduced from 1000
                     self.obs_builder.agent_forecast_cache._memory_cleanup()
+
+                # Clear TensorFlow session if available
+                try:
+                    import tensorflow as tf
+                    tf.keras.backend.clear_session()
+                except Exception:
+                    pass
+
+                # Flush log buffer more aggressively
                 self._flush_log_buffer()
+
+                # Clear validation caches
                 if hasattr(self.obs_builder.validator, 'validation_cache'):
                     self.obs_builder.validator.validation_cache.clear()
-                gc.collect()
+
+                # Clear forecaster caches if available
+                if hasattr(self.forecaster, '_global_cache'):
+                    if len(self.forecaster._global_cache) > 4000:  # Reduced threshold
+                        self.forecaster._global_cache.clear()
+                if hasattr(self.forecaster, '_agent_cache'):
+                    if len(self.forecaster._agent_cache) > 2000:  # Reduced threshold
+                        self.forecaster._agent_cache.clear()
+
+                # Multiple garbage collection cycles for thorough cleanup
+                for _ in range(2):
+                    gc.collect()
+
+                # Clear CUDA cache
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                except Exception:
+                    pass
+
         except Exception as e:
             if self.error_count < self.max_errors:
                 print(f"⚠️ Memory cleanup failed: {e}")
@@ -1114,6 +1397,21 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         except Exception:
             return float(default)
 
+    def _ensure_float(self, x, default=0.0):
+        """Enhanced safety helper to ensure all logged fields are valid floats with no NaNs/None."""
+        try:
+            if x is None:
+                return float(default)
+            if isinstance(x, (list, tuple, np.ndarray)):
+                x = np.asarray(x).reshape(-1)
+                x = x[0] if x.size > 0 else default
+            result = float(x)
+            if not np.isfinite(result):
+                return float(default)
+            return result
+        except (ValueError, TypeError, OverflowError):
+            return float(default)
+
     def _get_actuals_for_logging(self) -> Dict[str, float]:
         out = {'wind': 0.0, 'solar': 0.0, 'hydro': 0.0, 'price': 0.0, 'load': 0.0}
         try:
@@ -1165,12 +1463,36 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
                 invf = int(getattr(self.env, "investment_freq", 12))
 
-                def dist(k):
+                # FIXED: Use generator's horizons map to translate names to steps
+                def steps_for_key(k):
+                    """Convert horizon name to steps using generator's horizons map."""
                     try:
-                        h = int(str(k).split("_")[-1])
-                        return abs(h - invf)
-                    except Exception:
-                        return 10**9
+                        # Get horizons map from forecaster
+                        hmap = getattr(self.forecaster, "horizons", {})
+                        if not hmap:
+                            # CANONICAL: Use cached config source of truth for horizon fallback
+                            try:
+                                hmap = getattr(getattr(self.base_env, 'config', None), 'forecast_horizons', {}).copy()
+                                if not hmap:
+                                    raise ValueError("No forecast_horizons in config")
+                            except Exception:
+                                # FAIL-FAST: No hardcoded horizon fallbacks allowed for production safety
+                                raise ValueError("Cannot access forecast_horizons from base_env.config: "
+                                               "config missing or malformed. Fix config initialization to maintain single source of truth.")
+
+                        # Extract horizon name from key (e.g., "price_forecast_short" -> "short")
+                        name = str(k).split("_")[-1]
+                        if name not in hmap:
+                            raise ValueError(f"Horizon '{name}' not found in config.forecast_horizons. "
+                                           f"Available horizons: {list(hmap.keys())}. Fix config to maintain single source of truth.")
+                        return int(hmap[name])
+                    except Exception as e:
+                        raise ValueError(f"Failed to get horizon steps for key '{k}': {str(e)}. "
+                                       f"Ensure all forecast keys follow pattern 'target_forecast_horizon' with valid horizons from config.")
+
+                def dist(k):
+                    """Calculate distance between horizon steps and investment frequency."""
+                    return abs(steps_for_key(k) - invf)
 
                 k_best, v_best = min(cand, key=lambda kv: dist(kv[0]))
                 pf_aligned = float(v_best)
@@ -1211,7 +1533,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             # Apply safety bounds using the new helper method
             portfolio_value = self._safe_portfolio_value(portfolio_value, initial_budget)
 
-            perf = float(SafeDivision._safe_divide(portfolio_value, initial_budget, 1.0))
+            perf = float(_safe_divide(portfolio_value, initial_budget, 1.0))
             perf_clipped = float(np.clip(perf, 0.0, 10.0))
             overall_risk = float(np.clip(getattr(self.env, "overall_risk_snapshot", 0.5), 0.0, 1.0))
             market_risk = float(np.clip(getattr(self.env, "market_risk_snapshot", 0.5), 0.0, 1.0))
@@ -1232,7 +1554,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
                 # --- START: CURRENCY & METRIC SETUP ---
                 # Get the single source of truth for currency conversion from the environment
-                dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
+                dkk_to_usd_rate = self._get_currency_rate()
+
+                # GUARDRAIL: Check currency rate is valid to prevent regression
+                assert dkk_to_usd_rate > 0, f"Invalid currency rate: {dkk_to_usd_rate}"
 
                 # Fetch core financial values from the environment (all are in DKK at this stage)
                 # These will be converted to USD before logging.
@@ -1346,7 +1671,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 step_ms = float(self._last_step_wall_ms)
                 def clip_frac(key):
                     tot = max(1, self._last_clip_totals.get(key, 1))
-                    return float(SafeDivision._safe_divide(self._last_clip_counts.get(key, 0), tot, 0.0))
+                    return float(_safe_divide(self._last_clip_counts.get(key, 0), tot, 0.0))
                 clip_inv, clip_bat, clip_rsk, clip_meta = clip_frac("investor"), clip_frac("battery"), clip_frac("risk"), clip_frac("meta")
 
                 # MAE@1 using previous forecast cache (non-monetary)
@@ -1360,8 +1685,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
                 # Forecast alignment score diagnostic (non-monetary)
                 try:
-                    price_scale_fallback = getattr(getattr(self.env, 'config', object()), 'price_scale', 10.0)
-                    cur_price_norm = float(np.clip(self._safe_float(actuals['price'], 0.0) / price_scale_fallback, -10.0, 10.0))
+                    # Use z-score normalization consistent with env observations ([-1,1] scale)
+                    cur_price_norm = float(np.clip(self._safe_float(actuals['price'], 0.0), -1.0, 1.0))
                     realized_ret_dummy = 0.0 # Placeholder as real return calc is complex here
                     forecast_alignment_score = float(np.sign(self._last_price_forecast_aligned - cur_price_norm) * realized_ret_dummy)
                 except Exception:
@@ -1372,12 +1697,12 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     ts_str, int(step_t), int(self.episode_count), meta_reward, inv_freq, cap_frac,
                     meta_a0, meta_a1, inv_a0, inv_a1, inv_a2, batt_a0, risk_a0,
                     *forecasts_logged,
-                    self._last_price_forecast_norm, self._last_price_forecast_aligned,
-                    perf, portfolio_value_usd, equity_usd, total_return_nav_usd, overall_risk, market_risk,
-                    budget_usd, wind_c, solar_c, hydro_c, batt_e,
+                    self._ensure_float(self._last_price_forecast_norm), self._ensure_float(self._last_price_forecast_aligned),
+                    perf, self._ensure_float(portfolio_value_usd), self._ensure_float(equity_usd), self._ensure_float(total_return_nav_usd), overall_risk, market_risk,
+                    self._ensure_float(budget_usd), wind_c, solar_c, hydro_c, batt_e,
                     price_act, load_act, wind_act, solar_act, hydro_act,
-                    market_stress, market_vol, revenue_step_usd,
-                    generation_revenue_usd, mtm_pnl_usd, distributed_profits_usd, cumulative_returns_usd, investment_capital_usd, fund_performance,
+                    market_stress, market_vol, self._ensure_float(revenue_step_usd),
+                    self._ensure_float(generation_revenue_usd), self._ensure_float(mtm_pnl_usd), self._ensure_float(distributed_profits_usd), self._ensure_float(cumulative_returns_usd), self._ensure_float(investment_capital_usd), self._ensure_float(fund_performance),
                     self._ep_meta_return, step_in_ep, episode_end,
                     *r6,
                     r_fin, r_risk, r_sus, r_eff, r_div,
@@ -1389,7 +1714,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 ]
 
                 self.log_buffer.append(row)
-                if len(self.log_buffer) >= 25 or self.step_count % 500 == 0 or len(self.log_buffer) >= self._flush_every_rows or episode_end:
+                # CONSISTENT LOGGING: Flush immediately for 20-timestep logging consistency
+                # This ensures logged steps are immediately visible in CSV file
+                if (self.step_count % self._log_interval == 0) or len(self.log_buffer) >= 25 or self.step_count % 500 == 0 or len(self.log_buffer) >= self._flush_every_rows or episode_end:
                     self._flush_log_buffer()
         except Exception as e:
             if self.error_count < self.max_errors:
@@ -1477,10 +1804,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 class BaselineCSVWrapper(ParallelEnv):
     """Baseline wrapper that adds CSV logging without forecasting overhead."""
 
-    def __init__(self, base_env, log_path=None, total_timesteps=50000, log_last_n=100):
+    def __init__(self, base_env, log_path=None, total_timesteps=50000, log_interval=20):
         self.env = base_env
         self.total_timesteps = total_timesteps
-        self.log_last_n = log_last_n
+        self.log_interval = log_interval
 
         # CSV logging setup
         self.log_path = log_path
@@ -1494,6 +1821,9 @@ class BaselineCSVWrapper(ParallelEnv):
         # Initialize CSV file
         if self.log_path:
             self._init_csv()
+            print(f"📊 Baseline logging: every {self.log_interval} timesteps")
+        else:
+            print("⚡ No logging configured - maximum speed mode")
 
         # Copy attributes from base environment
         self.metadata = getattr(base_env, 'metadata', {})
@@ -1543,7 +1873,7 @@ class BaselineCSVWrapper(ParallelEnv):
 
             # Calculate portfolio value in USD using config rate
             fund_nav = getattr(env, 'fund_nav', 500_000_000)
-            dkk_to_usd = getattr(env, '_dkk_to_usd_rate', 0.145)  # From config: 0.145
+            dkk_to_usd = self._get_currency_rate()
             portfolio_value_usd = fund_nav * dkk_to_usd
 
             # Get current data point
@@ -1567,23 +1897,23 @@ class BaselineCSVWrapper(ParallelEnv):
                 'timestep': i,
                 'timestamp': str(timestamp),
                 'step_in_episode': getattr(env, 'step_in_episode', i),
-                'Total_Portfolio_Value_USD': portfolio_value_usd,
-                'Investment_Capital_USD': getattr(env, 'investment_capital', 500_000_000) * dkk_to_usd,
-                'Distributed_Profits_USD': getattr(env, 'distributed_profits', 0) * dkk_to_usd,
-                'Cumulative_Returns_USD': getattr(env, 'cumulative_returns', 0) * dkk_to_usd,
-                'Generation_Revenue_USD': getattr(env, 'last_generation_revenue', 0) * dkk_to_usd,
-                'MTM_Value_USD': getattr(env, 'mtm_portfolio_value', 0) * dkk_to_usd,
-                'Operational_Revenue_USD': getattr(env, 'last_revenue', 0) * dkk_to_usd,
-                'Battery_Revenue_USD': getattr(env, 'last_battery_revenue', 0) * dkk_to_usd,
-                'MTM_PnL_USD': getattr(env, 'last_mtm_pnl', 0) * dkk_to_usd,
+                'Total_Portfolio_Value_USD': self._ensure_float(portfolio_value_usd),
+                'Investment_Capital_USD': self._ensure_float(getattr(env, 'investment_capital', 500_000_000) * dkk_to_usd),
+                'Distributed_Profits_USD': self._ensure_float(getattr(env, 'distributed_profits', 0) * dkk_to_usd),
+                'Cumulative_Returns_USD': self._ensure_float(getattr(env, 'cumulative_returns', 0) * dkk_to_usd),
+                'Generation_Revenue_USD': self._ensure_float(getattr(env, 'last_generation_revenue', 0) * dkk_to_usd),
+                'MTM_Value_USD': self._ensure_float(getattr(env, 'mtm_portfolio_value', 0) * dkk_to_usd),
+                'Operational_Revenue_USD': self._ensure_float(getattr(env, 'last_revenue', 0) * dkk_to_usd),
+                'Battery_Revenue_USD': self._ensure_float(getattr(env, 'last_battery_revenue', 0) * dkk_to_usd),
+                'MTM_PnL_USD': self._ensure_float(getattr(env, 'last_mtm_pnl', 0) * dkk_to_usd),
                 'Battery_Energy_MWh': getattr(env, 'battery_energy', 0),
                 'Battery_Capacity_MW': getattr(env, 'battery_capacity', 100),
                 'Wind_Generation_MW': wind,
                 'Solar_Generation_MW': solar,
                 'Hydro_Generation_MW': hydro,
                 'Load_MW': load,
-                'Price_DKK_MWh': price_dkk,
-                'Price_USD_MWh': price_dkk * dkk_to_usd,
+                'Price_DKK_MWh': self._ensure_float(price_dkk),
+                'Price_USD_MWh': self._ensure_float(price_dkk * dkk_to_usd),
                 'Capital_Allocation_Fraction': getattr(env, 'capital_allocation_fraction', 0.1),
                 'Investment_Frequency': getattr(env, 'investment_freq', 6),
                 'Market_Volatility': getattr(env, 'market_volatility', 0),
@@ -1599,9 +1929,9 @@ class BaselineCSVWrapper(ParallelEnv):
             # Add to buffer
             self.csv_buffer.append(row)
 
-            # Flush buffer if needed
-            if len(self.csv_buffer) >= self.buffer_size:
-                self._flush_csv_buffer()
+            # CONSISTENT LOGGING: Flush immediately for 20-timestep logging consistency
+            # This ensures logged steps are immediately visible in CSV file
+            self._flush_csv_buffer()
 
         except Exception as e:
             print(f"Warning: CSV logging error: {e}")
@@ -1633,8 +1963,8 @@ class BaselineCSVWrapper(ParallelEnv):
 
         self.step_count += 1
 
-        # Log if within logging window
-        if self.log_last_n == 0 or self.step_count > (self.total_timesteps - self.log_last_n):
+        # CONSISTENT LOGGING: Log every N timesteps as specified by log_interval
+        if self.step_count % self.log_interval == 0:
             self._log_step(obs, rewards, dones, truncs, infos)
 
         return obs, rewards, dones, truncs, infos
@@ -1710,7 +2040,7 @@ class UltraFastProgressWrapper(ParallelEnv):
                         portfolio_value_dkk = getattr(self.env, 'init_budget', 3_448_275_862)  # 500M USD in DKK
 
             # Convert DKK to USD for display
-            dkk_to_usd_rate = getattr(self.env.config, 'dkk_to_usd_rate', 0.145)
+            dkk_to_usd_rate = self._get_currency_rate()
             portfolio_value = (portfolio_value_dkk * dkk_to_usd_rate) / 1e6  # Convert to USD millions
 
             # Validate portfolio value for consistency
@@ -1724,8 +2054,7 @@ class UltraFastProgressWrapper(ParallelEnv):
             if len(self.portfolio_history) > 10:
                 self.portfolio_history.pop(0)  # Keep last 10 values
 
-            # Get financial breakdown with DKK to USD conversion
-            dkk_to_usd_rate = getattr(self.env, '_dkk_to_usd_rate', 0.145)
+            # Get financial breakdown with DKK to USD conversion (reuse rate from above)
             ops_revenue_dkk = getattr(self.env, 'last_generation_revenue', 0.0)
             ops_revenue_usd = ops_revenue_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
 

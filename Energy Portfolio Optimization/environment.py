@@ -4,18 +4,18 @@
 """
 Multi-agent renewable energy investment environment with hybrid economic model.
 
-HYBRID FUND STRUCTURE ($700M Total Capital):
+HYBRID FUND STRUCTURE ($800M Total Capital):
 ==============================================================================
 ECONOMIC MODEL: Clear separation between physical ownership and financial trading
 
-1) PHYSICAL OWNERSHIP ($589M deployed - 84.1% allocation):
-   - Wind farms: 225 MW ($405M) - Fractional ownership: 15% of 1,500MW wind farm
-   - Solar farms: 100 MW ($120M) - Fractional ownership: 10% of 1,000MW solar farm
-   - Hydro plants: 20 MW ($60M) - Fractional ownership: 2% of 1,000MW hydro plant
+1) PHYSICAL OWNERSHIP ($704M deployed - 88% allocation):
+   - Wind farms: 270 MW ($540M) - Fractional ownership: 18% of 1,500MW wind farm
+   - Solar farms: 100 MW ($100M) - Fractional ownership: 10% of 1,000MW solar farm
+   - Hydro plants: 40 MW ($60M) - Fractional ownership: 4% of 1,000MW hydro plant
    - Battery storage: 10 MWh ($4M) - Direct ownership
-   - Total: 345 MW physical capacity generating real electricity
+   - Total: 420 MW physical capacity generating real electricity
 
-2) FINANCIAL TRADING ($111M allocated - 15.9% allocation):
+2) FINANCIAL TRADING ($96M allocated - 12% allocation):
    - Renewable energy index derivatives
    - Wind/solar/hydro futures contracts
    - Energy storage arbitrage instruments
@@ -118,21 +118,21 @@ class StabilizedObservationManager:
     def _build_spaces(self) -> Dict[str, spaces.Box]:
         sp: Dict[str, spaces.Box] = {}
 
-        # Use per-dimension bounds to allow negative normalized price where applicable.
-        inv_low  = np.array([0.0, 0.0, 0.0, -10.0, 0.0, 0.0], dtype=np.float32)
-        inv_high = np.array([10.0, 10.0, 10.0,  10.0, 10.0, 10.0], dtype=np.float32)
+        # Use per-dimension bounds with price_n in [-1,1] (z-score/3.0 normalization)
+        inv_low  = np.array([0.0, 0.0, 0.0, -1.0, 0.0, 0.0], dtype=np.float32)
+        inv_high = np.array([1.0, 1.0, 1.0,  1.0, 1.0, 10.0], dtype=np.float32)  # budget_n still uses /10 scaling
 
-        bat_low  = np.array([-10.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        bat_high = np.array([ 10.0,10.0,10.0,10.0], dtype=np.float32)
+        bat_low  = np.array([-1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        bat_high = np.array([ 1.0, 10.0, 10.0, 1.0], dtype=np.float32)  # price_n [-1,1], others keep existing scales
 
         # risk: [price_n, vol*10, stress*10, wind_pos_rel*10, solar_pos_rel*10, hydro_pos_rel*10,
-        #        cap_frac*10, equity_rel*10, risk_multiplier*5]
-        risk_low  = np.array([-10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        risk_high = np.array([ 10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0,10.0], dtype=np.float32)
+        #        cap_frac*10, equity_rel*10, risk_multiplier*5] - price_n now [-1,1]
+        risk_low  = np.array([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        risk_high = np.array([ 1.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0], dtype=np.float32)
 
-        # meta: idx4 is price_n which can be negative
-        meta_low  = np.array([0.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        meta_high = np.array([10.0]*11, dtype=np.float32)
+        # meta: idx4 is price_n which can be negative (now [-1,1])
+        meta_low  = np.array([0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        meta_high = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0, 10.0], dtype=np.float32)
 
         sp["investor_0"]         = spaces.Box(low=inv_low,  high=inv_high,  shape=(6,),  dtype=np.float32)
         sp["battery_operator_0"] = spaces.Box(low=bat_low,  high=bat_high,  shape=(4,),  dtype=np.float32)
@@ -177,21 +177,22 @@ class ProfitFocusedRewardCalculator:
         self.operational_vols = {'wind': 0.03, 'solar': 0.025, 'hydro': 0.015}
         self.operational_correlations = {'wind_solar': 0.4, 'wind_hydro': 0.2, 'solar_hydro': 0.3}
 
-        # OPERATIONAL EXCELLENCE FOCUSED: Reward weights for renewable energy fund management
-        if config and hasattr(config, 'forecast_accuracy_reward_weight'):
+        # FIXED: Use reward weights from config to maintain single source of truth
+        if config and hasattr(config, 'profit_reward_weight'):
+            # Use config-driven reward weights
             self.reward_weights = {
-                'operational_revenue': 0.20,    # REDUCED: Renewable energy revenue
-                'risk_management': 0.15,        # REDUCED: Volatility and drawdowns
-                'hedging_effectiveness': 0.15,  # MAINTAINED: Price exposure management
-                'nav_stability': 0.50,          # INCREASED: Fund growth is PRIMARY goal
+                'operational_revenue': getattr(config, 'profit_reward_weight', 1.0) * 0.4,  # Scale profit weight
+                'risk_management': getattr(config, 'risk_penalty_weight', 5.0) * 0.1,      # Scale risk penalty
+                'hedging_effectiveness': 0.15,  # Default hedging weight
+                'nav_stability': 0.35,          # Remaining weight for stability
                 'cash_flow': 0.0,               # Merged into operational_revenue
-                'forecast': 0.0,                # Disabled - focus on fundamentals
+                'forecast': getattr(config, 'forecast_accuracy_reward_weight', 0.3) * 0.1,  # Scale forecast weight
             }
             # Trading controls from config
-            self.forecast_confidence_threshold = getattr(config, 'forecast_confidence_threshold', 0.70)  # 70% confidence threshold
-            self.max_drawdown_threshold = 0.60       # USER SPECIFIED: 60% drawdown threshold (learning mode)
+            self.forecast_confidence_threshold = getattr(config, 'forecast_confidence_threshold', 0.70)
+            self.max_drawdown_threshold = 0.60  # Conservative for learning
         else:
-            # Fallback to operational excellence focused values if no config
+            # Fallback weights if no config available
             self.reward_weights = {
                 'operational_revenue': 0.50,    # PRIMARY: Maximize renewable energy revenue
                 'risk_management': 0.25,        # SECONDARY: Minimize volatility and drawdowns
@@ -623,12 +624,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         # CAPEX tables from config (get DKK values for internal calculations)
         self.asset_capex = self.config.get_asset_capex(currency='DKK')
-        if isinstance(asset_capex, dict):
-            try:
-                # If override provided, assume it's in USD and convert to DKK
-                for key, value_usd in asset_capex.items():
-                    self.asset_capex[key] = value_usd / self.config.dkk_to_usd_rate
-            except Exception: pass
+        # Note: If overrides are needed later, they should be passed as explicit parameters
 
         # Initialize fund with proper allocation structure
         self.total_fund_value = float(self.init_budget)  # Total fund: 5.52B DKK
@@ -647,6 +643,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # FIXED: Deploy initial assets (ONE-TIME ONLY)
         if not self.assets_deployed:
             self._deploy_initial_assets_once(initial_asset_plan)
+
+        # CRITICAL FIX: Initialize reward calculator AFTER asset deployment with correct baseline NAV
+        if self.reward_calculator is None:
+            # Use post-CAPEX NAV as baseline instead of pre-CAPEX init_budget
+            post_capex_nav = self._calculate_fund_nav()
+            self.reward_calculator = ProfitFocusedRewardCalculator(initial_budget=post_capex_nav, config=self.config)
+            # Store config reference for reward calculator
+            if hasattr(self.reward_calculator, 'config'):
+                self.reward_calculator.config = self.config
+            logging.info(f"Reward calculator initialized with post-CAPEX baseline NAV: {post_capex_nav:,.0f} DKK")
 
         # FIXED: Currency conversion and data loading
         # Convert DKK prices to USD (Danish data) - SINGLE CONVERSION POINT
@@ -667,8 +673,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # Store conversion rate for final reporting only
         self._dkk_to_usd_rate = DKK_TO_USD
 
+        # Initialize conversion logging flag first
+        if not hasattr(self, '_conversion_logged'):
+            self._conversion_logged = False
+
         # Log DKK price range for verification
-        if hasattr(self, '_conversion_logged') and not self._conversion_logged:
+        if not self._conversion_logged:
             logging.info(f"Price system: Using DKK throughout, USD conversion rate = {DKK_TO_USD:.3f}")
             logging.info(f"DKK price range: {price_dkk_filtered.min():.1f}-{price_dkk_filtered.max():.1f} DKK/MWh")
             self._conversion_logged = True
@@ -688,7 +698,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         # Normalize prices for agent observations (z-score with bounds)
         price_normalized = (price_dkk_filtered - price_rolling_mean) / (price_rolling_std + 1e-6)
-        price_normalized_clipped = np.clip(price_normalized, -3.0, 3.0)  # ±3 sigma bounds
+        price_normalized_clipped = np.clip(price_normalized, -self.config.price_z_score_clip, self.config.price_z_score_clip)  # ±3 sigma bounds
 
         self._price = price_normalized_clipped.to_numpy()  # Normalized for agents
 
@@ -698,9 +708,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         # FIXED: Prices remain in DKK throughout system for consistency
         # Raw prices in _price_raw are DKK, normalized prices in _price are z-scores
-
-        # Initialize conversion logging flag
-        self._conversion_logged = False
 
         self._load  = self.data.get('load',  pd.Series(0.0, index=self.data.index)).astype(float).to_numpy()
         self._riskS = self.data.get('risk',  pd.Series(0.3, index=self.data.index)).astype(float).to_numpy()
@@ -741,11 +748,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             "meta_controller_0":  spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),  # FIXED: [-1,1] instead of [0,1]
         }
 
-        # FIXED: reward calc & risk controller with config
-        self.reward_calculator = ProfitFocusedRewardCalculator(initial_budget=self.init_budget, config=self.config)
-        # Store config reference for reward calculator
-        if hasattr(self.reward_calculator, 'config'):
-            self.reward_calculator.config = self.config
+        # CRITICAL FIX: Initialize reward calculator AFTER asset deployment to use correct baseline NAV
+        # This will be moved after _deploy_initial_assets_once() call
+        self.reward_calculator = None  # Temporary placeholder
+
         try:
             self.enhanced_risk_controller = EnhancedRiskController(lookback_window=144) if enhanced_risk_controller else None
         except Exception:
@@ -819,8 +825,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
 
-        logging.info(f"Hybrid renewable fund initialized with ${self.init_budget:,.0f}")
+        # Display both DKK and USD for clarity
+        usd_value = self.init_budget * getattr(self.config, 'dkk_to_usd_rate', 0.145)
+        logging.info(f"Hybrid renewable fund initialized with {self.init_budget:,.0f} DKK (~${usd_value/1e6:,.0f}M USD)")
         self._log_fund_structure()
+
+        # GUARDRAIL: Startup assert to prevent regression
+        assert hasattr(self, "_price_raw") and hasattr(self, "_price"), "Price arrays not initialized"
 
     # =====================================================================
     # FIXED: ONE-TIME ASSET DEPLOYMENT
@@ -839,15 +850,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
         try:
             total_capex = 0.0
             
-            # Calculate total CAPEX required
+            # Calculate total CAPEX required (using consistent DKK values)
             for asset_type, specs in plan.items():
                 if asset_type == 'wind':
-                    # Special handling for wind farm fractional ownership
-                    # 75 MW = 5 WTGs × 15MW each × $25M per WTG = $125M
-                    if specs['capacity_mw'] == 75.0:
-                        capex = 125_000_000.0  # Fixed cost for 5 × 15MW WTGs
-                    else:
-                        capex = specs['capacity_mw'] * self.asset_capex['wind_mw']
+                    # Use DKK CAPEX for all wind calculations (standardized)
+                    capex = specs['capacity_mw'] * self.asset_capex['wind_mw']
                 elif asset_type == 'solar':
                     capex = specs['capacity_mw'] * self.asset_capex['solar_mw']
                 elif asset_type == 'hydro':
@@ -1013,7 +1020,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
             # 2) Physical assets with realistic depreciation
             # Infrastructure assets depreciate over time (typical 20-30 year life)
-            years_elapsed = self.t / (365.25 * 24 * 6)  # Convert timesteps to years (10-min intervals)
+            # FIXED: Safety check for self.t attribute
+            current_timestep = getattr(self, 't', 0)
+            years_elapsed = current_timestep / (365.25 * 24 * 6)  # Convert timesteps to years (10-min intervals)
 
             # Apply 2% annual straight-line depreciation (realistic for renewable infrastructure)
             annual_depreciation_rate = 0.02  # 2% per year
@@ -1098,29 +1107,42 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 if forecast_key not in forecasts:
                     continue
 
-                # Normalize actual
-                actual_raw = getattr(self, f"_{target}")[self.t] if hasattr(self, f"_{target}") else 0.0
+                # FIXED: Use consistent normalization for both actual and forecast
                 if target == "price":
-                    actual_normalized = actual_raw / 100.0  # DKK scale: ~345 DKK/MWh → ~3.45
+                    # For price: use z-score normalization for both actual and forecast
+                    # self._price[t] is already z-score normalized
+                    actual_normalized = float(getattr(self, f"_{target}")[self.t]) if hasattr(self, f"_{target}") else 0.0
+
+                    # Convert forecast from raw DKK to z-score using same rolling stats
+                    fv = float(forecasts[forecast_key])  # raw DKK forecast
+                    i = min(self.t, len(self._price_mean) - 1)
+                    mean = float(self._price_mean[i])
+                    std = max(float(self._price_std[i]), 1e-6)
+                    forecast_normalized = (fv - mean) / std
+                    # Apply same clipping as in price normalization
+                    forecast_normalized = float(np.clip(forecast_normalized, -3.0, 3.0))
+
                 elif target in ["wind", "solar", "hydro"]:
+                    # For renewables: use scale normalization for both
+                    actual_raw = getattr(self, f"_{target}")[self.t] if hasattr(self, f"_{target}") else 0.0
                     scale = getattr(self, f"{target}_scale", 1.0)
                     actual_normalized = actual_raw / max(scale, 1e-9)
-                elif target == "load":
-                    actual_normalized = actual_raw / max(getattr(self, "load_scale", 1.0), 1e-9)
-                else:
-                    actual_normalized = actual_raw
 
-                # Normalize forecast to same scale (DKK system)
-                fv = float(forecasts[forecast_key])
-                if target == "price":
-                    forecast_normalized = fv / 100.0  # DKK scale: ~345 DKK/MWh → ~3.45
-                elif target in ["wind", "solar", "hydro"]:
-                    scale = getattr(self, f"{target}_scale", 1.0)
+                    fv = float(forecasts[forecast_key])
                     forecast_normalized = fv / max(scale, 1e-9)
+
                 elif target == "load":
+                    # For load: use load_scale normalization for both
+                    actual_raw = getattr(self, f"_{target}")[self.t] if hasattr(self, f"_{target}") else 0.0
+                    actual_normalized = actual_raw / max(getattr(self, "load_scale", 1.0), 1e-9)
+
+                    fv = float(forecasts[forecast_key])
                     forecast_normalized = fv / max(getattr(self, "load_scale", 1.0), 1e-9)
+
                 else:
-                    forecast_normalized = fv
+                    # For other targets: use raw values
+                    actual_normalized = getattr(self, f"_{target}")[self.t] if hasattr(self, f"_{target}") else 0.0
+                    forecast_normalized = float(forecasts[forecast_key])
 
                 # MAPE-like error vs current forecast (online)
                 error = abs(actual_normalized - forecast_normalized) / (abs(actual_normalized) + 1e-6)
@@ -1146,32 +1168,92 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # PATCH: aligned-horizon forecast helpers
     # ------------------------------------------------------------------
     def _aligned_horizon_steps(self) -> int:
+        """DEPRECATED: Use config-driven horizon selection instead."""
+        # This method is kept for backward compatibility but should use config
         try:
-            k = int(max(1, getattr(self, "investment_freq", 6)))
-            if   k <= 6:  return 6
-            elif k <= 12: return 12
-            else:         return min(24, k)
-        except Exception:
-            return 6
+            inv_freq = int(max(1, getattr(self, "investment_freq", 6)))
+
+            # FAIL-FAST: Strict horizon lookup without silent defaults
+            horizons = self.config.forecast_horizons
+            if not horizons:
+                raise ValueError("config.forecast_horizons is empty or missing")
+
+            # FAIL-FAST: No hardcoded horizon lists allowed for production safety
+            # All required horizons must be defined in config.forecast_horizons
+            if not horizons:
+                raise ValueError("config.forecast_horizons is empty. Define all required horizons in config to maintain single source of truth.")
+
+            # Verify minimum required horizons exist (get from config if available)
+            if hasattr(self.config, 'required_forecast_horizons'):
+                required_horizons = self.config.required_forecast_horizons
+            else:
+                # If not defined in config, require at least these basic horizons
+                required_horizons = ['immediate', 'short', 'medium', 'long', 'strategic']
+
+            missing = [h for h in required_horizons if h not in horizons]
+            if missing:
+                raise ValueError(f"Missing required horizons in config: {missing}. "
+                               f"Available: {list(horizons.keys())}. "
+                               f"Add missing horizons to config.forecast_horizons to maintain single source of truth.")
+
+            # Use strict horizon steps for alignment (no .get() defaults)
+            if inv_freq <= horizons['immediate']:
+                return horizons['immediate']
+            elif inv_freq <= horizons['short']:
+                return horizons['short']
+            elif inv_freq <= horizons['medium']:
+                return horizons['medium']
+            elif inv_freq <= horizons['long']:
+                return horizons['long']
+            else:
+                return horizons['strategic']
+        except Exception as e:
+            # FAIL-FAST: No silent fallback to hardcoded values
+            raise ValueError(f"Cannot align horizon steps: config.forecast_horizons invalid or missing. "
+                           f"Investment frequency: {getattr(self, 'investment_freq', 'unknown')}. "
+                           f"Config state: {getattr(self.config, 'forecast_horizons', 'missing')}. "
+                           f"Original error: {e}")
 
     def _get_aligned_price_forecast(self, t: int, default: float = None) -> Optional[float]:
         if not hasattr(self, "forecast_generator") or self.forecast_generator is None:
             return default
         try:
-            h = self._aligned_horizon_steps()
+            # FIXED: Use named horizon alignment instead of numeric
+            h_steps = self._aligned_horizon_steps()
+
+            # CANONICAL: Map steps to horizon names using config source of truth
+            horizon_name = "immediate"  # default
+            for name, steps in self.config.forecast_horizons.items():
+                if h_steps <= steps:
+                    horizon_name = name
+                    break
+            else:
+                # If h_steps exceeds all defined horizons, use the largest one
+                horizon_name = max(self.config.forecast_horizons.keys(),
+                                 key=lambda k: self.config.forecast_horizons[k])
+
             if hasattr(self.forecast_generator, "predict_all_horizons"):
                 d = self.forecast_generator.predict_all_horizons(timestep=t)
                 if isinstance(d, dict):
-                    for k in (f"price_forecast_{h}", f"price_forecast_h{h}", f"price_h{h}", "price_forecast_aligned"):
+                    # Try aligned horizon name first
+                    aligned_key = f"price_forecast_{horizon_name}"
+                    if aligned_key in d and np.isfinite(d[aligned_key]):
+                        return float(d[aligned_key])
+
+                    # Fallback to immediate
+                    for k in ("price_forecast_immediate",):
                         if k in d and np.isfinite(d[k]): return float(d[k])
-                    for k in ("price_forecast_immediate", "price_forecast_1", "price_h1"):
-                        if k in d and np.isfinite(d[k]): return float(d[k])
+
             if hasattr(self.forecast_generator, "predict_for_agent"):
                 d = self.forecast_generator.predict_for_agent(agent="investor_0", timestep=t)
                 if isinstance(d, dict):
-                    for k in (f"price_forecast_{h}", f"price_forecast_h{h}", f"price_h{h}", "price_forecast_aligned"):
-                        if k in d and np.isfinite(d[k]): return float(d[k])
-                    for k in ("price_forecast_immediate", "price_forecast_1", "price_h1"):
+                    # Try aligned horizon name first
+                    aligned_key = f"price_forecast_{horizon_name}"
+                    if aligned_key in d and np.isfinite(d[aligned_key]):
+                        return float(d[aligned_key])
+
+                    # Fallback to immediate
+                    for k in ("price_forecast_immediate",):
                         if k in d and np.isfinite(d[k]): return float(d[k])
         except Exception:
             pass
@@ -1214,14 +1296,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self._last_seed = None
 
         # Check if this is a true episode reset (end of data) or just PPO buffer reset
-        is_true_episode_end = (self.t >= self.max_steps)
+        # FIXED: Safety check for self.t attribute
+        current_timestep = getattr(self, 't', 0)
+        is_true_episode_end = (current_timestep >= self.max_steps)
 
         # Only reset time if true episode end
         if is_true_episode_end:
             self.t = 0
             print(f"[RESET] TRUE EPISODE RESET: End of data reached, resetting to start")
         else:
-            print(f"[PPO] PPO BUFFER RESET: Preserving financial state at step {self.t}")
+            print(f"[PPO] PPO BUFFER RESET: Preserving financial state at step {current_timestep}")
 
         self.step_in_episode = 0
         self.agents = self.possible_agents[:]
@@ -1317,7 +1401,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self._calculate_fund_nav()
 
     def step(self, actions: Dict[str, Any]):
-        if self.t >= self.max_steps:
+        # FIXED: Safety check for self.t attribute
+        current_timestep = getattr(self, 't', 0)
+        if current_timestep >= self.max_steps:
             return self._terminal_step()
 
         try:
@@ -1432,13 +1518,19 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.risk_multiplier = 0.5 + 0.75 * normalized_val  # [0.5,2.0]
 
     def _apply_meta_control(self, meta_action: np.ndarray):
-        # FIXED: Handle normalized [-1,1] action space
+        # FIXED: Handle normalized [-1,1] action space with symmetric mapping
         a0, a1 = np.array(meta_action, dtype=np.float32).reshape(-1)[:2]
-        # Convert [-1,1] to [0,1] for capital allocation
-        normalized_a0 = (float(np.clip(a0, -1.0, 1.0)) + 1.0) / 2.0  # [-1,1] -> [0,1]
-        cap = self.META_CAP_MIN + normalized_a0 * (self.META_CAP_MAX - self.META_CAP_MIN)
+
+        # Generic symmetric mapping function for [-1,1] -> [min,max]
+        def map_from_minus1_1(x, lo, hi):
+            x = float(np.clip(x, -1.0, 1.0))
+            return lo + (x + 1.0) * 0.5 * (hi - lo)
+
+        # Apply symmetric mapping to both components
+        cap = map_from_minus1_1(a0, self.META_CAP_MIN, self.META_CAP_MAX)
         self.capital_allocation_fraction = float(np.clip(cap, self.META_CAP_MIN, self.META_CAP_MAX))
-        freq = int(round(self.META_FREQ_MIN + float(np.clip(a1, 0.0, 1.0)) * (self.META_FREQ_MAX - self.META_FREQ_MIN)))
+
+        freq = int(round(map_from_minus1_1(a1, self.META_FREQ_MIN, self.META_FREQ_MAX)))
         self.investment_freq = int(np.clip(freq, self.META_FREQ_MIN, self.META_FREQ_MAX))
 
     # ------------------------------------------------------------------
@@ -1623,45 +1715,74 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     # Create consistent feature set for DL overlay (independent of forecasting add-on)
                     # Core features that are always available
                     state_feats = np.array([
-                        self.budget / self.init_budget,
-                        self.equity / self.init_budget,
-                        self.market_volatility,
-                        self.market_stress
-                    ])
+                        float(self.budget / self.init_budget),
+                        float(self.equity / self.init_budget),
+                        float(self.market_volatility),
+                        float(self.market_stress)
+                    ], dtype=np.float32)
 
                     position_feats = np.array([
-                        self.financial_positions['wind_instrument_value'] / self.init_budget,
-                        self.financial_positions['solar_instrument_value'] / self.init_budget,
-                        self.financial_positions['hydro_instrument_value'] / self.init_budget
-                    ])
+                        float(self.financial_positions['wind_instrument_value'] / self.init_budget),
+                        float(self.financial_positions['solar_instrument_value'] / self.init_budget),
+                        float(self.financial_positions['hydro_instrument_value'] / self.init_budget)
+                    ], dtype=np.float32)
 
                     # Optional forecast features (add-on)
                     if hasattr(self, 'forecast_generator') and self.forecast_generator is not None:
                         try:
                             forecasts = self.forecast_generator.predict_all_horizons(timestep=self.t)
                             if isinstance(forecasts, dict):
+                                # ENHANCED: Use investment_freq-aligned horizon instead of always immediate
+                                # This improves signal relevance for the DL overlay
+                                h = 'immediate'  # default
+                                if hasattr(self, 'investment_freq'):
+                                    # FAIL-FAST: Strict horizon lookup without silent defaults
+                                    inv_freq = self.investment_freq
+                                    horizons = self.config.forecast_horizons
+                                    if not horizons:
+                                        raise ValueError("config.forecast_horizons is empty or missing")
+
+                                    # Use strict horizon steps for alignment (no .get() defaults)
+                                    if inv_freq <= horizons['immediate']:
+                                        h = 'immediate'
+                                    elif inv_freq <= horizons['short']:
+                                        h = 'short'
+                                    elif inv_freq <= horizons['medium']:
+                                        h = 'medium'
+                                    elif inv_freq <= horizons['long']:
+                                        h = 'long'
+                                    else:
+                                        h = 'strategic'
+
                                 gen_forecast = np.array([
-                                    forecasts.get('wind_immediate', 0.0),
-                                    forecasts.get('solar_immediate', 0.0),
-                                    forecasts.get('hydro_immediate', 0.0)
-                                ])
+                                    float(forecasts.get(f'wind_{h}', 0.0)),
+                                    float(forecasts.get(f'solar_{h}', 0.0)),
+                                    float(forecasts.get(f'hydro_{h}', 0.0))
+                                ], dtype=np.float32)
                             else:
-                                gen_forecast = np.array([0.0, 0.0, 0.0])
+                                gen_forecast = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                         except Exception:
-                            gen_forecast = np.array([0.0, 0.0, 0.0])
+                            gen_forecast = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                     else:
                         # No forecasting add-on - use zeros
-                        gen_forecast = np.array([0.0, 0.0, 0.0])
+                        gen_forecast = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
                     # Portfolio metrics
                     portfolio_metrics = np.array([
-                        self.capital_allocation_fraction,
-                        self.investment_freq / 100.0,
-                        forecast_confidence
-                    ])
+                        float(self.capital_allocation_fraction),
+                        float(self.investment_freq / 100.0),
+                        float(forecast_confidence)
+                    ], dtype=np.float32)
+
+                    # Validate array shapes before concatenation
+                    assert state_feats.shape == (4,), f"state_feats shape: {state_feats.shape}, expected (4,)"
+                    assert position_feats.shape == (3,), f"position_feats shape: {position_feats.shape}, expected (3,)"
+                    assert gen_forecast.shape == (3,), f"gen_forecast shape: {gen_forecast.shape}, expected (3,)"
+                    assert portfolio_metrics.shape == (3,), f"portfolio_metrics shape: {portfolio_metrics.shape}, expected (3,)"
 
                     # Always create 13-feature vector (4+3+3+3) regardless of add-ons
-                    features = np.concatenate([state_feats, position_feats, gen_forecast, portfolio_metrics], axis=0)[None, :]
+                    features = np.concatenate([state_feats, position_feats, gen_forecast, portfolio_metrics], axis=0)
+                    features = features.reshape(1, -1)  # Ensure 2D shape (1, 13)
 
                     # Get DL predictions
                     pred = self.dl_adapter.model(features, training=False)
@@ -1696,6 +1817,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Portfolio-level hedge direction (use DL prediction if available, otherwise heuristic)
             if dl_hedge_params is not None:
                 # Use DL model predictions with blending
+                # NOTE: DL overlay outputs hedge_intensity in [0.5, 2.0] by design
                 dl_intensity = np.clip(dl_hedge_params['hedge_intensity'], 0.5, 2.0)
                 dl_direction = np.clip(dl_hedge_params['hedge_direction'], 0.0, 1.0)
 
@@ -1935,7 +2057,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
     def _battery_dispatch_policy(self, i: int) -> Tuple[str, float]:
         """
         FIXED: Decide ('charge'/'discharge'/'idle', intensity 0..1) from price now vs. aligned forecast.
-        Uses consistent z-score normalization for both current price and forecast.
+        Uses consistent DKK pricing for both current price and forecast comparisons.
         """
         try:
             # Current price (use raw DKK price for consistent units)
@@ -2551,7 +2673,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if hasattr(self.enhanced_risk_controller, "update_risk_history") and \
                hasattr(self.enhanced_risk_controller, "calculate_comprehensive_risk"):
                 env_state = {
-                    'price': float(self._price[i]),
+                    'price': float(self._price_raw[i]) if hasattr(self, '_price_raw') and i < len(self._price_raw)
+                             else float(self._price[i] * self._price_std[i] + self._price_mean[i]) if hasattr(self, '_price_std') and hasattr(self, '_price_mean') and i < len(self._price_std) and i < len(self._price_mean)
+                             else float(self._price[i]),
                     'budget': self.budget,
                     'initial_budget': self.init_budget,
                     'timestep': self.t,
@@ -2586,7 +2710,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _fill_obs(self):
         i = min(self.t, self.max_steps - 1)
-        price_n = float(np.clip(SafeDivision.div(self._price[i], 10.0, 0.0), -10.0, 10.0))
+        # Map z-score (±3σ) to [-1,1] for consistent observation normalization
+        price_n = float(np.clip(self._price[i] / self.config.price_normalization_divisor, -1.0, 1.0))
         load_n  = float(np.clip(SafeDivision.div(self._load[i],  self.load_scale, 0.0), 0.0, 1.0))
         windf   = float(np.clip(SafeDivision.div(self._wind[i],  self.wind_scale, 0.0), 0.0, 1.0))
         solarf  = float(np.clip(SafeDivision.div(self._solar[i], self.solar_scale, 0.0), 0.0, 1.0))
@@ -2646,7 +2771,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     'wind': float(self._wind[i]),
                     'solar': float(self._solar[i]),
                     'hydro': float(self._hydro[i]),
-                    'price': float(self._price[i]),
+                    'price_dkk': float(self._price_raw[i]) if hasattr(self, '_price_raw') and i < len(self._price_raw) else float(self._price[i] * self._price_std[i] + self._price_mean[i]) if hasattr(self, '_price_std') and hasattr(self, '_price_mean') and i < len(self._price_std) and i < len(self._price_mean) else float(self._price[i]),
+                    'price_z': float(self._price[i]),  # Z-score normalized price for clarity
                     'load':  float(self._load[i]),
                     
                     # PHYSICAL ASSETS (Fixed capacities)

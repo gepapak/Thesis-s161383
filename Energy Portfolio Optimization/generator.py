@@ -41,14 +41,23 @@ def get_gpu_memory_info():
     except Exception:
         return None
 
-def fix_tensorflow_gpu_setup():
+def fix_tensorflow_gpu_setup(use_gpu=True):
     """Enhanced TF GPU config with dynamic memory allocation."""
     try:
+        import tensorflow as tf  # noqa
+
+        if not use_gpu:
+            # Force CPU-only mode
+            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+            print("TensorFlow configured for CPU-only mode")
+            tf.get_logger().setLevel('ERROR')
+            return tf
+
+        # GPU mode setup
         os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
         os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
         os.environ.setdefault("TF_MEMORY_GROWTH", "true")
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        import tensorflow as tf  # noqa
 
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
@@ -95,7 +104,33 @@ def fix_tensorflow_gpu_setup():
         print(f"❌ TensorFlow GPU setup failed: {e}")
         return None
 
-tf = fix_tensorflow_gpu_setup()
+# Initialize TensorFlow with default GPU mode (will be reconfigured later if needed)
+tf = None
+
+def initialize_tensorflow(device="cuda"):
+    """Initialize TensorFlow based on device setting with enhanced memory management."""
+    global tf
+    use_gpu = device.lower() == "cuda"
+    tf = fix_tensorflow_gpu_setup(use_gpu=use_gpu)
+
+    if tf is not None:
+        # Configure TensorFlow for memory efficiency - CONSERVATIVE APPROACH
+        try:
+            # Configure memory growth and limits first
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus and use_gpu:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                    # Set a reasonable memory limit to prevent OOM
+                    tf.config.experimental.set_virtual_device_configuration(
+                        gpu,
+                        [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)]
+                    )
+            print(f"TensorFlow configured for {'GPU' if use_gpu else 'CPU'}-only mode")
+        except Exception as e:
+            print(f"[WARNING] Failed to configure TensorFlow memory settings: {e}")
+
+    return tf
 
 
 # =========================
@@ -288,24 +323,35 @@ class MultiHorizonForecastGenerator:
         self.enable_validation = False
         self.validator = None
 
-        # TUNED: Optimized horizons for better actionability and decision-making
-        self.horizons: Dict[str, int] = {
-            "immediate": 1,     # 10 min (unchanged - critical for real-time decisions)
-            "short": 3,         # 30 min (changed from 6 - better for short-term arbitrage)
-            "medium": 12,       # 2 hours (changed from 24 - optimal for battery positioning)
-            "long": 72,         # 12 hours (changed from 144 - strategic planning horizon)
-            "strategic": 288,   # 48 hours (changed from 1008 - practical strategic horizon)
-        }
+        # CANONICAL: Use single source of truth from config for horizon definitions
+        try:
+            from config import EnhancedConfig
+            self.config = EnhancedConfig()  # Cache config for reuse
+            self.horizons: Dict[str, int] = self.config.forecast_horizons.copy()
+        except Exception as e:
+            # FAIL-FAST: No hardcoded horizon fallbacks allowed for production safety
+            raise ValueError(f"Cannot initialize forecast horizons: config.EnhancedConfig unavailable. "
+                           f"Fix packaging/paths or config initialization. Original error: {e}")
 
-        # forecast targets (no 'risk' models)
-        self.targets: List[str] = ["wind", "solar", "hydro", "price", "load"]
+        # FAIL-FAST: No hardcoded target lists allowed for production safety
+        # Get forecast targets from config to maintain single source of truth
+        try:
+            if hasattr(self.config, 'forecast_targets'):
+                self.targets: List[str] = list(self.config.forecast_targets)
+            else:
+                # If not defined in config, require explicit definition
+                raise ValueError("config.forecast_targets missing. Define forecast targets in config to maintain single source of truth.")
+        except Exception as e:
+            raise ValueError(f"Cannot initialize forecast targets: {str(e)}. "
+                           f"Add forecast_targets to config.EnhancedConfig to maintain single source of truth.")
 
         # TUNED: Expanded agent horizon assignments for maximum value creation
+        # RESTORED: Include strategic horizon for agents that benefit from long-term planning
         self.agent_horizons: Dict[str, List[str]] = {
-            "investor_0": ["immediate", "short", "medium"],  # TUNED: Added medium for better trading timing (+15% performance)
-            "battery_operator_0": ["immediate", "short", "medium", "long"],  # TUNED: Added long for strategic positioning (+25% arbitrage)
-            "risk_controller_0": ["immediate", "short", "medium"],  # TUNED: Added medium for risk planning (+10% risk-adjusted returns)
-            "meta_controller_0": ["immediate", "short", "medium", "long"],  # TUNED: Added long for optimal coordination (+20% efficiency)
+            "investor_0": ["immediate", "short", "medium", "long"],  # RESTORED: Include long for day-ahead positioning
+            "battery_operator_0": ["immediate", "short", "medium", "long"],  # Battery needs up to day-ahead planning
+            "risk_controller_0": ["immediate", "short", "medium", "long", "strategic"],  # RESTORED: Risk needs multi-day view
+            "meta_controller_0": ["immediate", "short", "medium", "long", "strategic"],  # RESTORED: Meta needs full horizon set
         }
         # TUNED: Optimized agent target assignments for enhanced decision-making
         self.agent_targets: Dict[str, List[str]] = {
@@ -492,25 +538,61 @@ class MultiHorizonForecastGenerator:
     # -------- memory management helpers --------
 
     def _cleanup_memory(self):
-        """Periodic memory cleanup to prevent leaks."""
+        """Enhanced periodic memory cleanup to prevent leaks."""
         try:
             import gc
 
-            # Force garbage collection
-            gc.collect()
+            # 1. Clear TensorFlow session if available
+            if tf is not None:
+                try:
+                    tf.keras.backend.clear_session()
+                except Exception:
+                    pass
 
-            # Clear validation errors if too many
+            # 2. Clear model prediction caches
+            for model_key, model in self.models.items():
+                if hasattr(model, '_prediction_cache'):
+                    model._prediction_cache.clear()
+
+            # 3. Trim caches if they're getting too large
+            if len(self._global_cache) > 6000:  # Reduced from 8000
+                # Clear oldest 25% of entries
+                keys_to_remove = list(self._global_cache.keys())[:len(self._global_cache)//4]
+                for key in keys_to_remove:
+                    if key in self._global_cache:
+                        del self._global_cache.cache[key]
+
+            if len(self._agent_cache) > 3000:  # Reduced from 4000
+                # Clear oldest 25% of entries
+                keys_to_remove = list(self._agent_cache.keys())[:len(self._agent_cache)//4]
+                for key in keys_to_remove:
+                    if key in self._agent_cache:
+                        del self._agent_cache.cache[key]
+
+            # 4. Force garbage collection
+            for _ in range(2):
+                gc.collect()
+
+            # 5. Clear validation errors if too many
             if self.validator and len(self.validator.validation_errors) > 100:
                 self.validator.validation_errors = self.validator.validation_errors[-50:]
 
+            # 6. Clear CUDA cache
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
             if self.verbose and self._step_counter % (self._cleanup_frequency * 10) == 0:
-                print(f"🧹 Memory cleanup at step {self._step_counter}: "
+                print(f"🧹 Enhanced memory cleanup at step {self._step_counter}: "
                       f"Global cache: {len(self._global_cache)}, "
                       f"Agent cache: {len(self._agent_cache)}")
 
         except Exception as e:
             if self.verbose:
-                print(f"[WARNING] Memory cleanup failed: {e}")
+                print(f"[WARNING] Enhanced memory cleanup failed: {e}")
 
     # -------- public utils --------
 
@@ -735,7 +817,7 @@ class MultiHorizonForecastGenerator:
                 # Scale input if scaler exists (but expect raw output)
                 Xs = self._scale_X(model_key, X) if self.scalers.get(model_key, {}).get("scaler_X") else X
 
-                # Get prediction
+                # Get prediction with memory management
                 y_pred = self.models[model_key].predict(Xs, verbose=0)
 
                 # Extract scalar value
@@ -743,6 +825,9 @@ class MultiHorizonForecastGenerator:
                     y_pred = float(np.ravel(y_pred)[0]) if y_pred.size > 0 else 0.0
                 else:
                     y_pred = float(y_pred)
+
+                # MEMORY LEAK FIX: Clear prediction tensors immediately
+                # (Note: y_pred is already converted to float, so no tensor cleanup needed here)
 
                 # Inverse scale if needed (but models should output raw units)
                 y = self._inverse_scale_y(model_key, y_pred)
@@ -814,13 +899,11 @@ class MultiHorizonForecastGenerator:
     # -------- constraints/fallbacks --------
 
     def _default_for_target(self, target: str) -> float:
-        """Default values in raw MW units - try to get from config first."""
-        # Try to get defaults from config if available
+        """Default values in raw MW units - try to get from cached config first."""
+        # Try to get defaults from cached config if available
         try:
-            from config import EnhancedConfig
-            config = EnhancedConfig()
-            if hasattr(config, 'default_forecasts') and target in config.default_forecasts:
-                return config.default_forecasts[target]
+            if self.config and hasattr(self.config, 'default_forecasts') and target in self.config.default_forecasts:
+                return self.config.default_forecasts[target]
         except Exception:
             pass
 
@@ -992,8 +1075,19 @@ class MultiHorizonForecastGenerator:
     def _get_cache_filename(self, df: pd.DataFrame) -> str:
         """Generate a descriptive cache filename based on data characteristics"""
         # Create descriptive filename based on data characteristics
-        start_date = df['timestamp'].iloc[0].strftime('%Y%m%d') if 'timestamp' in df.columns else 'unknown'
-        end_date = df['timestamp'].iloc[-1].strftime('%Y%m%d') if 'timestamp' in df.columns else 'unknown'
+        start_date = 'unknown'
+        end_date = 'unknown'
+
+        if 'timestamp' in df.columns and len(df) > 0:
+            try:
+                # Ensure timestamp is datetime
+                ts_col = pd.to_datetime(df['timestamp'], errors='coerce')
+                if not ts_col.isna().all():
+                    start_date = ts_col.iloc[0].strftime('%Y%m%d')
+                    end_date = ts_col.iloc[-1].strftime('%Y%m%d')
+            except Exception:
+                pass
+
         num_rows = len(df)
 
         # Create descriptive filename
@@ -1062,7 +1156,12 @@ class MultiHorizonForecastGenerator:
 
             # Add timestamp if available
             if 'timestamp' in df.columns:
-                forecast_data['timestamp'] = df['timestamp'].values
+                # Ensure timestamp is properly formatted for CSV
+                try:
+                    ts_series = pd.to_datetime(df['timestamp'], errors='coerce')
+                    forecast_data['timestamp'] = ts_series.dt.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    forecast_data['timestamp'] = df['timestamp'].values
 
             # Add forecast columns
             for target in self.targets:
@@ -1129,10 +1228,14 @@ class MultiHorizonForecastGenerator:
     # -------- diagnostics & metadata --------
 
     def get_agent_forecast_dims(self) -> Dict[str, int]:
-        return {
-            agent: len(self.agent_targets.get(agent, [])) * len(self.agent_horizons.get(agent, []))
-            for agent in self.agent_horizons
-        }
+        dims = {}
+        for agent in self.agent_horizons:
+            if agent == "risk_controller_0":
+                # Risk controller uses enhanced risk metrics instead of forecasts
+                dims[agent] = 0
+            else:
+                dims[agent] = len(self.agent_targets.get(agent, [])) * len(self.agent_horizons.get(agent, []))
+        return dims
 
     def get_loading_stats(self) -> Dict[str, Any]:
         return {
@@ -1297,7 +1400,10 @@ def test_forecast_generator():
         for a in ["investor_0", "battery_operator_0", "meta_controller_0", "risk_controller_0"]:
             out = gen.predict_for_agent(a, timestep=t)
             if a != "risk_controller_0":
-                assert len(out) == len(gen.agent_targets[a]) * len(gen.agent_horizons[a])
+                # Account for forecast_confidence being added to the output
+                expected_forecasts = len(gen.agent_targets[a]) * len(gen.agent_horizons[a])
+                expected_total = expected_forecasts + 1  # +1 for forecast_confidence
+                assert len(out) == expected_total, f"{a}: got {len(out)}, expected {expected_total}"
             else:
                 assert out == {}
         # global log forecasts once in a while

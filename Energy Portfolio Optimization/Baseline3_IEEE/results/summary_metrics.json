@@ -1,0 +1,26 @@
+{
+  "total_evaluations": 8000,
+  "final_value": 5517241379.310346,
+  "final_value_usd": 800000000.0000001,
+  "initial_value_usd": 800000000.0000001,
+  "total_return": 0.0,
+  "performance_metrics": {
+    "grid_integration_score": 0.813125,
+    "interoperability_score": 0.6430416666666666,
+    "communication_reliability": 0.422125,
+    "power_quality_score": 0.5945625,
+    "overall_compliance_score": 0.6182135416666666
+  },
+  "ieee_standards_summary": {
+    "ieee_1547_avg_score": 0.813125,
+    "ieee_2030_avg_score": 0.6430416666666666,
+    "ieee_1815_avg_score": 0.422125,
+    "ieee_3000_avg_score": 0.5945625
+  },
+  "compliance_statistics": {
+    "overall_compliance_mean": 0.6182135416666666,
+    "overall_compliance_std": 0.1458606922811433,
+    "min_compliance_score": 0.16666666666666666,
+    "max_compliance_score": 1.0
+  }
+}

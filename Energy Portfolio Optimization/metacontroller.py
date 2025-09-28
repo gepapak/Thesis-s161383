@@ -101,7 +101,7 @@ class EnhancedMemoryTracker:
                 return "heavy", current_memory
             if current_memory > self.cleanup_thresholds["medium"]:
                 return "medium", current_memory
-            if current_memory > self.cleanup_thresholds["light"] or (self.cleanup_counter % 800 == 0):
+            if current_memory > self.cleanup_thresholds["light"] or (self.cleanup_counter % 100 == 0):
                 return "light", current_memory
             return None, current_memory
 
@@ -316,16 +316,15 @@ def safe_multithreaded_processing(function, policies, multithreading=True, max_w
 
 
 # ======================== Observation Validator =============================
-class EnhancedObservationValidator:
+from wrapper import BaseObservationValidator, ObservationValidatorMixin
+
+class EnhancedObservationValidator(BaseObservationValidator, ObservationValidatorMixin):
     """Enhanced observation validator with comprehensive dimension checking."""
 
     def __init__(self, env, debug=False):
-        self.env = env
-        self.debug = debug
-        self.logger = logging.getLogger(__name__)
+        # Initialize base class
+        super().__init__(env, debug)
         self.observation_specs = self._build_enhanced_specs()
-        self.validation_cache: Dict[Any, bool] = {}
-        self.validation_errors = deque(maxlen=100)
 
     def _build_enhanced_specs(self) -> Dict[str, Dict[str, Any]]:
         specs = {}
@@ -365,20 +364,7 @@ class EnhancedObservationValidator:
                 }
         return specs
 
-    def _estimate_agent_dimension(self, agent: str) -> int:
-        # FIXED: Correct total dimensions (base + forecast + confidence)
-        # Based on actual agent forecast allocations from generator.py:
-        # - investor_0: 6 base + 12 forecast + 1 confidence = 19
-        # - battery_operator_0: 4 base + 12 forecast + 1 confidence = 17
-        # - risk_controller_0: 9 base + 12 forecast (no confidence) = 21
-        # - meta_controller_0: 11 base + 20 forecast + 1 confidence = 32
-        estimates = {
-            "investor_0": 19,           # UPDATED: +1 for confidence
-            "battery_operator_0": 17,   # UPDATED: +1 for confidence
-            "risk_controller_0": 21,    # No change (no confidence)
-            "meta_controller_0": 32,    # UPDATED: +1 for confidence
-        }
-        return int(estimates.get(agent, 20))
+
 
     def validate_observation_dict(self, obs_dict: Dict[str, np.ndarray]) -> bool:
         if not isinstance(obs_dict, dict):
@@ -392,13 +378,7 @@ class EnhancedObservationValidator:
                 return False
         return True
 
-    def _obs_signature(self, agent: str, obs: Any):
-        if isinstance(obs, np.ndarray):
-            try:
-                return (agent, obs.shape, obs.dtype, hash(obs.tobytes()))
-            except Exception:
-                return (agent, obs.shape, obs.dtype, None)
-        return (agent, type(obs), str(obs)[:64])
+
 
     def validate_single_observation(self, agent: str, obs: Any) -> bool:
         sig = self._obs_signature(agent, obs)
@@ -411,82 +391,46 @@ class EnhancedObservationValidator:
             return False
 
         spec = self.observation_specs[agent]
-        ok = True
-        problems = []
+        # Use base class validation logic
+        ok, problems = self._validate_observation_basic(
+            agent, obs, spec["expected_dim"], spec["low"], spec["high"]
+        )
 
-        if not isinstance(obs, np.ndarray):
-            problems.append(f"type={type(obs)} expected np.ndarray")
-            ok = False
-        else:
-            if obs.ndim != 1:
-                problems.append(f"ndim={obs.ndim} expected 1D")
-                ok = False
-            elif obs.shape[0] != spec["expected_dim"]:
-                problems.append(f"dim={obs.shape[0]} expected {spec['expected_dim']}")
-                ok = False
-            if obs.dtype != np.float32:
-                problems.append(f"dtype={obs.dtype} expected float32")
-            if np.any(~np.isfinite(obs)):
-                nbad = int(np.sum(~np.isfinite(obs)))
-                problems.append(f"{nbad} non-finite")
-                ok = False
-            if np.any(obs < spec["low"]) or np.any(obs > spec["high"]):
-                out = int(np.sum((obs < spec["low"]) | (obs > spec["high"])) )
-                problems.append(f"{out} out-of-bounds")
-
-        if problems and self.debug:
-            msg = f"Validation issues for {agent}: " + "; ".join(problems)
-            self.validation_errors.append(msg)
-            self.logger.warning(msg)
+        # Log issues using base class method
+        self._log_validation_issues(agent, problems)
 
         self.validation_cache[sig] = ok
-        if len(self.validation_cache) > 2000:
-            for k in list(self.validation_cache.keys())[:500]:
-                del self.validation_cache[k]
+        # Use base class cache cleanup
+        self._cleanup_cache()
         return ok
 
     def fix_observation(self, agent: str, obs: Any) -> np.ndarray:
         """Fix obs to expected shape/type/range."""
         if agent not in self.observation_specs:
-            return np.zeros(self._estimate_agent_dimension(agent), dtype=np.float32)
+            expected_dim = self._estimate_agent_dimension(agent)
+            return self.create_fallback_observation(expected_dim)
 
         spec = self.observation_specs[agent]
         expected = spec["expected_dim"]
 
         try:
-            if not isinstance(obs, np.ndarray):
-                if obs is None:
-                    obs = np.zeros(expected, np.float32)
-                elif isinstance(obs, (list, tuple)):
-                    obs = np.array(obs, np.float32)
+            # Use mixin method for shape fixing
+            obs = self.fix_observation_shape(obs, expected)
+
+            # Handle padding with intelligent fill values
+            if obs.shape[0] < expected:
+                if obs.size > 0 and np.any(np.isfinite(obs)):
+                    fill = float(np.median(obs[np.isfinite(obs)]))
                 else:
-                    obs = np.full(expected, float(obs), np.float32)
-            else:
-                obs = obs.astype(np.float32)
+                    fill = float((spec["low"][0] + spec["high"][0]) / 2.0)
+                fill = float(np.clip(fill, spec["low"][0], spec["high"][0]))
+                obs = np.concatenate([obs, np.full(expected - obs.shape[0], fill, np.float32)])
 
-            if obs.ndim != 1:
-                obs = obs.flatten()
-
-            if obs.shape[0] != expected:
-                if obs.shape[0] < expected:
-                    if obs.size > 0 and np.any(np.isfinite(obs)):
-                        fill = float(np.median(obs[np.isfinite(obs)]))
-                    else:
-                        fill = float((spec["low"][0] + spec["high"][0]) / 2.0)
-                    fill = float(np.clip(fill, spec["low"][0], spec["high"][0]))
-                    obs = np.concatenate([obs, np.full(expected - obs.shape[0], fill, np.float32)])
-                else:
-                    obs = obs[:expected]
-
-            invalid = ~np.isfinite(obs)
-            if np.any(invalid):
-                rep = float((spec["low"][0] + spec["high"][0]) / 2.0)
-                obs[invalid] = rep
-
-            obs = np.clip(obs, spec["low"], spec["high"]).astype(np.float32)
+            # Use base class sanitization
+            obs = self._sanitize_observation(obs, spec["low"], spec["high"])
             return obs
         except Exception:
-            return ((spec["low"] + spec["high"]) / 2.0).astype(np.float32)
+            return self.create_fallback_observation(expected, spec["low"], spec["high"])
 
     def get_validation_stats(self) -> Dict[str, Any]:
         return {
@@ -814,12 +758,33 @@ class MultiESGAgent:
                     # Truncate to correct size
                     a = a[:target_size]
 
-            # Apply bounds if available
+            # Apply bounds if available - ROBUSTIFIED for complex action space objects
             if hasattr(action_space, "low") and hasattr(action_space, "high"):
                 low = getattr(action_space, "low", None)
                 high = getattr(action_space, "high", None)
                 if low is not None and high is not None:
-                    a = np.clip(a, low, high)
+                    try:
+                        # Ensure low/high are convertible to numpy arrays for clipping
+                        low_np = np.asarray(low, dtype=np.float32).flatten()
+                        high_np = np.asarray(high, dtype=np.float32).flatten()
+
+                        # Ensure size matches a
+                        target_size = a.size
+                        if low_np.size < target_size:
+                            low_np = np.pad(low_np, (0, target_size - low_np.size), 'constant', constant_values=-1.0)
+                        elif low_np.size > target_size:
+                            low_np = low_np[:target_size]
+
+                        if high_np.size < target_size:
+                            high_np = np.pad(high_np, (0, target_size - high_np.size), 'constant', constant_values=1.0)
+                        elif high_np.size > target_size:
+                            high_np = high_np[:target_size]
+
+                        a = np.clip(a, low_np, high_np)
+                    except Exception:
+                        # Log warning about complex bounds and skip clipping
+                        if hasattr(self, 'logger'):
+                            self.logger.warning(f"Complex action space bounds for {agent_name}, skipping clipping")
 
             return a.astype(np.float32)
 
@@ -835,11 +800,26 @@ class MultiESGAgent:
                 elif hasattr(action_space, "shape") and action_space.shape is not None:
                     target_size = int(np.prod(action_space.shape))
                     if hasattr(action_space, "low") and hasattr(action_space, "high"):
-                        # Use midpoint of action space
-                        low = np.asarray(action_space.low).flatten()
-                        high = np.asarray(action_space.high).flatten()
-                        midpoint = (low + high) / 2.0
-                        return midpoint[:target_size].astype(np.float32)
+                        # Use midpoint of action space - ROBUSTIFIED for complex bounds
+                        try:
+                            low = np.asarray(action_space.low, dtype=np.float32).flatten()
+                            high = np.asarray(action_space.high, dtype=np.float32).flatten()
+
+                            # Ensure both arrays have the same size
+                            min_size = min(low.size, high.size, target_size)
+                            low = low[:min_size]
+                            high = high[:min_size]
+
+                            midpoint = (low + high) / 2.0
+
+                            # Pad to target size if needed
+                            if midpoint.size < target_size:
+                                midpoint = np.pad(midpoint, (0, target_size - midpoint.size), 'constant', constant_values=0.0)
+
+                            return midpoint[:target_size].astype(np.float32)
+                        except Exception:
+                            # Fallback to zeros if midpoint calculation fails
+                            return np.zeros(target_size, dtype=np.float32)
                     else:
                         return np.zeros(target_size, dtype=np.float32)
                 else:

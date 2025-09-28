@@ -1,0 +1,30 @@
+# TESTED AND WORKING PACKAGE VERSIONS FOR RENEWABLE ENERGY TRADING SYSTEM
+# Successfully tested on Windows with Python 3.10
+# Compatible with stable-baselines3 model loading and evaluation
+
+# Core ML/RL packages - EXACT WORKING VERSIONS
+numpy==1.26.4
+torch==2.8.0
+stable-baselines3==2.7.0
+gymnasium==1.2.0
+
+# Data processing
+pandas==2.3.2
+
+# Scientific computing
+scipy==1.15.3
+scikit-learn==1.7.2
+
+# Visualization
+matplotlib==3.5.3
+tensorboard==2.20.0
+
+# Core dependencies (exact versions)
+cloudpickle==2.2.1
+typing-extensions==4.15.0
+farama-notifications>=0.0.1
+filelock>=3.19.1
+
+# Additional utilities for HPC
+psutil
+tqdm

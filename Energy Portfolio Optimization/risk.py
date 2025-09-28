@@ -57,7 +57,7 @@ def _adaptive_scale(x: float, min_val: float = 0.0, max_val: float = 1.0,
 
 class SafeDivision:
     @staticmethod
-    def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    def div(numerator: float, denominator: float, default: float = 0.0) -> float:
         """Robust division with protection against zero-division."""
         if abs(denominator) < 1e-8:
             return default
@@ -147,7 +147,7 @@ class EnhancedRiskController:
             recent_avg = float(np.mean(prices[-min(5, window):]))
             older_avg = float(np.mean(prices[-window:-min(5, window)])) if window > 5 else recent_avg
 
-            momentum = SafeDivision._safe_divide(abs(recent_avg - older_avg), abs(older_avg), default=0.10)
+            momentum = SafeDivision.div(abs(recent_avg - older_avg), abs(older_avg), default=0.10)
 
             mrisk = 0.6 * vol + 0.4 * (0.5 * momentum)
             return _clip01(mrisk)
@@ -170,7 +170,7 @@ class EnhancedRiskController:
             totals = [sum(d.values()) for d in recent if isinstance(d, dict)]
             if len(totals) > 1:
                 mean_gen = float(np.mean(totals))
-                vol = SafeDivision._safe_divide(float(np.std(totals)), abs(mean_gen), default=0.20)
+                vol = SafeDivision.div(float(np.std(totals)), abs(mean_gen), default=0.20)
                 vol = min(vol, 1.0)
             else:
                 vol = 0.20
@@ -180,7 +180,7 @@ class EnhancedRiskController:
                 last3 = totals[-3:]
                 drops = []
                 for prev, curr in zip(last3[:-1], last3[1:]):
-                    d = SafeDivision._safe_divide(max(0.0, (prev - curr)), abs(prev), default=0.0)
+                    d = SafeDivision.div(max(0.0, (prev - curr)), abs(prev), default=0.0)
                     drops.append(d)
                 if drops:
                     intermittency = min(max(drops), 0.5)
@@ -207,15 +207,15 @@ class EnhancedRiskController:
                     shares = [c / total for c in caps]
                     hhi = sum(s * s for s in shares)  # Herfindahl index
                     # Normalize HHI to [0,1] concentration risk (0 best diversified → 1 fully concentrated)
-                    min_hhi = SafeDivision._safe_divide(1.0, len(shares))
-                    conc = SafeDivision._safe_divide((hhi - min_hhi), (1.0 - min_hhi), default=0.5)
+                    min_hhi = SafeDivision.div(1.0, len(shares))
+                    conc = SafeDivision.div((hhi - min_hhi), (1.0 - min_hhi), default=0.5)
                 else:
                     conc = 0.5
             else:
                 conc = 0.8  # single-tech concentration
 
             if initial_budget > 0:
-                deploy = SafeDivision._safe_divide(max(0.0, (initial_budget - max(0.0, float(budget)))), float(initial_budget))
+                deploy = SafeDivision.div(max(0.0, (initial_budget - max(0.0, float(budget)))), float(initial_budget))
                 capital = min(1.0, 1.5 * deploy)
             else:
                 capital = 0.50
@@ -233,7 +233,7 @@ class EnhancedRiskController:
         """
         try:
             if initial_budget > 0:
-                cash_ratio = SafeDivision._safe_divide(float(max(0.0, budget)), float(initial_budget))
+                cash_ratio = SafeDivision.div(float(max(0.0, budget)), float(initial_budget))
                 buffer_risk = max(0.0, (0.05 - cash_ratio) * 20.0)  # >0 when cash < 5% of initial
             else:
                 buffer_risk = 0.50
@@ -244,7 +244,7 @@ class EnhancedRiskController:
                 cfa = cfa[np.isfinite(cfa)]
                 if cfa.size > 1:
                     mu = float(np.mean(cfa))
-                    cf_vol = SafeDivision._safe_divide(float(np.std(cfa)), abs(mu), default=0.10) if abs(mu) > 1e-12 else 0.10
+                    cf_vol = SafeDivision.div(float(np.std(cfa)), abs(mu), default=0.10) if abs(mu) > 1e-12 else 0.10
                     cf_vol = min(cf_vol, 1.0)
 
             lrisk = 0.6 * buffer_risk + 0.4 * cf_vol
@@ -266,7 +266,7 @@ class EnhancedRiskController:
                 base = 0.20
 
             # Simple annual seasonality; 144 steps/day × 365 days
-            season = 0.05 + 0.05 * abs(np.sin(SafeDivision._safe_divide((timestep or 0) * 2 * np.pi, (365 * 144))))
+            season = 0.05 + 0.05 * abs(np.sin(SafeDivision.div((timestep or 0) * 2 * np.pi, (365 * 144))))
             rrisk = base + season
             return _clip01(rrisk)
         except Exception as e:
@@ -507,7 +507,7 @@ class EnhancedRiskController:
             totals = [sum(d.values()) for d in recent if isinstance(d, dict)]
             if len(totals) > 1:
                 mu = float(np.mean(totals))
-                gv = SafeDivision._safe_divide(float(np.std(totals)), abs(mu), default=0.20) if mu != 0 else 0.20
+                gv = SafeDivision.div(float(np.std(totals)), abs(mu), default=0.20) if mu != 0 else 0.20
                 out.append(min(1.0, gv * 5.0))
             else:
                 out.append(0.20)
@@ -534,7 +534,7 @@ class EnhancedRiskController:
             cf = cf[np.isfinite(cf)]
             if cf.size > 1:
                 mu = float(np.mean(cf))
-                lv = SafeDivision._safe_divide(float(np.std(cf)), abs(mu), default=0.15) if abs(mu) > 1e-12 else 0.15
+                lv = SafeDivision.div(float(np.std(cf)), abs(mu), default=0.15) if abs(mu) > 1e-12 else 0.15
                 out.append(min(1.0, lv))
             else:
                 out.append(0.15)
@@ -572,14 +572,14 @@ class EnhancedRiskController:
             if len(caps) < 2:
                 return 0.0
             total = float(sum(caps))
-            shares = [SafeDivision._safe_divide(c, total) for c in caps]
+            shares = [SafeDivision.div(c, total) for c in caps]
             # Shannon entropy normalized
             entropy = 0.0
             for s in shares:
                 if s > 0:
                     entropy -= s * np.log(s + 1e-8)
             max_entropy = np.log(len(shares))
-            return SafeDivision._safe_divide(entropy, max_entropy, default=0.0) if max_entropy > 0 else 0.0
+            return SafeDivision.div(entropy, max_entropy, default=0.0) if max_entropy > 0 else 0.0
         except Exception:
             return 0.0
 

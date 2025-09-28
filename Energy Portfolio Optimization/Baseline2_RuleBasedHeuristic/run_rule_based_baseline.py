@@ -4,33 +4,58 @@ Baseline 2 Runner: Rule-Based Heuristic System
 
 Runs the rule-based heuristic baseline for IEEE benchmarking.
 Implements domain expert knowledge through simple decision rules.
+
+This baseline focuses exclusively on expert system/rule-based approaches:
+- Weather-based renewable energy investment decisions
+- Price-based battery arbitrage rules
+- Risk-based position sizing heuristics
+- Domain expert knowledge without optimization algorithms
+
+NO mathematical optimization or machine learning - pure expert system approach.
 """
 
 import numpy as np
 import pandas as pd
 import os
+import sys
 import json
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
-from rule_based_optimizer import RuleBasedEnergyOptimizer, RuleBasedRiskManager
+
+# Add parent directory to path for importing main project modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import from main project
+from config import EnhancedConfig
+
+# Import local baseline optimizer
+from rule_based_optimizer import ExpertSystemEnergyOptimizer
 
 class RuleBasedBaselineRunner:
     """Runner for rule-based heuristic baseline."""
     
-    def __init__(self, data_path, output_dir="baseline2_results"):
+    def __init__(self, data_path=None, output_dir="baseline2_results"):
+        # Use shared data from root directory if no specific path provided
+        if data_path is None:
+            data_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trainingdata.csv")
+
         self.data_path = data_path
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
-        
+
+        # Load main project configuration for consistency
+        self.config = EnhancedConfig()
+
         # Load and prepare data
         self.data = self.load_data()
-        
-        # Initialize optimizers
-        self.optimizer = RuleBasedEnergyOptimizer()
-        self.risk_manager = RuleBasedRiskManager()
-        
+
+        # Initialize expert system optimizer
+        self.optimizer = ExpertSystemEnergyOptimizer(
+            initial_budget=self.config.init_budget
+        )
+
         # Results storage
         self.results = []
         
@@ -68,14 +93,8 @@ class RuleBasedBaselineRunner:
             # Get current data
             data_row = self.data.iloc[t]
             
-            # Risk assessment
-            risk_assessment = self.risk_manager.assess_market_risk(data_row)
-            
-            # Execute optimization step
+            # Execute optimization step (risk assessment is integrated in the optimizer)
             result = self.optimizer.step(data_row, t)
-            
-            # Add risk assessment to result
-            result['risk_assessment'] = risk_assessment
             
             self.results.append(result)
             
@@ -83,16 +102,19 @@ class RuleBasedBaselineRunner:
             if t % 10000 == 0 or t == max_timesteps - 1:
                 elapsed = time.time() - start_time
                 progress = (t + 1) / max_timesteps * 100
-                portfolio_return = (result['portfolio_value'] - 5e8) / 5e8 * 100
+                initial_budget = 8e8 / 0.145  # $800M USD in DKK
+                portfolio_return = (result['portfolio_value'] - initial_budget) / initial_budget * 100
                 
+                # Convert to USD for display
+                portfolio_value_usd = result['portfolio_value'] * 0.145  # DKK to USD
+                cash_usd = result['cash'] * 0.145  # DKK to USD
                 print(f"Progress: {progress:5.1f}% | Step: {t:6,} | "
-                      f"Portfolio: ${result['portfolio_value']/1e6:.1f}M | "
+                      f"Portfolio: ${portfolio_value_usd/1e6:.1f}M USD | "
                       f"Return: {portfolio_return:+5.1f}% | "
-                      f"Cash: ${result['cash']/1e6:.1f}M | "
+                      f"Cash: ${cash_usd/1e6:.1f}M USD | "
                       f"Wind: {result['wind_capacity']:.0f}MW | "
                       f"Solar: {result['solar_capacity']:.0f}MW | "
                       f"Hydro: {result['hydro_capacity']:.0f}MW | "
-                      f"Risk: {risk_assessment['risk_level']} | "
                       f"Elapsed: {elapsed:.0f}s")
         
         total_time = time.time() - start_time
@@ -110,12 +132,8 @@ class RuleBasedBaselineRunner:
         # Convert results to DataFrame
         df = pd.DataFrame(self.results)
         
-        # Flatten nested dictionaries
-        risk_df = pd.json_normalize(df['risk_assessment'])
-        risk_df.columns = ['risk_' + col for col in risk_df.columns]
-        
-        # Combine dataframes
-        df_flat = pd.concat([df.drop('risk_assessment', axis=1), risk_df], axis=1)
+        # Use dataframe as-is (no nested dictionaries to flatten)
+        df_flat = df
         
         # Save detailed results
         results_path = os.path.join(self.output_dir, "detailed_results.csv")
@@ -147,11 +165,12 @@ class RuleBasedBaselineRunner:
         fig, axes = plt.subplots(3, 2, figsize=(15, 18))
         fig.suptitle('Rule-Based Heuristic System - Performance Report', fontsize=16)
         
-        # Portfolio value over time
-        axes[0, 0].plot(df['timestep'], df['portfolio_value'] / 1e6, 'b-', linewidth=2)
+        # Portfolio value over time (convert to USD)
+        portfolio_values_usd = df['portfolio_value'] * 0.145  # Convert DKK to USD
+        axes[0, 0].plot(df['timestep'], portfolio_values_usd / 1e6, 'b-', linewidth=2)
         axes[0, 0].set_title('Portfolio Value Over Time')
         axes[0, 0].set_xlabel('Timestep')
-        axes[0, 0].set_ylabel('Portfolio Value (Million DKK)')
+        axes[0, 0].set_ylabel('Portfolio Value (Million USD)')
         axes[0, 0].grid(True, alpha=0.3)
         
         # Asset capacity over time
@@ -164,11 +183,12 @@ class RuleBasedBaselineRunner:
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
         
-        # Cash position over time
-        axes[1, 0].plot(df['timestep'], df['cash'] / 1e6, 'g-', linewidth=2)
+        # Cash position over time (convert to USD)
+        cash_values_usd = df['cash'] * 0.145  # Convert DKK to USD
+        axes[1, 0].plot(df['timestep'], cash_values_usd / 1e6, 'g-', linewidth=2)
         axes[1, 0].set_title('Cash Position Over Time')
         axes[1, 0].set_xlabel('Timestep')
-        axes[1, 0].set_ylabel('Cash (Million DKK)')
+        axes[1, 0].set_ylabel('Cash (Million USD)')
         axes[1, 0].grid(True, alpha=0.3)
         
         # Battery state of charge
@@ -310,7 +330,8 @@ def main():
     print("\n" + "="*60)
     print("FINAL RESULTS - Rule-Based Heuristic System")
     print("="*60)
-    print(f"Final Portfolio Value: ${final_metrics['final_value']/1e6:.2f}M")
+    print(f"Final Portfolio Value: ${final_metrics['final_value_usd']/1e6:.2f}M USD")
+    print(f"Initial Portfolio Value: ${final_metrics['initial_value_usd']/1e6:.2f}M USD")
     print(f"Total Return: {final_metrics['total_return']*100:.2f}%")
     print(f"Sharpe Ratio: {final_metrics['sharpe_ratio']:.3f}")
     print(f"Maximum Drawdown: {final_metrics['max_drawdown']*100:.2f}%")
@@ -318,9 +339,9 @@ def main():
     print(f"Wind Capacity: {final_metrics['wind_capacity_mw']:.0f} MW")
     print(f"Solar Capacity: {final_metrics['solar_capacity_mw']:.0f} MW")
     print(f"Hydro Capacity: {final_metrics['hydro_capacity_mw']:.0f} MW")
-    print(f"Final Cash: ${final_metrics['final_cash']/1e6:.2f}M")
-    print(f"Battery Utilization: {final_metrics['battery_utilization']*100:.1f}%")
-    print(f"Total Investments: {final_metrics['total_investments']}")
+    print(f"Final Cash: ${final_metrics['final_cash_usd']/1e6:.2f}M USD")
+    print(f"Battery Utilization: {final_metrics.get('battery_utilization', 0)*100:.1f}%")
+    print(f"Total Investments: {final_metrics.get('total_investment_decisions', 0)}")
     print("="*60)
 
 

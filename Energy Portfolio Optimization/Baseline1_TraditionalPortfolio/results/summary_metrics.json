@@ -1,0 +1,14 @@
+{
+  "final_value": 5522965312.024838,
+  "final_value_usd": 800829970.2436016,
+  "initial_value_usd": 800000000.0000001,
+  "total_return": 0.0010374628045018194,
+  "sharpe_ratio": -5.041613333868073,
+  "max_drawdown": -0.004690940682769104,
+  "volatility": 0.003740356252259635,
+  "var_95": -6.65471906793564e-05,
+  "calmar_ratio": 0.2211630618806708,
+  "final_weights": "[0.2 0.2 0.2 0.2 0.2]",
+  "final_battery_soc": 0,
+  "battery_total_revenue": 0
+}

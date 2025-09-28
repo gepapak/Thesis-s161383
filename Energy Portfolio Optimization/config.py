@@ -51,9 +51,9 @@ class EnhancedConfig:
         self.operating_cost_rate = 0.03  # 3% of revenue
         self.maintenance_cost_mwh = 3.5 / self.dkk_to_usd_rate  # $3.5/MWh → ~24.1 DKK/MWh
         self.insurance_rate = 0.004  # 0.4% of asset value annually
-        self.management_fee_rate = 0.005  # 0.5% of fund value annually (realistic for infrastructure)
+        self.management_fee_rate = 0.015  # 1.5% of fund value annually (realistic for infrastructure)
         self.property_tax_rate = 0.005  # 0.5% of asset value annually
-        self.debt_service_rate = 0.008  # 0.8% of asset value annually (realistic debt service)
+        self.debt_service_rate = 0.015  # 1.5% of asset value annually (realistic debt service)
         self.distribution_rate = 0.30  # 30% of positive cash distributed
         self.administration_fee_rate = 0.0001  # 0.01% of fund value annually (basic admin)
 
@@ -134,16 +134,16 @@ class EnhancedConfig:
         # MEMORY AND PERFORMANCE PARAMETERS
         # =============================================================================
 
-        # Memory limits (MB)
-        self.max_memory_mb = 1500.0  # Environment memory limit
-        self.metacontroller_memory_mb = 6000  # Meta controller memory limit
-        self.wrapper_memory_mb = 500  # Wrapper memory limit
+        # Memory limits (MB) - INCREASED FOR PERFORMANCE
+        self.max_memory_mb = 6000.0  # Environment memory limit (INCREASED)
+        self.metacontroller_memory_mb = 12000  # Meta controller memory limit (INCREASED)
+        self.wrapper_memory_mb = 2000  # Wrapper memory limit (INCREASED)
 
-        # Cache sizes
-        self.forecast_cache_size = 1000
-        self.agent_forecast_cache_size = 2000
-        self.lru_cache_size = 2000
-        self.lru_memory_limit_mb = 50.0
+        # Cache sizes - INCREASED FOR PERFORMANCE
+        self.forecast_cache_size = 2000  # Increased for better performance
+        self.agent_forecast_cache_size = 4000  # Increased for better performance
+        self.lru_cache_size = 3000  # Increased for better performance
+        self.lru_memory_limit_mb = 100.0  # Increased for better performance
 
         # =============================================================================
         # RISK MANAGEMENT PARAMETERS
@@ -208,6 +208,30 @@ class EnhancedConfig:
         self.price_scale = 10.0  # Price normalization scale
         self.price_clip_min = -1000.0  # Minimum price for clipping
         self.price_clip_max = 1e9  # Maximum price for clipping
+
+        # STANDARDIZATION: Shared normalization constants (single source of truth)
+        self.price_normalization_divisor = 3.0  # Z-score to [-1,1] mapping: clip(z_score / 3.0, -1, 1)
+        self.price_z_score_clip = 3.0  # Clip z-scores to ±3σ before normalization
+
+        # FALLBACK STATS: For consistent two-step normalization when rolling stats unavailable
+        self.price_fallback_mean = 250.0  # Typical DKK/MWh price for fallback z-score calculation
+        self.price_fallback_std = 50.0    # Typical price volatility for fallback z-score calculation
+
+        # CANONICAL HORIZONS: Single source of truth matching trained models
+        # These exact values must match the saved model files
+        self.forecast_horizons = {
+            "immediate": 1,      # 10 min - direct next step
+            "short": 6,          # 1 hour - 6 steps ahead
+            "medium": 24,        # 4 hours - 24 steps ahead
+            "long": 144,         # 24 hours - 144 steps ahead
+            "strategic": 1008    # 7 days - 1008 steps ahead
+        }
+
+        # CANONICAL FORECAST TARGETS: Single source of truth for all forecast models
+        self.forecast_targets = ["wind", "solar", "hydro", "price", "load"]
+
+        # CANONICAL REQUIRED HORIZONS: Minimum horizons that must exist
+        self.required_forecast_horizons = ["immediate", "short", "medium", "long", "strategic"]
 
         # Default forecast values (MW or DKK/MWh) - FIXED: Standardized on DKK
         self.default_forecasts = {
