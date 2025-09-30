@@ -274,7 +274,7 @@ class AdvancedFeatureEngine:
             current_hydro = float(env._hydro[t] if t < len(env._hydro) else 0.0)
             current_load = float(env._load[t] if t < len(env._load) else 0.0)
 
-            features[0] = current_price / 1000.0  # Normalized price
+            features[0] = current_price / 100.0  # Normalized price (IDENTICAL to Normal version)
             features[1] = (current_wind + current_solar + current_hydro) / 1000.0  # Total generation
             features[2] = current_load / 1000.0  # Load
             features[3] = float(getattr(env, 't', t)) / 1000.0  # Time normalized
@@ -351,7 +351,7 @@ class AdvancedFeatureEngine:
 
             # FIXED: Match main.py's exact 13-feature structure
             # === MARKET STATE FEATURES (0-3) ===
-            features[0] = price / 1000.0  # Normalized price
+            features[0] = price / 100.0  # Normalized price (IDENTICAL to Normal version)
             features[1] = current_generation / 1000.0  # Total generation
             features[2] = load / 1000.0  # Load
             features[3] = 0.0  # Time (simplified)

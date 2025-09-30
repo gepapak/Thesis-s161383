@@ -645,7 +645,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self._deploy_initial_assets_once(initial_asset_plan)
 
         # CRITICAL FIX: Initialize reward calculator AFTER asset deployment with correct baseline NAV
-        if self.reward_calculator is None:
+        if getattr(self, 'reward_calculator', None) is None:
             # Use post-CAPEX NAV as baseline instead of pre-CAPEX init_budget
             post_capex_nav = self._calculate_fund_nav()
             self.reward_calculator = ProfitFocusedRewardCalculator(initial_budget=post_capex_nav, config=self.config)
@@ -653,6 +653,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if hasattr(self.reward_calculator, 'config'):
                 self.reward_calculator.config = self.config
             logging.info(f"Reward calculator initialized with post-CAPEX baseline NAV: {post_capex_nav:,.0f} DKK")
+        else:
+            logging.info(f"Reward calculator already exists: {type(self.reward_calculator)}")
 
         # FIXED: Currency conversion and data loading
         # Convert DKK prices to USD (Danish data) - SINGLE CONVERSION POINT
@@ -698,7 +700,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         # Normalize prices for agent observations (z-score with bounds)
         price_normalized = (price_dkk_filtered - price_rolling_mean) / (price_rolling_std + 1e-6)
-        price_normalized_clipped = np.clip(price_normalized, -self.config.price_z_score_clip, self.config.price_z_score_clip)  # ±3 sigma bounds
+        price_normalized_clipped = np.clip(price_normalized, -3.0, 3.0)  # ±3 sigma bounds
 
         self._price = price_normalized_clipped.to_numpy()  # Normalized for agents
 
@@ -748,9 +750,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
             "meta_controller_0":  spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),  # FIXED: [-1,1] instead of [0,1]
         }
 
-        # CRITICAL FIX: Initialize reward calculator AFTER asset deployment to use correct baseline NAV
-        # This will be moved after _deploy_initial_assets_once() call
-        self.reward_calculator = None  # Temporary placeholder
+        # CRITICAL FIX: Reward calculator is now initialized AFTER asset deployment above
+        # No need to set to None here as it's already properly initialized
 
         try:
             self.enhanced_risk_controller = EnhancedRiskController(lookback_window=144) if enhanced_risk_controller else None
@@ -2599,6 +2600,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
             forecast_signal_score = financial.get('forecast_signal_score', 0.0)
             
             # Calculate reward using FIXED calculator
+            if self.reward_calculator is None:
+                logging.error(f"Reward calculator is None at step {self.current_step}. Initializing now...")
+                # Emergency initialization
+                post_capex_nav = self._calculate_fund_nav()
+                self.reward_calculator = ProfitFocusedRewardCalculator(initial_budget=post_capex_nav, config=self.config)
+                logging.info(f"Emergency reward calculator initialized with NAV: {post_capex_nav:,.0f} DKK")
+
             reward = self.reward_calculator.calculate_reward(
                 fund_nav=fund_nav,
                 cash_flow=cash_flow,
@@ -2632,9 +2640,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 'risk_level': risk_level,
                 'efficiency': efficiency,
                 'forecast_signal_score': forecast_signal_score,
-                'reward_components': self.reward_calculator.reward_weights.copy()
+                'reward_components': self.reward_calculator.reward_weights.copy() if self.reward_calculator else {}
             }
-            self.last_reward_weights = self.reward_calculator.reward_weights.copy()
+            self.last_reward_weights = self.reward_calculator.reward_weights.copy() if self.reward_calculator else {}
             
         except Exception as e:
             logging.error(f"Reward assignment error: {e}")
@@ -2710,8 +2718,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _fill_obs(self):
         i = min(self.t, self.max_steps - 1)
-        # Map z-score (±3σ) to [-1,1] for consistent observation normalization
-        price_n = float(np.clip(self._price[i] / self.config.price_normalization_divisor, -1.0, 1.0))
+        price_n = float(np.clip(SafeDivision.div(self._price[i], 10.0, 0.0), -10.0, 10.0))
         load_n  = float(np.clip(SafeDivision.div(self._load[i],  self.load_scale, 0.0), 0.0, 1.0))
         windf   = float(np.clip(SafeDivision.div(self._wind[i],  self.wind_scale, 0.0), 0.0, 1.0))
         solarf  = float(np.clip(SafeDivision.div(self._solar[i], self.solar_scale, 0.0), 0.0, 1.0))

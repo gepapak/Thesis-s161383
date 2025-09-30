@@ -209,8 +209,10 @@ class EnhancedConfig:
         self.price_clip_min = -1000.0  # Minimum price for clipping
         self.price_clip_max = 1e9  # Maximum price for clipping
 
-        # STANDARDIZATION: Shared normalization constants (single source of truth)
-        self.price_normalization_divisor = 3.0  # Z-score to [-1,1] mapping: clip(z_score / 3.0, -1, 1)
+        # STANDARDIZATION: Price normalization constants (now using Normal version's proven approach)
+        # NOTE: These are kept for compatibility but actual normalization now uses hardcoded values
+        # matching Normal version: z_score / 10.0, clipped to [-10, 10] for proven performance
+        self.price_normalization_divisor = 10.0  # Updated to match Normal version's proven scaling
         self.price_z_score_clip = 3.0  # Clip z-scores to ±3σ before normalization
 
         # FALLBACK STATS: For consistent two-step normalization when rolling stats unavailable

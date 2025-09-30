@@ -1857,7 +1857,10 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, forecaster
                     episode_data,
                     forecast_generator=forecaster,
                     dl_adapter=getattr(base_env, 'dl_adapter', None),
-                    config=getattr(base_env, 'config', None)
+                    config=getattr(base_env, 'config', None),
+                    investment_freq=getattr(base_env, 'investment_freq', 12),
+                    init_budget=getattr(base_env, 'init_budget', None),
+                    enhanced_risk_controller=True
                 )
 
                 # MEMORY FIX: Explicitly clear episode data from memory after env creation
@@ -2465,9 +2468,7 @@ def main():
             config=config  # Pass config to environment
         )
 
-        # FIXED: Apply command line forecast confidence threshold
-        if hasattr(base_env, 'reward_calculator') and hasattr(base_env.reward_calculator, 'forecast_confidence_threshold'):
-            base_env.reward_calculator.forecast_confidence_threshold = args.forecast_confidence_threshold
+        # NOTE: Forecast confidence threshold will be set after reward calculator initialization
 
         # Step 2: Create HedgeAdapter with proper environment reference
         dl_adapter = None
@@ -2547,6 +2548,12 @@ def main():
             except Exception as e:
                 print(f"   Warning: DL adapter dimension info: {e}")
 
+        # FIXED: Apply command line forecast confidence threshold after reward calculator is initialized
+        if hasattr(base_env, 'reward_calculator') and base_env.reward_calculator is not None:
+            if hasattr(base_env.reward_calculator, 'forecast_confidence_threshold'):
+                base_env.reward_calculator.forecast_confidence_threshold = args.forecast_confidence_threshold
+                print(f"   Forecast confidence threshold set to: {args.forecast_confidence_threshold}")
+
         print("Enhanced environment created successfully!")
         print("   Multi-objective rewards: enabled")
         print("   Enhanced risk management: enabled")
@@ -2554,6 +2561,8 @@ def main():
         print(f"   Metrics CSV: {log_path}")
     except Exception as e:
         print(f"Failed to setup environment: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
     # Optional one-time validation (safe)
