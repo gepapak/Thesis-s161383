@@ -1,487 +1,487 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Baseline 1: Classical Portfolio Optimization for IEEE Benchmarking
+Traditional Portfolio Optimizer - Improved Version
 
-PURE CLASSICAL FINANCE APPROACH - NO MACHINE LEARNING OR HEURISTICS
+Implements classical portfolio optimization using actual renewable energy data:
+- Equal Weight
+- Minimum Variance
+- Maximum Sharpe Ratio
+- Markowitz Mean-Variance (with risk aversion)
+- Risk Parity
 
-This baseline implements exclusively classical financial portfolio optimization:
-- Modern Portfolio Theory (Markowitz mean-variance optimization)
-- Black-Litterman model with market equilibrium
-- Risk parity allocation (equal risk contribution)
-- Minimum variance portfolio
-- Maximum Sharpe ratio portfolio
-- Traditional financial metrics (Sharpe ratio, VaR, Calmar ratio, etc.)
+Uses actual revenue from renewable generation (price × quantity) for realistic returns.
 
-Theoretical Foundation:
-- Markowitz (1952): Portfolio Selection
-- Black & Litterman (1992): Global Portfolio Optimization
-- Maillard et al. (2010): Risk Parity Portfolio
-
-NO adaptive learning, NO heuristics, NO machine learning components.
-Pure mathematical optimization based on established financial theory.
+Based on Modern Portfolio Theory and classical financial optimization.
 """
 
+from __future__ import annotations
+import logging
 import numpy as np
 import pandas as pd
-import cvxpy as cp
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Callable
+from pathlib import Path
+from math import sqrt
 from scipy.optimize import minimize
-from sklearn.covariance import LedoitWolf
-import warnings
-warnings.filterwarnings('ignore')
 
-class ClassicalPortfolioOptimizer:
+# ----------------------------- Logging ------------------------------------- #
+
+logger = logging.getLogger("baseline.traditional")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+# ----------------------------- Config ------------------------------------- #
+
+@dataclass
+class Timebase:
+    """Timebase configuration (hours per step)."""
+    time_step_hours: float = 10.0 / 60.0  # default: 10-minute steps
+
+    @property
+    def steps_per_day(self) -> int:
+        return int(round(24.0 / self.time_step_hours))
+
+    @property
+    def steps_per_year(self) -> int:
+        return self.steps_per_day * 365
+
+    def rf_per_step(self, rf_annual: float) -> float:
+        """Convert annual risk-free rate to per-step rate via geometric compounding."""
+        return (1.0 + rf_annual) ** (self.time_step_hours / (24.0 * 365.0)) - 1.0
+
+
+# ----------------------------- Utilities ----------------------------------- #
+
+def _shrink_cov_identity(cov: np.ndarray, shrinkage: float = 0.1) -> np.ndarray:
+    """Simple Ledoit-Wolf style shrinkage towards identity."""
+    n = cov.shape[0]
+    diag = np.trace(cov) / n
+    identity = np.eye(n) * diag
+    return (1 - shrinkage) * cov + shrinkage * identity
+
+
+def _risk_parity_weights(cov: np.ndarray, tol: float = 1e-8, max_iter: int = 10_000) -> np.ndarray:
     """
-    Classical Portfolio Optimization using Modern Portfolio Theory.
+    Solve risk parity via cyclic coordinate descent on log-weights.
+    Ensures w>=0 and sum w = 1.
+    """
+    n = cov.shape[0]
+    w = np.ones(n) / n
+    target = (w @ cov @ w) / n  # equal risk contributions target
 
-    Implements pure mathematical optimization approaches from financial literature:
-    1. Markowitz Mean-Variance Optimization (1952)
-    2. Black-Litterman Model (1992)
-    3. Risk Parity Portfolio (Maillard et al., 2010)
-    4. Minimum Variance Portfolio
-    5. Maximum Sharpe Ratio Portfolio
+    for _ in range(max_iter):
+        rc = w * (cov @ w)  # risk contributions
+        err = rc - target
+        if np.linalg.norm(err, ord=1) < tol:
+            break
+        # update rule
+        w *= target / np.clip(rc, 1e-16, None)
+        w = np.clip(w, 0.0, None)
+        s = w.sum()
+        if s == 0:
+            w = np.ones(n) / n
+        else:
+            w /= s
+        # refresh target
+        port_var = max(w @ cov @ w, 1e-16)
+        target = port_var / n
+    return w
 
-    NO adaptive learning, heuristics, or machine learning components.
+
+def _slsqp_box_simplex(
+    objective: Callable[[np.ndarray], float],
+    grad: Optional[Callable[[np.ndarray], np.ndarray]],
+    n: int,
+    lb: float = 0.0,
+    ub: float = 1.0,
+    w0: Optional[np.ndarray] = None,
+    bounds_override: Optional[List[Tuple[float, float]]] = None,
+) -> np.ndarray:
+    """
+    Minimize objective(w) with SLSQP subject to sum w = 1 and lb<=w<=ub,
+    with optional per-asset bounds.
+    """
+    if bounds_override is not None:
+        bounds = bounds_override
+    else:
+        bounds = [(lb, ub) for _ in range(n)]
+    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    if w0 is None:
+        w0 = np.ones(n) / n
+    res = minimize(
+        objective, w0, jac=grad, method="SLSQP", bounds=bounds, constraints=cons,
+        options={"maxiter": 200, "ftol": 1e-9, "disp": False}
+    )
+    if not res.success or not np.isfinite(res.fun):
+        logger.warning("SLSQP did not converge (%s) — falling back to equal weight.", res.message)
+        return np.ones(n) / n
+    w = res.x
+    w = np.clip(w, [b[0] for b in bounds], [b[1] for b in bounds])
+    w /= w.sum() if w.sum() != 0 else 1.0
+    return w
+
+
+# --------------------------- Optimizer Config ------------------------------- #
+
+@dataclass
+class OptimizerConfig:
+    method: str = "markowitz_mean_variance"
+    risk_aversion_lambda: float = 5.0   # only for markowitz_mean_variance
+    shrinkage: float = 0.1
+    allow_short: bool = False
+    seed: int = 42
+
+
+# --------------------------- Main Optimizer Class --------------------------- #
+
+class TraditionalPortfolioOptimizer:
+    """
+    Rolling-window optimizer for hybrid infrastructure fund.
+
+    Tradable assets:
+    - Physical: wind, solar, hydro (operational yields)
+    - Financial: price (MTM returns, capped at 12% weight)
+    - Cash: risk-free asset
+
+    Implements classical portfolio optimization with proper hybrid fund structure.
     """
 
-    def __init__(self, initial_budget=8e8/0.145, lookback_window=252, rebalance_freq=30):  # $800M USD in DKK
-        """
-        Initialize classical portfolio optimizer.
+    risky_assets: Tuple[str, ...] = ("wind", "solar", "hydro", "price")
 
-        Args:
-            initial_budget: Initial portfolio value (DKK) - will be converted to USD for reporting
-            lookback_window: Historical data window for optimization (trading days)
-            rebalance_freq: Rebalancing frequency (trading days)
-        """
-        self.initial_budget = initial_budget
-        self.current_budget = initial_budget
+    def __init__(
+        self,
+        timebase: Timebase,
+        rf_annual: float = 0.02,
+        opt_cfg: Optional[OptimizerConfig] = None,
+        initial_budget: float = 800_000_000.0,  # $800M USD
+        dkk_to_usd_rate: float = 0.145,
+        lookback_window: Optional[int] = None,
+        rebalance_freq: Optional[int] = None,
+    ):
+        self.timebase = timebase
+        self.rf_annual = rf_annual
+        self.rf_step = timebase.rf_per_step(rf_annual)
+        self.opt_cfg = opt_cfg or OptimizerConfig()
+        np.random.seed(self.opt_cfg.seed)
 
-        # Currency conversion rate (from config.py)
-        self.dkk_to_usd_rate = 0.145  # 1 USD = ~6.9 DKK (2024 rate)
-        self.lookback_window = lookback_window
-        self.rebalance_freq = rebalance_freq
+        # Portfolio parameters
+        self.initial_budget_usd = initial_budget
+        self.current_budget_usd = initial_budget
+        self.dkk_to_usd_rate = dkk_to_usd_rate
 
-        # Asset universe - renewable energy assets
-        self.assets = ['wind', 'solar', 'hydro', 'price_index', 'cash']
-        self.n_assets = len(self.assets)
+        # Time-aware defaults from Timebase
+        self.rebalance_freq = rebalance_freq or max(1, self.timebase.steps_per_year // 12)  # ~monthly
+        self.lookback_window = lookback_window or self.timebase.steps_per_year  # ~1 year
 
-        # Classical portfolio parameters (from literature)
-        self.risk_aversion = 3.0      # Typical institutional investor (Brandt, 2010)
-        self.max_weight = 0.40        # Regulatory constraint (UCITS directive)
-        self.min_weight = 0.05        # Minimum diversification
-        self.risk_free_rate = 0.02    # 2% annual risk-free rate
-
-        # Portfolio state
+        # Weights: 3 risky assets + cash
+        self.n_assets = len(self.risky_assets) + 1
         self.weights = np.ones(self.n_assets) / self.n_assets  # Equal weight start
-        self.positions = self.weights * self.initial_budget
-        self.returns_history = []
-        self.portfolio_values = []
-
+        
         # Performance tracking
-        self.metrics = {
-            'total_return': 0.0,
-            'sharpe_ratio': 0.0,
-            'max_drawdown': 0.0,
-            'volatility': 0.0,
-            'var_95': 0.0,
-            'calmar_ratio': 0.0,
-            'sortino_ratio': 0.0,
-            'information_ratio': 0.0
+        self.portfolio_values = []
+        self.returns_history = []
+        
+        # Selection map to functions
+        self._methods: Dict[str, Callable[[np.ndarray, np.ndarray, float], np.ndarray]] = {
+            "equal_weight": self._equal_weight,
+            "min_variance": self._min_variance,
+            "max_sharpe": self._max_sharpe,
+            "markowitz_mean_variance": self._markowitz_mv,
+            "risk_parity": self._risk_parity,
         }
 
-        # Covariance estimation (Ledoit-Wolf shrinkage)
-        self.cov_estimator = LedoitWolf()
+    # ------------------ Returns construction (core accuracy) ---------------- #
 
-        # Optimization method tracking
-        self.current_method = 'equal_weight'
-        self.optimization_methods = [
-            'markowitz_mean_variance',
-            'black_litterman',
-            'risk_parity',
-            'minimum_variance',
-            'maximum_sharpe'
-        ]
-        self.method_index = 0
-        
-    def calculate_asset_returns(self, data, t):
+    def build_asset_returns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculate classical asset returns using standard financial methodology.
+        Build asset returns for a hybrid fund *correctly separated* into:
+        - Operational yields for wind/solar/hydro (no price drift baked in)
+        - A separate 'price' asset that captures mark-to-market price return
 
-        Pure financial approach - no MARL-specific logic.
-        Uses standard return calculation: R_t = (P_t - P_{t-1}) / P_{t-1}
+        This lets the optimizer allocate at most 12% to price (via bounds),
+        while physical sleeves remain driven by operations.
         """
-        if t < 2:  # Need at least 2 periods for return calculation
-            return np.zeros(self.n_assets)
+        req = {"timestamp", "wind", "solar", "hydro", "price"}
+        missing = [c for c in req if c not in df.columns]
+        if missing:
+            raise ValueError(f"Input CSV missing required columns: {missing}")
 
-        # Get current and previous period data
-        if t >= len(data):
-            return np.zeros(self.n_assets)
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
-        current_data = data.iloc[t]
-        previous_data = data.iloc[t-1]
+        # --- Physical revenue (ownership & opex) ---
+        wind_own, solar_own, hydro_own = 0.18, 0.10, 0.04
+        wind_opex, solar_opex, hydro_opex = 0.05, 0.03, 0.08
 
-        returns = np.zeros(self.n_assets)
+        price = df["price"].astype(float)
+        wind_rev  = df["wind"].astype(float)  * wind_own  * price * (1 - wind_opex)
+        solar_rev = df["solar"].astype(float) * solar_own * price * (1 - solar_opex)
+        hydro_rev = df["hydro"].astype(float) * hydro_own * price * (1 - hydro_opex)
 
-        try:
-            # Very conservative returns for traditional portfolio baseline
-            # Use minimal returns to avoid unrealistic performance
+        # Physical capital base (DKK), derived from fund config (88% of $800M)
+        physical_capex_dkk = (800_000_000 * 0.88) / 0.145
 
-            # All assets get very small random returns
-            for i in range(4):  # Wind, Solar, Hydro, Battery
-                returns[i] = np.random.normal(0, 0.0001)  # 0.01% hourly volatility
+        # Calibrate net-to-capital yield: scale gross revenue to a realistic net yield
+        # (Your previous calibration 0.0216 is kept here but applied only to the physical sleeves)
+        revenue_scaling = 0.0216
 
-            # Cash return (risk-free rate)
-            returns[4] = self.risk_free_rate / 8760  # Hourly risk-free rate
+        def op_yield(rev: pd.Series) -> pd.Series:
+            scaled = rev * revenue_scaling
+            y = (scaled / physical_capex_dkk).fillna(0.0).astype(float)
+            # No winsorization needed - operational yields are already stable and scaled
+            return y
 
-            # Apply very tight bounds for realistic returns (±0.05% hourly max)
-            returns = np.clip(returns, -0.0005, 0.0005)
+        wind_r  = op_yield(wind_rev)
+        solar_r = op_yield(solar_rev)
+        hydro_r = op_yield(hydro_rev)
 
-            # Handle any NaN or infinite values
-            returns = np.nan_to_num(returns, nan=0.0, posinf=0.0005, neginf=-0.0005)
+        # --- Financial sleeve as its own asset ---
+        # Use pct_change with cap ±0.1% per 10-min
+        price_ret = price.pct_change().fillna(0.0).clip(-0.001, 0.001)
 
-        except Exception as e:
-            # Fallback to zero returns if calculation fails
-            returns = np.zeros(self.n_assets)
+        return pd.DataFrame({
+            "timestamp": df["timestamp"],
+            "wind":  wind_r.values,
+            "solar": solar_r.values,
+            "hydro": hydro_r.values,
+            "price": price_ret.values,   # separate sleeve
+        })
 
-        return returns
-    
-    def estimate_covariance_matrix(self, returns_data):
-        """Estimate covariance matrix using Ledoit-Wolf shrinkage."""
-        if len(returns_data) < 10:
-            # Use identity matrix for insufficient data
-            return np.eye(self.n_assets) * 0.01
-            
-        returns_array = np.array(returns_data)
-        if returns_array.shape[0] < returns_array.shape[1]:
-            # Transpose if needed
-            returns_array = returns_array.T
-            
-        try:
-            cov_matrix, _ = self.cov_estimator.fit(returns_array).covariance_, self.cov_estimator.shrinkage_
-            return cov_matrix
-        except:
-            return np.eye(self.n_assets) * 0.01
-    
-    def markowitz_optimization(self, expected_returns, cov_matrix):
+    # ---------------------------- Optimization Methods ---------------------------------- #
+
+    def _equal_weight(self, mu: np.ndarray, cov: np.ndarray, rf_step: float) -> np.ndarray:
+        n = len(mu)
+        if n == 4:  # wind, solar, hydro, price
+            # Cap price at 12%, distribute rest equally among physical assets
+            w_price = 0.12
+            w_physical_each = (1.0 - w_price) / 3  # ~29.33% each for wind/solar/hydro
+            w_risky = np.array([w_physical_each, w_physical_each, w_physical_each, w_price])
+        else:
+            w_risky = np.ones(n) / n
+        return w_risky
+
+    def _min_variance(self, mu: np.ndarray, cov: np.ndarray, rf_step: float) -> np.ndarray:
+        n = len(mu)
+        cov = _shrink_cov_identity(cov, self.opt_cfg.shrinkage)
+        # Per-asset bounds: (0,1) for physicals, (0,0.12) for price
+        bounds = [(0.0, 1.0) for _ in range(n)]
+        if n == 4:  # wind, solar, hydro, price
+            bounds[-1] = (0.0, 0.12)  # cap price at 12%
+        def obj(w):
+            return float(w @ cov @ w)
+        return _slsqp_box_simplex(obj, None, n, bounds_override=bounds)
+
+    def _max_sharpe(self, mu: np.ndarray, cov: np.ndarray, rf_step: float) -> np.ndarray:
+        n = len(mu)
+        cov = _shrink_cov_identity(cov, self.opt_cfg.shrinkage)
+        # Per-asset bounds: (0,1) for physicals, (0,0.12) for price
+        bounds = [(0.0, 1.0) for _ in range(n)]
+        if n == 4:  # wind, solar, hydro, price
+            bounds[-1] = (0.0, 0.12)  # cap price at 12%
+        def obj(w):
+            port_mu = float(mu @ w)
+            port_var = max(float(w @ cov @ w), 1e-16)
+            port_vol = sqrt(port_var)
+            # Maximize (port_mu - rf) / vol  == minimize negative
+            sharpe = (port_mu - rf_step) / port_vol
+            return -sharpe if np.isfinite(sharpe) else 1e6
+        return _slsqp_box_simplex(obj, None, n, bounds_override=bounds)
+
+    def _markowitz_mv(self, mu: np.ndarray, cov: np.ndarray, rf_step: float) -> np.ndarray:
         """
-        Markowitz mean-variance optimization.
-        Maximize: w^T * mu - (lambda/2) * w^T * Sigma * w
-        Subject to: sum(w) = 1, w >= min_weight, w <= max_weight
+        Mean-variance with risk_aversion_lambda: minimize 0.5 * lambda * w^T C w - (mu - rf)·w
         """
-        w = cp.Variable(self.n_assets)
-        
-        # Objective: maximize expected return - risk penalty
-        portfolio_return = w.T @ expected_returns
-        portfolio_risk = cp.quad_form(w, cov_matrix)
-        objective = cp.Maximize(portfolio_return - (self.risk_aversion / 2) * portfolio_risk)
-        
-        # Constraints
-        constraints = [
-            cp.sum(w) == 1,  # Fully invested
-            w >= self.min_weight,  # No short selling
-            w <= self.max_weight   # Concentration limits
-        ]
-        
-        # Solve optimization
-        problem = cp.Problem(objective, constraints)
-        try:
-            problem.solve(solver=cp.ECOS, verbose=False)
-            if w.value is not None:
-                return np.array(w.value).flatten()
-        except:
-            pass
-            
-        # Fallback to equal weights
-        return np.ones(self.n_assets) / self.n_assets
-    
-    def risk_parity_optimization(self, cov_matrix):
+        n = len(mu)
+        lam = float(self.opt_cfg.risk_aversion_lambda)
+        cov = _shrink_cov_identity(cov, self.opt_cfg.shrinkage)
+        adj_mu = mu - rf_step  # excess returns
+        # Per-asset bounds: (0,1) for physicals, (0,0.12) for price
+        bounds = [(0.0, 1.0) for _ in range(n)]
+        if n == 4:  # wind, solar, hydro, price
+            bounds[-1] = (0.0, 0.12)  # cap price at 12%
+        def obj(w):
+            return 0.5 * lam * float(w @ cov @ w) - float(adj_mu @ w)
+        return _slsqp_box_simplex(obj, None, n, bounds_override=bounds)
+
+    def _risk_parity(self, mu: np.ndarray, cov: np.ndarray, rf_step: float) -> np.ndarray:
+        cov = _shrink_cov_identity(cov, self.opt_cfg.shrinkage)
+        w = _risk_parity_weights(cov)
+        # Cap price at 12% and renormalize
+        if len(w) == 4:  # wind, solar, hydro, price
+            w[-1] = min(w[-1], 0.12)
+            w /= w.sum()
+        return w
+
+    # ------------------------ Rolling optimization ------------------------- #
+
+    def rebalance_weights(
+        self,
+        returns_window: pd.DataFrame,
+        method: str,
+    ) -> Dict[str, float]:
+        method = method.lower()
+        if method not in self._methods:
+            raise ValueError(f"Unknown method '{method}'. Valid: {list(self._methods)}")
+
+        # assemble mu/cov for risky assets
+        R = returns_window[list(self.risky_assets)].dropna()
+        if len(R) < max(30, len(self.risky_assets) * 3):
+            # not enough data => equal-weight risky + rest cash
+            w_risky = np.ones(len(self.risky_assets)) / len(self.risky_assets)
+        else:
+            mu = R.mean(axis=0).values  # arithmetic mean per step
+            cov = np.cov(R.values, rowvar=False)
+            w_risky = self._methods[method](mu, cov, self.rf_step)
+
+        # combine with cash as residual
+        w_risky = np.clip(w_risky, 0.0, 1.0)
+        w_cash = 1.0 - float(np.sum(w_risky))
+        if w_cash < 0 and not self.opt_cfg.allow_short:
+            # normalize to simplex if numerical drift
+            s = np.sum(np.clip(w_risky, 0.0, 1.0))
+            w_risky = np.clip(w_risky, 0.0, 1.0) / (s if s > 0 else 1.0)
+            w_cash = 1.0 - float(np.sum(w_risky))
+            w_cash = max(w_cash, 0.0)
+
+        weights: Dict[str, float] = {a: float(w) for a, w in zip(self.risky_assets, w_risky)}
+        weights["cash"] = float(w_cash)
+        return weights
+
+    # ------------------------ Portfolio Execution ------------------------- #
+
+    def step(self, data: pd.DataFrame, t: int, returns_df: pd.DataFrame) -> Dict:
         """
-        Risk parity optimization - equal risk contribution from each asset.
-        """
-        def risk_parity_objective(weights, cov_matrix):
-            portfolio_vol = np.sqrt(weights.T @ cov_matrix @ weights)
-            marginal_contrib = cov_matrix @ weights / portfolio_vol
-            contrib = weights * marginal_contrib
-            target_contrib = portfolio_vol / self.n_assets
-            return np.sum((contrib - target_contrib) ** 2)
-        
-        # Constraints
-        constraints = [
-            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},  # Fully invested
-        ]
-        bounds = [(self.min_weight, self.max_weight) for _ in range(self.n_assets)]
-        
-        # Initial guess
-        x0 = np.ones(self.n_assets) / self.n_assets
-        
-        try:
-            result = minimize(
-                risk_parity_objective,
-                x0,
-                args=(cov_matrix,),
-                method='SLSQP',
-                bounds=bounds,
-                constraints=constraints,
-                options={'maxiter': 1000}
-            )
-            if result.success:
-                return result.x
-        except:
-            pass
-            
-        return x0
-    
-    def black_litterman_optimization(self, market_caps, expected_returns, cov_matrix):
-        """
-        Black-Litterman model with market equilibrium.
-        """
-        # Market equilibrium weights (based on market caps)
-        w_market = market_caps / np.sum(market_caps)
-        
-        # Implied equilibrium returns
-        pi = self.risk_aversion * cov_matrix @ w_market
-        
-        # Black-Litterman formula (simplified - no views)
-        tau = 0.025  # Scaling factor
-        omega = np.eye(self.n_assets) * 0.01  # Uncertainty in views
-        
-        # Posterior expected returns
-        M1 = np.linalg.inv(tau * cov_matrix)
-        M2 = np.linalg.inv(omega)
-        M3 = np.linalg.inv(M1 + M2)
-        
-        mu_bl = M3 @ (M1 @ pi + M2 @ expected_returns)
-        
-        # Optimize with Black-Litterman returns
-        return self.markowitz_optimization(mu_bl, cov_matrix)
+        Execute one portfolio step.
 
-    def minimum_variance_optimization(self, cov_matrix):
-        """
-        Minimum variance portfolio optimization.
-        Minimizes portfolio variance without regard to expected returns.
-        """
-        n_assets = self.n_assets
-
-        def portfolio_variance(weights):
-            return np.dot(weights, np.dot(cov_matrix, weights))
-
-        # Constraints
-        constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
-        bounds = [(self.min_weight, self.max_weight) for _ in range(n_assets)]
-
-        # Initial guess
-        x0 = np.ones(n_assets) / n_assets
-
-        try:
-            result = minimize(portfolio_variance, x0, method='SLSQP',
-                            bounds=bounds, constraints=constraints)
-            if result.success:
-                return result.x
-        except:
-            pass
-
-        return x0
-
-    def maximum_sharpe_optimization(self, expected_returns, cov_matrix):
-        """
-        Maximum Sharpe ratio portfolio optimization.
-        Maximizes (return - risk_free_rate) / volatility.
-        """
-        n_assets = self.n_assets
-
-        def negative_sharpe(weights):
-            portfolio_return = np.dot(weights, expected_returns)
-            portfolio_vol = np.sqrt(np.dot(weights, np.dot(cov_matrix, weights)))
-            if portfolio_vol == 0:
-                return -np.inf
-            return -(portfolio_return - self.risk_free_rate / 252) / portfolio_vol
-
-        # Constraints
-        constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
-        bounds = [(self.min_weight, self.max_weight) for _ in range(n_assets)]
-
-        # Initial guess
-        x0 = np.ones(n_assets) / n_assets
-
-        try:
-            result = minimize(negative_sharpe, x0, method='SLSQP',
-                            bounds=bounds, constraints=constraints)
-            if result.success:
-                return result.x
-        except:
-            pass
-
-        return x0
-
-    def step(self, data, t):
-        """
-        Execute one optimization step.
-        
         Args:
-            data: Market data DataFrame
+            data: Full market data DataFrame
             t: Current timestep
-            
+            returns_df: Pre-computed returns DataFrame
+
         Returns:
-            dict: Portfolio metrics and actions
+            dict: Portfolio metrics and state
         """
-        # Calculate current asset returns
-        current_returns = self.calculate_asset_returns(data, t)
-        self.returns_history.append(current_returns)
-        
-        # Rebalance portfolio if needed
-        if t % self.rebalance_freq == 0 and len(self.returns_history) >= 10:
-            self.rebalance_portfolio()
-        
-        # Calculate portfolio return using classical approach
-        portfolio_return = np.sum(self.weights * current_returns)
+        # Get current returns (if available)
+        if t >= len(returns_df):
+            current_returns = np.zeros(len(self.risky_assets))
+        else:
+            current_returns = returns_df.iloc[t][list(self.risky_assets)].values
 
-        # Apply classical transaction costs (institutional rates: 5-10 bps)
-        if t % self.rebalance_freq == 0 and t > 0:
-            # Estimate turnover based on weight changes
-            if hasattr(self, 'previous_weights'):
-                turnover = np.sum(np.abs(self.weights - self.previous_weights)) / 2
-                transaction_costs = turnover * 0.0008  # 8 bps institutional rate
-                portfolio_return -= transaction_costs
-            self.previous_weights = self.weights.copy()
+        # Rebalance if needed
+        if t > 0 and t % self.rebalance_freq == 0 and len(returns_df) >= self.lookback_window:
+            # Get lookback window
+            start_idx = max(0, t - self.lookback_window)
+            returns_window = returns_df.iloc[start_idx:t]
 
-        # Apply realistic bounds for portfolio returns (±0.5% hourly max)
-        portfolio_return = np.clip(portfolio_return, -0.005, 0.005)
+            # Rebalance weights
+            try:
+                weights_dict = self.rebalance_weights(returns_window, self.opt_cfg.method)
+                # Convert to array in risky_assets order + cash: [wind, solar, hydro, price, cash]
+                self.weights = np.array(
+                    [weights_dict[a] for a in self.risky_assets] + [weights_dict["cash"]]
+                )
+            except Exception as e:
+                logger.warning(f"Rebalancing failed at step {t}: {e}")
+                # Keep current weights
 
-        # Safety check for numerical stability
-        if not np.isfinite(portfolio_return):
-            portfolio_return = 0.0
+        # Calculate portfolio return
+        # Risky assets return
+        risky_weights = self.weights[:len(self.risky_assets)]
+        risky_return = np.sum(risky_weights * current_returns)
+
+        # Cash return (risk-free rate)
+        cash_weight = self.weights[-1]
+        cash_return = cash_weight * self.rf_step
+
+        # Total portfolio return
+        portfolio_return = risky_return + cash_return
 
         # Update portfolio value
-        self.current_budget *= (1 + portfolio_return)
+        self.current_budget_usd *= (1 + portfolio_return)
+        self.portfolio_values.append(self.current_budget_usd)
+        self.returns_history.append(portfolio_return)
 
-        # Apply reasonable bounds for institutional portfolio (50%-200% range)
-        min_value = self.initial_budget * 0.5   # Maximum 50% loss
-        max_value = self.initial_budget * 2.0   # Maximum 100% gain
-        self.current_budget = np.clip(self.current_budget, min_value, max_value)
+        # Calculate metrics
+        metrics = self._calculate_metrics()
 
-        self.portfolio_values.append(self.current_budget)
-        
-        # Update positions
-        self.positions = self.weights * self.current_budget
-        
-        # Calculate performance metrics
-        self.update_metrics()
-        
         return {
-            'portfolio_value': self.current_budget,
+            'portfolio_value': self.current_budget_usd,
             'weights': self.weights.copy(),
-            'positions': self.positions.copy(),
-            'returns': current_returns,
-            'metrics': self.metrics.copy()
+            'returns': portfolio_return,
+            'metrics': metrics
         }
-    
-    def cycle_optimization_method(self):
-        """
-        Cycle through different classical optimization methods.
-        This demonstrates various approaches from financial literature.
-        """
-        self.method_index = (self.method_index + 1) % len(self.optimization_methods)
-        self.current_method = self.optimization_methods[self.method_index]
-        print(f"Switching to optimization method: {self.current_method}")
 
-    def rebalance_portfolio(self):
-        """
-        Rebalance portfolio using classical optimization methods.
-        Cycles through different approaches to demonstrate various classical techniques.
-        """
-        if len(self.returns_history) < max(30, self.lookback_window // 10):
-            # Not enough data for optimization
-            return
-
-        # Prepare data for optimization
-        if len(self.returns_history) < self.lookback_window:
-            returns_data = self.returns_history
-        else:
-            returns_data = self.returns_history[-self.lookback_window:]
-
-        returns_array = np.array(returns_data)
-        expected_returns = np.mean(returns_array, axis=0)
-        cov_matrix = self.estimate_covariance_matrix(returns_data)
-
-        # Market cap weights for Black-Litterman (renewable energy sector weights)
-        market_caps = np.array([0.35, 0.25, 0.20, 0.15, 0.05])  # Wind, Solar, Hydro, Price, Cash
-
-        try:
-            # Apply current optimization method
-            if self.current_method == 'markowitz_mean_variance':
-                new_weights = self.markowitz_optimization(expected_returns, cov_matrix)
-            elif self.current_method == 'black_litterman':
-                new_weights = self.black_litterman_optimization(market_caps, expected_returns, cov_matrix)
-            elif self.current_method == 'risk_parity':
-                new_weights = self.risk_parity_optimization(cov_matrix)
-            elif self.current_method == 'minimum_variance':
-                new_weights = self.minimum_variance_optimization(cov_matrix)
-            elif self.current_method == 'maximum_sharpe':
-                new_weights = self.maximum_sharpe_optimization(expected_returns, cov_matrix)
-            else:
-                new_weights = np.ones(self.n_assets) / self.n_assets
-
-            # Validate weights
-            if np.any(np.isnan(new_weights)) or np.sum(new_weights) < 0.95 or np.sum(new_weights) > 1.05:
-                print(f"Invalid weights from {self.current_method}, using equal weights")
-                new_weights = np.ones(self.n_assets) / self.n_assets
-
-            self.weights = new_weights
-
-        except Exception as e:
-            print(f"Optimization failed for {self.current_method}: {e}, using equal weights")
-            self.weights = np.ones(self.n_assets) / self.n_assets
-    
-    def update_metrics(self):
-        """Update performance metrics."""
+    def _calculate_metrics(self) -> Dict[str, float]:
+        """Calculate portfolio performance metrics."""
         if len(self.portfolio_values) < 2:
-            return
-            
+            return {
+                'total_return': 0.0,
+                'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0,
+                'volatility': 0.0,
+                'calmar_ratio': 0.0
+            }
+
         values = np.array(self.portfolio_values)
-        returns = np.diff(values) / values[:-1]
-        
+        returns = np.array(self.returns_history)
+
         # Total return
-        self.metrics['total_return'] = (self.current_budget - self.initial_budget) / self.initial_budget
-        
+        total_return = (self.current_budget_usd - self.initial_budget_usd) / self.initial_budget_usd
+
         # Sharpe ratio (annualized)
         if len(returns) > 1 and np.std(returns) > 0:
-            excess_returns = returns - 0.02/(365*24)  # Risk-free rate
-            self.metrics['sharpe_ratio'] = np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(365*24)
-        
+            excess_returns = returns - self.rf_step
+            sharpe_ratio = np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(self.timebase.steps_per_year)
+        else:
+            sharpe_ratio = 0.0
+
         # Maximum drawdown
         peak = np.maximum.accumulate(values)
         drawdown = (values - peak) / peak
-        self.metrics['max_drawdown'] = np.min(drawdown)
-        
+        max_drawdown = np.min(drawdown)
+
         # Volatility (annualized)
         if len(returns) > 1:
-            self.metrics['volatility'] = np.std(returns) * np.sqrt(365*24)
-        
-        # Value at Risk (95%)
-        if len(returns) >= 20:
-            self.metrics['var_95'] = np.percentile(returns, 5)
-        
+            volatility = np.std(returns) * np.sqrt(self.timebase.steps_per_year)
+        else:
+            volatility = 0.0
+
         # Calmar ratio
-        if abs(self.metrics['max_drawdown']) > 1e-6:
-            self.metrics['calmar_ratio'] = self.metrics['total_return'] / abs(self.metrics['max_drawdown'])
-    
-    def get_summary(self):
-        """Get portfolio summary for reporting."""
+        if abs(max_drawdown) > 1e-6:
+            calmar_ratio = total_return / abs(max_drawdown)
+        else:
+            calmar_ratio = 0.0
+
         return {
-            'final_value': self.current_budget,
-            'final_value_usd': self.current_budget * self.dkk_to_usd_rate,  # Convert to USD for reporting
-            'initial_value_usd': self.initial_budget * self.dkk_to_usd_rate,  # Initial value in USD
-            'total_return': self.metrics['total_return'],
-            'sharpe_ratio': self.metrics['sharpe_ratio'],
-            'max_drawdown': self.metrics['max_drawdown'],
-            'volatility': self.metrics['volatility'],
-            'var_95': self.metrics['var_95'],
-            'calmar_ratio': self.metrics['calmar_ratio'],
-            'final_weights': self.weights.copy(),
-            'final_battery_soc': 0  # Classical portfolio doesn't use battery
+            'total_return': total_return,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'volatility': volatility,
+            'calmar_ratio': calmar_ratio
         }
 
+    def get_summary(self) -> Dict[str, float]:
+        """Get final portfolio summary."""
+        metrics = self._calculate_metrics()
 
-# Battery optimization removed - Baseline1 focuses purely on classical portfolio optimization
-# Battery functionality moved to separate specialized baseline if needed
+        return {
+            'final_value': self.current_budget_usd,
+            'final_value_usd': self.current_budget_usd,
+            'initial_value_usd': self.initial_budget_usd,
+            'total_return': metrics['total_return'],
+            'sharpe_ratio': metrics['sharpe_ratio'],
+            'max_drawdown': metrics['max_drawdown'],
+            'volatility': metrics['volatility'],
+            'calmar_ratio': metrics['calmar_ratio'],
+            'final_weights': self.weights.copy(),
+            'optimization_method': self.opt_cfg.method
+        }
 
-# End of ClassicalPortfolioOptimizer module
