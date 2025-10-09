@@ -45,7 +45,7 @@ except Exception:
 # Inlined utilities so utils.py is no longer needed
 # =====================================================================
 
-def load_energy_data(csv_path: str, convert_to_raw_units: bool = True) -> pd.DataFrame:
+def load_energy_data(csv_path: str, convert_to_raw_units: bool = True, config=None, mw_scale_overrides=None) -> pd.DataFrame:
     """
     Load energy time series data from CSV with optional unit conversion.
     Requires at least: wind, solar, hydro, price, load.
@@ -56,6 +56,8 @@ def load_energy_data(csv_path: str, convert_to_raw_units: bool = True) -> pd.Dat
         csv_path: Path to CSV file
         convert_to_raw_units: If True, converts capacity factors to absolute MW units
                              to match forecast model training data
+        config: EnhancedConfig object with mw_conversion_scales
+        mw_scale_overrides: Dict with CLI override values for MW scales
     """
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"Data file not found: {csv_path}")
@@ -87,7 +89,7 @@ def load_energy_data(csv_path: str, convert_to_raw_units: bool = True) -> pd.Dat
     # Convert capacity factors to raw MW values for direct forecasting
     if convert_to_raw_units and _is_capacity_factor_data(df):
         print("[INFO] Converting capacity factors to raw MW values for direct forecasting...")
-        df = _convert_to_raw_mw_values(df)
+        df = _convert_to_raw_mw_values(df, config=config, mw_scale_overrides=mw_scale_overrides)
         print("[OK] Raw MW conversion completed - forecasts will work directly with these units")
     else:
         print("[INFO] Data already in raw MW units - ready for direct forecasting")
@@ -109,20 +111,35 @@ def _is_capacity_factor_data(df: pd.DataFrame) -> bool:
     return True  # All values <= 2, likely capacity factors
 
 
-def _convert_to_raw_mw_values(df: pd.DataFrame) -> pd.DataFrame:
+def _convert_to_raw_mw_values(df: pd.DataFrame, config=None, mw_scale_overrides=None) -> pd.DataFrame:
     """Convert capacity factors to raw MW values for direct forecasting.
 
     This eliminates normalization complexity and uses the exact training scale.
+
+    Args:
+        df: DataFrame with capacity factor data
+        config: EnhancedConfig object with mw_conversion_scales
+        mw_scale_overrides: Dict with CLI override values for MW scales
     """
 
-    # EXACT conversion factors derived from scaler analysis
-    # These ensure models receive data in the same scale they were trained on
-    capacity_mw = {
-        'wind': 1103,    # From training scaler mean: 1103.4 MW
-        'solar': 100,    # From training scaler mean: 61.5 MW (min 100 for stability)
-        'hydro': 534,    # From training scaler mean: 534.1 MW
-        'load': 2999,    # From training scaler mean: 2999.8 MW
-    }
+    # Get MW conversion scales from config or use fallback defaults
+    if config and hasattr(config, 'mw_conversion_scales'):
+        capacity_mw = config.mw_conversion_scales.copy()
+    else:
+        # Fallback to original hardcoded values if no config
+        capacity_mw = {
+            'wind': 1103,    # From training scaler mean: 1103.4 MW
+            'solar': 100,    # From training scaler mean: 61.5 MW (min 100 for stability)
+            'hydro': 534,    # From training scaler mean: 534.1 MW
+            'load': 2999,    # From training scaler mean: 2999.8 MW
+        }
+
+    # Apply CLI overrides if provided
+    if mw_scale_overrides:
+        for key, value in mw_scale_overrides.items():
+            if value is not None and key in capacity_mw:
+                capacity_mw[key] = float(value)
+                print(f"[OVERRIDE] Using CLI override for {key}: {value} MW")
 
     df_converted = df.copy()
 
@@ -394,17 +411,17 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                 checkpoint_count = checkpoint_state.get('checkpoint_count', 0)
                 print(f"✅ Resuming from step {total_trained:,} (checkpoint {checkpoint_count})")
 
-                # Try to load DL overlay weights if available
+                # HIGH: Improve DL Checkpoint Loading - robustly load DL weights
                 if hasattr(env, 'dl_adapter') and env.dl_adapter is not None:
-                    dl_weights_path = os.path.join(os.path.dirname(resume_from), "hedge_optimizer_online.h5")
+                    dl_weights_path = os.path.join(resume_from, "hedge_optimizer_online.h5")  # Correctly construct relative to resume_from
                     if os.path.exists(dl_weights_path):
                         try:
+                            # Rely only on the presence of load_weights method, remove overly complex nested hasattr checks
                             if hasattr(env.dl_adapter.model, "load_weights"):
                                 env.dl_adapter.model.load_weights(dl_weights_path)
                                 print(f"✅ Loaded DL overlay weights from {dl_weights_path}")
-                            elif hasattr(env.dl_adapter.model, "model") and hasattr(env.dl_adapter.model.model, "load_weights"):
-                                env.dl_adapter.model.model.load_weights(dl_weights_path)
-                                print(f"✅ Loaded DL overlay weights from {dl_weights_path}")
+                            else:
+                                print(f"⚠️ DL adapter model does not have load_weights method")
                         except Exception as e:
                             print(f"⚠️ Could not load DL overlay weights: {e}")
             else:
@@ -768,13 +785,18 @@ class HedgeAdapter:
         except Exception:
             market_vol = market_stress = 0.5
 
+        # CRITICAL: Fix feature scaling - scale market_vol and market_stress to [0,10] range
+        # This matches the RL observation space conventions for these metrics
+        market_vol_scaled = market_vol * 10.0
+        market_stress_scaled = market_stress * 10.0
+
         # FIXED: Return only 4 state features to match environment (4+3+3+3=13 total)
         # This ensures DL overlay training uses same feature dimensions as prediction
         feats = np.array([
             budget_ratio,            # 0: budget ratio (matches environment state_feats[0])
             cap_frac,                # 1: equity ratio (matches environment state_feats[1])
-            market_vol,              # 2: market volatility (matches environment state_feats[2])
-            market_stress            # 3: market stress (matches environment state_feats[3])
+            market_vol_scaled,       # 2: market volatility scaled to [0,10] (matches environment state_feats[2])
+            market_stress_scaled     # 3: market stress scaled to [0,10] (matches environment state_feats[3])
         ], dtype=np.float32)
         return feats
 
@@ -871,7 +893,8 @@ class HedgeAdapter:
                 'hedge_intensity': np.array([hedge_intensity], dtype=np.float32),
                 'risk_allocation': risk_allocation.astype(np.float32),
                 'hedge_direction': np.array([hedge_direction], dtype=np.float32),
-                'hedge_effectiveness': np.array([hedge_effectiveness], dtype=np.float32)
+                'hedge_effectiveness': np.array([hedge_effectiveness], dtype=np.float32),
+                'hedge_intensity_uncertainty': np.array([0.1], dtype=np.float32)  # CRITICAL: Add fifth target
             }
 
         except Exception as e:
@@ -880,7 +903,8 @@ class HedgeAdapter:
                 'hedge_intensity': np.array([1.0], dtype=np.float32),
                 'risk_allocation': np.array([0.4, 0.35, 0.25], dtype=np.float32),
                 'hedge_direction': np.array([1.0], dtype=np.float32),
-                'hedge_effectiveness': np.array([0.7], dtype=np.float32)
+                'hedge_effectiveness': np.array([0.7], dtype=np.float32),
+                'hedge_intensity_uncertainty': np.array([0.1], dtype=np.float32)  # CRITICAL: Add fifth target
             }
 
     # ---------- hedge parameter inference ----------
@@ -966,19 +990,57 @@ class HedgeAdapter:
             }
 
     def _get_generation_forecast(self, t: int) -> np.ndarray:
-        """Get generation forecast for hedge decision making"""
+        """CRITICAL: Get generation forecast for hedge decision making (not current generation)"""
         try:
             e = self.e
-            wind = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
-            solar = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
-            hydro = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
 
-            # Normalize by capacity
-            wind_cap = max(getattr(e, 'wind_capacity_mw', 225), 1e-6)
-            solar_cap = max(getattr(e, 'solar_capacity_mw', 100), 1e-6)
-            hydro_cap = max(getattr(e, 'hydro_capacity_mw', 40), 1e-6)
+            # CRITICAL: Fix data source - extract forecast signal, not current generation
+            # 1. Determine the investment_freq-aligned horizon
+            investment_freq = getattr(e, 'investment_freq', 10)
+            if investment_freq <= 50:
+                horizon = 'short'
+            else:
+                horizon = 'medium'
 
-            return np.array([wind/wind_cap, solar/solar_cap, hydro/hydro_cap], dtype=np.float32)
+            # 2. Call forecast_generator.predict_for_agent or predict_all_horizons
+            if hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
+                try:
+                    # Try to get forecast for specific agent (assuming 'investor' agent)
+                    forecast_data = e.forecast_generator.predict_for_agent('investor', t)
+                    if forecast_data and horizon in forecast_data:
+                        wind_forecast = float(forecast_data[horizon].get('wind', 0.0))
+                        solar_forecast = float(forecast_data[horizon].get('solar', 0.0))
+                        hydro_forecast = float(forecast_data[horizon].get('hydro', 0.0))
+                    else:
+                        # Fallback to predict_all_horizons
+                        all_forecasts = e.forecast_generator.predict_all_horizons(t)
+                        if all_forecasts and horizon in all_forecasts:
+                            wind_forecast = float(all_forecasts[horizon].get('wind', 0.0))
+                            solar_forecast = float(all_forecasts[horizon].get('solar', 0.0))
+                            hydro_forecast = float(all_forecasts[horizon].get('hydro', 0.0))
+                        else:
+                            raise ValueError("No forecast data available")
+                except Exception:
+                    # Fallback to current generation if forecast fails
+                    wind_forecast = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
+                    solar_forecast = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
+                    hydro_forecast = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
+            else:
+                # Fallback to current generation if no forecast_generator
+                wind_forecast = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
+                solar_forecast = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
+                hydro_forecast = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
+
+            # 3. Normalize using environment's P95 scales to achieve [0, 1] range
+            wind_scale = max(getattr(e, 'wind_scale', 225), 1e-6)
+            solar_scale = max(getattr(e, 'solar_scale', 100), 1e-6)
+            hydro_scale = max(getattr(e, 'hydro_scale', 40), 1e-6)
+
+            return np.array([
+                wind_forecast / wind_scale,
+                solar_forecast / solar_scale,
+                hydro_forecast / hydro_scale
+            ], dtype=np.float32)
         except Exception:
             return np.array([0.35, 0.20, 0.45], dtype=np.float32)  # Default capacity factors
 
@@ -989,7 +1051,19 @@ class HedgeAdapter:
             # Match environment portfolio_metrics: capital_allocation_fraction, investment_freq, forecast_confidence
             cap_alloc = float(getattr(e, 'capital_allocation_fraction', 0.1))
             inv_freq = float(getattr(e, 'investment_freq', 10)) / 100.0  # Normalized
+
+            # HIGH: Fix Forecast Confidence - extract calculated confidence from forecast_generator
             forecast_conf = 1.0  # Default confidence
+            if hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
+                try:
+                    # Extract calculated Forecast Confidence score directly from forecast_generator
+                    forecast_conf = e.forecast_generator.calculate_forecast_confidence('investor', t)
+                    if not isinstance(forecast_conf, (int, float)) or not np.isfinite(forecast_conf):
+                        forecast_conf = 1.0
+                    else:
+                        forecast_conf = float(np.clip(forecast_conf, 0.0, 1.0))  # Ensure [0,1] range
+                except Exception:
+                    forecast_conf = 1.0  # Fallback to default
 
             return np.array([cap_alloc, inv_freq, forecast_conf], dtype=np.float32)
         except Exception:
@@ -1126,6 +1200,7 @@ class HedgeAdapter:
             risk_allocation_list = []
             hedge_direction_list = []
             hedge_effectiveness_list = []
+            hedge_intensity_uncertainty_list = []  # CRITICAL: Add fifth target list
 
             for i in idx:
                 hedge_params = self.buffer[i][4]
@@ -1140,6 +1215,10 @@ class HedgeAdapter:
                 effectiveness = hedge_params['hedge_effectiveness']
                 hedge_effectiveness_list.append(float(effectiveness) if np.isscalar(effectiveness) else float(effectiveness.item()))
 
+                # CRITICAL: Add fifth target extraction
+                uncertainty = hedge_params.get('hedge_intensity_uncertainty', np.array([0.1], dtype=np.float32))
+                hedge_intensity_uncertainty_list.append(float(uncertainty) if np.isscalar(uncertainty) else float(uncertainty.item()))
+
                 # Risk allocation is an array - ensure it's properly shaped
                 allocation = hedge_params['risk_allocation']
                 if np.isscalar(allocation):
@@ -1152,11 +1231,12 @@ class HedgeAdapter:
                         allocation = np.pad(allocation, (0, max(0, 3 - len(allocation))), 'constant')[:3]
                 risk_allocation_list.append(allocation)
 
-            # Convert to numpy arrays
-            hedge_intensity_targets = np.array(hedge_intensity_list, dtype=np.float32)
-            hedge_direction_targets = np.array(hedge_direction_list, dtype=np.float32)
-            hedge_effectiveness_targets = np.array(hedge_effectiveness_list, dtype=np.float32)
-            risk_allocation_targets = np.array(risk_allocation_list, dtype=np.float32)
+            # Convert to numpy arrays and CRITICAL: Reshape scalar targets to (batch_size, 1)
+            hedge_intensity_targets = np.array(hedge_intensity_list, dtype=np.float32).reshape(-1, 1)
+            hedge_direction_targets = np.array(hedge_direction_list, dtype=np.float32).reshape(-1, 1)
+            hedge_effectiveness_targets = np.array(hedge_effectiveness_list, dtype=np.float32).reshape(-1, 1)
+            hedge_intensity_uncertainty_targets = np.array(hedge_intensity_uncertainty_list, dtype=np.float32).reshape(-1, 1)  # CRITICAL: Add fifth target
+            risk_allocation_targets = np.array(risk_allocation_list, dtype=np.float32)  # Keep as (batch_size, 3)
 
             # Combine all input features
             X_combined = np.concatenate([Xb, Pb, Gb, Mb], axis=1)
@@ -1169,7 +1249,8 @@ class HedgeAdapter:
                         "hedge_intensity": hedge_intensity_targets,
                         "risk_allocation": risk_allocation_targets,
                         "hedge_direction": hedge_direction_targets,
-                        "hedge_effectiveness": hedge_effectiveness_targets
+                        "hedge_effectiveness": hedge_effectiveness_targets,
+                        "hedge_intensity_uncertainty": hedge_intensity_uncertainty_targets  # CRITICAL: Add fifth target
                     })
 
                 # ROBUST SOLUTION: Use custom training to avoid compilation issues
@@ -1179,7 +1260,8 @@ class HedgeAdapter:
                         "hedge_intensity": hedge_intensity_targets,
                         "risk_allocation": risk_allocation_targets,
                         "hedge_direction": hedge_direction_targets,
-                        "hedge_effectiveness": hedge_effectiveness_targets
+                        "hedge_effectiveness": hedge_effectiveness_targets,
+                        "hedge_intensity_uncertainty": hedge_intensity_uncertainty_targets  # CRITICAL: Add fifth target
                     }
                     training_losses = self._custom_train_step(X_combined, targets)
                 else:
@@ -1530,8 +1612,8 @@ def get_episode_info(episode_num):
         "description": f"{half} {year}"
     }
 
-def load_episode_data(episode_data_dir, episode_num):
-    """Load data for a specific episode"""
+def load_episode_data(episode_data_dir, episode_num, config=None, mw_scale_overrides=None):
+    """Load data for a specific episode with configurable MW conversion"""
     import os
     import pandas as pd
 
@@ -1548,11 +1630,9 @@ def load_episode_data(episode_data_dir, episode_num):
         filepath = os.path.join(episode_data_dir, filename)
         if os.path.exists(filepath):
             print(f"   📁 Loading episode data: {filepath}")
-            data = pd.read_csv(filepath)
 
-            # Parse timestamp column if it exists
-            if 'timestamp' in data.columns:
-                data['timestamp'] = pd.to_datetime(data['timestamp'], errors='coerce')
+            # Use load_energy_data for consistent processing including MW conversion
+            data = load_energy_data(filepath, convert_to_raw_units=True, config=config, mw_scale_overrides=mw_scale_overrides)
 
             print(f"   📊 Episode {episode_num} data: {len(data)} rows")
             return data
@@ -1614,7 +1694,7 @@ def cooling_period(minutes, episode_num):
     except Exception:
         print(f"\n   ✅ Cooling period complete")
 
-def run_episode_training(agent, base_env, env, args, monitoring_dirs, forecaster=None):
+def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw_scale_overrides, forecaster=None):
     """Run training across multiple 6-month episodes"""
     import os
     import time
@@ -1825,7 +1905,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, forecaster
                 pass
 
             # 1. Load episode data
-            episode_data = load_episode_data(args.episode_data_dir, episode_num)
+            episode_data = load_episode_data(args.episode_data_dir, episode_num, config=config, mw_scale_overrides=mw_scale_overrides)
 
             # 2. Precompute forecasts for this episode (if forecasting enabled)
             if args.enable_forecasts and forecaster is not None:
@@ -2316,6 +2396,16 @@ def main():
         help="Batch size to use for offline forecast precompute (TF inference)."
     )
 
+    # MW Scale Configuration - Fix for capacity-factor→MW conversion
+    parser.add_argument("--wind_mw_scale", type=float, default=None,
+                       help="Override wind MW scale for capacity factor conversion (default: from config)")
+    parser.add_argument("--solar_mw_scale", type=float, default=None,
+                       help="Override solar MW scale for capacity factor conversion (default: from config)")
+    parser.add_argument("--hydro_mw_scale", type=float, default=None,
+                       help="Override hydro MW scale for capacity factor conversion (default: from config)")
+    parser.add_argument("--load_mw_scale", type=float, default=None,
+                       help="Override load MW scale for capacity factor conversion (default: from config)")
+
     # NEW: Episode training arguments
     parser.add_argument("--episode_training", action="store_true", help="Enable episode-based training with 6-month datasets")
     parser.add_argument("--episode_data_dir", type=str, default="training_dataset", help="Directory containing episode datasets")
@@ -2378,7 +2468,7 @@ def main():
     else:
         print(f"\nLoading data from: {args.data_path}")
         try:
-            data = load_energy_data(args.data_path)
+            data = load_energy_data(args.data_path, config=config, mw_scale_overrides=mw_scale_overrides)
             print(f"Data loaded: {data.shape}")
             print(f"Columns: {list(data.columns)}")
             if "timestamp" in data.columns and data["timestamp"].notna().any():
@@ -2444,6 +2534,22 @@ def main():
     # 4) Config setup (MOVED UP - must happen before environment creation)
     print("\nCreating optimized training configuration...")
     config = EnhancedConfig(optimized_params=best_params)
+
+    # Apply MW scale overrides from CLI arguments
+    mw_scale_overrides = {
+        'wind': args.wind_mw_scale,
+        'solar': args.solar_mw_scale,
+        'hydro': args.hydro_mw_scale,
+        'load': args.load_mw_scale
+    }
+
+    # Update config with CLI overrides if provided
+    if any(v is not None for v in mw_scale_overrides.values()):
+        print("\nApplying MW scale overrides from CLI:")
+        for key, value in mw_scale_overrides.items():
+            if value is not None:
+                config.mw_conversion_scales[key] = float(value)
+                print(f"  {key}: {value} MW")
 
     # Re-seed using config.seed to ensure consistency with agent init
     random.seed(config.seed)
@@ -2648,6 +2754,8 @@ def main():
                 env=env,
                 args=args,
                 monitoring_dirs=monitoring_dirs,
+                config=config,
+                mw_scale_overrides=mw_scale_overrides,
                 forecaster=forecaster
             )
         else:

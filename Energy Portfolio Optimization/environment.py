@@ -118,7 +118,7 @@ class StabilizedObservationManager:
     def _build_spaces(self) -> Dict[str, spaces.Box]:
         sp: Dict[str, spaces.Box] = {}
 
-        # Use per-dimension bounds with price_n in [-1,1] (z-score/3.0 normalization)
+        # Use per-dimension bounds with price_n in [-1,1] (z-score clipped to [-3,3] then divided by 3)
         inv_low  = np.array([0.0, 0.0, 0.0, -1.0, 0.0, 0.0], dtype=np.float32)
         inv_high = np.array([1.0, 1.0, 1.0,  1.0, 1.0, 10.0], dtype=np.float32)  # budget_n still uses /10 scaling
 
@@ -2718,7 +2718,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _fill_obs(self):
         i = min(self.t, self.max_steps - 1)
-        price_n = float(np.clip(SafeDivision.div(self._price[i], 10.0, 0.0), -10.0, 10.0))
+        # FIXED: Price normalization - z-score already clipped to [-3,3], divide by 3 to get [-1,1]
+        price_n = float(np.clip(self._price[i] / 3.0, -1.0, 1.0))
         load_n  = float(np.clip(SafeDivision.div(self._load[i],  self.load_scale, 0.0), 0.0, 1.0))
         windf   = float(np.clip(SafeDivision.div(self._wind[i],  self.wind_scale, 0.0), 0.0, 1.0))
         solarf  = float(np.clip(SafeDivision.div(self._solar[i], self.solar_scale, 0.0), 0.0, 1.0))

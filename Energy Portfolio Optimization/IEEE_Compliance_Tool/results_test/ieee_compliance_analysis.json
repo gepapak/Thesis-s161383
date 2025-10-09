@@ -1,0 +1,31 @@
+{
+  "ieee_1547_analysis": {
+    "avg_compliance_score": 0.819,
+    "voltage_compliance_rate": 0.992,
+    "frequency_compliance_rate": 0.948,
+    "power_factor_compliance_rate": 0.517
+  },
+  "ieee_2030_analysis": {
+    "avg_compliance_score": 0.635,
+    "interoperability_compliance_rate": 0.75,
+    "latency_compliance_rate": 0.879,
+    "data_integrity_compliance_rate": 0.276
+  },
+  "ieee_1815_analysis": {
+    "avg_compliance_score": 0.4145,
+    "dnp3_compliance_rate": 0.44,
+    "scada_compliance_rate": 0.389
+  },
+  "ieee_3000_analysis": {
+    "avg_compliance_score": 0.5785,
+    "power_quality_compliance_rate": 0.61,
+    "harmonic_compliance_rate": 0.547
+  },
+  "overall_analysis": {
+    "avg_overall_compliance": 0.61175,
+    "compliance_std": 0.14526694196847856,
+    "min_compliance": 0.25,
+    "max_compliance": 1.0,
+    "compliance_trend": "improving"
+  }
+}

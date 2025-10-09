@@ -1,0 +1,12 @@
+{
+  "method": "Traditional Portfolio - equal_weight",
+  "total_return": -0.26697801101833984,
+  "sharpe_ratio": -18.00104669863348,
+  "max_drawdown": 0.277997457433817,
+  "volatility": 0.026956398334181605,
+  "final_value_usd": 586417594.6047052,
+  "initial_value_usd": 800000000.0,
+  "final_portfolio_value": 586417594.6047052,
+  "initial_portfolio_value": 800000000.0,
+  "status": "completed"
+}

@@ -347,6 +347,9 @@ class EnhancedRiskController:
 
             comp['overall_risk'] = _clip01(overall)
 
+            # HIGH: Add internal storage for canonical Overall Risk score
+            self._last_overall_risk = comp['overall_risk']
+
             # Final sanitize (finite & in range)
             for k, v in list(comp.items()):
                 if not isinstance(v, (int, float)) or not np.isfinite(v):
@@ -551,9 +554,14 @@ class EnhancedRiskController:
         except Exception:
             out.append(0.35)
 
-        # 6) Overall indicator
+        # 6) Overall indicator - HIGH: Fix Metric 6 to use canonical weighted risk score
         try:
-            overall = float(np.mean(out[:5])) if len(out) >= 5 else 0.25
+            # Use the canonical, weighted risk score stored in self._last_overall_risk
+            if hasattr(self, '_last_overall_risk') and self._last_overall_risk is not None:
+                overall = float(self._last_overall_risk)
+            else:
+                # Fallback to simple average if canonical score not available
+                overall = float(np.mean(out[:5])) if len(out) >= 5 else 0.25
             out.append(_clip01(overall))
         except Exception:
             out.append(0.25)

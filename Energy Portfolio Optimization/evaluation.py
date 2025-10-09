@@ -145,10 +145,11 @@ class PortfolioAnalysisConfig:
             self.target_ai_return = 0.0544
 
 
-# SafeDivision utility function to avoid duplication with other modules
-def safe_div(numerator, denominator, default=0.0):
+class SafeDivision:
     """Safe division utility to avoid division by zero."""
-    return numerator / denominator if denominator != 0 else default
+    @staticmethod
+    def div(numerator, denominator, default=0.0):
+        return numerator / denominator if denominator != 0 else default
 
 
 class PortfolioAnalyzer:
@@ -215,7 +216,7 @@ class PortfolioAnalyzer:
         actual_return = metrics['total_return']
         metrics['vs_baseline_target'] = actual_return - self.config.target_baseline_return
         metrics['vs_ai_target'] = actual_return - self.config.target_ai_return
-        metrics['target_achievement_ratio'] = safe_div(actual_return, self.config.target_ai_return, 0.0)
+        metrics['target_achievement_ratio'] = SafeDivision.div(actual_return, self.config.target_ai_return, 0.0)
 
         return metrics
 
@@ -257,7 +258,7 @@ class PortfolioAnalyzer:
         economic['fund_size_initial'] = initial_pv
         economic['fund_size_final'] = final_pv
         economic['fund_growth'] = final_pv - initial_pv if initial_pv > 0 else 0.0
-        economic['fund_growth_percentage'] = safe_div(economic['fund_growth'], initial_pv, 0.0) * 100
+        economic['fund_growth_percentage'] = SafeDivision.div(economic['fund_growth'], initial_pv, 0.0) * 100
 
         # Asset allocation efficiency
         physical_target = self.config.physical_allocation
@@ -267,7 +268,7 @@ class PortfolioAnalyzer:
         # Revenue analysis
         total_rewards = self.results.get('total_rewards', 0.0)
         economic['total_rewards'] = total_rewards
-        economic['reward_efficiency'] = safe_div(total_rewards, initial_pv, 0.0) if initial_pv > 0 else 0.0
+        economic['reward_efficiency'] = SafeDivision.div(total_rewards, initial_pv, 0.0) if initial_pv > 0 else 0.0
 
         return economic
 
@@ -303,7 +304,7 @@ class PortfolioAnalyzer:
 
         if actual_return > baseline_target:
             ai_analysis['ai_enhancement'] = actual_return - baseline_target
-            ai_analysis['enhancement_percentage'] = safe_div(ai_analysis['ai_enhancement'], baseline_target, 0.0) * 100
+            ai_analysis['enhancement_percentage'] = SafeDivision.div(ai_analysis['ai_enhancement'], baseline_target, 0.0) * 100
         else:
             ai_analysis['ai_enhancement'] = 0.0
             ai_analysis['enhancement_percentage'] = 0.0
@@ -518,7 +519,7 @@ class PortfolioAnalyzer:
         economic['fund_size_initial'] = initial_pv
         economic['fund_size_final'] = final_pv
         economic['fund_growth'] = final_pv - initial_pv if initial_pv > 0 else 0.0
-        economic['fund_growth_percentage'] = safe_div(economic['fund_growth'], initial_pv, 0.0) * 100
+        economic['fund_growth_percentage'] = SafeDivision.div(economic['fund_growth'], initial_pv, 0.0) * 100
 
         # Asset allocation efficiency
         physical_target = self.config.physical_allocation
@@ -528,7 +529,7 @@ class PortfolioAnalyzer:
         # Revenue analysis
         total_rewards = self.results.get('total_rewards', 0.0)
         economic['total_rewards'] = total_rewards
-        economic['reward_efficiency'] = safe_div(total_rewards, initial_pv, 0.0) if initial_pv > 0 else 0.0
+        economic['reward_efficiency'] = SafeDivision.div(total_rewards, initial_pv, 0.0) if initial_pv > 0 else 0.0
 
         return economic
 
@@ -564,7 +565,7 @@ class PortfolioAnalyzer:
 
         if actual_return > baseline_target:
             ai_analysis['ai_enhancement'] = actual_return - baseline_target
-            ai_analysis['enhancement_percentage'] = safe_div(ai_analysis['ai_enhancement'], baseline_target, 0.0) * 100
+            ai_analysis['enhancement_percentage'] = SafeDivision.div(ai_analysis['ai_enhancement'], baseline_target, 0.0) * 100
         else:
             ai_analysis['ai_enhancement'] = 0.0
             ai_analysis['enhancement_percentage'] = 0.0
@@ -834,18 +835,19 @@ def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[st
     }
 
 
-def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: str, timesteps: int) -> Tuple[bool, Optional[Dict]]:
+def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: str, timesteps: int, output_dir: str = "evaluation_results") -> Tuple[bool, Optional[Dict]]:
     """Run a single baseline and return success status and results."""
     print(f"🚀 Running {baseline_name}...")
 
-    baseline_output = os.path.join(baseline_dir, "results")
+    # Create baseline-specific subdirectory within the main evaluation results folder
+    baseline_output = os.path.join(output_dir, f"baseline_{baseline_name.lower().replace(' ', '_')}")
     os.makedirs(baseline_output, exist_ok=True)
 
     # Determine the script to run
     script_map = {
         "Traditional Portfolio": "run_traditional_baseline.py",
         "Rule-Based Heuristic": "run_rule_based_baseline.py",
-        "IEEE Standards": "run_ieee_baseline.py"
+        "Buy-and-Hold Strategy": "run_buy_and_hold_baseline.py"
     }
 
     script_name = script_map.get(baseline_name)
@@ -914,7 +916,7 @@ def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: s
         return False, {'error': str(e)}
 
 
-def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000) -> Dict[str, Any]:
+def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000, output_dir: str = "evaluation_results") -> Dict[str, Any]:
     """Run traditional baseline methods and return results."""
     print("🏛️ Running traditional baseline methods...")
 
@@ -924,24 +926,14 @@ def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000) -> Di
     baselines = [
         ("Traditional Portfolio", "Baseline1_TraditionalPortfolio"),
         ("Rule-Based Heuristic", "Baseline2_RuleBasedHeuristic"),
-        ("Buy-and-Hold Strategy", "create_buy_and_hold_baseline")  # Replace IEEE with relevant baseline
+        ("Buy-and-Hold Strategy", "Baseline3_BuyAndHold")
     ]
 
     print("🚀 Executing traditional baselines...")
 
     for i, (baseline_name, baseline_dir) in enumerate(baselines, 1):
-        # Handle special baseline types
-        if baseline_dir == "create_buy_and_hold_baseline":
-            # Create buy-and-hold baseline directly
-            try:
-                results = create_buy_and_hold_baseline(eval_data_path, timesteps)
-                success = True
-            except Exception as e:
-                success = False
-                results = {'error': str(e)}
-        else:
-            # Run traditional baseline via subprocess
-            success, results = run_single_baseline(baseline_name, baseline_dir, eval_data_path, timesteps)
+        # Run traditional baseline via subprocess
+        success, results = run_single_baseline(baseline_name, baseline_dir, eval_data_path, timesteps, output_dir)
 
         baseline_key = f"baseline_{i}"
         if success and results:
@@ -1198,7 +1190,8 @@ def create_evaluation_environment(data: pd.DataFrame,
                                  model_dir: str = "saved_models",
                                  scaler_dir: str = "saved_scalers",
                                  log_path: Optional[str] = None,
-                                 dl_overlay_weights_path: Optional[str] = None) -> Tuple[Any, Optional[Any]]:
+                                 dl_overlay_weights_path: Optional[str] = None,
+                                 output_dir: str = "evaluation_results") -> Tuple[Any, Optional[Any]]:
     """Create evaluation environment with optional forecasting."""
     print_progress("🏗️ Setting up evaluation environment...")
 
@@ -1263,9 +1256,10 @@ def create_evaluation_environment(data: pd.DataFrame,
         if forecaster is not None and enable_forecasting:
             print_progress("🔄 Wrapping environment with forecasting...")
             if log_path is None:
-                os.makedirs("evaluation_logs", exist_ok=True)
+                logs_dir = os.path.join(output_dir, "evaluation_logs")
+                os.makedirs(logs_dir, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_path = f"evaluation_logs/unified_evaluation_{timestamp}.csv"
+                log_path = os.path.join(logs_dir, f"unified_evaluation_{timestamp}.csv")
 
             eval_env = MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
             print_progress("✅ Environment created with forecasting wrapper")
@@ -1450,13 +1444,16 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
                 extraction_method = "wrapped.equity"
             else:
                 # Fallback to initial value in DKK (800M USD = ~5.52B DKK)
-                dkk_rate = getattr(getattr(eval_env, 'config', None), 'dkk_to_usd_rate', 0.145)
-                portfolio_value_dkk = 800_000_000 / dkk_rate  # Convert USD to DKK
+                portfolio_value_dkk = 800_000_000 / 0.145  # Convert USD to DKK
                 extraction_method = "fallback"
 
             # Convert DKK to USD for consistent analysis
-            # Get conversion rate from environment config (centralized)
-            dkk_to_usd_rate = getattr(getattr(eval_env, 'config', None), 'dkk_to_usd_rate', 0.145)
+            # Get conversion rate from environment or use default
+            dkk_to_usd_rate = 0.145  # Default rate
+            if hasattr(eval_env, 'config') and hasattr(eval_env.config, 'dkk_to_usd_rate'):
+                dkk_to_usd_rate = eval_env.config.dkk_to_usd_rate
+            elif hasattr(eval_env, 'env') and hasattr(eval_env.env, 'config') and hasattr(eval_env.env.config, 'dkk_to_usd_rate'):
+                dkk_to_usd_rate = eval_env.env.config.dkk_to_usd_rate
 
             # Convert to USD for analysis
             portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
@@ -1620,12 +1617,15 @@ def run_agent_evaluation(agent_system,
                 portfolio_value_dkk = eval_env.env.equity
             else:
                 # Fallback to initial value in DKK (800M USD = ~5.52B DKK)
-                dkk_rate = getattr(getattr(eval_env, 'config', None), 'dkk_to_usd_rate', 0.145)
-                portfolio_value_dkk = 800_000_000 / dkk_rate  # Convert USD to DKK
+                portfolio_value_dkk = 800_000_000 / 0.145  # Convert USD to DKK
 
             # Convert DKK to USD for consistent analysis
-            # Get conversion rate from environment config (centralized)
-            dkk_to_usd_rate = getattr(getattr(eval_env, 'config', None), 'dkk_to_usd_rate', 0.145)
+            # Get conversion rate from environment or use default
+            dkk_to_usd_rate = 0.145  # Default rate
+            if hasattr(eval_env, 'config') and hasattr(eval_env.config, 'dkk_to_usd_rate'):
+                dkk_to_usd_rate = eval_env.config.dkk_to_usd_rate
+            elif hasattr(eval_env, 'env') and hasattr(eval_env.env, 'config') and hasattr(eval_env.env.config, 'dkk_to_usd_rate'):
+                dkk_to_usd_rate = eval_env.env.config.dkk_to_usd_rate
 
             # Convert to USD for analysis
             portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
@@ -1667,7 +1667,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
     # 1. Evaluate Baselines (use basic environment)
     print_progress("📊 [1/3] EVALUATING BASELINES...", 1, 3)
     try:
-        baseline_results = run_traditional_baselines(args.eval_data, args.eval_steps or 8000)
+        baseline_results = run_traditional_baselines(args.eval_data, args.eval_steps or 8000, args.output_dir)
         if baseline_results:
             comprehensive_results['configurations']['baselines'] = baseline_results
             print_progress("✅ Baseline evaluation completed")
@@ -1688,7 +1688,8 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                 eval_data,
                 enable_forecasting=False,  # No forecasting for normal models
                 model_dir=args.model_dir,
-                scaler_dir=args.scaler_dir
+                scaler_dir=args.scaler_dir,
+                output_dir=args.output_dir
             )
 
             if normal_eval_env:
@@ -1731,7 +1732,8 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                 enable_forecasting=True,  # Enable forecasting for full models
                 model_dir=args.model_dir,
                 scaler_dir=args.scaler_dir,
-                dl_overlay_weights_path=dl_weights_path if os.path.exists(dl_weights_path) else None
+                dl_overlay_weights_path=dl_weights_path if os.path.exists(dl_weights_path) else None,
+                output_dir=args.output_dir
             )
 
             if enhanced_eval_env:
@@ -2084,7 +2086,8 @@ def main():
         eval_data,
         enable_forecasting=enable_forecasting,
         model_dir=args.model_dir,
-        scaler_dir=args.scaler_dir
+        scaler_dir=args.scaler_dir,
+        output_dir=args.output_dir
     )
 
     if eval_env is None:
@@ -2133,7 +2136,8 @@ def main():
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                     eval_data,
                     enable_forecasting=True,
-                    dl_overlay_weights_path=dl_weights_path
+                    dl_overlay_weights_path=dl_weights_path,
+                    output_dir=args.output_dir
                 )
                 eval_env = enhanced_eval_env if enhanced_eval_env else eval_env
 
@@ -2168,7 +2172,8 @@ def main():
 
         baseline_results = run_traditional_baselines(
             args.eval_data,
-            args.eval_steps or 10000  # Use same default as agents
+            args.eval_steps or 10000,  # Use same default as agents
+            args.output_dir
         )
 
         if baseline_results and 'error' not in baseline_results:
@@ -2197,7 +2202,8 @@ def main():
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                     eval_data,
                     enable_forecasting=True,
-                    dl_overlay_weights_path=dl_weights_path
+                    dl_overlay_weights_path=dl_weights_path,
+                    output_dir=args.output_dir
                 )
                 eval_env = enhanced_eval_env if enhanced_eval_env else eval_env
 
@@ -2234,7 +2240,7 @@ def main():
                 print("❌ No AI models found for comparison")
 
         # Run traditional baselines with same steps as AI agents
-        baseline_results = run_traditional_baselines(args.eval_data, args.eval_steps or 10000)
+        baseline_results = run_traditional_baselines(args.eval_data, args.eval_steps or 10000, args.output_dir)
 
         # Combine results
         if ai_results and baseline_results and 'error' not in baseline_results:

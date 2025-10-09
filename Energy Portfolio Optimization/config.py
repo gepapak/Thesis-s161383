@@ -235,6 +235,16 @@ class EnhancedConfig:
         # CANONICAL REQUIRED HORIZONS: Minimum horizons that must exist
         self.required_forecast_horizons = ["immediate", "short", "medium", "long", "strategic"]
 
+        # CAPACITY-FACTOR TO MW CONVERSION SCALES: Configurable for different datasets
+        # These values are used when converting capacity factors [0,1] to raw MW values
+        # Default values derived from training scaler analysis - can be overridden
+        self.mw_conversion_scales = {
+            'wind': 1103,    # From training scaler mean: 1103.4 MW
+            'solar': 100,    # From training scaler mean: 61.5 MW (min 100 for stability)
+            'hydro': 534,    # From training scaler mean: 534.1 MW
+            'load': 2999,    # From training scaler mean: 2999.8 MW
+        }
+
         # Default forecast values (MW or DKK/MWh) - FIXED: Standardized on DKK
         self.default_forecasts = {
             "wind": 330.0,    # ~30% of capacity

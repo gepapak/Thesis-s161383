@@ -73,28 +73,10 @@ def fix_tensorflow_gpu_setup(use_gpu=True):
                 except Exception as e:
                     print(f"[WARNING] Failed to set memory growth for GPU {i}: {e}")
 
-            try:
-                # Dynamic memory limit calculation
-                if memory_info:
-                    # Use 70% of available memory, minimum 2GB, maximum 8GB
-                    available_mb = memory_info['free_mb']
-                    memory_limit = max(2048, min(8192, int(available_mb * 0.7)))
-                    print(f"GPU Memory - Total: {memory_info['total_mb']}MB, "
-                          f"Free: {memory_info['free_mb']}MB, Setting limit: {memory_limit}MB")
-                else:
-                    # Conservative fallback
-                    memory_limit = 3072
-                    print(f"[WARNING] Could not detect GPU memory, using conservative limit: {memory_limit}MB")
-
-                tf.config.experimental.set_virtual_device_configuration(
-                    gpus[0],
-                    [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=memory_limit)]
-                )
-                print(f"[OK] Set GPU memory limit to {memory_limit}MB")
-
-            except Exception as e:
-                print(f"[WARNING] Failed to set memory limit: {e}")
-                # Continue without memory limit
+            # HIGH: Fix GPU Initialization Conflict - avoid setting memory_limit after memory_growth
+            # Rely solely on memory_growth or cuda_malloc_async for dynamic GPU memory allocation
+            print(f"[OK] Using dynamic GPU memory allocation (memory_growth=True)")
+            print(f"[INFO] Skipping fixed memory_limit to prevent OOM errors on modern HPC environments")
         else:
             print("No GPUs found, using CPU")
 
@@ -116,17 +98,13 @@ def initialize_tensorflow(device="cuda"):
     if tf is not None:
         # Configure TensorFlow for memory efficiency - CONSERVATIVE APPROACH
         try:
-            # Configure memory growth and limits first
+            # HIGH: Fix GPU Initialization Conflict - rely solely on memory_growth
             gpus = tf.config.list_physical_devices('GPU')
             if gpus and use_gpu:
                 for gpu in gpus:
                     tf.config.experimental.set_memory_growth(gpu, True)
-                    # Set a reasonable memory limit to prevent OOM
-                    tf.config.experimental.set_virtual_device_configuration(
-                        gpu,
-                        [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)]
-                    )
-            print(f"TensorFlow configured for {'GPU' if use_gpu else 'CPU'}-only mode")
+                    # Remove hardcoded VirtualDeviceConfiguration(memory_limit=X) to prevent instability
+            print(f"TensorFlow configured for {'GPU' if use_gpu else 'CPU'}-only mode with dynamic memory allocation")
         except Exception as e:
             print(f"[WARNING] Failed to configure TensorFlow memory settings: {e}")
 

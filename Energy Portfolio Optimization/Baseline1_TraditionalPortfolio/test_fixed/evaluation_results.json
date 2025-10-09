@@ -1,0 +1,12 @@
+{
+  "method": "Traditional Portfolio - markowitz_mean_variance",
+  "total_return": -0.9194089074230852,
+  "sharpe_ratio": 1.0938405273445058,
+  "max_drawdown": 0.9972110674821081,
+  "volatility": 5.5156221092505575,
+  "final_value_usd": 64472874.0615318,
+  "initial_value_usd": 800000000.0,
+  "final_portfolio_value": 64472874.0615318,
+  "initial_portfolio_value": 800000000.0,
+  "status": "completed"
+}

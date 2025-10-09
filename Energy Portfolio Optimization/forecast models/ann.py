@@ -144,14 +144,14 @@ def ann_model(
     # ----------------
     # Output dirs & filenames (target + horizon label)
     # ----------------
-    for d in ["models", "scalers", "metadata", "datasets", "history", "seeds"]:
+    for d in ["saved_models", "saved_scalers", "metadata", "datasets", "history", "seeds"]:
         os.makedirs(d, exist_ok=True)
 
     prefix = f"{target}_{horizon_label}"
-    model_path_best         = f"models/{prefix}_model_best.h5"
-    model_path              = f"models/{prefix}_model.h5"
-    scaler_x_path           = f"scalers/{prefix}_sc_X.pkl"
-    scaler_y_path           = f"scalers/{prefix}_sc_y.pkl"
+    model_path_best         = f"saved_models/{prefix}_model_best.h5"
+    model_path              = f"saved_models/{prefix}_model.h5"
+    scaler_x_path           = f"saved_scalers/{prefix}_sc_X.pkl"
+    scaler_y_path           = f"saved_scalers/{prefix}_sc_y.pkl"
     original_data_path      = f"datasets/{prefix}_original_series.csv"
     test_data_path          = f"datasets/{prefix}_test_data.csv"
     seed_window_raw_path    = f"seeds/{prefix}_seed_window_raw.npy"
@@ -250,26 +250,34 @@ def ann_model(
         print("✅ Good generalization (val ≈ test).")
 
     # ----------------
-    # Save artifacts (compatible format)
+    # Save artifacts (TensorFlow 2.10.1 compatible format)
     # ----------------
-    # Save model in more compatible way
+    # Save model in TF 2.10.1 compatible way
     try:
-        # Method 1: Save with explicit options for compatibility
-        model.save(model_path, save_format='h5', include_optimizer=False)
-        print(f"✅ Model saved (method 1): {model_path}")
-    except Exception as e:
-        print(f"⚠️ Method 1 failed: {e}")
+        # Method 1: Save architecture and weights separately for maximum compatibility
+        model_json = model.to_json()
+        arch_path = model_path.replace('.h5', '_architecture.json')
+        weights_path = model_path.replace('.h5', '_weights.h5')
+
+        with open(arch_path, 'w') as f:
+            f.write(model_json)
+        model.save_weights(weights_path)
+
+        # Also try to save the full model for convenience
         try:
-            # Method 2: Recreate model and save weights only
-            model_json = model.to_json()
-            with open(model_path.replace('.h5', '_architecture.json'), 'w') as f:
-                f.write(model_json)
-            model.save_weights(model_path.replace('.h5', '_weights.h5'))
-            print(f"✅ Model saved (method 2): architecture + weights")
-        except Exception as e2:
-            print(f"❌ Both save methods failed: {e2}")
-            # Fallback: save the model anyway
+            model.save(model_path, save_format='h5', include_optimizer=False, save_traces=False)
+            print(f"✅ Model saved (full + separate): {model_path}")
+        except Exception:
+            print(f"✅ Model saved (separate only): {arch_path} + {weights_path}")
+
+    except Exception as e:
+        print(f"❌ Model save failed: {e}")
+        # Last resort: try basic save
+        try:
             model.save(model_path)
+            print(f"✅ Model saved (basic): {model_path}")
+        except Exception as e2:
+            print(f"❌ All save methods failed: {e2}")
 
     joblib.dump(sc_X, scaler_x_path)
     joblib.dump(sc_y, scaler_y_path)

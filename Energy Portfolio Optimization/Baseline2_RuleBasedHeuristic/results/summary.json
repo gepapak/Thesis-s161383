@@ -1,0 +1,31 @@
+{
+  "total_return": 0.0064352105161797814,
+  "annual_return": 0.04304453672627795,
+  "sharpe_ratio": 175.58518472086553,
+  "max_drawdown": 1.61024484255649e-05,
+  "volatility": 0.00013124419786847465,
+  "final_value_usd": 805148446.3133665,
+  "initial_value_usd": 800000000.0,
+  "final_value_dkk": 5552747905.609425,
+  "initial_value_dkk": 5517241379.310346,
+  "wind_capacity_mw": 320.00030735973417,
+  "solar_capacity_mw": 0.0,
+  "hydro_capacity_mw": 0.0,
+  "final_cash_usd": 165147831.59389827,
+  "final_cash_dkk": 1138950562.7165399,
+  "rule_triggers": {
+    "wind_investment": 8,
+    "solar_investment": 0,
+    "hydro_investment": 0,
+    "battery_charge": 818,
+    "battery_discharge": 707,
+    "risk_reduction": 7992
+  },
+  "battery_charge_count": 818,
+  "battery_discharge_count": 707,
+  "battery_idle_count": 6475,
+  "total_investment_decisions": 8,
+  "total_operational_revenue_usd": 4564659.099183814,
+  "total_battery_revenue_usd": 88479.2075401111,
+  "total_cash_return_usd": 495308.0066447454
+}

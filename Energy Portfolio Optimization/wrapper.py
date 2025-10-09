@@ -39,7 +39,7 @@ except Exception:
     _HAS_ENHANCED_MONITORING = False
     EnhancedMetricsMonitor = None
 
-# Price normalization: Uses Normal version's proven scaling (divide by 10.0, clip to [-10, 10])
+# Price normalization: z-score divided by 3 and clipped to [-1, 1] to match env observation space
 
 
 # =========================
@@ -115,7 +115,7 @@ class EnhancedLRUCache:
 class ForecastPostProcessor:
     """
     - Normalizes forecasts to match env observation scales:
-        price -> z-score normalization using env's rolling mean/std, divided by 10.0, clipped to [-10,10] (same as env price_n)
+        price -> z-score normalization using env's rolling mean/std, divided by 3, clipped to [-1,1] (same as env price_n)
         wind/solar/hydro -> divide by env's p95 scales, clipped [0,1]
         load -> divide by env.load_scale, clipped [0,1]
       Unknown targets are passed through unchanged.
@@ -130,11 +130,12 @@ class ForecastPostProcessor:
         self.align_horizons = bool(align_horizons)
 
     def _normalize_price_zscore(self, value: float, mean: float, std: float) -> float:
-        """FIXED: Use Normal version's EXACT price normalization (z-score clipped to [-3,3])"""
+        """FIXED: Price normalization to match env - z-score divided by 3 and clipped to [-1,1]"""
         try:
-            # Step 1: Z-score with provided stats, then clip to ±3 sigma (EXACTLY like Normal)
+            # Step 1: Z-score with provided stats
             z_score = (value - mean) / max(std, 1e-6)
-            return float(np.clip(z_score, -3.0, 3.0))  # IDENTICAL to Normal version
+            # Step 2: Divide by 3 and clip to [-1,1] to match env observation space
+            return float(np.clip(z_score / 3.0, -1.0, 1.0))
         except Exception:
             # Fallback to safe default
             return 0.0
@@ -1666,24 +1667,27 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
                 # Forecast alignment score diagnostic (non-monetary)
                 try:
-                    # Use z-score normalization consistent with env observations ([-3,3] scale like Normal)
+                    # Use z-score normalization consistent with env observations ([-1,1] scale)
                     price_val = self._safe_float(actuals['price'], 0.0)
-                    # Apply same z-score normalization as Normal wrapper
+                    # Apply same z-score normalization as env: z-score / 3 clipped to [-1,1]
                     try:
                         t = getattr(self.env, 't', 0)
                         if hasattr(self.env, '_price_mean') and hasattr(self.env, '_price_std'):
                             if t < len(self.env._price_mean) and t < len(self.env._price_std):
                                 mean = float(self.env._price_mean[t])
                                 std = max(float(self.env._price_std[t]), 1e-6)
-                                cur_price_norm = float(np.clip((price_val - mean) / std, -3.0, 3.0))
+                                z = (price_val - mean) / std
+                                cur_price_norm = float(np.clip(z / 3.0, -1.0, 1.0))
                             else:
                                 # Fallback normalization
                                 mean, std = 250.0, 50.0
-                                cur_price_norm = float(np.clip((price_val - mean) / std, -3.0, 3.0))
+                                z = (price_val - mean) / std
+                                cur_price_norm = float(np.clip(z / 3.0, -1.0, 1.0))
                         else:
                             # Fallback normalization
                             mean, std = 250.0, 50.0
-                            cur_price_norm = float(np.clip((price_val - mean) / std, -3.0, 3.0))
+                            z = (price_val - mean) / std
+                            cur_price_norm = float(np.clip(z / 3.0, -1.0, 1.0))
                     except Exception:
                         cur_price_norm = 0.0
                     realized_ret_dummy = 0.0 # Placeholder as real return calc is complex here
