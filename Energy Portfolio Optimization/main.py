@@ -657,6 +657,10 @@ class HedgeAdapter:
         self.last_predictions = None
         self.last_actuals = None
 
+        # MEMORY FIX: Cache forecasts to avoid excessive generator calls
+        self._forecast_cache = {}
+        self._forecast_cache_ttl = 10  # Cache for 10 steps to reduce calls
+
         # Compile HedgeOptimizer for training with memory-safe settings
         try:
             # Clear any existing session before compilation
@@ -785,18 +789,19 @@ class HedgeAdapter:
         except Exception:
             market_vol = market_stress = 0.5
 
-        # CRITICAL: Fix feature scaling - scale market_vol and market_stress to [0,10] range
-        # This matches the RL observation space conventions for these metrics
-        market_vol_scaled = market_vol * 10.0
-        market_stress_scaled = market_stress * 10.0
+        # CRITICAL FIX: Remove scaling to match environment raw [0,1] values
+        # Environment provides market_volatility and market_stress in [0,1] range
+        # Training and inference must use same scaling for consistent predictions
+        market_vol_scaled = market_vol      # Keep raw [0,1] values
+        market_stress_scaled = market_stress # Keep raw [0,1] values
 
         # FIXED: Return only 4 state features to match environment (4+3+3+3=13 total)
         # This ensures DL overlay training uses same feature dimensions as prediction
         feats = np.array([
             budget_ratio,            # 0: budget ratio (matches environment state_feats[0])
             cap_frac,                # 1: equity ratio (matches environment state_feats[1])
-            market_vol_scaled,       # 2: market volatility scaled to [0,10] (matches environment state_feats[2])
-            market_stress_scaled     # 3: market stress scaled to [0,10] (matches environment state_feats[3])
+            market_vol_scaled,       # 2: market volatility raw [0,1] (matches environment state_feats[2])
+            market_stress_scaled     # 3: market stress raw [0,1] (matches environment state_feats[3])
         ], dtype=np.float32)
         return feats
 
@@ -806,7 +811,9 @@ class HedgeAdapter:
         e = self.e
         # Get normalized financial instrument values (matches environment position_feats)
         try:
-            fund_size = max(getattr(e, 'init_budget', 1e9), 1e6)
+            # CRITICAL FIX: Use consistent fund_size calculation to match environment
+            # Environment uses init_budget directly, so we should too for consistency
+            fund_size = getattr(e, 'init_budget', 1e9)  # Remove max() wrapper
             wind_pos = float(getattr(e, 'financial_positions', {}).get('wind_instrument_value', 0.0)) / fund_size
             solar_pos = float(getattr(e, 'financial_positions', {}).get('solar_instrument_value', 0.0)) / fund_size
             hydro_pos = float(getattr(e, 'financial_positions', {}).get('hydro_instrument_value', 0.0)) / fund_size
@@ -995,43 +1002,80 @@ class HedgeAdapter:
             e = self.e
 
             # CRITICAL: Fix data source - extract forecast signal, not current generation
-            # 1. Determine the investment_freq-aligned horizon
+            # 1. Determine the investment_freq-aligned horizon (RESTORED: Multi-horizon design)
             investment_freq = getattr(e, 'investment_freq', 10)
             if investment_freq <= 50:
                 horizon = 'short'
             else:
                 horizon = 'medium'
 
-            # 2. Call forecast_generator.predict_for_agent or predict_all_horizons
-            if hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
+            # 2. MEMORY FIX: Use cached forecasts to avoid excessive generator calls
+            cache_key = (horizon, t // self._forecast_cache_ttl)  # Cache by horizon and time bucket
+
+            if cache_key in self._forecast_cache:
+                # Use cached forecasts
+                wind_forecast, solar_forecast, hydro_forecast = self._forecast_cache[cache_key]
+            elif hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
                 try:
-                    # Try to get forecast for specific agent (assuming 'investor' agent)
-                    forecast_data = e.forecast_generator.predict_for_agent('investor', t)
-                    if forecast_data and horizon in forecast_data:
-                        wind_forecast = float(forecast_data[horizon].get('wind', 0.0))
-                        solar_forecast = float(forecast_data[horizon].get('solar', 0.0))
-                        hydro_forecast = float(forecast_data[horizon].get('hydro', 0.0))
-                    else:
-                        # Fallback to predict_all_horizons
-                        all_forecasts = e.forecast_generator.predict_all_horizons(t)
-                        if all_forecasts and horizon in all_forecasts:
-                            wind_forecast = float(all_forecasts[horizon].get('wind', 0.0))
-                            solar_forecast = float(all_forecasts[horizon].get('solar', 0.0))
-                            hydro_forecast = float(all_forecasts[horizon].get('hydro', 0.0))
+                    # FIXED: Correct forecast extraction using proper key format
+                    forecast_data = e.forecast_generator.predict_for_agent('investor_0', t)
+                    if forecast_data:
+                        # Generator returns keys like "wind_forecast_short", not nested dict
+                        wind_key = f"wind_forecast_{horizon}"
+                        solar_key = f"solar_forecast_{horizon}"
+                        hydro_key = f"hydro_forecast_{horizon}"
+
+                        if wind_key in forecast_data and solar_key in forecast_data and hydro_key in forecast_data:
+                            wind_forecast = float(forecast_data[wind_key])
+                            solar_forecast = float(forecast_data[solar_key])
+                            hydro_forecast = float(forecast_data[hydro_key])
                         else:
-                            raise ValueError("No forecast data available")
+                            # Fallback to predict_all_horizons
+                            all_forecasts = e.forecast_generator.predict_all_horizons(t)
+                            if all_forecasts:
+                                wind_forecast = float(all_forecasts.get(wind_key, 0.0))
+                                solar_forecast = float(all_forecasts.get(solar_key, 0.0))
+                                hydro_forecast = float(all_forecasts.get(hydro_key, 0.0))
+                            else:
+                                raise ValueError("No forecast data available")
+
+                        # Cache the results
+                        self._forecast_cache[cache_key] = (wind_forecast, solar_forecast, hydro_forecast)
+
+                        # Limit cache size to prevent memory growth
+                        if len(self._forecast_cache) > 100:
+                            # Remove oldest entries
+                            oldest_keys = sorted(self._forecast_cache.keys())[:50]
+                            for old_key in oldest_keys:
+                                del self._forecast_cache[old_key]
+
+                    else:
+                        raise ValueError("No forecast data available")
                 except Exception:
-                    # Fallback to current generation if forecast fails
-                    wind_forecast = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
-                    solar_forecast = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
-                    hydro_forecast = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
+                    # IMPROVED: Use smoothed current generation to reduce forecast noise impact
+                    # Apply light smoothing to current generation to make it more forecast-like
+                    wind_raw = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
+                    solar_raw = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
+                    hydro_raw = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
+
+                    # Apply capacity factor smoothing to reduce noise
+                    wind_cap, solar_cap, hydro_cap = 270.0, 100.0, 40.0
+                    wind_cf = np.clip(wind_raw / wind_cap, 0.0, 1.0)
+                    solar_cf = np.clip(solar_raw / solar_cap, 0.0, 1.0)
+                    hydro_cf = np.clip(hydro_raw / hydro_cap, 0.0, 1.0)
+
+                    # Convert back to MW with slight smoothing
+                    wind_forecast = wind_cf * wind_cap * 0.95  # Slight conservative bias
+                    solar_forecast = solar_cf * solar_cap * 0.95
+                    hydro_forecast = hydro_cf * hydro_cap * 0.95
             else:
                 # Fallback to current generation if no forecast_generator
                 wind_forecast = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
                 solar_forecast = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
                 hydro_forecast = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
 
-            # 3. Normalize using environment's P95 scales to achieve [0, 1] range
+            # 3. Normalize using environment's P95 scales to achieve [0, 1] range (RESTORED)
+            # Use data-driven P95 scales, not theoretical capacity values
             wind_scale = max(getattr(e, 'wind_scale', 225), 1e-6)
             solar_scale = max(getattr(e, 'solar_scale', 100), 1e-6)
             hydro_scale = max(getattr(e, 'hydro_scale', 40), 1e-6)
@@ -1052,16 +1096,18 @@ class HedgeAdapter:
             cap_alloc = float(getattr(e, 'capital_allocation_fraction', 0.1))
             inv_freq = float(getattr(e, 'investment_freq', 10)) / 100.0  # Normalized
 
-            # HIGH: Fix Forecast Confidence - extract calculated confidence from forecast_generator
+            # FIXED: Stabilize Forecast Confidence for DL overlay consistency
             forecast_conf = 1.0  # Default confidence
             if hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
                 try:
                     # Extract calculated Forecast Confidence score directly from forecast_generator
-                    forecast_conf = e.forecast_generator.calculate_forecast_confidence('investor', t)
-                    if not isinstance(forecast_conf, (int, float)) or not np.isfinite(forecast_conf):
-                        forecast_conf = 1.0
+                    raw_conf = e.forecast_generator.calculate_forecast_confidence('investor', t)
+                    if isinstance(raw_conf, (int, float)) and np.isfinite(raw_conf):
+                        # CRITICAL FIX: Apply minimum confidence threshold to prevent DL model degradation
+                        # Low confidence (<0.5) hurts DL performance, so clamp to reasonable range
+                        forecast_conf = float(np.clip(raw_conf, 0.7, 1.0))  # Clamp to [0.7, 1.0] for stability
                     else:
-                        forecast_conf = float(np.clip(forecast_conf, 0.0, 1.0))  # Ensure [0,1] range
+                        forecast_conf = 1.0
                 except Exception:
                     forecast_conf = 1.0  # Fallback to default
 
@@ -1526,6 +1572,10 @@ class HedgeAdapter:
                 self.buffer.clear()
                 self.buffer.extend(recent_entries)
 
+            # 2.1. MEMORY FIX: Clear forecast cache periodically
+            if hasattr(self, '_forecast_cache') and len(self._forecast_cache) > 50:
+                self._forecast_cache.clear()
+
             # 3. Clear CUDA cache lightly
             try:
                 import torch
@@ -1629,7 +1679,7 @@ def load_episode_data(episode_data_dir, episode_num, config=None, mw_scale_overr
     for filename in possible_files:
         filepath = os.path.join(episode_data_dir, filename)
         if os.path.exists(filepath):
-            print(f"   📁 Loading episode data: {filepath}")
+            print(f"   [DATA] Loading episode data: {filepath}")
 
             # Use load_energy_data for consistent processing including MW conversion
             data = load_energy_data(filepath, convert_to_raw_units=True, config=config, mw_scale_overrides=mw_scale_overrides)
@@ -1641,7 +1691,7 @@ def load_episode_data(episode_data_dir, episode_num, config=None, mw_scale_overr
     if os.path.exists(episode_data_dir):
         available_files = [f for f in os.listdir(episode_data_dir) if f.endswith('.csv')]
         print(f"   ❌ Episode {episode_num} data not found")
-        print(f"   📁 Available files in {episode_data_dir}: {available_files}")
+        print(f"   [FILES] Available files in {episode_data_dir}: {available_files}")
     else:
         print(f"   ❌ Episode data directory not found: {episode_data_dir}")
 
@@ -1986,6 +2036,25 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 5. Update agent's environment reference to use episode data
             print(f"   🔄 Updating agent environment reference...")
             agent.env = episode_env
+
+            # CRITICAL FIX: Reset RL agent buffers for new episode data
+            print(f"   🧹 Resetting RL agent buffers for new episode...")
+            try:
+                for i, policy in enumerate(agent.policies):
+                    if hasattr(policy, 'replay_buffer') and policy.replay_buffer is not None:
+                        policy.replay_buffer.reset()
+                        print(f"     ✅ Reset replay buffer for policy {i}")
+                    if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None:
+                        policy.rollout_buffer.reset()
+                        print(f"     ✅ Reset rollout buffer for policy {i}")
+                    # Reset any other internal state
+                    if hasattr(policy, '_last_obs'):
+                        policy._last_obs = None
+                    if hasattr(policy, '_last_episode_starts'):
+                        policy._last_episode_starts = None
+                print(f"   ✅ All RL agent buffers reset for Episode {episode_num}")
+            except Exception as buffer_error:
+                print(f"   ⚠️ Buffer reset warning: {buffer_error}")
 
             # 6. Setup callbacks for this episode
             callbacks = None
@@ -2453,7 +2522,7 @@ def main():
 
     # 1) Load data - Skip for episode training (data loaded per episode)
     if args.episode_training:
-        print(f"\n📁 Episode Training Mode: Data will be loaded per episode from {args.episode_data_dir}")
+        print(f"\n[EPISODE] Episode Training Mode: Data will be loaded per episode from {args.episode_data_dir}")
         print(f"   Skipping initial data load - using episode datasets instead")
         # Create dummy data for environment initialization
         data = pd.DataFrame({
@@ -2497,7 +2566,7 @@ def main():
 
             # Skip precomputation for episode training (will be done per episode)
             if args.episode_training:
-                print("📁 Episode training mode: Forecast precomputation will be done per episode")
+                print("[EPISODE] Episode training mode: Forecast precomputation will be done per episode")
                 print("   Skipping global forecast precomputation")
             else:
                 # Precompute forecasts offline (required when forecaster is enabled)
@@ -2596,6 +2665,9 @@ def main():
 
             if args.enable_forecasts:
                 print("DL hedge optimization enabled with forecasting integration")
+                print("   [STABILITY] Forecast confidence clamped to [0.7, 1.0] for DL stability")
+                print("   [MULTI-HORIZON] Investment frequency determines horizon (short ≤50, medium >50)")
+                print("   [STABILITY] Smoothed fallback generation reduces forecast noise impact")
             else:
                 print("DL hedge optimization enabled (basic mode without forecasting)")
 

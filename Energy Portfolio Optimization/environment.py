@@ -1755,10 +1755,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                                     else:
                                         h = 'strategic'
 
+                                # CRITICAL FIX: Use correct forecast key format that generator produces
+                                # Generator produces keys like 'wind_forecast_short', not 'wind_short'
                                 gen_forecast = np.array([
-                                    float(forecasts.get(f'wind_{h}', 0.0)),
-                                    float(forecasts.get(f'solar_{h}', 0.0)),
-                                    float(forecasts.get(f'hydro_{h}', 0.0))
+                                    float(forecasts.get(f'wind_forecast_{h}', 0.0)),
+                                    float(forecasts.get(f'solar_forecast_{h}', 0.0)),
+                                    float(forecasts.get(f'hydro_forecast_{h}', 0.0))
                                 ], dtype=np.float32)
                             else:
                                 gen_forecast = np.array([0.0, 0.0, 0.0], dtype=np.float32)

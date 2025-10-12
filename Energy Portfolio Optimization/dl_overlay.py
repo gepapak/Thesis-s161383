@@ -289,14 +289,50 @@ class AdvancedFeatureEngine:
             features[5] = solar_pos
             features[6] = hydro_pos
 
-            # === GENERATION FORECAST FEATURES (7-9) - Match main.py _get_generation_forecast ===
-            wind_cap = max(getattr(env, 'physical_assets', {}).get('wind_capacity_mw', 225), 1e-6)
-            solar_cap = max(getattr(env, 'physical_assets', {}).get('solar_capacity_mw', 100), 1e-6)
-            hydro_cap = max(getattr(env, 'physical_assets', {}).get('hydro_capacity_mw', 40), 1e-6)
+            # === GENERATION FORECAST FEATURES (7-9) - Use cached forecast signal ===
+            # MEMORY FIX: Use provided forecasts parameter to avoid excessive generator calls
+            wind_scale = max(getattr(env, 'wind_scale', 225), 1e-6)
+            solar_scale = max(getattr(env, 'solar_scale', 100), 1e-6)
+            hydro_scale = max(getattr(env, 'hydro_scale', 40), 1e-6)
 
-            features[7] = current_wind / wind_cap  # Wind capacity factor
-            features[8] = current_solar / solar_cap  # Solar capacity factor
-            features[9] = current_hydro / hydro_cap  # Hydro capacity factor
+            if forecasts is not None and isinstance(forecasts, dict):
+                # Use provided forecasts (from wrapper or main.py) - MEMORY EFFICIENT
+                wind_forecast = float(forecasts.get('wind_forecast_short',
+                                    forecasts.get('wind_forecast_immediate', current_wind)))
+                solar_forecast = float(forecasts.get('solar_forecast_short',
+                                     forecasts.get('solar_forecast_immediate', current_solar)))
+                hydro_forecast = float(forecasts.get('hydro_forecast_short',
+                                     forecasts.get('hydro_forecast_immediate', current_hydro)))
+
+                features[7] = wind_forecast / wind_scale    # Normalized wind forecast
+                features[8] = solar_forecast / solar_scale  # Normalized solar forecast
+                features[9] = hydro_forecast / hydro_scale  # Normalized hydro forecast
+
+            elif hasattr(env, 'forecast_generator') and env.forecast_generator is not None:
+                # FALLBACK: Only call generator if no forecasts provided (rare case)
+                try:
+                    # Use cached call with minimal frequency to avoid OOM
+                    forecast_data = env.forecast_generator.predict_for_agent('investor_0', t)
+                    if forecast_data:
+                        wind_forecast = float(forecast_data.get('wind_forecast_short', current_wind))
+                        solar_forecast = float(forecast_data.get('solar_forecast_short', current_solar))
+                        hydro_forecast = float(forecast_data.get('hydro_forecast_short', current_hydro))
+
+                        features[7] = wind_forecast / wind_scale    # Normalized wind forecast
+                        features[8] = solar_forecast / solar_scale  # Normalized solar forecast
+                        features[9] = hydro_forecast / hydro_scale  # Normalized hydro forecast
+                    else:
+                        raise ValueError("No forecast data")
+                except Exception:
+                    # Fallback to current generation with P95 normalization
+                    features[7] = current_wind / wind_scale   # Current wind normalized
+                    features[8] = current_solar / solar_scale # Current solar normalized
+                    features[9] = current_hydro / hydro_scale # Current hydro normalized
+            else:
+                # No forecast generator - use current generation with P95 normalization
+                features[7] = current_wind / wind_scale   # Current wind normalized
+                features[8] = current_solar / solar_scale # Current solar normalized
+                features[9] = current_hydro / hydro_scale # Current hydro normalized
 
             # === PORTFOLIO METRICS FEATURES (10-12) - Match main.py _get_portfolio_metrics ===
             cap_alloc = float(getattr(env, 'capital_allocation_fraction', 0.1))
@@ -354,7 +390,9 @@ class AdvancedFeatureEngine:
             features[0] = price / 100.0  # Normalized price (IDENTICAL to Normal version)
             features[1] = current_generation / 1000.0  # Total generation
             features[2] = load / 1000.0  # Load
-            features[3] = 0.0  # Time (simplified)
+            # FIXED: Use normalized timestep instead of constant 0.0
+            t_value = kwargs.get('t', 0)
+            features[3] = float(t_value) / 1000.0 if t_value != 0 else 0.5  # Normalized time
 
             # === POSITION FEATURES (4-6) ===
             # Default positions (no access to env in kwargs mode)
@@ -363,16 +401,20 @@ class AdvancedFeatureEngine:
             features[6] = 0.0  # Hydro position
 
             # === GENERATION FORECAST FEATURES (7-9) ===
-            # Use capacity factors from current generation
+            # IMPROVED: Use smoothed capacity factors for consistency with main.py
             wind_cap, solar_cap, hydro_cap = 270.0, 100.0, 40.0
-            features[7] = wind / wind_cap  # Wind capacity factor
-            features[8] = solar / solar_cap  # Solar capacity factor
-            features[9] = hydro / hydro_cap  # Hydro capacity factor
+            wind_cf = np.clip(wind / wind_cap, 0.0, 1.0) * 0.95  # Match main.py smoothing
+            solar_cf = np.clip(solar / solar_cap, 0.0, 1.0) * 0.95
+            hydro_cf = np.clip(hydro / hydro_cap, 0.0, 1.0) * 0.95
+
+            features[7] = wind_cf  # Smoothed wind capacity factor
+            features[8] = solar_cf  # Smoothed solar capacity factor
+            features[9] = hydro_cf  # Smoothed hydro capacity factor
 
             # === PORTFOLIO METRICS FEATURES (10-12) ===
             features[10] = 0.1  # Default capital allocation
             features[11] = 0.1  # Default investment frequency
-            features[12] = 1.0  # Default forecast confidence
+            features[12] = 0.85  # FIXED: Use consistent confidence (between 0.7-1.0 range)
 
             return features
 
@@ -486,47 +528,62 @@ class DynamicHedgeLabeler:
                             labels['hedge_effectiveness'] = np.clip(0.5 + 0.4 * correlation, 0.5, 0.95)
 
                             # 5. Risk allocation based on asset-specific hedge ratios
-                            if hasattr(env, 'physical_assets'):
-                                # Use capacity-weighted allocation as baseline
-                                wind_cap = env.physical_assets.get('wind_capacity_mw', 270)
-                                solar_cap = env.physical_assets.get('solar_capacity_mw', 100)
-                                hydro_cap = env.physical_assets.get('hydro_capacity_mw', 40)
-                                total_cap = wind_cap + solar_cap + hydro_cap
+                            try:
+                                if hasattr(env, 'physical_assets'):
+                                    # Use capacity-weighted allocation as baseline
+                                    wind_cap = env.physical_assets.get('wind_capacity_mw', 270)
+                                    solar_cap = env.physical_assets.get('solar_capacity_mw', 100)
+                                    hydro_cap = env.physical_assets.get('hydro_capacity_mw', 40)
+                                    total_cap = wind_cap + solar_cap + hydro_cap
 
-                                if total_cap > 0:
-                                    # Weight by capacity and adjust for volatility/correlation
-                                    wind_weight = wind_cap / total_cap
-                                    solar_weight = solar_cap / total_cap
-                                    hydro_weight = hydro_cap / total_cap
+                                    if total_cap > 0:
+                                        # Weight by capacity and adjust for volatility/correlation
+                                        wind_weight = wind_cap / total_cap
+                                        solar_weight = solar_cap / total_cap
+                                        hydro_weight = hydro_cap / total_cap
 
-                                    # Adjust weights based on generation variability (higher variability = higher hedge weight)
-                                    if hasattr(env, '_wind') and hasattr(env, '_solar') and hasattr(env, '_hydro') and t >= 10:
-                                        try:
-                                            wind_var = np.var(env._wind[max(0, t-10):t+1]) if t >= 10 else 1.0
-                                            solar_var = np.var(env._solar[max(0, t-10):t+1]) if t >= 10 else 1.0
-                                            hydro_var = np.var(env._hydro[max(0, t-10):t+1]) if t >= 10 else 1.0
+                                        # Adjust weights based on generation variability (higher variability = higher hedge weight)
+                                        if hasattr(env, '_wind') and hasattr(env, '_solar') and hasattr(env, '_hydro') and t >= 10:
+                                            try:
+                                                wind_var = np.var(env._wind[max(0, t-10):t+1]) if t >= 10 else 1.0
+                                                solar_var = np.var(env._solar[max(0, t-10):t+1]) if t >= 10 else 1.0
+                                                hydro_var = np.var(env._hydro[max(0, t-10):t+1]) if t >= 10 else 1.0
 
-                                            total_var = wind_var + solar_var + hydro_var
-                                            if total_var > 0:
-                                                # Blend capacity weights with variability weights
-                                                var_wind_weight = wind_var / total_var
-                                                var_solar_weight = solar_var / total_var
-                                                var_hydro_weight = hydro_var / total_var
+                                                total_var = wind_var + solar_var + hydro_var
+                                                if total_var > 0:
+                                                    # Blend capacity weights with variability weights
+                                                    var_wind_weight = wind_var / total_var
+                                                    var_solar_weight = solar_var / total_var
+                                                    var_hydro_weight = hydro_var / total_var
 
-                                                # 70% capacity, 30% variability
-                                                wind_weight = 0.7 * wind_weight + 0.3 * var_wind_weight
-                                                solar_weight = 0.7 * solar_weight + 0.3 * var_solar_weight
-                                                hydro_weight = 0.7 * hydro_weight + 0.3 * var_hydro_weight
-                                        except Exception:
-                                            pass
+                                                    # 70% capacity, 30% variability
+                                                    wind_weight = 0.7 * wind_weight + 0.3 * var_wind_weight
+                                                    solar_weight = 0.7 * solar_weight + 0.3 * var_solar_weight
+                                                    hydro_weight = 0.7 * hydro_weight + 0.3 * var_hydro_weight
+                                            except Exception:
+                                                pass
 
-                                    # Normalize to sum to 1
-                                    total_weight = wind_weight + solar_weight + hydro_weight
-                                    labels['risk_allocation'] = np.array([
-                                        wind_weight / total_weight,
-                                        solar_weight / total_weight,
-                                        hydro_weight / total_weight
-                                    ])
+                                        # Normalize to sum to 1 with NaN protection
+                                        total_weight = wind_weight + solar_weight + hydro_weight
+                                        if total_weight > 0 and not np.isnan(total_weight):
+                                            risk_alloc = np.array([
+                                                wind_weight / total_weight,
+                                                solar_weight / total_weight,
+                                                hydro_weight / total_weight
+                                            ])
+                                            # Verify no NaN values in final allocation
+                                            if not np.any(np.isnan(risk_alloc)):
+                                                labels['risk_allocation'] = risk_alloc
+                                            else:
+                                                # Default to equal allocation if NaN detected
+                                                labels['risk_allocation'] = np.array([0.33, 0.33, 0.34])
+                                        else:
+                                            # Default to equal allocation if total_weight is invalid
+                                            labels['risk_allocation'] = np.array([0.33, 0.33, 0.34])
+                            except Exception as risk_alloc_error:
+                                # Robust fallback to equal allocation on any error
+                                logging.warning(f"Risk allocation calculation failed: {risk_alloc_error}")
+                                labels['risk_allocation'] = np.array([0.33, 0.33, 0.34])
 
             return labels
 

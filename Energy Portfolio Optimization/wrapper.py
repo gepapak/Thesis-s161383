@@ -1434,14 +1434,27 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         pf_norm = 0.0
         pf_aligned = 0.0
         try:
-            price_items = [(k, all_forecasts[k]) for k in all_forecasts.keys() if "price_forecast_" in str(k).lower()]
+            # ENHANCED: Filter out None/NaN values from price_items
+            price_items = []
+            for k in all_forecasts.keys():
+                if "price_forecast_" in str(k).lower():
+                    v = all_forecasts[k]
+                    if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                        price_items.append((k, v))
+
             if price_items:
                 cand = []
                 for k, v in price_items:
-                    n = self.obs_builder.postproc.normalize_value(k, v)
-                    cand.append((k, n))
-                    if pf_norm == 0.0:
-                        pf_norm = float(n)
+                    try:
+                        n = self.obs_builder.postproc.normalize_value(k, v)
+                        # ENHANCED: Filter out None/NaN normalized values
+                        if n is not None and not (isinstance(n, float) and np.isnan(n)):
+                            cand.append((k, n))
+                            if pf_norm == 0.0:
+                                pf_norm = float(n)
+                    except Exception:
+                        # Skip invalid normalization results
+                        continue
 
                 invf = int(getattr(self.env, "investment_freq", 12))
 
@@ -1476,8 +1489,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     """Calculate distance between horizon steps and investment frequency."""
                     return abs(steps_for_key(k) - invf)
 
-                k_best, v_best = min(cand, key=lambda kv: dist(kv[0]))
-                pf_aligned = float(v_best)
+                # ENHANCED: Ensure cand is not empty before calling min()
+                if cand:
+                    k_best, v_best = min(cand, key=lambda kv: dist(kv[0]))
+                    pf_aligned = float(v_best)
         except Exception:
             pass
         return pf_norm, pf_aligned
@@ -1667,27 +1682,11 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
                 # Forecast alignment score diagnostic (non-monetary)
                 try:
-                    # Use z-score normalization consistent with env observations ([-1,1] scale)
+                    # FIXED: Use centralized price normalization to eliminate DRY violation
                     price_val = self._safe_float(actuals['price'], 0.0)
-                    # Apply same z-score normalization as env: z-score / 3 clipped to [-1,1]
                     try:
-                        t = getattr(self.env, 't', 0)
-                        if hasattr(self.env, '_price_mean') and hasattr(self.env, '_price_std'):
-                            if t < len(self.env._price_mean) and t < len(self.env._price_std):
-                                mean = float(self.env._price_mean[t])
-                                std = max(float(self.env._price_std[t]), 1e-6)
-                                z = (price_val - mean) / std
-                                cur_price_norm = float(np.clip(z / 3.0, -1.0, 1.0))
-                            else:
-                                # Fallback normalization
-                                mean, std = 250.0, 50.0
-                                z = (price_val - mean) / std
-                                cur_price_norm = float(np.clip(z / 3.0, -1.0, 1.0))
-                        else:
-                            # Fallback normalization
-                            mean, std = 250.0, 50.0
-                            z = (price_val - mean) / std
-                            cur_price_norm = float(np.clip(z / 3.0, -1.0, 1.0))
+                        # Use centralized normalization method instead of duplicating logic
+                        cur_price_norm = self.obs_builder.postproc.normalize_value('price', price_val)
                     except Exception:
                         cur_price_norm = 0.0
                     realized_ret_dummy = 0.0 # Placeholder as real return calc is complex here
