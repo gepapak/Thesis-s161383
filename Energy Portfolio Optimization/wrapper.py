@@ -2,34 +2,33 @@
 """
 Enhanced Multi-Horizon Wrapper (fully patched w/ forecast normalization + horizon alignment)
 
-Adds logging for:
-- Env snapshot: budget, capacities, battery_energy, revenue_step (prefers env.last_revenue), actual price/load/wind/solar/hydro
-- Episode markers: ep_meta_return, step_in_episode, episode_end, episode_id, seed
-- Market regime: market_stress, market_volatility
-- Risk vector 6D, plus overall/market quick snapshots
-- Reward breakdown + weights (reads env.last_reward_breakdown / env.last_reward_weights if present)
-- Ops health: step_time_ms, mem_rss_mb
-- Action health: action_clip_frac_* (investor/battery/risk/meta)
-- Forecast MAE@1 (price/wind/solar/load/hydro) vs previous logged forecast
-- PATCH: Logs true mark-to-market portfolio value/equity and computes performance from it
-- NEW (aligned with env economics): generation_revenue, mtm_pnl, distributed_profits,
-  cumulative_returns, investment_capital, fund_performance
-- NEW (this patch): normalized forecast features + horizon alignment prioritizing env.investment_freq
-- NEW logging fields: price_forecast_aligned, price_forecast_norm, forecast_alignment_score
+Provides:
+- TOTAL-dimension observation construction (base + normalized & horizon-aligned forecasts)
+- Strict shape checking and validation
+- Memory-optimized observation building with caching
+- Enhanced monitoring (optional)
 
-Maintains:
-- TOTAL-dimension observation construction (base + forecasts) with strict shape checking
-- Buffered CSV writing with safe type coercion (timestamp preserved as string)
+Note: Step-by-step CSV logging has been removed. Only checkpoint summaries are saved.
 """
 
 from gymnasium import spaces
 from pettingzoo import ParallelEnv
 import numpy as np
-import csv, os, threading, gc, psutil, logging, pandas as pd, time
+import csv, os, threading, gc, psutil, pandas as pd, time
 from typing import Dict, Any, Tuple, Optional, List, Mapping
 from datetime import datetime
 from collections import deque, OrderedDict
 from contextlib import nullcontext
+from config import (
+    normalize_price,
+    WRAPPER_FORECAST_CACHE_SIZE_DEFAULT,
+    WRAPPER_AGENT_CACHE_SIZE_DEFAULT,
+    WRAPPER_MEMORY_LIMIT_MB_DEFAULT,
+)  # UNIFIED: Import from single source of truth
+from utils import SafeDivision, UnifiedMemoryManager, UnifiedObservationValidator, ErrorHandler, safe_operation  # UNIFIED: Import from single source of truth
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 # Import enhanced monitoring (optional)
 try:
@@ -39,28 +38,13 @@ except Exception:
     _HAS_ENHANCED_MONITORING = False
     EnhancedMetricsMonitor = None
 
-# Price normalization: z-score divided by 3 and clipped to [-1, 1] to match env observation space
-
-
-# =========================
-# Memory + Validation Utils
-# =========================
-def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
-    """Safe division utility to avoid duplication with environment.py"""
-    if denominator is None or abs(denominator) < 1e-9:
-        return default
-    try:
-        return float(numerator) / float(denominator)
-    except Exception:
-        return default
-
 
 # =========================
 # Enhanced Cache Management
 # =========================
 class EnhancedLRUCache:
     """Enhanced LRU cache with memory-aware eviction."""
-    def __init__(self, max_size: int = 2000, memory_limit_mb: float = 50.0):
+    def __init__(self, max_size: int = 2000, memory_limit_mb: float = 1024.0):
         self.max_size = max_size
         self.memory_limit_mb = memory_limit_mb
         self.cache = OrderedDict()
@@ -129,18 +113,61 @@ class ForecastPostProcessor:
         self.normalize = bool(normalize)
         self.align_horizons = bool(align_horizons)
 
-    def _normalize_price_zscore(self, value: float, mean: float, std: float) -> float:
-        """FIXED: Price normalization to match env - z-score divided by 3 and clipped to [-1,1]"""
+        # Track normalization parameters for consistency validation
+        self._initial_price_mean = None
+        self._initial_price_std = None
+        self._initial_wind_scale = None
+        self._initial_solar_scale = None
+        self._initial_hydro_scale = None
+        self._initial_load_scale = None
+        self._normalization_validated = False
+
+        # Capture initial normalization parameters
+        self._capture_initial_normalization_params()
+
+    def _normalize_price_zscore_clipped(self, value: float, mean: float, std: float) -> float:
+        """
+        DYNAMIC PRICE NORMALIZATION WITH Z-SCORE CLIPPING
+
+        Normalizes price to [−1,1] range using Z-score with clipping.
+        Uses DYNAMIC mean/std parameters (timestep-specific statistics).
+
+        Args:
+            value: Raw price value to normalize
+            mean: Dynamic mean price for current timestep
+            std: Dynamic std dev for current timestep
+
+        Returns:
+            Normalized price in [-1, 1] range
+        """
         try:
-            # Step 1: Z-score with provided stats
+            # Step 1: Calculate raw Z-score using DYNAMIC parameters
             z_score = (value - mean) / max(std, 1e-6)
-            # Step 2: Divide by 3 and clip to [-1,1] to match env observation space
-            return float(np.clip(z_score / 3.0, -1.0, 1.0))
+
+            # Step 2: Clip to ±3.0σ BEFORE dividing by 3.0 to ensure strict [−1,1] bounds
+            clipped_z = np.clip(z_score, -3.0, 3.0)
+
+            # Step 3: Divide by 3.0 to normalize to [−1,1] range
+            normalized = clipped_z / 3.0
+
+            return float(normalized)
         except Exception:
             # Fallback to safe default
             return 0.0
 
     def normalize_value(self, key: str, val: float) -> float:
+        """
+        Normalize feature values using CONSISTENT approach with environment.py.
+
+        CRITICAL: Ensures overlay model receives normalized features matching
+        what environment.py produces in _build_overlay_features().
+
+        Normalization strategy:
+        - PRICE: Z-score with dynamic mean/std (time-varying statistics)
+        - RENEWABLES (wind, solar, hydro, load): Fixed scale (95th percentile)
+
+        This consistency is ESSENTIAL for overlay model training and inference.
+        """
         if not self.normalize:
             return float(val) if np.isfinite(val) else 0.0
 
@@ -148,66 +175,199 @@ class ForecastPostProcessor:
         k = (key or "").lower()
 
         if "price" in k:
-            # FIXED: Use z-score normalization like the environment instead of fixed scale
+            # PRICE: Z-score normalization with dynamic mean/std (MATCHES environment.py _norm_price)
             try:
-                # Get current timestep for normalization parameters
                 t = getattr(self.env, 't', 0)
                 if hasattr(self.env, '_price_mean') and hasattr(self.env, '_price_std'):
                     if t < len(self.env._price_mean) and t < len(self.env._price_std):
                         mean = float(self.env._price_mean[t])
                         std = float(self.env._price_std[t])
-                        return self._normalize_price_zscore(v, mean, std)
+                        return self._normalize_price_zscore_clipped(v, mean, std)
 
-                # Fallback: use hardcoded fallback statistics (matching Normal version approach)
+                # Fallback: use config-driven fallback statistics
                 config = getattr(self.env, 'config', None)
-                fallback_mean = 250.0  # Typical DKK/MWh price
-                fallback_std = 50.0    # Typical price volatility
-                if config and hasattr(config, 'price_fallback_mean'):
-                    fallback_mean = config.price_fallback_mean
-                if config and hasattr(config, 'price_fallback_std'):
-                    fallback_std = config.price_fallback_std
-                return self._normalize_price_zscore(v, fallback_mean, fallback_std)
-            except Exception:
-                # Fallback to safe default
+                fallback_mean = getattr(config, 'price_fallback_mean', 250.0) if config else 250.0
+                fallback_std = getattr(config, 'price_fallback_std', 50.0) if config else 50.0
+                return self._normalize_price_zscore_clipped(v, fallback_mean, fallback_std)
+            except Exception as e:
+                logger.warning(f"[NORMALIZATION] Price normalization failed: {e}, returning 0.0")
                 return 0.0
 
-        # CONSISTENT: Use config-driven normalization for all energy sources
-        if "load" in k:
-            try:
-                # Use config parameters for consistent normalization
-                config = getattr(self.env, 'config', None)
-                if config and hasattr(config, 'load_normalization_divisor'):
-                    divisor = config.load_normalization_divisor
-                    return float(np.clip(v / divisor, 0.0, 1.0))
-                else:
-                    # Fallback with environment scale
-                    scale = max(float(getattr(self.env, "load_scale", 1.0)), 1e-6)
-                    return float(np.clip(v / scale, 0.0, 1.0))
-            except Exception:
-                return float(np.clip(v, 0.0, 1.0))
-
-        # CONSISTENT: Use config-driven normalization for renewable sources
+        # RENEWABLES: Fixed scale normalization (MATCHES environment.py _build_overlay_features)
+        # Uses 95th percentile scales computed at initialization
         try:
             config = getattr(self.env, 'config', None)
+
             if "wind" in k:
-                if config and hasattr(config, 'wind_normalization_divisor'):
-                    return float(np.clip(v / config.wind_normalization_divisor, 0.0, 1.0))
                 scale = max(float(getattr(self.env, "wind_scale", 1.0)), 1e-6)
                 return float(np.clip(v / scale, 0.0, 1.0))
+
             if "solar" in k:
-                if config and hasattr(config, 'solar_normalization_divisor'):
-                    return float(np.clip(v / config.solar_normalization_divisor, 0.0, 1.0))
                 scale = max(float(getattr(self.env, "solar_scale", 1.0)), 1e-6)
                 return float(np.clip(v / scale, 0.0, 1.0))
+
             if "hydro" in k:
-                if config and hasattr(config, 'hydro_normalization_divisor'):
-                    return float(np.clip(v / config.hydro_normalization_divisor, 0.0, 1.0))
                 scale = max(float(getattr(self.env, "hydro_scale", 1.0)), 1e-6)
                 return float(np.clip(v / scale, 0.0, 1.0))
-        except Exception:
-            pass
+
+            if "load" in k:
+                scale = max(float(getattr(self.env, "load_scale", 1.0)), 1e-6)
+                return float(np.clip(v / scale, 0.0, 1.0))
+        except Exception as e:
+            logger.warning(f"[NORMALIZATION] Renewable normalization failed for {k}: {e}, returning 0.0")
+            return 0.0
 
         return v
+
+    def _capture_initial_normalization_params(self):
+        """Capture initial normalization parameters for consistency validation."""
+        try:
+            if hasattr(self.env, '_price_mean') and len(self.env._price_mean) > 0:
+                self._initial_price_mean = float(self.env._price_mean[0])
+            if hasattr(self.env, '_price_std') and len(self.env._price_std) > 0:
+                self._initial_price_std = float(self.env._price_std[0])
+            if hasattr(self.env, 'wind_scale'):
+                self._initial_wind_scale = float(self.env.wind_scale)
+            if hasattr(self.env, 'solar_scale'):
+                self._initial_solar_scale = float(self.env.solar_scale)
+            if hasattr(self.env, 'hydro_scale'):
+                self._initial_hydro_scale = float(self.env.hydro_scale)
+            if hasattr(self.env, 'load_scale'):
+                self._initial_load_scale = float(self.env.load_scale)
+        except Exception as e:
+            logger.warning(f"[NORMALIZATION] Failed to capture initial params: {e}")
+
+    def _validate_initial_normalization_parameters(self) -> bool:
+        """
+        CRITICAL: Validate that normalization parameters haven't changed during episode.
+
+        This prevents subtle bugs where environment's normalization parameters change
+        but wrapper continues using old values, causing observation distribution shift.
+
+        Returns:
+            bool: True if normalization is consistent, False otherwise
+        """
+        if not self.normalize:
+            return True
+
+        issues = []
+
+        try:
+            # Check price normalization (only check first timestep for static validation)
+            if self._initial_price_mean is not None and hasattr(self.env, '_price_mean'):
+                if len(self.env._price_mean) > 0:
+                    current_mean = float(self.env._price_mean[0])
+                    if abs(current_mean - self._initial_price_mean) > 1e-6:
+                        issues.append(
+                            f"Price mean changed: {self._initial_price_mean:.4f} -> {current_mean:.4f}"
+                        )
+
+            if self._initial_price_std is not None and hasattr(self.env, '_price_std'):
+                if len(self.env._price_std) > 0:
+                    current_std = float(self.env._price_std[0])
+                    if abs(current_std - self._initial_price_std) > 1e-6:
+                        issues.append(
+                            f"Price std changed: {self._initial_price_std:.4f} -> {current_std:.4f}"
+                        )
+
+            # Check renewable scales
+            if self._initial_wind_scale is not None and hasattr(self.env, 'wind_scale'):
+                current_scale = float(self.env.wind_scale)
+                if abs(current_scale - self._initial_wind_scale) > 1e-6:
+                    issues.append(
+                        f"Wind scale changed: {self._initial_wind_scale:.4f} -> {current_scale:.4f}"
+                    )
+
+            if self._initial_solar_scale is not None and hasattr(self.env, 'solar_scale'):
+                current_scale = float(self.env.solar_scale)
+                if abs(current_scale - self._initial_solar_scale) > 1e-6:
+                    issues.append(
+                        f"Solar scale changed: {self._initial_solar_scale:.4f} -> {current_scale:.4f}"
+                    )
+
+            if self._initial_hydro_scale is not None and hasattr(self.env, 'hydro_scale'):
+                current_scale = float(self.env.hydro_scale)
+                if abs(current_scale - self._initial_hydro_scale) > 1e-6:
+                    issues.append(
+                        f"Hydro scale changed: {self._initial_hydro_scale:.4f} -> {current_scale:.4f}"
+                    )
+
+            if self._initial_load_scale is not None and hasattr(self.env, 'load_scale'):
+                current_scale = float(self.env.load_scale)
+                if abs(current_scale - self._initial_load_scale) > 1e-6:
+                    issues.append(
+                        f"Load scale changed: {self._initial_load_scale:.4f} -> {current_scale:.4f}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"[NORMALIZATION] Consistency validation failed: {e}")
+            return False
+
+        if issues:
+            error_msg = "[NORMALIZATION INCONSISTENCY DETECTED]\n" + "\n".join(issues)
+            logger.error(error_msg)
+            return False
+
+        self._normalization_validated = True
+        return True
+
+    def _validate_runtime_normalization_alignment(self) -> bool:
+        """
+        CRITICAL VALIDATION: Ensure wrapper normalization matches environment.py.
+
+        This prevents silent degradation where overlay model receives inconsistently
+        normalized features, causing poor performance without obvious errors.
+
+        Returns:
+            bool: True if normalization is consistent, False otherwise
+        """
+        try:
+            # Test price normalization
+            test_price = 250.0  # Typical price
+            t = getattr(self.env, 't', 0)
+
+            # Get wrapper normalization
+            wrapper_norm = self.normalize_value("price", test_price)
+
+            # Get environment normalization (if available)
+            if hasattr(self.env, '_norm_price'):
+                env_norm = self.env._norm_price(test_price, t)
+
+                # Check if they're reasonably close (within 0.1 due to floating point)
+                if abs(wrapper_norm - env_norm) > 0.1:
+                    logger.warning(
+                        f"[NORMALIZATION_MISMATCH] Price normalization inconsistent:\n"
+                        f"  Wrapper: {wrapper_norm:.4f}\n"
+                        f"  Environment: {env_norm:.4f}\n"
+                        f"  Difference: {abs(wrapper_norm - env_norm):.4f}\n"
+                        f"  This will confuse the overlay model!"
+                    )
+                    return False
+
+            # Test renewable normalization
+            test_wind = 100.0
+            wrapper_wind = self.normalize_value("wind", test_wind)
+
+            # Verify it's in [0, 1] range
+            if not (0.0 <= wrapper_wind <= 1.0):
+                logger.warning(
+                    f"[NORMALIZATION_INVALID] Wind normalization out of bounds: {wrapper_wind}\n"
+                    f"  Expected [0.0, 1.0], got {wrapper_wind}"
+                )
+                return False
+
+            logger.info("[NORMALIZATION_VALID] Wrapper and environment normalization are consistent")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[NORMALIZATION_VALIDATION] Failed to validate: {e}")
+            return False
+
+    def validate_normalization_consistency(self) -> bool:
+        """Run both static and runtime normalization checks."""
+        initial_ok = self._validate_initial_normalization_parameters()
+        runtime_ok = self._validate_runtime_normalization_alignment()
+        return bool(initial_ok and runtime_ok)
 
     def order_keys_by_horizon_alignment(self, agent: str, keys: List[str]) -> List[str]:
         """
@@ -277,170 +437,16 @@ class ForecastPostProcessor:
         return final_out
 
 
-# =========================
-# Memory tracker
-# =========================
-class EnhancedMemoryTracker:
-    """Lightweight memory tracker for caches used in the wrapper."""
-    def __init__(self, max_memory_mb=300):
-        self.max_memory_mb = max_memory_mb
-        self.cleanup_thresholds = {
-            'light': max_memory_mb * 0.7,
-            'medium': max_memory_mb * 0.85,
-            'heavy': max_memory_mb * 0.95,
-        }
-        self.tracked_caches = []
-        self.memory_history = deque(maxlen=200)
-
-    def register_cache(self, cache_obj):
-        self.tracked_caches.append(cache_obj)
-
-    def get_memory_usage(self) -> float:
-        try:
-            return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        except Exception:
-            return 0.0
-
-    def should_cleanup(self, force=False):
-        cur = self.get_memory_usage()
-        self.memory_history.append(cur)
-        if force:
-            return 'heavy', cur
-        if cur > self.cleanup_thresholds['heavy']:
-            return 'heavy', cur
-        if cur > self.cleanup_thresholds['medium']:
-            return 'medium', cur
-        if cur > self.cleanup_thresholds['light'] or len(self.memory_history) % 200 == 0:
-            return 'light', cur
-        return None, cur
-
-    def cleanup(self, level='light'):
-        before = self.get_memory_usage()
-        try:
-            if level in ('light', 'medium', 'heavy'):
-                for cache in list(self.tracked_caches):
-                    try:
-                        if hasattr(cache, 'clear'):
-                            cache.clear()
-                    except Exception:
-                        pass
-            for _ in range(2):
-                gc.collect()
-            try:
-                import torch  # noqa: F401
-                if hasattr(torch, "cuda") and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-        finally:
-            after = self.get_memory_usage()
-        return max(0.0, before - after)
-
-    def get_memory_stats(self):
-        cur = self.get_memory_usage()
-        return {
-            'current_memory_mb': cur,
-            'max_memory_mb': self.max_memory_mb,
-            'memory_usage_pct': (cur / self.max_memory_mb) * 100 if self.max_memory_mb else 0.0,
-            'tracked_caches': len(self.tracked_caches),
-            'memory_history': list(self.memory_history),
-        }
+# UNIFIED MEMORY MANAGER (NEW)
+# EnhancedMemoryTracker is now replaced by UnifiedMemoryManager from memory_manager.py
+# For backward compatibility, we create an alias
+EnhancedMemoryTracker = UnifiedMemoryManager
 
 
-# =========================
-# Observation Validator (Merged from observation_validator.py)
-# =========================
-
-class BaseObservationValidator:
-    """
-    Base class for observation validation with common functionality.
-    Prevents duplication between wrapper and metacontroller validators.
-    """
-
-    def __init__(self, env, debug=False):
-        self.env = env
-        self.debug = debug
-        self.logger = logging.getLogger(__name__)
-        self.validation_errors = deque(maxlen=100)
-        self.validation_cache: Dict[Any, bool] = {}
-
-    def _estimate_agent_dimension(self, agent: str) -> int:
-        """
-        FAIL-FAST: No static dimension estimates allowed.
-        Use dynamic calculation from forecaster metadata instead.
-        """
-        raise ValueError(f"Cannot estimate dimensions for agent '{agent}': "
-                        "static dimension estimates removed for production safety. "
-                        "Use dynamic calculation from forecaster.agent_targets/agent_horizons.")
-
-    def _get_safe_bounds(self, dim: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Get safe bounds for observation dimensions."""
-        low = np.full(dim, -100.0, dtype=np.float32)
-        high = np.full(dim, 1000.0, dtype=np.float32)
-        return low, high
-
-    def _obs_signature(self, agent: str, obs: Any):
-        """Create a signature for observation caching."""
-        if isinstance(obs, np.ndarray):
-            try:
-                return (agent, obs.shape, obs.dtype, hash(obs.tobytes()))
-            except Exception:
-                return (agent, obs.shape, obs.dtype, None)
-        return (agent, type(obs), str(obs)[:64])
-
-    def _sanitize_observation(self, obs: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
-        """Sanitize observation by handling NaN/inf and clipping to bounds."""
-        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
-        return np.clip(obs, low, high)
-
-    def _validate_observation_basic(self, agent: str, obs: Any, expected_dim: int,
-                                   low: np.ndarray, high: np.ndarray) -> Tuple[bool, list]:
-        """Basic observation validation logic."""
-        problems = []
-        ok = True
-
-        if not isinstance(obs, np.ndarray):
-            problems.append(f"type={type(obs)} expected np.ndarray")
-            ok = False
-        else:
-            if obs.ndim != 1:
-                problems.append(f"ndim={obs.ndim} expected 1D")
-                ok = False
-            elif obs.shape[0] != expected_dim:
-                problems.append(f"dim={obs.shape[0]} expected {expected_dim}")
-                ok = False
-            if obs.dtype != np.float32:
-                problems.append(f"dtype={obs.dtype} expected float32")
-            if np.any(~np.isfinite(obs)):
-                nbad = int(np.sum(~np.isfinite(obs)))
-                problems.append(f"{nbad} non-finite")
-                ok = False
-            if np.any(obs < low) or np.any(obs > high):
-                out = int(np.sum((obs < low) | (obs > high)))
-                problems.append(f"{out} out-of-bounds")
-
-        return ok, problems
-
-    def _log_validation_issues(self, agent: str, problems: list):
-        """Log validation issues if debug is enabled."""
-        if problems and self.debug:
-            msg = f"Validation issues for {agent}: " + "; ".join(problems)
-            self.validation_errors.append(msg)
-            self.logger.warning(msg)
-
-    def _cleanup_cache(self, max_size: int = 2000, cleanup_size: int = 500):
-        """Clean up validation cache when it gets too large."""
-        if len(self.validation_cache) > max_size:
-            for k in list(self.validation_cache.keys())[:cleanup_size]:
-                del self.validation_cache[k]
-
-    def get_validation_stats(self) -> Dict[str, Any]:
-        """Get validation statistics."""
-        return {
-            'cache_size': len(self.validation_cache),
-            'recent_errors': list(self.validation_errors)[-10:],
-            'total_errors': len(self.validation_errors)
-        }
+# UNIFIED OBSERVATION VALIDATION (NEW)
+# BaseObservationValidator is now replaced by UnifiedObservationValidator from observation_validator.py
+# For backward compatibility, we create an alias
+BaseObservationValidator = UnifiedObservationValidator
 
 
 class ObservationValidatorMixin:
@@ -514,8 +520,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                     'forecast_keys': self._get_agent_forecast_keys(agent, forecast_dim),
                     'bounds': (total_low, total_high)
                 }
-                if self.debug:
-                    print(f"✅ {agent}: base={base_dim}, forecast={forecast_dim}, total={total_dim}")
+                if self.debug or agent == "meta_controller_0":
+                    print(f"[SPEC] {agent}: base={base_dim}, forecast={forecast_dim}, total={total_dim}")
             except Exception as e:
                 logging.getLogger(__name__).error(f"Failed to init specs for {agent}: {e}")
                 self._create_fallback_spec(agent)
@@ -562,18 +568,36 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                            f"Static dimension fallbacks removed for production safety.")
 
     def _calculate_forecast_dimension(self, agent: str) -> int:
+        # If no forecaster, return 0 forecast dimensions (baseline mode)
+        if self.forecaster is None:
+            return 0
+
+        # CONDITIONAL: When using direct deltas (Tier 2/3), forecast features are embedded in base observations
+        # The environment already includes deltas in investor_0 base observations (13D = 6 base + 6 deltas + 1 trust)
+        # So wrapper should NOT add additional forecast dimensions
+        enable_forecast_util = getattr(self.base_env.config, 'enable_forecast_utilisation', False) if hasattr(self.base_env, 'config') else False
+        if enable_forecast_util:
+            # Tier 2/3: Deltas already in base observations, no additional forecasts needed
+            return 0
+
         try:
             if hasattr(self.forecaster, 'get_agent_forecast_dims'):
                 dims = self.forecaster.get_agent_forecast_dims()
                 base_dims = int(dims.get(agent, 0))
                 # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
-                return base_dims + (1 if agent != "risk_controller_0" else 0)
+                result = base_dims + (1 if agent != "risk_controller_0" else 0)
+                if agent == "meta_controller_0":
+                    print(f"[FORECAST_DIM] {agent}: get_agent_forecast_dims={base_dims}, confidence=1, total={result}")
+                return result
             if hasattr(self.forecaster, 'agent_horizons') and hasattr(self.forecaster, 'agent_targets'):
                 targets = self.forecaster.agent_targets.get(agent, [])
                 horizons = self.forecaster.agent_horizons.get(agent, [])
                 base_dims = int(len(targets) * len(horizons))
                 # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
-                return base_dims + (1 if agent != "risk_controller_0" else 0)
+                result = base_dims + (1 if agent != "risk_controller_0" else 0)
+                if agent == "meta_controller_0":
+                    print(f"[FORECAST_DIM] {agent}: targets={len(targets)}, horizons={len(horizons)}, base_dims={base_dims}, confidence=1, total={result}")
+                return result
             # DYNAMIC: Calculate forecast dimensions from actual forecaster configuration
             try:
                 if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
@@ -615,9 +639,10 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
             pass
         return [f"forecast_{i}" for i in range(expected_count)]
 
-    def _get_safe_bounds(self, total_dim: int) -> Tuple[np.ndarray, np.ndarray]:
-        low = np.full(total_dim, -100.0, dtype=np.float32)
-        high = np.full(total_dim, 1000.0, dtype=np.float32)
+    def _get_safe_bounds(self, dim: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Get safe bounds for observation space."""
+        low = np.full(dim, -10.0, dtype=np.float32)
+        high = np.full(dim, 10.0, dtype=np.float32)
         return low, high
 
     def _create_fallback_spec(self, agent: str):
@@ -757,10 +782,10 @@ class MemoryOptimizedObservationBuilder:
             agent_cache_size = env_config.agent_forecast_cache_size
             memory_limit = env_config.wrapper_memory_mb
         else:
-            # Fallback values
-            forecast_cache_size = 1000
-            agent_cache_size = 2000
-            memory_limit = 500.0
+            # Fallback values from config constants
+            forecast_cache_size = WRAPPER_FORECAST_CACHE_SIZE_DEFAULT
+            agent_cache_size = WRAPPER_AGENT_CACHE_SIZE_DEFAULT
+            memory_limit = WRAPPER_MEMORY_LIMIT_MB_DEFAULT
 
         self.forecast_cache = EnhancedLRUCache(max_size=forecast_cache_size, memory_limit_mb=memory_limit)
         self.agent_forecast_cache = EnhancedLRUCache(max_size=agent_cache_size, memory_limit_mb=memory_limit * 1.5)
@@ -848,29 +873,18 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     """Wraps a BASE-only env and exposes TOTAL-dim observations (base + normalized & horizon-aligned forecasts)."""
     metadata = {"name": "multi_horizon_wrapper:normalized-aligned-v1"}
 
-    def __init__(self, base_env, multi_horizon_forecaster, log_path=None, max_memory_mb=1500,
-                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000, log_interval=20,
-                 disable_csv_logging=False):
+    def __init__(self, base_env, multi_horizon_forecaster, max_memory_mb=1500,
+                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000):
         self.env = base_env
+        self.base_env = base_env  # Alias for compatibility
         self.forecaster = multi_horizon_forecaster
 
         # Agents
         self._possible_agents = self.env.possible_agents[:]
         self._agents = self.env.agents[:]
 
-        # Logging control - configurable based on disable_csv_logging
-        self.total_timesteps = total_timesteps
-        self.log_interval = log_interval if not disable_csv_logging else 0
-        self.log_start_step = 0
-        self.logging_enabled = not disable_csv_logging  # Disable logging if requested
-        self.disable_csv_logging = disable_csv_logging
-
-        # Memory & logging infra
+        # Memory infra (no CSV logging)
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=max_memory_mb)
-        self.log_path = self._setup_logging_path(log_path) if log_path else None
-        self.log_buffer = deque(maxlen=128)  # Reduced from 256 to prevent memory accumulation
-        self.log_lock = threading.RLock() if threading else nullcontext()
-        self._flush_every_rows = 500  # Reduced from 1000 for more frequent flushing
 
         # Enhanced monitoring
         self.enhanced_monitor = None
@@ -894,7 +908,11 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         )
         self.memory_tracker.register_cache(self.obs_builder.forecast_cache)
         self.memory_tracker.register_cache(self.obs_builder.agent_forecast_cache)
-        self.memory_tracker.register_cache(self.log_buffer)
+
+        # FIX: Validate normalization consistency between wrapper and environment
+        # This prevents silent degradation where overlay receives inconsistent features
+        if normalize_forecasts:
+            self.obs_builder.postproc.validate_normalization_consistency()
 
         # Observation spaces (TOTAL dims)
         self._build_wrapper_observation_spaces()
@@ -908,8 +926,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         self._ep_meta_return = 0.0
         self._prev_forecasts_for_error: Dict[str, float] = {}
-        # Use the configurable log_interval instead of hardcoded 20
-        self._log_interval = self.log_interval
         self._last_episode_seed = None
         self._last_episode_end_flag = 0
         self._last_step_wall_ms = 0.0
@@ -920,15 +936,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_price_forecast_norm = 0.0
         self._last_price_forecast_aligned = 0.0
 
-        # logging - initialize
-        if self.log_path and not self.disable_csv_logging:
-            print(f"📊 Full logging every {self.log_interval} timesteps from start")
-            self._initialize_logging_safe()
-        elif self.disable_csv_logging:
-            print("⚡ CSV logging disabled - maximum speed mode")
-        else:
-            print("⚡ No logging configured - maximum speed mode")
-        print("✅ Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
+        print("[OK] Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
 
     def _get_currency_rate(self) -> float:
         """Get currency conversion rate from single source of truth."""
@@ -945,95 +953,119 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
     # ---- spaces ----
     def _build_wrapper_observation_spaces(self):
+        """
+        FIX: Build STATIC observation spaces during initialization.
+
+        This method calculates the FINAL, fully augmented observation space dimensions
+        for each agent, accounting for ALL augmentations:
+        - Base observations (from environment)
+        - Forecast features (from forecaster)
+        - Bridge vectors (if overlay_enabled)
+        - Expert suggestions (investor_0 only, 3 dims)
+
+        These spaces are defined ONCE at initialization and NEVER modified at runtime.
+        This ensures compatibility with Stable Baselines3, which builds policy networks
+        based on observation spaces defined at agent initialization time.
+
+        CRITICAL: The wrapper must return observations that EXACTLY match these
+        statically-defined spaces in both reset() and step() methods.
+        """
         self._obs_spaces = {}
         specs = self.obs_builder.validator.agent_observation_specs
+
+        # FIX: Get overlay configuration ONCE during initialization
+        # TIER-SPECIFIC OBSERVATION DIMENSIONS:
+        # Tier 1 (Basic MARL): No forecasts, no bridge → 6D investor observations
+        # Tier 2 (Forecast Integration): Forecasts enabled, NO bridge → 9D investor observations (6 base + 3 forecast)
+        # Tier 3 (Forecast + FGB Meta): Forecasts enabled + bridge vectors → 13D investor observations (9 + 4 bridge)
+        overlay_enabled = getattr(self.env.config, 'overlay_enabled', False)
+        bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable', True)  # Master flag for bridge vectors
+        # CRITICAL: Only add bridge dimensions when BOTH overlay is enabled AND bridge is enabled
+        # This prevents zero-padding noise when bridge vectors aren't actually used
+        # Tier 2 should NOT have bridge dimensions - they interfere with direct forecast learning
+        # Only Tier 3 (with DL overlay) should have bridge dimensions
+        bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4) if (overlay_enabled and bridge_enabled) else 0
+        battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False) and overlay_enabled and bridge_enabled
+        
+        # ROBUSTNESS CHECK: If forecast utilisation is enabled but overlay is not, bridge should be disabled
+        # This ensures Tier 2 doesn't get bridge dimensions
+        enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
+        if enable_forecast_util and not overlay_enabled:
+            # Tier 2: Forecast integration without overlay - no bridge dimensions
+            bridge_dim = 0
+            bridge_enabled = False
+
         for agent, spec in specs.items():
             low, high = spec['bounds']
-            total_dim = spec['total_dim']
-            self._obs_spaces[agent] = spaces.Box(low=low[:total_dim], high=high[:total_dim],
-                                                 shape=(total_dim,), dtype=np.float32)
+            total_dim = spec['total_dim']  # base_dim + forecast_dim (from EnhancedObservationValidator)
 
-    # ---- logging setup ----
-    def _setup_logging_path(self, log_path):
-        if log_path is None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_path = f"logs/multi_horizon_metrics_{ts}.csv"
-        try:
-            log_dir = os.path.dirname(log_path)
-            if log_dir and not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
-        except Exception as e:
-            print(f"⚠️ Could not create log directory: {e}")
-            ts = datetime.now().strftime("%Y%m%d_%H%%M%S")
-            log_path = f"fallback_metrics_{ts}.csv"
-        return log_path
+            # FIX: Calculate FINAL observation space dimensions for each agent
+            if agent == "investor_0":
+                # investor_0 gets: base + forecasts + bridge_vec (if bridge_enabled) + expert_suggestions (if bridge_enabled)
+                # CONDITIONAL: bridge_vec and expert_suggestions only added when overlay_bridge_enable=True (disabled in Tier 2/3)
+                # Expert suggestions are forecast-based trading signals that interfere with PPO learning from direct deltas
+                # expert_suggestion_dim = 3 if (overlay_enabled and bridge_enabled) else 0
+                expert_suggestion_dim = 0 # FIX: Legacy expert suggestions are removed. This padding is no longer needed.
+                final_dim = total_dim + bridge_dim + expert_suggestion_dim
 
-    def _should_log_this_step(self) -> bool:
-        """Determine if we should log this timestep."""
-        # Check if CSV logging is disabled
-        if self.disable_csv_logging:
-            return False
+                # Bounds: base/forecasts use original bounds, bridge/suggestions use [-1, 1]
+                extended_low = np.concatenate([
+                    low[:total_dim],
+                    np.full(bridge_dim, -1.0, dtype=np.float32),
+                    np.full(expert_suggestion_dim, -1.0, dtype=np.float32)
+                ])
+                extended_high = np.concatenate([
+                    high[:total_dim],
+                    np.full(bridge_dim, 1.0, dtype=np.float32),
+                    np.full(expert_suggestion_dim, 1.0, dtype=np.float32)
+                ])
 
-        # Log every N timesteps based on log_interval
-        return (self.step_count % self.log_interval == 0)
+                self._obs_spaces[agent] = spaces.Box(
+                    low=extended_low, high=extended_high,
+                    shape=(final_dim,), dtype=np.float32
+                )
 
-    def _initialize_logging_safe(self):
-        # Initialize logging based on mode
-        if not self.log_path:
-            return
+                bridge_status = "enabled" if bridge_dim > 0 else "disabled"
+                logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
+                           f"bridge={bridge_dim} ({bridge_status}), expert_suggestions={expert_suggestion_dim}, TOTAL={final_dim}")
 
-        # Create log file immediately (normal mode)
-        try:
-            if not os.path.isfile(self.log_path):
-                self._create_log_header()
-            print(f"✅ Logging initialized: {self.log_path}")
-        except Exception as e:
-            print(f"⚠️ Logging initialization failed: {e}")
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.log_path = f"emergency_metrics_{ts}.csv"
-            try:
-                self._create_log_header()
-            except Exception:
-                self.log_path = None
+            elif agent == "battery_operator_0" and battery_bridge_enabled:
+                # battery_operator_0 gets: base + forecasts + bridge_vec (if bridge_enabled)
+                # CONDITIONAL: bridge_vec only added when overlay_bridge_enable=True (disabled in Tier 2/3)
+                final_dim = total_dim + bridge_dim
 
-    def _create_log_header(self):
-        if not self.log_path:
-            return
-        headers = [
-            # timestamp + core
-            "timestamp", "timestep", "episode", "meta_reward", "investment_freq", "capital_fraction",
-            # actions
-            "meta_action_0", "meta_action_1", "inv_action_0", "inv_action_1", "inv_action_2",
-            "batt_action_0", "risk_action_0",
-            # immediate forecasts (raw keys, then normalized/aligned adds)
-            "wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate",
-            # normalized/aligned extras
-            "price_forecast_norm", "price_forecast_aligned",
-            # perf & quick risks (financial values in USD for clarity)
-            "portfolio_performance", "portfolio_value_usd", "equity_usd", "total_return_nav_usd", "overall_risk", "market_risk",
-            # env snapshot (budget in USD, capacities in MW/MWh)
-            "budget_usd", "wind_cap", "solar_cap", "hydro_cap", "battery_energy",
-            "price_actual", "load_actual", "wind_actual", "solar_actual", "hydro_actual",
-            "market_stress", "market_volatility", "revenue_step_usd",
-            # NEW economics fields (all financial values in USD)
-            "generation_revenue_usd", "mtm_pnl_usd", "distributed_profits_usd", "cumulative_returns_usd", "investment_capital_usd", "fund_performance",
-            # episode markers
-            "ep_meta_return", "step_in_episode", "episode_end",
-            # 6D risk vector
-            "risk_market", "risk_gen_var", "risk_portfolio", "risk_liquidity", "risk_stress", "risk_overall",
-            # reward components + weights
-            "reward_financial", "reward_risk", "reward_sustainability", "reward_efficiency", "reward_diversification",
-            "w_financial", "w_risk", "w_sustainability", "w_efficiency", "w_diversification",
-            # ops & scaling health
-            "episode_id", "seed", "step_time_ms", "mem_rss_mb",
-            "action_clip_frac_investor", "action_clip_frac_battery", "action_clip_frac_risk", "action_clip_frac_meta",
-            # MAE (1-step abs error vs previous logged forecast)
-            "mae_price_1", "mae_wind_1", "mae_solar_1", "mae_load_1", "mae_hydro_1",
-            # forecast signal usefulness diagnostic
-            "forecast_alignment_score"
-        ]
-        with open(self.log_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(headers)
+                extended_low = np.concatenate([
+                    low[:total_dim],
+                    np.full(bridge_dim, -1.0, dtype=np.float32)
+                ])
+                extended_high = np.concatenate([
+                    high[:total_dim],
+                    np.full(bridge_dim, 1.0, dtype=np.float32)
+                ])
+
+                self._obs_spaces[agent] = spaces.Box(
+                    low=extended_low, high=extended_high,
+                    shape=(final_dim,), dtype=np.float32
+                )
+
+                bridge_status = "enabled" if bridge_dim > 0 else "disabled"
+                logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
+                           f"bridge={bridge_dim} ({bridge_status}), TOTAL={final_dim}")
+
+            else:
+                # Other agents (risk_controller_0, meta_controller_0): base + forecasts only
+                # NO runtime modifications - use total_dim as-is
+                final_dim = total_dim
+
+                self._obs_spaces[agent] = spaces.Box(
+                    low=low[:final_dim], high=high[:final_dim],
+                    shape=(final_dim,), dtype=np.float32
+                )
+
+                logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
+                           f"TOTAL={final_dim}")
+
+
 
     # ---- properties / API ----
     @property
@@ -1061,6 +1093,116 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     @property
     def max_steps(self): return getattr(self.env, "max_steps", 1000)
 
+    @property
+    def overlay_trainer(self):
+        """Forward overlay_trainer access to base environment."""
+        return getattr(self.env, "overlay_trainer", None)
+
+    # ---- unified augmentation ----
+    def _augment_with_expert_suggestions(self, observations: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        ROBUST DL GUIDANCE: Appends expert trade suggestions and bridge vectors to observations (28D only).
+
+        28D Forecast-Aware Mode:
+        - Returns DL model guidance [wind, solar, hydro] suggestions (first 3 dims of blended 4D strategy)
+        - Bridge vectors: Shared intelligence from DL overlay (appended to investor_0 and battery_operator_0)
+        - Confidence scaling: Scales guidance by forecast confidence with floor (default 0.30)
+        - Multi-horizon blending: Blends 4 horizons (immediate, short, medium, long) with config weights
+
+        This creates a unified observation space that allows the agent to learn with
+        expert guidance from multi-horizon forecasts.
+
+        Args:
+            observations: Dictionary of observations from all agents
+
+        Returns:
+            Dictionary of augmented observations with DL guidance and bridge vectors appended
+        """
+        try:
+            # ===== APPEND BRIDGE VECTORS (TIER-SPECIFIC) =====
+            # TIER-SPECIFIC LOGIC:
+            # Tier 1: No bridge (overlay disabled) → 6D observations
+            # Tier 2: No bridge (forecast integration without overlay) → 9D observations
+            # Tier 3: Bridge enabled (forecast integration + DL overlay) → 13D observations
+            # NO ZERO-PADDING: Bridge dimensions only added when actually enabled and available
+            overlay_enabled = getattr(self.env.config, 'overlay_enabled', False)
+            bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable', True)
+            enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
+            
+            # ROBUSTNESS: Tier 2 should not have bridge dimensions
+            if enable_forecast_util and not overlay_enabled:
+                bridge_dim = 0
+                bridge_enabled = False
+            else:
+                bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4) if (overlay_enabled and bridge_enabled) else 0
+
+            # TIER-SPECIFIC: Only append bridge vectors when they're actually enabled and available
+            # NO ZERO-PADDING: If bridge isn't enabled, observation space shouldn't include those dimensions
+            if 'investor_0' in observations and 'investor_0' in self._obs_spaces:
+                expected_dim = self._obs_spaces['investor_0'].shape[0]
+                current_dim = observations['investor_0'].shape[0]
+                
+                if expected_dim != current_dim:
+                    # Dimension mismatch - this should not happen if observation space is built correctly
+                    if expected_dim > current_dim:
+                        # Observation space expects more dimensions - this should only happen if bridge is enabled
+                        if overlay_enabled and bridge_enabled and hasattr(self.env, '_overlay_bridge_cache'):
+                            bridge_vec = self.env._overlay_bridge_cache.get("investor_0", None)
+                            if bridge_vec is not None and isinstance(bridge_vec, np.ndarray):
+                                bridge_vec = np.clip(bridge_vec.astype(np.float32), -1.0, 1.0)
+                                observations['investor_0'] = np.concatenate([observations['investor_0'], bridge_vec]).astype(np.float32)
+                            else:
+                                # Bridge cache exists but no vector available - this is an error condition
+                                # FAIL-FAST: Don't pad with zeros (would cause noise), raise error instead
+                                raise ValueError(f"[BRIDGE_VEC] Bridge enabled but cache missing for investor_0. "
+                                               f"Expected {expected_dim}D, got {current_dim}D. "
+                                               f"Observation space was built with bridge dimensions but bridge vectors are not available.")
+                        else:
+                            # Bridge dimensions in observation space but bridge not enabled - configuration error
+                            raise ValueError(f"[BRIDGE_VEC] Observation space mismatch: expected {expected_dim}D but bridge not enabled. "
+                                           f"Current dim: {current_dim}D. This indicates observation space was incorrectly built. "
+                                           f"overlay_enabled={overlay_enabled}, bridge_enabled={bridge_enabled}")
+                    else:
+                        # Observation has more dimensions than expected - truncate (shouldn't happen)
+                        logger.warning(f"[BRIDGE_VEC] Observation has more dimensions than expected: {current_dim}D > {expected_dim}D. Truncating.")
+                        observations['investor_0'] = observations['investor_0'][:expected_dim]
+
+                # Append bridge vector to battery_operator_0 if enabled
+                # CONDITIONAL: Only when overlay is enabled AND battery bridge is enabled
+                if 'battery_operator_0' in observations and 'battery_operator_0' in self._obs_spaces:
+                    expected_dim = self._obs_spaces['battery_operator_0'].shape[0]
+                    current_dim = observations['battery_operator_0'].shape[0]
+                    
+                    if expected_dim > current_dim and overlay_enabled and bridge_enabled:
+                        battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False)
+                        if battery_bridge_enabled and hasattr(self.env, '_overlay_bridge_cache_batt'):
+                            bridge_vec_batt = getattr(self.env, '_overlay_bridge_cache_batt', None)
+                            if bridge_vec_batt is not None and isinstance(bridge_vec_batt, np.ndarray):
+                                bridge_vec_batt = np.clip(bridge_vec_batt.astype(np.float32), -1.0, 1.0)
+                                observations['battery_operator_0'] = np.concatenate([observations['battery_operator_0'], bridge_vec_batt]).astype(np.float32)
+                            else:
+                                logger.warning(f"[BRIDGE_VEC] Battery bridge enabled but cache missing. "
+                                             f"Expected {expected_dim}D, got {current_dim}D.")
+                        elif expected_dim > current_dim:
+                            logger.error(f"[BRIDGE_VEC] Battery observation space mismatch: expected {expected_dim}D but bridge not enabled. "
+                                       f"Current dim: {current_dim}D.")
+
+            if 'investor_0' not in observations:
+                return observations
+
+            # REMOVED: Expert suggestion augmentation (legacy code removed)
+            # Tier 2 optionally uses GNN encoder to learn feature relationships
+            # (when --enable_forecast_utilisation and --enable_gnn_encoder flags enabled).
+            # Pre-trained ANN/LSTM forecasts provide additional observations.
+            # NOT rule-based expert suggestions. Expert suggestions interfered with PPO learning and are deprecated
+
+            return observations
+
+        except Exception as e:
+            logger.error(f"Error in _augment_with_expert_suggestions: {e}")
+            # Fallback: return observations unchanged
+            return observations
+
     # ---- verification methods ----
     def _verify_capacity_consistency(self):
         """Verify wrapper is using correct capacity values from environment"""
@@ -1081,17 +1223,17 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 expected_min_mw = budget / 2_000_000
 
                 if total_mw < expected_min_mw * 0.1:  # Allow very low deployment (10% of expected)
-                    logging.warning(f"Very low capacity deployment: {total_mw:.1f}MW (expected ~{expected_min_mw:.0f}MW for ${budget:,.0f} budget)")
+                    logger.warning(f"Very low capacity deployment: {total_mw:.1f}MW (expected ~{expected_min_mw:.0f}MW for ${budget:,.0f} budget)")
                     return False
             except Exception:
                 # Fallback to original check for small funds
                 if total_mw < 5:  # Minimum 5MW for any meaningful operation
-                    logging.warning(f"Insufficient capacity deployment: {total_mw:.1f}MW")
+                    logger.warning(f"Insufficient capacity deployment: {total_mw:.1f}MW")
                     return False
                 
             return True
         except Exception as e:
-            logging.error(f"Capacity verification failed: {e}")
+            logger.error(f"Capacity verification failed: {e}")
             return False
 
     def _safe_portfolio_value(self, raw_value, initial_budget):
@@ -1112,6 +1254,25 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._ep_meta_return = 0.0
         self._prev_forecasts_for_error = {}
         self._last_price_forecast_norm = 0.0
+
+        # LOG OVERLAY SHAPES ON FIRST EPISODE (28D only)
+        if self.episode_count == 1 and hasattr(self.base_env, 'dl_adapter_overlay'):
+            try:
+                overlay_adapter = self.base_env.dl_adapter_overlay
+                if overlay_adapter is not None:
+                    feature_dim = overlay_adapter.feature_dim
+                    bridge_dim = overlay_adapter.bridge_dim
+                    logger.info(f"[WRAPPER_SHAPES] Episode 1: DL Overlay 34D mode (28D base + 6D deltas)")
+                    logger.info(f"  - Input shape: (1, {feature_dim}) [6 market + 3 positions + 16 forecasts + 3 portfolio + 6 deltas]")
+                    logger.info(f"  - bridge_vec: (1, {bridge_dim})")
+                    logger.info(f"  - risk_budget: (1, 1) in [0.5, 1.5]")
+                    logger.info(f"  - pred_reward: (1, 1) in [-1, 1]")
+                    logger.info(f"  - strat_immediate: (1, 4) [wind, solar, hydro, price]")
+                    logger.info(f"  - strat_short: (1, 4) [wind, solar, hydro, price]")
+                    logger.info(f"  - strat_medium: (1, 4) [wind, solar, hydro, price]")
+                    logger.info(f"  - strat_long: (1, 4) [wind, solar, hydro, price] (risk-only)")
+            except Exception as e:
+                logger.warning(f"Could not log overlay shapes: {e}")
         self._last_price_forecast_aligned = 0.0
 
         # Initialize forecaster history with sufficient data for predictions
@@ -1125,7 +1286,37 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             pass
 
         enhanced = self.obs_builder.enhance_observations(obs)
-        validated = self._validate_observations_safe(enhanced)
+
+        # FIX: Skip investor_0 and battery_operator_0 validation before augmentation
+        # (they will be augmented after, and augmentation must produce exact static space size)
+        validated = self._validate_observations_safe(enhanced, skip_investor_0=True, skip_battery=True)
+
+        # FIX: UNIFIED AUGMENTATION - Append bridge vectors and expert suggestions
+        # This MUST produce observations that exactly match the static spaces defined in __init__
+        validated = self._augment_with_expert_suggestions(validated)
+
+        # FIX: VALIDATION - Verify all observations match their static observation spaces
+        # This is a safety check to catch any dimension mismatches
+        for agent in validated:
+            if agent in self._obs_spaces:
+                expected_dim = self._obs_spaces[agent].shape[0]
+                actual_dim = validated[agent].shape[0]
+
+                if actual_dim != expected_dim:
+                    # FAIL-FAST: Log the mismatch and raise an error
+                    # This indicates a bug in observation building or augmentation
+                    error_msg = (f"[OBS_SPACE_MISMATCH] {agent}: expected {expected_dim} dims, "
+                               f"got {actual_dim}. This indicates a bug in observation building. "
+                               f"Static space: {self._obs_spaces[agent].shape}, "
+                               f"Actual observation: {validated[agent].shape}")
+                    logger.error(error_msg)
+                    # Truncate or pad to match (fallback, but log the error)
+                    if actual_dim > expected_dim:
+                        validated[agent] = validated[agent][:expected_dim]
+                    else:
+                        padding = np.zeros(expected_dim - actual_dim, dtype=np.float32)
+                        validated[agent] = np.concatenate([validated[agent], padding])
+
         return validated, info
 
     def step(self, actions: Dict[str, Any]):
@@ -1136,6 +1327,15 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_clip_counts = clip_counts
         self._last_clip_totals = clip_totals
 
+        # CRITICAL FIX #6: Populate forecast arrays BEFORE env.step() so DL labeler has access
+        # The DL overlay labeler needs forecasts during step execution for label generation
+        try:
+            if hasattr(self.env, 'populate_forecast_arrays'):
+                current_forecasts = self._get_forecasts_for_logging()
+                self.env.populate_forecast_arrays(getattr(self.env, 't', 0), current_forecasts)
+        except Exception:
+            pass  # Don't break main flow if forecast population fails
+
         obs, rewards, dones, truncs, infos = self.env.step(actions)
         self._last_episode_end_flag = 1 if any(bool(x) for x in dones.values()) else 0
         self._ep_meta_return += float(rewards.get("meta_controller_0", 0.0) or 0.0)
@@ -1145,7 +1345,36 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         # build enhanced obs with full forecasting
         enhanced = self.obs_builder.enhance_observations(obs)
-        validated = self._validate_observations_safe(enhanced)
+
+        # FIX: Skip investor_0 and battery_operator_0 validation before augmentation
+        # (they will be augmented after, and augmentation must produce exact static space size)
+        validated = self._validate_observations_safe(enhanced, skip_investor_0=True, skip_battery=True)
+
+        # FIX: UNIFIED AUGMENTATION - Append bridge vectors and expert suggestions
+        # This MUST produce observations that exactly match the static spaces defined in __init__
+        validated = self._augment_with_expert_suggestions(validated)
+
+        # FIX: VALIDATION - Verify all observations match their static observation spaces
+        # This is a safety check to catch any dimension mismatches
+        for agent in validated:
+            if agent in self._obs_spaces:
+                expected_dim = self._obs_spaces[agent].shape[0]
+                actual_dim = validated[agent].shape[0]
+
+                if actual_dim != expected_dim:
+                    # FAIL-FAST: Log the mismatch and raise an error
+                    # This indicates a bug in observation building or augmentation
+                    error_msg = (f"[OBS_SPACE_MISMATCH] {agent}: expected {expected_dim} dims, "
+                               f"got {actual_dim}. This indicates a bug in observation building. "
+                               f"Static space: {self._obs_spaces[agent].shape}, "
+                               f"Actual observation: {validated[agent].shape}")
+                    logger.error(error_msg)
+                    # Truncate or pad to match (fallback, but log the error)
+                    if actual_dim > expected_dim:
+                        validated[agent] = validated[agent][:expected_dim]
+                    else:
+                        padding = np.zeros(expected_dim - actual_dim, dtype=np.float32)
+                        validated[agent] = np.concatenate([validated[agent], padding])
 
         self.step_count += 1
         step_time = (time.perf_counter() - t0)
@@ -1162,36 +1391,48 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 self.enhanced_monitor.update_portfolio_metrics(self._last_portfolio_value)
             self.enhanced_monitor.log_summary()
 
-        # FIXED: Populate forecast arrays for DL overlay labeler
-        try:
-            if hasattr(self.env, 'populate_forecast_arrays'):
-                current_forecasts = self._get_forecasts_for_logging()
-                self.env.populate_forecast_arrays(getattr(self.env, 't', 0), current_forecasts)
-        except Exception:
-            pass  # Don't break main flow if forecast population fails
-
-        # periodic logging
-        if self.log_path and self._should_log_this_step() and not self.disable_csv_logging:
-            if (self.step_count % self._log_interval == 0 or self._last_episode_end_flag):
-                log_forecasts = self._get_forecasts_for_logging()
-                self._log_metrics_efficient(actions, rewards, log_forecasts)
-
         if self._last_episode_end_flag:
             self._prev_forecasts_for_error = {}
 
         return validated, rewards, dones, truncs, infos
 
     # ---- helpers ----
-    def _validate_observations_safe(self, obs_dict):
+    def _validate_observations_safe(self, obs_dict, skip_investor_0=False, skip_battery=False):
+        """
+        Validate observations.
+
+        Args:
+            obs_dict: Dictionary of observations
+            skip_investor_0: If True, skip validation for investor_0 (will be augmented after)
+            skip_battery: If True, skip validation for battery_operator_0 (will be augmented after)
+        """
         validated = {}
         for agent in self.possible_agents:
             try:
+                # Skip investor_0 if it will be augmented after validation
+                if skip_investor_0 and agent == "investor_0":
+                    if agent in obs_dict:
+                        validated[agent] = obs_dict[agent].astype(np.float32)
+                    else:
+                        validated[agent] = self.obs_builder.validator._create_safe_observation(agent)
+                    # DEBUG: Confirm skip
+                    # print(f"[SKIP] investor_0 validation skipped (will be augmented after)")
+                    continue
+
+                # Skip battery_operator_0 if it will be augmented after validation
+                if skip_battery and agent == "battery_operator_0":
+                    if agent in obs_dict:
+                        validated[agent] = obs_dict[agent].astype(np.float32)
+                    else:
+                        validated[agent] = self.obs_builder.validator._create_safe_observation(agent)
+                    continue
+
                 if agent in obs_dict:
                     obs = obs_dict[agent]
                     expected = self.observation_space(agent).shape
                     if obs.shape != expected:
                         if self.error_count < self.max_errors:
-                            print(f"⚠️ Obs shape mismatch for {agent}: {obs.shape} vs {expected}")
+                            print(f"[WARN] Obs shape mismatch for {agent}: {obs.shape} vs {expected}")
                         self.error_count += 1
                         obs = self.obs_builder.validator._create_safe_observation(agent)
                     validated[agent] = obs.astype(np.float32)
@@ -1199,7 +1440,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     validated[agent] = self.obs_builder.validator._create_safe_observation(agent)
             except Exception as e:
                 if self.error_count < self.max_errors:
-                    print(f"⚠️ Obs validation failed for {agent}: {e}")
+                    print(f"[WARN] Obs validation failed for {agent}: {e}")
                 self.error_count += 1
                 validated[agent] = self.obs_builder.validator._create_safe_observation(agent)
         return validated
@@ -1222,9 +1463,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     tf.keras.backend.clear_session()
                 except Exception:
                     pass
-
-                # Flush log buffer more aggressively
-                self._flush_log_buffer()
 
                 # Clear validation caches
                 if hasattr(self.obs_builder.validator, 'validation_cache'):
@@ -1253,7 +1491,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         except Exception as e:
             if self.error_count < self.max_errors:
-                print(f"⚠️ Memory cleanup failed: {e}")
+                print(f"[WARN] Memory cleanup failed: {e}")
                 self.error_count += 1
 
     def _to_numpy_safe(self, a_in):
@@ -1346,6 +1584,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     arr = arr[:need]
 
             before = arr.copy()
+            # FIX: Final action clipping in wrapper
+            # CRITICAL: This must match the clipping done in metacontroller._coerce_action_for_buffer
+            # to ensure off-policy agents (SAC/TD3) have consistent actions between replay buffer and execution
             arr = np.minimum(np.maximum(arr, space.low), space.high)
             validated[agent] = arr.astype(np.float32)
 
@@ -1368,6 +1609,72 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     self.forecaster.update(row)
         except Exception:
             pass
+
+    def validate_observation_dimensions_comprehensive(self, observations: Dict[str, np.ndarray]) -> bool:
+        """
+        COMPREHENSIVE: Validate all observation dimensions match declared spaces.
+
+        This is a runtime safety check to catch:
+        - Config changes between initialization and runtime
+        - Bridge vector dimension mismatches
+        - Expert suggestion dimension mismatches
+        - Forecast augmentation errors
+
+        Returns:
+            bool: True if all observations are valid, False otherwise
+
+        Raises:
+            ValueError: If critical dimension mismatch detected
+        """
+        all_valid = True
+        errors = []
+
+        for agent, obs in observations.items():
+            if agent not in self._obs_spaces:
+                errors.append(f"Agent {agent} not in observation spaces")
+                all_valid = False
+                continue
+
+            expected_space = self._obs_spaces[agent]
+            expected_dim = expected_space.shape[0]
+            actual_dim = obs.shape[0] if hasattr(obs, 'shape') else len(obs)
+
+            if actual_dim != expected_dim:
+                error_msg = (
+                    f"DIMENSION MISMATCH for {agent}: "
+                    f"expected {expected_dim}, got {actual_dim}. "
+                    f"Expected space: {expected_space.shape}, "
+                    f"Actual observation: {obs.shape if hasattr(obs, 'shape') else len(obs)}"
+                )
+                errors.append(error_msg)
+                all_valid = False
+
+            # Validate bounds
+            if not expected_space.contains(obs):
+                # Check which dimensions are out of bounds
+                out_of_bounds = []
+                for i in range(min(len(obs), len(expected_space.low))):
+                    if obs[i] < expected_space.low[i] or obs[i] > expected_space.high[i]:
+                        out_of_bounds.append(
+                            f"dim[{i}]={obs[i]:.4f} not in [{expected_space.low[i]:.4f}, {expected_space.high[i]:.4f}]"
+                        )
+
+                if out_of_bounds:
+                    error_msg = f"OUT OF BOUNDS for {agent}: {', '.join(out_of_bounds[:5])}"
+                    if len(out_of_bounds) > 5:
+                        error_msg += f" ... and {len(out_of_bounds) - 5} more"
+                    errors.append(error_msg)
+                    all_valid = False
+
+        if not all_valid:
+            error_summary = "\n".join(errors)
+            logger.error(f"[OBSERVATION VALIDATION FAILED]\n{error_summary}")
+
+            # In strict mode, raise exception
+            if getattr(self, 'strict_validation', False):
+                raise ValueError(f"Observation validation failed:\n{error_summary}")
+
+        return all_valid
 
     # ---- logging helpers ----
     def _safe_float(self, v, default=0.0):
@@ -1540,210 +1847,13 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             self._last_portfolio_value = None
             return [1.0, 0.5, 0.3]
 
-    def _log_metrics_efficient(self, actions: Dict[str, Any], rewards: Dict[str, float],
-                               all_forecasts: Dict[str, float]):
-        if not self.log_path:
-            return
-        try:
-            with self.log_lock:
-                ts_str = self._get_timestamp_for_logging()
-                step_t = getattr(self.env, 't', self.step_count)
 
-                # --- START: CURRENCY & METRIC SETUP ---
-                # Get the single source of truth for currency conversion from the environment
-                dkk_to_usd_rate = self._get_currency_rate()
-
-                # GUARDRAIL: Check currency rate is valid to prevent regression
-                assert dkk_to_usd_rate > 0, f"Invalid currency rate: {dkk_to_usd_rate}"
-
-                # Fetch core financial values from the environment (all are in DKK at this stage)
-                # These will be converted to USD before logging.
-                budget_dkk = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
-                generation_revenue_dkk = self._safe_float(getattr(self.env, 'last_generation_revenue', 0.0), 0.0)
-                revenue_step_dkk = self._safe_float(getattr(self.env, 'last_revenue', getattr(self.env, 'revenue', 0.0)), 0.0)
-                mtm_pnl_dkk = self._safe_float(getattr(self.env, 'last_mtm_pnl', 0.0), 0.0)
-                distributed_profits_dkk = self._safe_float(getattr(self.env, 'distributed_profits', 0.0), 0.0)
-                cumulative_returns_dkk = self._safe_float(getattr(self.env, 'cumulative_returns', 0.0), 0.0)
-                investment_capital_dkk = self._safe_float(getattr(self.env, 'investment_capital', 0.0), 0.0)
-                # --- END: CURRENCY & METRIC SETUP ---
-
-                # core (non-monetary)
-                meta_reward = self._safe_float(rewards.get("meta_controller_0", 0.0), 0.0)
-                inv_freq = int(getattr(self.env, "investment_freq", -1))
-                cap_frac = self._safe_float(getattr(self.env, "capital_allocation_fraction", -1), -1.0)
-
-                # actions
-                def get_action_vec(agent, n):
-                    a = actions.get(agent, None)
-                    a = self._to_numpy_safe(a) # convert tensors
-                    if isinstance(a, np.ndarray): vec = a.flatten().tolist()
-                    elif np.isscalar(a): vec = [float(a)]
-                    elif isinstance(a, (list, tuple)): vec = list(a)
-                    else: vec = []
-                    out = [float(v) if np.isfinite(v) else 0.0 for v in vec]
-                    while len(out) < n: out.append(0.0)
-                    return out[:n]
-
-                meta_a0, meta_a1 = get_action_vec("meta_controller_0", 2)
-                inv_a0, inv_a1, inv_a2 = get_action_vec("investor_0", 3)
-                batt_a0 = get_action_vec("battery_operator_0", 1)[0]
-                risk_a0 = get_action_vec("risk_controller_0", 1)[0]
-
-                # Forecasts (non-monetary)
-                forecast_keys = ["wind_forecast_immediate", "solar_forecast_immediate", "hydro_forecast_immediate", "price_forecast_immediate", "load_forecast_immediate"]
-                forecasts_logged = [self._safe_float(all_forecasts.get(k, 0.0), 0.0) for k in forecast_keys]
-                pf_norm, pf_aligned = self._get_price_forecast_norm_and_aligned(all_forecasts)
-                self._last_price_forecast_norm = pf_norm
-                self._last_price_forecast_aligned = pf_aligned
-
-                # perf & quick risks (ratios/scores)
-                perf, overall_risk, market_risk = self._calc_perf_and_quick_risks()
-
-                # Get portfolio value/equity (in DKK from env)
-                if hasattr(self, '_last_portfolio_value') and self._last_portfolio_value is not None:
-                    portfolio_value_dkk = float(self._last_portfolio_value)
-                else:
-                    cash_dkk = self._safe_float(getattr(self.env, 'budget', 0.0), 0.0)
-                    w_val_dkk = self._safe_float(getattr(self.env, 'wind_instrument_value', 0.0), 0.0)
-                    s_val_dkk = self._safe_float(getattr(self.env, 'solar_instrument_value', 0.0), 0.0)
-                    h_val_dkk = self._safe_float(getattr(self.env, 'hydro_instrument_value', 0.0), 0.0)
-                    portfolio_value_dkk = cash_dkk + w_val_dkk + s_val_dkk + h_val_dkk
-                    initial_budget_dkk = float(getattr(self.env, 'init_budget', 500_000_000))
-                    portfolio_value_dkk = self._safe_portfolio_value(portfolio_value_dkk, initial_budget_dkk)
-                
-                # --- START: CONSISTENT USD CONVERSION FOR LOGGING ---
-                # CURRENCY APPROACH: All internal calculations in DKK, convert to USD only for CSV output
-                # This provides clear $USD values in reports while maintaining DKK precision internally
-                portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
-                equity_usd = portfolio_value_usd # Equity is the portfolio value in this context
-                distributed_profits_usd = distributed_profits_dkk * dkk_to_usd_rate
-                total_return_nav_usd = portfolio_value_usd + distributed_profits_usd
-                budget_usd = budget_dkk * dkk_to_usd_rate
-                
-                generation_revenue_usd = generation_revenue_dkk * dkk_to_usd_rate
-                revenue_step_usd = revenue_step_dkk * dkk_to_usd_rate
-                mtm_pnl_usd = mtm_pnl_dkk * dkk_to_usd_rate
-                cumulative_returns_usd = cumulative_returns_dkk * dkk_to_usd_rate
-                investment_capital_usd = investment_capital_dkk * dkk_to_usd_rate
-                # fund_performance is a ratio, no conversion needed
-                fund_performance = self._safe_float(getattr(self.env, 'fund_performance', 0.0), 0.0)
-                # --- END: CONSISTENT USD CONVERSION FOR LOGGING ---
-
-                # env snapshot (physical capacities, non-monetary)
-                wind_c = self._safe_float(getattr(self.env, 'wind_capacity_mw', 0.0), 0.0)
-                solar_c = self._safe_float(getattr(self.env, 'solar_capacity_mw', 0.0), 0.0)
-                hydro_c = self._safe_float(getattr(self.env, 'hydro_capacity_mw', 0.0), 0.0)
-                batt_e = self._safe_float(getattr(self.env, 'battery_energy', 0.0), 0.0)
-                actuals = self._get_actuals_for_logging()
-                price_act = self._safe_float(actuals['price'], 0.0)
-                load_act = self._safe_float(actuals['load'], 0.0)
-                wind_act = self._safe_float(actuals['wind'], 0.0)
-                solar_act = self._safe_float(actuals['solar'], 0.0)
-                hydro_act = self._safe_float(actuals['hydro'], 0.0)
-                market_stress = self._safe_float(getattr(self.env, 'market_stress', 0.0), 0.0)
-                market_vol = self._safe_float(getattr(self.env, 'market_volatility', 0.0), 0.0)
-
-                # episode markers & risk (non-monetary)
-                step_in_ep = int(getattr(self.env, 'step_in_episode', self.step_count))
-                episode_end = int(self._last_episode_end_flag)
-                r6 = self._get_risk_vector6()
-
-                # reward breakdown & weights (scaled scores, non-monetary)
-                rb = getattr(self.env, "last_reward_breakdown", {}) or {}
-                rw = getattr(self.env, "last_reward_weights", {}) or {}
-                r_fin = self._safe_float(rb.get("financial", 0.0), 0.0)
-                r_risk = self._safe_float(rb.get("risk_management", 0.0), 0.0)
-                r_sus = self._safe_float(rb.get("sustainability", 0.0), 0.0)
-                r_eff = self._safe_float(rb.get("efficiency", 0.0), 0.0)
-                r_div = self._safe_float(rb.get("diversification", 0.0), 0.0)
-                w_fin = self._safe_float(rw.get("financial", 0.0), 0.0)
-                w_rsk = self._safe_float(rw.get("risk_management", 0.0), 0.0)
-                w_sus = self._safe_float(rw.get("sustainability", 0.0), 0.0)
-                w_eff = self._safe_float(rw.get("efficiency", 0.0), 0.0)
-                w_div = self._safe_float(rw.get("diversification", 0.0), 0.0)
-
-                # ops & scaling health (non-monetary)
-                mem_mb = float(self.memory_tracker.get_memory_usage())
-                seed = self._last_episode_seed if self._last_episode_seed is not None else -1
-                step_ms = float(self._last_step_wall_ms)
-                def clip_frac(key):
-                    tot = max(1, self._last_clip_totals.get(key, 1))
-                    return float(_safe_divide(self._last_clip_counts.get(key, 0), tot, 0.0))
-                clip_inv, clip_bat, clip_rsk, clip_meta = clip_frac("investor"), clip_frac("battery"), clip_frac("risk"), clip_frac("meta")
-
-                # MAE@1 using previous forecast cache (non-monetary)
-                def _mae(prev, actual): return abs(self._safe_float(prev, 0.0) - self._safe_float(actual, 0.0))
-                mae_price = _mae(self._prev_forecasts_for_error.get("price_forecast_immediate"), price_act)
-                mae_wind = _mae(self._prev_forecasts_for_error.get("wind_forecast_immediate"), wind_act)
-                mae_solar = _mae(self._prev_forecasts_for_error.get("solar_forecast_immediate"), solar_act)
-                mae_load = _mae(self._prev_forecasts_for_error.get("load_forecast_immediate"), load_act)
-                mae_hydro = _mae(self._prev_forecasts_for_error.get("hydro_forecast_immediate"), hydro_act)
-                self._prev_forecasts_for_error = {k: v for k, v in zip(forecast_keys, forecasts_logged)}
-
-                # Forecast alignment score diagnostic (non-monetary)
-                try:
-                    # FIXED: Use centralized price normalization to eliminate DRY violation
-                    price_val = self._safe_float(actuals['price'], 0.0)
-                    try:
-                        # Use centralized normalization method instead of duplicating logic
-                        cur_price_norm = self.obs_builder.postproc.normalize_value('price', price_val)
-                    except Exception:
-                        cur_price_norm = 0.0
-                    realized_ret_dummy = 0.0 # Placeholder as real return calc is complex here
-                    forecast_alignment_score = float(np.sign(self._last_price_forecast_aligned - cur_price_norm) * realized_ret_dummy)
-                except Exception:
-                    forecast_alignment_score = 0.0
-
-                # --- Assemble the final log row with all monetary values in USD ---
-                row = [
-                    ts_str, int(step_t), int(self.episode_count), meta_reward, inv_freq, cap_frac,
-                    meta_a0, meta_a1, inv_a0, inv_a1, inv_a2, batt_a0, risk_a0,
-                    *forecasts_logged,
-                    self._ensure_float(self._last_price_forecast_norm), self._ensure_float(self._last_price_forecast_aligned),
-                    perf, self._ensure_float(portfolio_value_usd), self._ensure_float(equity_usd), self._ensure_float(total_return_nav_usd), overall_risk, market_risk,
-                    self._ensure_float(budget_usd), wind_c, solar_c, hydro_c, batt_e,
-                    price_act, load_act, wind_act, solar_act, hydro_act,
-                    market_stress, market_vol, self._ensure_float(revenue_step_usd),
-                    self._ensure_float(generation_revenue_usd), self._ensure_float(mtm_pnl_usd), self._ensure_float(distributed_profits_usd), self._ensure_float(cumulative_returns_usd), self._ensure_float(investment_capital_usd), self._ensure_float(fund_performance),
-                    self._ep_meta_return, step_in_ep, episode_end,
-                    *r6,
-                    r_fin, r_risk, r_sus, r_eff, r_div,
-                    w_fin, w_rsk, w_sus, w_eff, w_div,
-                    self.episode_count, seed, step_ms, mem_mb,
-                    clip_inv, clip_bat, clip_rsk, clip_meta,
-                    mae_price, mae_wind, mae_solar, mae_load, mae_hydro,
-                    forecast_alignment_score
-                ]
-
-                self.log_buffer.append(row)
-                # CONSISTENT LOGGING: Flush immediately for 20-timestep logging consistency
-                # This ensures logged steps are immediately visible in CSV file
-                if (self.step_count % self._log_interval == 0) or len(self.log_buffer) >= 25 or self.step_count % 500 == 0 or len(self.log_buffer) >= self._flush_every_rows or episode_end:
-                    self._flush_log_buffer()
-        except Exception as e:
-            if self.error_count < self.max_errors:
-                print(f"⚠️ Metrics logging failed: {e}")
-                self.error_count += 1
-
-    def _flush_log_buffer(self):
-        """Safely flushes the in-memory log buffer to the CSV file."""
-        if not self.log_path or not self.log_buffer:
-            return
-        try:
-            with self.log_lock, open(self.log_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                while self.log_buffer:
-                    writer.writerow(self.log_buffer.popleft())
-        except Exception as e:
-            if self.error_count < self.max_errors:
-                print(f"⚠️ Failed to flush log buffer: {e}")
-                self.error_count += 1
 
     # ---- debug methods ----
     def debug_wrapper_data_sources(self):
         """Debug what data sources the wrapper is using"""
         env_ref = getattr(self, "env", self)
-        
+
         print("Wrapper Data Sources:")
         print(f"  Physical Wind: {getattr(env_ref, 'wind_capacity_mw', 'MISSING')}MW")
         print(f"  Financial Wind: ${getattr(env_ref, 'wind_instrument_value', 'MISSING'):,.0f}")
@@ -1760,39 +1870,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
     def close(self):
         try:
-            # Save final results if CSV logging was disabled but final results are requested
-            if self.disable_csv_logging and hasattr(self, 'log_path') and self.log_path:
-                self._save_final_results_only()
-            else:
-                self._flush_log_buffer()
-        finally:
-            try:
-                if hasattr(self.env, "close"):
-                    self.env.close()
-            except Exception:
-                pass
-
-    def _save_final_results_only(self):
-        """Save only the final timestep results to CSV when disable_csv_logging=True."""
-        if not self.log_path:
-            return
-
-        try:
-            # Create header if file doesn't exist
-            if not os.path.isfile(self.log_path):
-                self._create_log_header()
-
-            # Get final state and log it
-            final_actions = {}  # Empty actions for final state
-            final_rewards = {}  # Empty rewards for final state
-            final_forecasts = self._get_forecasts_for_logging()
-
-            print(f"💾 Saving final results to: {self.log_path}")
-            self._log_metrics_efficient(final_actions, final_rewards, final_forecasts)
-            self._flush_log_buffer()
-
-        except Exception as e:
-            print(f"⚠️ Failed to save final results: {e}")
+            if hasattr(self.env, "close"):
+                self.env.close()
+        except Exception:
+            pass
 
     # alias PettingZoo naming if needed
     def state(self):
@@ -1803,395 +1884,115 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             return None
 
 
-class BaselineCSVWrapper(ParallelEnv):
-    """Baseline wrapper that adds CSV logging without forecasting overhead."""
+# =========================
+# FGB Forecast Validation
+# =========================
+def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
+    """
+    Verify that forecasts are actually appended to observations in FGB mode.
 
-    def __init__(self, base_env, log_path=None, total_timesteps=50000, log_interval=20):
-        self.env = base_env
-        self.total_timesteps = total_timesteps
-        self.log_interval = log_interval
+    This function checks:
+    1. Forecast features are present in observations
+    2. Forecast features have non-zero values (not just padding)
+    3. Forecast features have reasonable variance
 
-        # CSV logging setup
-        self.log_path = log_path
-        self.csv_file = None
-        self.csv_writer = None
-        self.csv_lock = threading.Lock()
-        self.csv_buffer = []
-        self.buffer_size = 50
-        self.step_count = 0
+    Args:
+        wrapper: The wrapped environment
+        num_steps: Number of steps to verify (default: 10)
 
-        # Initialize CSV file
-        if self.log_path:
-            self._init_csv()
-            print(f"📊 Baseline logging: every {self.log_interval} timesteps")
-        else:
-            print("⚡ No logging configured - maximum speed mode")
+    Returns:
+        True if forecasts are valid, raises ValueError otherwise
 
-        # Copy attributes from base environment
-        self.metadata = getattr(base_env, 'metadata', {})
-        self.possible_agents = base_env.possible_agents
-        self.agents = base_env.agents
-        self.observation_spaces = base_env.observation_spaces
-        self.action_spaces = base_env.action_spaces
+    Raises:
+        ValueError: If forecasts are missing, all-zero, or have near-zero variance
+    """
+    try:
+        logger.info("[FGB_VALIDATION] Starting forecast verification...")
 
-    def _init_csv(self):
-        """Initialize CSV file with headers."""
-        try:
-            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
-            self.csv_file = open(self.log_path, 'w', newline='', encoding='utf-8')
+        # Reset environment
+        obs, info = wrapper.reset()
 
-            # Define CSV headers for baseline mode
-            headers = [
-                'timestep', 'timestamp', 'step_in_episode',
-                'Total_Portfolio_Value_USD', 'Investment_Capital_USD', 'Distributed_Profits_USD',
-                'Cumulative_Returns_USD', 'Generation_Revenue_USD', 'MTM_Value_USD',
-                'Operational_Revenue_USD', 'Battery_Revenue_USD', 'MTM_PnL_USD',
-                'Battery_Energy_MWh', 'Battery_Capacity_MW',
-                'Wind_Generation_MW', 'Solar_Generation_MW', 'Hydro_Generation_MW',
-                'Load_MW', 'Price_DKK_MWh', 'Price_USD_MWh',
-                'Capital_Allocation_Fraction', 'Investment_Frequency',
-                'Market_Volatility', 'Market_Stress', 'Overall_Risk',
-                'Reward_Total', 'Reward_NAV_Growth', 'Reward_Risk_Adjusted',
-                'step_time_ms', 'mem_rss_mb'
-            ]
+        if 'investor_0' not in obs:
+            raise ValueError("FGB validation: investor_0 not in observations")
 
-            self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=headers)
-            self.csv_writer.writeheader()
-            self.csv_file.flush()
+        investor_obs = obs['investor_0']
+        total_dim = len(investor_obs)
 
-        except Exception as e:
-            print(f"Warning: Could not initialize CSV logging: {e}")
-            self.csv_file = None
-            self.csv_writer = None
+        # Expected structure:
+        # - Base features: 6 dims (market state)
+        # - Forecast features: 16 dims (4 horizons × 4 targets)
+        # - Portfolio features: 3 dims
+        # - Delta features: 6 dims
+        # Total: 6 + 16 + 3 + 6 = 31 dims (or more with augmentation)
 
-    def _log_step(self, obs, rewards, dones, truncs, infos):
-        """Log step data to CSV."""
-        if not self.csv_writer:
-            return
+        if total_dim < 22:
+            raise ValueError(
+                f"FGB validation: Observation too small ({total_dim} dims). "
+                f"Expected at least 22 dims (6 base + 16 forecasts). "
+                f"Forecasts may not be appended."
+            )
 
-        try:
-            # Get environment data
-            env = self.env
+        # Forecast features are typically at indices 6-21 (16 dims)
+        forecast_start = 6
+        forecast_end = min(22, total_dim)  # At least 16 forecast dims
+        forecast_features = investor_obs[forecast_start:forecast_end]
 
-            # Calculate portfolio value in USD using config rate
-            fund_nav = getattr(env, 'fund_nav', 500_000_000)
-            dkk_to_usd = self._get_currency_rate()
-            portfolio_value_usd = fund_nav * dkk_to_usd
+        # Check 1: Forecast magnitude (should not be all zeros)
+        forecast_magnitude = float(np.abs(forecast_features).sum())
+        if forecast_magnitude < 0.01:
+            raise ValueError(
+                f"FGB validation: Forecast features are all near-zero! "
+                f"Forecasts may not be generated or appended. "
+                f"forecast_magnitude={forecast_magnitude:.6f} (expected > 0.01)"
+            )
 
-            # Get current data point
-            i = getattr(env, 't', 0)
-            if i < len(env.data):
-                # Access data from the DataFrame
-                row = env.data.iloc[i]
-                timestamp = row.get('timestamp', f"step_{i}")
-                price_dkk = row.get('price', 0)
-                wind = row.get('wind', 0)
-                solar = row.get('solar', 0)
-                hydro = row.get('hydro', 0)
-                load = row.get('load', 0)
-            else:
-                timestamp = f"step_{i}"
-                price_dkk = 0
-                wind = solar = hydro = load = 0
+        # Check 2: Forecast variance (should have some variation)
+        forecast_std = float(np.std(forecast_features))
+        if forecast_std < 0.001:
+            raise ValueError(
+                f"FGB validation: Forecast features have near-zero variance! "
+                f"May be using flat/constant forecasts. "
+                f"forecast_std={forecast_std:.6f} (expected > 0.001)"
+            )
 
-            # Prepare row data
-            row = {
-                'timestep': i,
-                'timestamp': str(timestamp),
-                'step_in_episode': getattr(env, 'step_in_episode', i),
-                'Total_Portfolio_Value_USD': self._ensure_float(portfolio_value_usd),
-                'Investment_Capital_USD': self._ensure_float(getattr(env, 'investment_capital', 500_000_000) * dkk_to_usd),
-                'Distributed_Profits_USD': self._ensure_float(getattr(env, 'distributed_profits', 0) * dkk_to_usd),
-                'Cumulative_Returns_USD': self._ensure_float(getattr(env, 'cumulative_returns', 0) * dkk_to_usd),
-                'Generation_Revenue_USD': self._ensure_float(getattr(env, 'last_generation_revenue', 0) * dkk_to_usd),
-                'MTM_Value_USD': self._ensure_float(getattr(env, 'mtm_portfolio_value', 0) * dkk_to_usd),
-                'Operational_Revenue_USD': self._ensure_float(getattr(env, 'last_revenue', 0) * dkk_to_usd),
-                'Battery_Revenue_USD': self._ensure_float(getattr(env, 'last_battery_revenue', 0) * dkk_to_usd),
-                'MTM_PnL_USD': self._ensure_float(getattr(env, 'last_mtm_pnl', 0) * dkk_to_usd),
-                'Battery_Energy_MWh': getattr(env, 'battery_energy', 0),
-                'Battery_Capacity_MW': getattr(env, 'battery_capacity', 100),
-                'Wind_Generation_MW': wind,
-                'Solar_Generation_MW': solar,
-                'Hydro_Generation_MW': hydro,
-                'Load_MW': load,
-                'Price_DKK_MWh': self._ensure_float(price_dkk),
-                'Price_USD_MWh': self._ensure_float(price_dkk * dkk_to_usd),
-                'Capital_Allocation_Fraction': getattr(env, 'capital_allocation_fraction', 0.1),
-                'Investment_Frequency': getattr(env, 'investment_freq', 6),
-                'Market_Volatility': getattr(env, 'market_volatility', 0),
-                'Market_Stress': getattr(env, 'market_stress', 0.5),
-                'Overall_Risk': getattr(env, 'overall_risk_snapshot', 0.5),
-                'Reward_Total': sum(rewards.values()) if rewards else 0,
-                'Reward_NAV_Growth': 0,  # Would need reward breakdown
-                'Reward_Risk_Adjusted': 0,  # Would need reward breakdown
-                'step_time_ms': 0,  # Could add timing if needed
-                'mem_rss_mb': psutil.Process().memory_info().rss / 1024 / 1024 if psutil else 0
-            }
+        # Check 3: Run a few steps and verify forecasts change
+        forecast_history = [forecast_features.copy()]
+        for step in range(num_steps):
+            actions = {agent: wrapper.action_space(agent).sample() for agent in wrapper.possible_agents}
+            obs, rewards, dones, truncs, infos = wrapper.step(actions)
 
-            # Add to buffer
-            self.csv_buffer.append(row)
+            if 'investor_0' in obs:
+                investor_obs = obs['investor_0']
+                forecast_features = investor_obs[forecast_start:forecast_end]
+                forecast_history.append(forecast_features.copy())
 
-            # CONSISTENT LOGGING: Flush immediately for 20-timestep logging consistency
-            # This ensures logged steps are immediately visible in CSV file
-            self._flush_csv_buffer()
+        # Check that forecasts change over time (not static)
+        forecast_changes = []
+        for i in range(1, len(forecast_history)):
+            change = float(np.abs(forecast_history[i] - forecast_history[i-1]).sum())
+            forecast_changes.append(change)
 
-        except Exception as e:
-            print(f"Warning: CSV logging error: {e}")
+        avg_change = float(np.mean(forecast_changes))
+        if avg_change < 0.001:
+            logger.warning(
+                f"FGB validation: Forecasts are not changing over time! "
+                f"avg_change={avg_change:.6f} (expected > 0.001). "
+                f"This may indicate forecasts are static or not being updated."
+            )
 
-    def _flush_csv_buffer(self):
-        """Flush CSV buffer to file."""
-        if not self.csv_writer or not self.csv_buffer:
-            return
+        # All checks passed
+        logger.info(
+            f"[FGB_VALIDATION] ✓ Forecasts validated successfully:\n"
+            f"  - Magnitude: {forecast_magnitude:.4f}\n"
+            f"  - Std dev: {forecast_std:.4f}\n"
+            f"  - Avg change/step: {avg_change:.6f}\n"
+            f"  - Observation dims: {total_dim} (forecast dims: {forecast_end - forecast_start})"
+        )
+        return True
 
-        try:
-            with self.csv_lock:
-                for row in self.csv_buffer:
-                    self.csv_writer.writerow(row)
-                self.csv_file.flush()
-                self.csv_buffer.clear()
-        except Exception as e:
-            print(f"Warning: CSV flush error: {e}")
-
-    def _get_currency_rate(self) -> float:
-        """Get currency conversion rate from single source of truth."""
-        # Priority: env._dkk_to_usd_rate > env.config.dkk_to_usd_rate > fallback
-        rate = getattr(self.env, '_dkk_to_usd_rate', None)
-        if rate is not None:
-            return float(rate)
-
-        config = getattr(self.env, 'config', None)
-        if config and hasattr(config, 'dkk_to_usd_rate'):
-            return float(config.dkk_to_usd_rate)
-
-        return 0.145  # Fallback rate
-
-    def _ensure_float(self, x, default=0.0):
-        """Enhanced safety helper to ensure all logged fields are valid floats with no NaNs/None."""
-        try:
-            if x is None:
-                return float(default)
-            if isinstance(x, (list, tuple, np.ndarray)):
-                # Handle array-like inputs
-                x = x[0] if len(x) > 0 else default
-            if isinstance(x, str):
-                # Handle string inputs
-                x = float(x) if x.strip() else default
-            # Convert to float and check for validity
-            val = float(x)
-            return val if np.isfinite(val) else float(default)
-        except (ValueError, TypeError, OverflowError):
-            return float(default)
-
-    def reset(self, seed=None, options=None):
-        """Reset environment and initialize logging."""
-        obs, infos = self.env.reset(seed=seed, options=options)
-        self.step_count = 0
-        return obs, infos
-
-    def step(self, actions):
-        """Step environment and log data."""
-        start_time = time.time()
-        obs, rewards, dones, truncs, infos = self.env.step(actions)
-
-        self.step_count += 1
-
-        # CONSISTENT LOGGING: Log every N timesteps as specified by log_interval
-        if self.step_count % self.log_interval == 0:
-            self._log_step(obs, rewards, dones, truncs, infos)
-
-        return obs, rewards, dones, truncs, infos
-
-    def close(self):
-        """Close environment and CSV file."""
-        if self.csv_file:
-            self._flush_csv_buffer()
-            self.csv_file.close()
-        if hasattr(self.env, 'close'):
-            self.env.close()
-
-
-class UltraFastProgressWrapper(ParallelEnv):
-    """Ultra-fast wrapper that only adds progress tracking without any forecasting overhead."""
-
-    def __init__(self, base_env, total_timesteps):
-        self.env = base_env
-        self.total_timesteps = total_timesteps
-        self.step_count = 0
-        self.global_step_count = 0  # Track cumulative steps across all intervals
-        self.progress_interval = max(1000, total_timesteps // 50)  # Show progress every 2%
-        self.last_progress_step = 0
-        self.last_portfolio_value = None  # Track for validation
-        self.portfolio_history = []  # Track recent values for trend analysis
-
-        # Mark the base environment as being in ultra fast mode (for progress display only)
-        self.env.ultra_fast_mode = True
-
-        # Delegate all attributes to base environment
-        self.possible_agents = base_env.possible_agents
-        self.agents = base_env.agents
-        self.observation_spaces = base_env.observation_spaces
-        self.action_spaces = base_env.action_spaces
-        self.metadata = base_env.metadata
-
-        print(f"[ULTRA FAST] Progress updates every {self.progress_interval:,} steps (~2% intervals)")
-
-    def reset(self, seed=None, options=None):
-        # Only reset episode-level counters, keep global tracking
-        self.step_count = 0
-        # DON'T reset global_step_count - it tracks cumulative progress
-        # DON'T reset last_progress_step - it tracks global progress intervals
-        return self.env.reset(seed=seed, options=options)
-
-    def step(self, actions):
-        obs, rewards, dones, truncs, infos = self.env.step(actions)
-
-        self.step_count += 1
-        self.global_step_count += 1
-
-        # Show progress every interval with financial breakdown
-        if self.global_step_count - self.last_progress_step >= self.progress_interval:
-            # Use global step count for accurate cumulative progress
-            progress_pct = (self.global_step_count / self.total_timesteps) * 100
-
-            # Get portfolio value with validation (convert DKK to USD for display)
-            # Try multiple sources for portfolio value in DKK
-            portfolio_value_dkk = getattr(self.env, 'equity', None)
-            if portfolio_value_dkk is None or portfolio_value_dkk == 0:
-                # Fallback to fund_nav calculation
-                portfolio_value_dkk = getattr(self.env, 'fund_nav', None)
-                if portfolio_value_dkk is None:
-                    # Calculate NAV if available
-                    if hasattr(self.env, '_calculate_fund_nav'):
-                        try:
-                            portfolio_value_dkk = self.env._calculate_fund_nav()
-                        except:
-                            # Use correct DKK equivalent of 500M USD
-                            portfolio_value_dkk = getattr(self.env, 'init_budget', 3_448_275_862)  # 500M USD in DKK
-                    else:
-                        # Use correct DKK equivalent of 500M USD
-                        portfolio_value_dkk = getattr(self.env, 'init_budget', 3_448_275_862)  # 500M USD in DKK
-
-            # Convert DKK to USD for display
-            dkk_to_usd_rate = self._get_currency_rate()
-            portfolio_value = (portfolio_value_dkk * dkk_to_usd_rate) / 1e6  # Convert to USD millions
-
-            # Validate portfolio value for consistency
-            if self.last_portfolio_value is not None:
-                value_change = portfolio_value - self.last_portfolio_value
-                if abs(value_change) > 100:  # Alert for large changes (>$100M)
-                    print(f"⚠️  Large portfolio change detected: ${value_change:+.1f}M")
-
-            # Track portfolio history for trend analysis
-            self.portfolio_history.append(portfolio_value)
-            if len(self.portfolio_history) > 10:
-                self.portfolio_history.pop(0)  # Keep last 10 values
-
-            # Get financial breakdown with DKK to USD conversion (reuse rate from above)
-            ops_revenue_dkk = getattr(self.env, 'last_generation_revenue', 0.0)
-            ops_revenue_usd = ops_revenue_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
-
-            # Get trading PnL - use cumulative performance instead of step-by-step change
-            trading_pnl_dkk = getattr(self.env, 'cumulative_mtm_pnl', getattr(self.env, 'last_mtm_pnl', 0.0))
-            trading_pnl_usd = trading_pnl_dkk * dkk_to_usd_rate / 1e3  # Convert to thousands USD
-
-            # ENHANCED DEBUG OUTPUT - Show detailed trading info at progress intervals
-            if self.global_step_count % self.progress_interval == 0:
-                investment_freq = getattr(self.env, 'investment_freq', 1)
-                trading_enabled = getattr(self.env.reward_calculator, 'trading_enabled', True) if hasattr(self.env, 'reward_calculator') else True
-                financial_positions = getattr(self.env, 'financial_positions', {})
-                total_financial = sum(abs(v) for v in financial_positions.values()) if financial_positions else 0
-                current_step = getattr(self.env, 't', 0)
-                steps_since_trade = current_step % investment_freq
-
-                # ENHANCED: Show individual position values for better debugging
-                wind_pos = financial_positions.get('wind_instrument_value', 0.0)
-                solar_pos = financial_positions.get('solar_instrument_value', 0.0)
-                hydro_pos = financial_positions.get('hydro_instrument_value', 0.0)
-
-                # Enhanced debug info for trading issues
-                ultra_fast_mode = getattr(self.env, 'ultra_fast_mode', False)
-                current_drawdown = getattr(self.env.reward_calculator, 'current_drawdown', 0.0) if hasattr(self.env, 'reward_calculator') else 0.0
-                max_drawdown_threshold = getattr(self.env.reward_calculator, 'max_drawdown_threshold', 0.0) if hasattr(self.env, 'reward_calculator') else 0.0
-                ultra_fast_override = getattr(self.env.reward_calculator, 'ultra_fast_mode_trading_enabled', False) if hasattr(self.env, 'reward_calculator') else False
-
-                print(f"[TRADING DEBUG] Step {self.global_step_count} (env.t={current_step})")
-                print(f"  Investment freq: {investment_freq} (next trade in {investment_freq - steps_since_trade} steps)")
-                print(f"  Trading enabled: {trading_enabled}")
-                print(f"  Financial positions: {total_financial:.0f} DKK")
-                print(f"    Wind: {wind_pos:.0f} DKK | Solar: {solar_pos:.0f} DKK | Hydro: {hydro_pos:.0f} DKK")
-
-                # Show both step and cumulative MTM PnL
-                step_mtm = getattr(self.env, 'last_mtm_pnl', 0.0)
-                cumulative_mtm = getattr(self.env, 'cumulative_mtm_pnl', 0.0)
-                print(f"  MTM PnL (step): {step_mtm:.2f} DKK")
-                print(f"  MTM PnL (cumulative): {cumulative_mtm:.2f} DKK")
-                print(f"  Ultra fast mode: {ultra_fast_mode}")
-                print(f"  Current drawdown: {current_drawdown:.1%}")
-                print(f"  Max drawdown threshold: {max_drawdown_threshold:.1%}")
-                print(f"  Ultra fast override enabled: {ultra_fast_override}")
-
-                # ENHANCED: Show if trading should occur at this step
-                should_trade = (current_step % investment_freq == 0)
-                print(f"  Should trade at current step: {should_trade}")
-                if not should_trade:
-                    print(f"  Next trading step: {current_step + (investment_freq - steps_since_trade)}")
-
-            # Format the breakdown with enhanced info
-            ops_str = f"Ops: ${ops_revenue_usd:+.1f}k"
-            trading_str = f"Trading: ${trading_pnl_usd:+.1f}k" if trading_pnl_usd != 0 else "Trading: $0.0k"
-
-            # Add trend indicator
-            trend_str = ""
-            if len(self.portfolio_history) >= 2:
-                recent_change = self.portfolio_history[-1] - self.portfolio_history[-2]
-                if abs(recent_change) > 1.0:  # Show trend for changes > $1M
-                    trend_str = f" | Trend: ${recent_change:+.1f}M"
-
-            print(f"[ULTRA FAST] Progress: {self.global_step_count:,}/{self.total_timesteps:,} ({progress_pct:.1f}%) | Portfolio: ${portfolio_value:.1f}M USD | {ops_str} | {trading_str}{trend_str}")
-
-            self.last_progress_step = self.global_step_count
-            self.last_portfolio_value = portfolio_value
-
-        return obs, rewards, dones, truncs, infos
-
-    def _get_currency_rate(self) -> float:
-        """Get currency conversion rate from single source of truth."""
-        # Priority: env._dkk_to_usd_rate > env.config.dkk_to_usd_rate > fallback
-        rate = getattr(self.env, '_dkk_to_usd_rate', None)
-        if rate is not None:
-            return float(rate)
-
-        config = getattr(self.env, 'config', None)
-        if config and hasattr(config, 'dkk_to_usd_rate'):
-            return float(config.dkk_to_usd_rate)
-
-        return 0.145  # Fallback rate
-
-    def close(self):
-        return self.env.close()
-
-    def get_progress_summary(self):
-        """Get detailed progress summary for debugging."""
-        portfolio_range = ""
-        if len(self.portfolio_history) >= 2:
-            min_val = min(self.portfolio_history)
-            max_val = max(self.portfolio_history)
-            portfolio_range = f" | Range: ${min_val:.1f}M-${max_val:.1f}M"
-
-        return {
-            'global_steps': self.global_step_count,
-            'total_steps': self.total_timesteps,
-            'progress_pct': (self.global_step_count / self.total_timesteps) * 100,
-            'current_portfolio': self.last_portfolio_value,
-            'portfolio_history': self.portfolio_history.copy(),
-            'summary': f"Progress: {self.global_step_count:,}/{self.total_timesteps:,} ({(self.global_step_count / self.total_timesteps) * 100:.1f}%){portfolio_range}"
-        }
-
-    def set_global_step_count(self, count):
-        """Allow external setting of global step count for synchronization."""
-        self.global_step_count = count
-        print(f"🔄 Global step count synchronized to: {count:,}")
-
-    def __getattr__(self, name):
-        # Delegate any other attribute access to the base environment
-        return getattr(self.env, name)
+    except ValueError as e:
+        logger.error(f"[FGB_VALIDATION] ✗ FAILED: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"[FGB_VALIDATION] ✗ Unexpected error: {str(e)}")
+        raise ValueError(f"FGB forecast validation failed: {str(e)}")

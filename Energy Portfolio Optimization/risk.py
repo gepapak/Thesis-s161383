@@ -21,6 +21,31 @@ import numpy as np
 from collections import deque
 import logging
 import inspect
+from utils import SafeDivision  # UNIFIED: Import from single source of truth
+from config import (
+    ADAPTIVE_SCALE_SATURATION_THRESHOLD,
+    ADAPTIVE_SCALE_MIN_OFFSET,
+    ADAPTIVE_SCALE_COMPRESSION_FACTOR,
+    REGULATORY_RISK_BASE_STRESS_WEIGHT,
+    REGULATORY_RISK_FALLBACK,
+    REGULATORY_RISK_SEASON_BASE,
+    REGULATORY_RISK_SEASON_AMPLITUDE,
+    REGULATORY_RISK_FALLBACK_ERROR,
+    RISK_FALLBACK_MARKET,
+    RISK_FALLBACK_OPERATIONAL,
+    RISK_FALLBACK_PORTFOLIO,
+    RISK_FALLBACK_LIQUIDITY,
+    RISK_FALLBACK_REGULATORY,
+    RISK_FALLBACK_OVERALL,
+    RISK_ACTION_MULTIPLIER_DEFAULT,
+    RISK_ACTION_MAX_INVESTMENT_DEFAULT,
+    RISK_ACTION_CASH_RESERVE_DEFAULT,
+    RISK_ACTION_HEDGE_DEFAULT,
+    RISK_ACTION_REBALANCE_DEFAULT,
+    RISK_ACTION_TOLERANCE_DEFAULT,
+    RISK_LOOKBACK_WINDOW_DEFAULT,
+    RISK_LOOKBACK_WINDOW_MAX,
+)  # UNIFIED: Import constants from config
 
 
 def _clip01(x: float) -> float:
@@ -30,38 +55,30 @@ def _clip01(x: float) -> float:
         return 0.5
 
 def _adaptive_scale(x: float, min_val: float = 0.0, max_val: float = 1.0,
-                   saturation_threshold: float = 0.95) -> float:
+                   saturation_threshold: float = ADAPTIVE_SCALE_SATURATION_THRESHOLD) -> float:
     """Adaptive scaling to prevent saturation at boundaries."""
     try:
         x = float(x)
         if x <= min_val:
-            return min_val + 0.01  # Small offset from minimum
+            return min_val + ADAPTIVE_SCALE_MIN_OFFSET
         elif x >= max_val:
-            return max_val - 0.01  # Small offset from maximum
+            return max_val - ADAPTIVE_SCALE_MIN_OFFSET
         elif x >= max_val * saturation_threshold:
             # Compress values near maximum to prevent saturation
             excess = x - max_val * saturation_threshold
             range_remaining = max_val * (1 - saturation_threshold)
-            compressed = max_val * saturation_threshold + range_remaining * (1 - np.exp(-excess * 5))
-            return min(compressed, max_val - 0.01)
+            compressed = max_val * saturation_threshold + range_remaining * (1 - np.exp(-excess * ADAPTIVE_SCALE_COMPRESSION_FACTOR))
+            return min(compressed, max_val - ADAPTIVE_SCALE_MIN_OFFSET)
         elif x <= min_val + (max_val - min_val) * (1 - saturation_threshold):
             # Expand values near minimum
             deficit = (min_val + (max_val - min_val) * (1 - saturation_threshold)) - x
             range_available = (max_val - min_val) * (1 - saturation_threshold)
-            expanded = min_val + range_available * (1 - np.exp(-deficit * 5))
-            return max(expanded, min_val + 0.01)
+            expanded = min_val + range_available * (1 - np.exp(-deficit * ADAPTIVE_SCALE_COMPRESSION_FACTOR))
+            return max(expanded, min_val + ADAPTIVE_SCALE_MIN_OFFSET)
         else:
             return x
     except Exception:
         return (min_val + max_val) / 2
-
-class SafeDivision:
-    @staticmethod
-    def div(numerator: float, denominator: float, default: float = 0.0) -> float:
-        """Robust division with protection against zero-division."""
-        if abs(denominator) < 1e-8:
-            return default
-        return numerator / denominator
 
 
 class EnhancedRiskController:
@@ -78,13 +95,16 @@ class EnhancedRiskController:
             except Exception:
                 config = None
 
+        # PHASE 5.10 FIX: Store config as instance variable for use in risk calculations
+        self.config = config
+
         # Use config values with fallbacks
         if config and hasattr(config, 'risk_lookback_window'):
             default_lookback = config.risk_lookback_window
         else:
-            default_lookback = 144
+            default_lookback = RISK_LOOKBACK_WINDOW_DEFAULT
 
-        self.lookback_window = int(max(1, min(lookback_window or default_lookback, 200)))  # guard + cap
+        self.lookback_window = int(max(1, min(lookback_window or default_lookback, RISK_LOOKBACK_WINDOW_MAX)))  # guard + cap
         self.logger = logging.getLogger(__name__)
 
         # Bounded histories to prevent memory growth
@@ -149,7 +169,11 @@ class EnhancedRiskController:
 
             momentum = SafeDivision.div(abs(recent_avg - older_avg), abs(older_avg), default=0.10)
 
-            mrisk = 0.6 * vol + 0.4 * (0.5 * momentum)
+            # PHASE 5.10 FIX: Use config parameters for market risk weights
+            vol_weight = getattr(self.config, 'market_risk_volatility_weight', 0.6) if self.config else 0.6
+            mom_weight = getattr(self.config, 'market_risk_momentum_weight', 0.4) if self.config else 0.4
+            mom_factor = getattr(self.config, 'market_risk_momentum_factor', 0.5) if self.config else 0.5
+            mrisk = vol_weight * vol + mom_weight * (mom_factor * momentum)
             return _clip01(mrisk)
         except Exception as e:
             self.logger.warning(f"Market risk calculation failed: {e}")
@@ -185,7 +209,10 @@ class EnhancedRiskController:
                 if drops:
                     intermittency = min(max(drops), 0.5)
 
-            orisk = 0.7 * vol + 0.3 * intermittency
+            # PHASE 5.10 FIX: Use config parameters for operational risk weights
+            vol_weight = getattr(self.config, 'operational_risk_volatility_weight', 0.7) if self.config else 0.7
+            int_weight = getattr(self.config, 'operational_risk_intermittency_weight', 0.3) if self.config else 0.3
+            orisk = vol_weight * vol + int_weight * intermittency
             return _clip01(orisk)
         except Exception as e:
             self.logger.warning(f"Operational risk calculation failed: {e}")
@@ -220,7 +247,10 @@ class EnhancedRiskController:
             else:
                 capital = 0.50
 
-            prisk = 0.6 * conc + 0.4 * capital
+            # PHASE 5.10 FIX: Use config parameters for portfolio risk weights
+            conc_weight = getattr(self.config, 'portfolio_risk_concentration_weight', 0.6) if self.config else 0.6
+            cap_weight = getattr(self.config, 'portfolio_risk_capital_weight', 0.4) if self.config else 0.4
+            prisk = conc_weight * conc + cap_weight * capital
             return _adaptive_scale(prisk, 0.0, 1.0)
         except Exception as e:
             self.logger.warning(f"Portfolio risk calculation failed: {e}")
@@ -247,7 +277,10 @@ class EnhancedRiskController:
                     cf_vol = SafeDivision.div(float(np.std(cfa)), abs(mu), default=0.10) if abs(mu) > 1e-12 else 0.10
                     cf_vol = min(cf_vol, 1.0)
 
-            lrisk = 0.6 * buffer_risk + 0.4 * cf_vol
+            # PHASE 5.10 FIX: Use config parameters for liquidity risk weights
+            buf_weight = getattr(self.config, 'liquidity_risk_buffer_weight', 0.6) if self.config else 0.6
+            cf_weight = getattr(self.config, 'liquidity_risk_cashflow_weight', 0.4) if self.config else 0.4
+            lrisk = buf_weight * buffer_risk + cf_weight * cf_vol
             return _adaptive_scale(lrisk, 0.0, 1.0)
         except Exception as e:
             self.logger.warning(f"Liquidity risk calculation failed: {e}")
@@ -261,17 +294,17 @@ class EnhancedRiskController:
         try:
             if len(self.market_stress_history) > 0:
                 avg_stress = float(np.mean(list(self.market_stress_history)[-5:]))
-                base = 0.4 * avg_stress
+                base = REGULATORY_RISK_BASE_STRESS_WEIGHT * avg_stress
             else:
-                base = 0.20
+                base = REGULATORY_RISK_FALLBACK
 
             # Simple annual seasonality; 144 steps/day × 365 days
-            season = 0.05 + 0.05 * abs(np.sin(SafeDivision.div((timestep or 0) * 2 * np.pi, (365 * 144))))
+            season = REGULATORY_RISK_SEASON_BASE + REGULATORY_RISK_SEASON_AMPLITUDE * abs(np.sin(SafeDivision.div((timestep or 0) * 2 * np.pi, (365 * 144))))
             rrisk = base + season
             return _clip01(rrisk)
         except Exception as e:
             self.logger.warning(f"Regulatory risk calculation failed: {e}")
-            return 0.35
+            return REGULATORY_RISK_FALLBACK_ERROR
 
     def calculate_forecast_uncertainty_risk(self, env_state: Dict) -> float:
         """
@@ -361,12 +394,12 @@ class EnhancedRiskController:
         except Exception as e:
             self.logger.warning(f"Comprehensive risk calculation failed: {e}")
             return {
-                'market_risk': 0.30,
-                'operational_risk': 0.20,
-                'portfolio_risk': 0.25,
-                'liquidity_risk': 0.15,
-                'regulatory_risk': 0.35,
-                'overall_risk': 0.25
+                'market_risk': RISK_FALLBACK_MARKET,
+                'operational_risk': RISK_FALLBACK_OPERATIONAL,
+                'portfolio_risk': RISK_FALLBACK_PORTFOLIO,
+                'liquidity_risk': RISK_FALLBACK_LIQUIDITY,
+                'regulatory_risk': RISK_FALLBACK_REGULATORY,
+                'overall_risk': RISK_FALLBACK_OVERALL
             }
 
     def get_risk_adjusted_actions(self, risk_assessment: Dict[str, float]) -> Dict[str, float]:
@@ -391,12 +424,12 @@ class EnhancedRiskController:
         except Exception as e:
             self.logger.warning(f"Risk actions calculation failed: {e}")
             return {
-                'risk_multiplier': 1.0,
-                'max_single_investment': 0.30,
-                'cash_reserve_target': 0.10,
-                'hedge_recommendation': 0.50,
-                'rebalance_urgency': 0.30,
-                'risk_tolerance': 0.70,
+                'risk_multiplier': RISK_ACTION_MULTIPLIER_DEFAULT,
+                'max_single_investment': RISK_ACTION_MAX_INVESTMENT_DEFAULT,
+                'cash_reserve_target': RISK_ACTION_CASH_RESERVE_DEFAULT,
+                'hedge_recommendation': RISK_ACTION_HEDGE_DEFAULT,
+                'rebalance_urgency': RISK_ACTION_REBALANCE_DEFAULT,
+                'risk_tolerance': RISK_ACTION_TOLERANCE_DEFAULT,
             }
 
     def get_risk_metrics_for_observation(self, expected_size: int = 6) -> np.ndarray:
@@ -575,17 +608,25 @@ class EnhancedRiskController:
 
     @staticmethod
     def _safe_diversification_index(wind_c: float, solar_c: float, hydro_c: float) -> float:
+        """
+        Calculate Shannon entropy-based diversification index.
+
+        FIX: Safe handling of s=0 case using np.where to prevent log(0) errors
+        """
         try:
             caps = [c for c in (wind_c, solar_c, hydro_c) if isinstance(c, (int, float)) and c > 0]
             if len(caps) < 2:
                 return 0.0
             total = float(sum(caps))
-            shares = [SafeDivision.div(c, total) for c in caps]
-            # Shannon entropy normalized
-            entropy = 0.0
-            for s in shares:
-                if s > 0:
-                    entropy -= s * np.log(s + 1e-8)
+            shares = np.array([SafeDivision.div(c, total) for c in caps], dtype=np.float64)
+
+            # FIX: Shannon entropy with safe handling of s=0
+            # Use np.where to ensure s * log(s) = 0 when s = 0
+            epsilon = 1e-10
+            safe_shares = np.maximum(shares, epsilon)
+            entropy_terms = np.where(shares > 0, shares * np.log(safe_shares), 0.0)
+            entropy = -np.sum(entropy_terms)
+
             max_entropy = np.log(len(shares))
             return SafeDivision.div(entropy, max_entropy, default=0.0) if max_entropy > 0 else 0.0
         except Exception:
@@ -619,3 +660,621 @@ class EnhancedRiskController:
             self.market_stress_history.clear()
         except Exception:
             pass
+
+
+# =====================================================================
+# FORECAST RISK MANAGER
+# =====================================================================
+# Uses forecasts for RISK MANAGEMENT instead of directional trading.
+# This replaces the broken forecast alignment reward system.
+
+class ForecastRiskManager:
+    """
+    Manages risk using forecast signals.
+
+    Instead of rewarding agents for following forecast directions,
+    this class uses forecasts to:
+    - Reduce position sizes when uncertainty is high
+    - Exit positions when forecasts change direction
+    - Take profits when forecasts are extreme
+    - Reward risk-adjusted performance
+    - NOVEL: Only trade when forecast delta > MAPE (signal filtering)
+    """
+
+    def __init__(self, config):
+        """
+        Initialize forecast risk manager.
+
+        Args:
+            config: Configuration object with risk management parameters
+        """
+        self.config = config
+
+        # Position scaling thresholds
+        self.confidence_high = getattr(config, 'forecast_confidence_high_threshold', 0.90)
+        self.confidence_medium = getattr(config, 'forecast_confidence_medium_threshold', 0.70)
+        self.confidence_low_scale = getattr(config, 'forecast_confidence_low_scale', 0.5)
+
+        # Volatility scaling thresholds
+        self.volatility_high = getattr(config, 'forecast_volatility_high_threshold', 1.5)
+        self.volatility_medium = getattr(config, 'forecast_volatility_medium_threshold', 1.0)
+
+        # Exit signal parameters
+        self.direction_change_exit = getattr(config, 'forecast_direction_change_exit_fraction', 0.5)
+        self.direction_change_min = getattr(config, 'forecast_direction_change_min_strength', 0.5)
+
+        # Profit-taking parameters
+        self.extreme_threshold = getattr(config, 'forecast_extreme_threshold', 2.0)
+        self.extreme_profit_taking = getattr(config, 'forecast_extreme_profit_taking_fraction', 0.3)
+
+        # Logging
+        self.log_decisions = getattr(config, 'log_position_scaling_decisions', False)
+
+        # Signal gate relaxation parameters (defaults keep backwards compatibility)
+        base_gate = getattr(config, 'forecast_signal_gate_multiplier', None)
+        if base_gate is None:
+            base_gate = getattr(config, 'signal_gate_initial_multiplier', None)
+        self.signal_gate_initial = max(0.5, float(base_gate if base_gate is not None else 3.0))
+        self.signal_gate_min = max(
+            0.1,
+            float(getattr(config, 'signal_gate_min_multiplier', getattr(config, 'signal_filter_mape_multiplier', 0.8)))
+        )
+        self.signal_gate_decay_start = max(0, int(getattr(config, 'signal_gate_decay_start', 720)))
+        self.signal_gate_decay_duration = max(1, int(getattr(config, 'signal_gate_decay_duration', 2880)))
+        self.signal_gate_decay_enabled = bool(getattr(config, 'enable_signal_gate_decay', True))
+        self.signal_gate_multiplier = self.signal_gate_initial  # legacy attribute
+        self._last_gate_multiplier = self.signal_gate_initial
+
+        # State tracking
+        self.prev_z_short = 0.0
+        self.prev_forecast_direction = 0
+
+        logging.info("ForecastRiskManager initialized")
+        logging.info(f"  Confidence thresholds: high={self.confidence_high}, med={self.confidence_medium}")
+        logging.info(f"  Volatility thresholds: high={self.volatility_high}, med={self.volatility_medium}")
+        logging.info(
+            f"  Signal gate: initial={self.signal_gate_initial:.2f}, min={self.signal_gate_min:.2f}, "
+            f"decay_start={self.signal_gate_decay_start}, decay_duration={self.signal_gate_decay_duration}"
+        )
+
+    def _current_gate_multiplier(self, timestep: int) -> float:
+        """Return the relaxed gate multiplier for the given timestep."""
+        if not self.signal_gate_decay_enabled:
+            self._last_gate_multiplier = self.signal_gate_initial
+            return self.signal_gate_initial
+
+        if timestep <= self.signal_gate_decay_start:
+            self._last_gate_multiplier = self.signal_gate_initial
+            return self.signal_gate_initial
+
+        progress = min(1.0, (timestep - self.signal_gate_decay_start) / self.signal_gate_decay_duration)
+        multiplier_range = self.signal_gate_initial - self.signal_gate_min
+        current = self.signal_gate_initial - progress * multiplier_range
+        lower = min(self.signal_gate_initial, self.signal_gate_min)
+        upper = max(self.signal_gate_initial, self.signal_gate_min)
+        current = float(np.clip(current, lower, upper))
+        self._last_gate_multiplier = current
+        return current
+
+    def compute_risk_adjustments(self,
+                                 z_short: float,
+                                 z_medium: float,
+                                 z_long: float,
+                                 forecast_trust: float,
+                                 position_pnl: float = 0.0,
+                                 timestep: int = 0,
+                                 forecast_deltas: Dict[str, float] = None,
+                                 mape_thresholds: Dict[str, float] = None) -> Dict[str, Any]:
+        """
+        Compute risk management adjustments based on forecasts.
+
+        Args:
+            z_short: Short-horizon forecast z-score
+            z_medium: Medium-horizon forecast z-score
+            z_long: Long-horizon forecast z-score
+            forecast_trust: Forecast confidence/trust [0, 1]
+            position_pnl: Current position P&L (for profit-taking)
+            timestep: Current timestep (for logging)
+            forecast_deltas: Dict with actual forecast deltas (price differences)
+                            {'short': delta_short, 'medium': delta_medium, 'long': delta_long}
+            mape_thresholds: Dict with MAPE thresholds for each horizon
+                            {'short': mape_short, 'medium': mape_medium, 'long': mape_long}
+
+        Returns:
+            Dict with risk adjustment factors:
+            - confidence_scale: Position scale based on confidence [0, 1]
+            - volatility_scale: Position scale based on volatility [0, 1]
+            - combined_scale: Combined position scale [0, 1]
+            - exit_signal: Fraction of position to exit [0, 1]
+            - profit_taking: Fraction of position to take profits [0, 1]
+            - risk_reward: Reward for good risk management
+            - trade_signal: Whether to trade (True) or stay neutral (False)
+            - signal_strength: Strength of trading signal [0, 1]
+            - active_horizons: List of horizons with significant signals
+        """
+        # =====================================================================
+        # NOVEL MULTI-HORIZON SIGNAL FILTERING
+        # =====================================================================
+        # Only trade when forecast delta > MAPE threshold (statistically significant)
+        # This filters out noise and focuses on high-confidence opportunities
+
+        trade_signal = False
+        signal_strength = 0.0
+        active_horizons = []
+        gate_multiplier = self._current_gate_multiplier(timestep)
+
+        if forecast_deltas is not None and mape_thresholds is not None:
+            # Check each horizon for statistically significant signals
+            horizon_signals = {}
+
+            for horizon in ['short', 'medium', 'long']:
+                delta = forecast_deltas.get(horizon, 0.0)
+                mape = mape_thresholds.get(horizon, 0.02)  # Default 2% MAPE
+                gate_threshold = abs(mape) * max(gate_multiplier, 0.1)
+
+                # Signal is significant if |delta| exceeds the gated threshold
+                is_significant = abs(delta) > gate_threshold
+
+                if is_significant:
+                    # Normalize signal strength by how much it exceeds the gated threshold
+                    strength = abs(delta) / max(gate_threshold, 1e-6)
+                    horizon_signals[horizon] = {
+                        'delta': delta,
+                        'strength': strength,
+                        'direction': np.sign(delta)
+                    }
+                    active_horizons.append(horizon)
+
+            # Aggregate signals across horizons
+            if len(horizon_signals) > 0:
+                trade_signal = True
+
+                # Weighted average by horizon (short=0.5, medium=0.3, long=0.2)
+                weights = {'short': 0.5, 'medium': 0.3, 'long': 0.2}
+                weighted_strength = 0.0
+
+                for horizon, signal in horizon_signals.items():
+                    weighted_strength += signal['strength'] * weights.get(horizon, 0.0)
+
+                # Normalize to [0, 1] range (cap at 3.0 for extreme signals)
+                signal_strength = min(weighted_strength / 3.0, 1.0)
+
+        # 1. CONFIDENCE-BASED POSITION SCALING
+        if forecast_trust > self.confidence_high:
+            confidence_scale = 1.0  # High confidence → normal positions
+        elif forecast_trust > self.confidence_medium:
+            confidence_scale = 0.7  # Medium confidence → 70% positions
+        else:
+            confidence_scale = self.confidence_low_scale  # Low confidence → 50% positions
+
+        # NOVEL: If no significant signal, reduce position to zero (stay neutral)
+        if not trade_signal:
+            confidence_scale *= 0.1  # 10% of normal (near-zero positions)
+
+        # 2. VOLATILITY-BASED POSITION SCALING
+        forecast_volatility = float(np.std([z_short, z_medium, z_long]))
+
+        if forecast_volatility > self.volatility_high:
+            volatility_scale = 0.5  # High volatility → 50% positions
+        elif forecast_volatility > self.volatility_medium:
+            volatility_scale = 0.75  # Medium volatility → 75% positions
+        else:
+            volatility_scale = 1.0  # Low volatility → normal positions
+
+        # 3. DIRECTION CHANGE EXIT SIGNAL
+        curr_forecast_direction = int(np.sign(z_short))
+
+        if (self.prev_forecast_direction != 0 and
+            curr_forecast_direction != self.prev_forecast_direction and
+            abs(self.prev_z_short) > self.direction_change_min):
+            # Forecast direction flipped → exit signal
+            exit_signal = self.direction_change_exit
+        else:
+            exit_signal = 0.0
+
+        # Update state
+        self.prev_z_short = z_short
+        self.prev_forecast_direction = curr_forecast_direction
+
+        # 4. EXTREME FORECAST PROFIT-TAKING
+        if abs(z_short) > self.extreme_threshold and position_pnl > 0:
+            # Extreme forecast + profitable position → take profits
+            profit_taking = self.extreme_profit_taking
+        else:
+            profit_taking = 0.0
+
+        # 5. COMBINED POSITION SCALE
+        combined_scale = confidence_scale * volatility_scale
+
+        # 6. RISK MANAGEMENT REWARD
+        # Reward for reducing positions when uncertainty/volatility is high
+        # AND for only trading when signals are statistically significant
+        risk_reward = 0.0
+
+        # Reward for signal filtering (only trade when delta > MAPE)
+        if trade_signal:
+            # Reward proportional to signal strength
+            risk_reward += 0.4 * signal_strength
+        else:
+            # Reward for staying neutral when no significant signal
+            risk_reward += 0.2
+
+        if forecast_trust < self.confidence_medium:
+            # Low confidence → reward conservative behavior
+            risk_reward += 0.2 * (1.0 - confidence_scale)
+
+        if forecast_volatility > self.volatility_medium:
+            # High volatility → reward conservative behavior
+            risk_reward += 0.2 * (1.0 - volatility_scale)
+
+        if exit_signal > 0:
+            # Exiting on direction change → reward
+            risk_reward += 0.1
+
+        if profit_taking > 0:
+            # Taking profits on extremes → reward
+            risk_reward += 0.1
+
+        # Logging
+        if self.log_decisions and timestep % 1000 == 0:
+            logging.info(f"[RISK_MGR] t={timestep}")
+            logging.info(f"  Forecast: z_short={z_short:.3f}, z_med={z_medium:.3f}, z_long={z_long:.3f}")
+            logging.info(f"  Trust: {forecast_trust:.3f}, Volatility: {forecast_volatility:.3f}")
+            logging.info(f"  NOVEL SIGNAL FILTER: trade={trade_signal}, strength={signal_strength:.3f}, active_horizons={active_horizons}")
+            logging.info(f"  Gate multiplier: {gate_multiplier:.2f}")
+            if forecast_deltas and mape_thresholds:
+                for h in ['short', 'medium', 'long']:
+                    delta = forecast_deltas.get(h, 0.0)
+                    mape = mape_thresholds.get(h, 0.02)
+                    logging.info(f"    {h}: delta={delta:.4f}, MAPE={mape:.4f}, significant={abs(delta) > mape}")
+            logging.info(f"  Scales: confidence={confidence_scale:.2f}, volatility={volatility_scale:.2f}, combined={combined_scale:.2f}")
+            logging.info(f"  Signals: exit={exit_signal:.2f}, profit_taking={profit_taking:.2f}")
+            logging.info(f"  Risk Reward: {risk_reward:.3f}")
+
+        return {
+            'confidence_scale': float(confidence_scale),
+            'volatility_scale': float(volatility_scale),
+            'combined_scale': float(combined_scale),
+            'exit_signal': float(exit_signal),
+            'profit_taking': float(profit_taking),
+            'risk_reward': float(risk_reward),
+            'forecast_volatility': float(forecast_volatility),
+            # NOVEL: Signal filtering outputs
+            'trade_signal': bool(trade_signal),
+            'signal_strength': float(signal_strength),
+            'active_horizons': active_horizons,
+            'num_active_horizons': len(active_horizons),
+            'signal_gate_multiplier': float(gate_multiplier),
+        }
+
+    def reset(self):
+        """Reset state for new episode."""
+        self.prev_z_short = 0.0
+        self.prev_forecast_direction = 0
+
+    def compute_investor_strategy(self,
+                                  forecast_deltas: Dict[str, float],
+                                  mape_thresholds: Dict[str, float],
+                                  current_positions: Dict[str, float],
+                                  forecast_trust: float) -> Dict[str, Any]:
+        """
+        NOVEL: Investor-specific strategy using multi-threshold approach.
+
+        Determines whether to HEDGE, TRADE, or AGGRESSIVE_TRADE based on
+        forecast signal strength relative to MAPE thresholds.
+
+        Strategy:
+        1. HEDGE (|delta| > 0.5x MAPE): Protect existing positions, small adjustments
+        2. TRADE (|delta| > 1.5x MAPE): Take new positions, normal size
+        3. AGGRESSIVE_TRADE (|delta| > 2.0x MAPE): Strong conviction, large positions
+        4. NEUTRAL (|delta| < 0.5x MAPE): Stay out, noise only
+
+        Multi-horizon consensus:
+        - Require at least 2 horizons to agree on direction
+        - Weight by horizon (short=50%, medium=30%, long=20%)
+        - Check directional consensus (70% threshold)
+
+        Args:
+            forecast_deltas: Dict with forecast deltas as PERCENTAGES (e.g., 0.02 = 2%)
+                            {'short': 0.015, 'medium': 0.025, 'long': 0.018}
+            mape_thresholds: Dict with MAPE thresholds as PERCENTAGES (e.g., 0.02 = 2%)
+                            {'short': 0.02, 'medium': 0.025, 'long': 0.03}
+            current_positions: Dict with current positions {'wind': 0.5, 'solar': 0.3, ...}
+            forecast_trust: Overall forecast confidence [0, 1]
+
+        Returns:
+            Dict with:
+            - strategy: 'neutral', 'hedge', 'trade', or 'aggressive_trade'
+            - position_scale: Recommended position scale [0, 1]
+            - direction: +1 (long), -1 (short), or 0 (neutral)
+            - signal_strength: Overall signal strength [0, 1]
+            - consensus: Whether horizons agree on direction
+            - active_horizons: List of horizons with signals
+            - hedge_signal: Whether hedging is recommended
+            - trade_signal: Whether trading is recommended
+        """
+        # Get thresholds from config
+        # NOVEL ADAPTIVE THRESHOLDS: Use MAPE-based confidence to switch between strategies
+        # When MAPE is LOW (good forecasts): Use MAPE-relative thresholds (aggressive trading)
+        # When MAPE is HIGH (bad forecasts): Use ABSOLUTE thresholds (conservative trading)
+        # This allows Tier 2 to exploit good forecasts while protecting against bad ones!
+
+        # Calculate average MAPE across horizons
+        mape_values = [mape_thresholds.get(h, 0.0) for h in ['short', 'medium', 'long'] if mape_thresholds.get(h, 0.0) > 1e-6]
+        avg_mape = np.mean(mape_values) if len(mape_values) > 0 else 0.05
+
+        # ADAPTIVE THRESHOLD LOGIC:
+        # If MAPE < 3% (excellent forecasts): Use MAPE-relative with LOW multipliers (enable trading)
+        # If MAPE 3-8% (good forecasts): Use MAPE-relative with MEDIUM multipliers
+        # If MAPE > 8% (poor forecasts): Use ABSOLUTE thresholds (protect capital)
+
+        if avg_mape < 0.03:  # Excellent forecasts (MAPE < 3%)
+            # Use aggressive MAPE-relative thresholds
+            hedge_mult = 0.3   # Very low - enable more trading
+            trade_mult = 0.8   # Low - enable aggressive trading
+            aggressive_mult = 1.5  # Medium - enable very aggressive trading
+            threshold_mode = 'aggressive'
+        elif avg_mape < 0.08:  # Good forecasts (MAPE 3-8%)
+            # Use balanced MAPE-relative thresholds
+            hedge_mult = 0.5   # Standard
+            trade_mult = 1.5   # Standard
+            aggressive_mult = 3.0  # Standard
+            threshold_mode = 'balanced'
+        else:  # Poor forecasts (MAPE > 8%)
+            # Use ABSOLUTE thresholds (ignore MAPE, use fixed values)
+            # This prevents trading on noise when forecasts are unreliable
+            hedge_mult = None  # Will use absolute values below
+            trade_mult = None
+            aggressive_mult = None
+            threshold_mode = 'absolute'
+
+        # Absolute mode fallback thresholds (percent moves)
+        abs_hedge_threshold = getattr(self.config, 'investor_absolute_hedge_threshold', 0.01)
+        abs_trade_threshold = getattr(self.config, 'investor_absolute_trade_threshold', 0.03)
+        abs_aggressive_threshold = getattr(self.config, 'investor_absolute_aggressive_threshold', 0.05)
+
+        # Position scales for each strategy
+        hedge_scale = getattr(self.config, 'investor_hedge_position_scale', 0.3)
+        trade_scale = getattr(self.config, 'investor_trade_position_scale', 0.7)
+        aggressive_scale = getattr(self.config, 'investor_aggressive_position_scale', 1.0)
+
+        # Consensus requirements
+        require_consensus = getattr(self.config, 'investor_require_consensus', True)
+        min_horizons = getattr(self.config, 'investor_consensus_min_horizons', 2)
+        direction_threshold = getattr(self.config, 'investor_consensus_direction_threshold', 0.7)
+
+        # Allow single-strong-horizon overrides when trust is high
+        single_horizon_override = getattr(self.config, 'investor_single_horizon_override', True)
+        single_horizon_strength = getattr(self.config, 'investor_single_horizon_strength', 0.6)
+        single_horizon_trust = getattr(self.config, 'investor_single_horizon_trust', 0.6)
+        single_horizon_scale = getattr(self.config, 'investor_single_horizon_scale', 0.8)
+
+        # Analyze each horizon
+        horizon_analysis = {}
+        weights = {'short': 0.5, 'medium': 0.3, 'long': 0.2}
+
+        for horizon in ['short', 'medium', 'long']:
+            delta = forecast_deltas.get(horizon, 0.0)
+            mape = mape_thresholds.get(horizon, 0.02)
+
+            # FIX #20: CRITICAL BUG - When MAPE = 0 (not enough data), IGNORE this horizon!
+            # Otherwise any delta > 0 triggers aggressive_trade (since thresholds = 0)
+            if mape < 1e-6:  # MAPE is effectively zero (not enough data)
+                # Skip this horizon - don't include in analysis
+                horizon_analysis[horizon] = {
+                    'delta': delta,
+                    'signal_type': 'neutral',  # Force neutral when no MAPE data
+                    'strength': 0.0,
+                    'direction': 0,
+                    'weight': weights[horizon],
+                    'skipped': True  # Mark as skipped due to insufficient data
+                }
+                continue
+
+            # Compute signal strength relative to different thresholds
+            # ADAPTIVE THRESHOLD COMPUTATION
+            if threshold_mode == 'absolute':
+                # When forecasts are unreliable fall back to fixed absolute thresholds
+                abs_delta = abs(delta)
+                direction = np.sign(delta)
+
+                if abs_delta > abs_aggressive_threshold:
+                    signal_type = 'aggressive_trade'
+                    strength = min(abs_delta / max(abs_aggressive_threshold, 1e-6), 2.0)
+                elif abs_delta > abs_trade_threshold:
+                    signal_type = 'trade'
+                    strength = min(abs_delta / max(abs_trade_threshold, 1e-6), 2.0)
+                elif abs_delta > abs_hedge_threshold:
+                    signal_type = 'hedge'
+                    strength = min(abs_delta / max(abs_hedge_threshold, 1e-6), 1.5)
+                else:
+                    signal_type = 'neutral'
+                    strength = 0.0
+            else:
+                # Use MAPE-relative thresholds when MAPE is low (good forecasts)
+                hedge_threshold = hedge_mult * mape
+                trade_threshold = trade_mult * mape
+                aggressive_threshold = aggressive_mult * mape
+
+                abs_delta = abs(delta)
+                direction = np.sign(delta)
+
+                # CRITICAL FIX: Reject extreme deltas regardless of MAPE
+                # If forecast error > 50% of price, it's noise - don't trade
+                if abs_delta > 0.5:  # 50% absolute cap
+                    signal_type = 'neutral'
+                    strength = 0.0
+                # Classify signal
+                elif abs_delta > aggressive_threshold:
+                    signal_type = 'aggressive_trade'
+                    strength = min(abs_delta / aggressive_threshold, 2.0)  # Cap at 2x
+                elif abs_delta > trade_threshold:
+                    signal_type = 'trade'
+                    strength = min(abs_delta / trade_threshold, 2.0)  # Cap at 2x
+                elif abs_delta > hedge_threshold:
+                    signal_type = 'hedge'
+                    strength = min(abs_delta / hedge_threshold, 2.0)  # Cap at 2x
+                else:
+                    signal_type = 'neutral'
+                    strength = 0.0
+
+            horizon_analysis[horizon] = {
+                'delta': delta,
+                'signal_type': signal_type,
+                'strength': strength,
+                'direction': direction,
+                'weight': weights[horizon],
+                'skipped': False
+            }
+
+        # Check for multi-horizon consensus
+        active_horizons = [h for h, a in horizon_analysis.items() if a['signal_type'] != 'neutral']
+
+        if len(active_horizons) == 0:
+            # No signals, stay neutral
+            return {
+                'strategy': 'neutral',
+                'position_scale': 0.1,
+                'direction': 0,
+                'signal_strength': 0.0,
+                'consensus': False,
+                'active_horizons': [],
+                'hedge_signal': False,
+                'trade_signal': False
+            }
+
+        # Compute weighted direction
+        weighted_direction = sum(
+            horizon_analysis[h]['direction'] * horizon_analysis[h]['weight']
+            for h in active_horizons
+        )
+        total_weight = sum(horizon_analysis[h]['weight'] for h in active_horizons)
+        avg_direction = weighted_direction / max(total_weight, 1e-6)
+
+        # Check consensus
+        consensus = (
+            len(active_horizons) >= min_horizons and
+            abs(avg_direction) >= direction_threshold
+        )
+
+        # Majority override: if at least two horizons agree on direction, treat as consensus
+        pos_horizons = [h for h in active_horizons if horizon_analysis[h]['direction'] > 0]
+        neg_horizons = [h for h in active_horizons if horizon_analysis[h]['direction'] < 0]
+        pos_weight = sum(horizon_analysis[h]['weight'] for h in pos_horizons)
+        neg_weight = sum(horizon_analysis[h]['weight'] for h in neg_horizons)
+
+        if not consensus and (len(pos_horizons) >= 2 or len(neg_horizons) >= 2):
+            consensus = True
+            if len(pos_horizons) >= len(neg_horizons):
+                avg_direction = pos_weight / max(total_weight, 1e-6)
+            else:
+                avg_direction = -neg_weight / max(total_weight, 1e-6)
+
+        # NOVEL FEATURE: FORECAST QUALITY BOOSTING
+        # When forecasts are excellent (MAPE < 3%), BOOST position sizes
+        # When forecasts are poor (MAPE > 8%), REDUCE position sizes
+        # This allows agent to capitalize on good forecasts while protecting against bad ones
+
+        if avg_mape < 0.03:  # Excellent forecasts
+            quality_boost = 1.3  # Increase position sizes by 30%
+        elif avg_mape < 0.05:  # Good forecasts
+            quality_boost = 1.1  # Increase position sizes by 10%
+        elif avg_mape < 0.08:  # Decent forecasts
+            quality_boost = 1.0  # No change
+        else:  # Poor forecasts
+            quality_boost = 0.7  # Reduce position sizes by 30%
+
+        forced_strategy = None
+        forced_position_scale = None
+
+        if require_consensus and not consensus and single_horizon_override and len(active_horizons) >= 1:
+            strongest_horizon = max(
+                active_horizons,
+                key=lambda h: horizon_analysis[h]['strength'] * horizon_analysis[h]['weight']
+            )
+            strongest_strength = horizon_analysis[strongest_horizon]['strength']
+
+            if (
+                strongest_strength >= single_horizon_strength and
+                forecast_trust >= single_horizon_trust and
+                horizon_analysis[strongest_horizon]['signal_type'] != 'neutral'
+            ):
+                # Promote strongest horizon to act as temporary consensus
+                consensus = True
+                avg_direction = horizon_analysis[strongest_horizon]['direction']
+                forced_strategy = horizon_analysis[strongest_horizon]['signal_type']
+                scale_lookup = {
+                    'hedge': hedge_scale,
+                    'trade': trade_scale,
+                    'aggressive_trade': aggressive_scale
+                }
+                forced_position_scale = scale_lookup.get(forced_strategy, trade_scale) * \
+                    forecast_trust * quality_boost * single_horizon_scale
+
+        # If consensus required but not met, downgrade to hedge or neutral
+        if require_consensus and not consensus:
+            # Check if at least one horizon suggests hedging
+            has_hedge = any(horizon_analysis[h]['signal_type'] in ['hedge', 'trade', 'aggressive_trade']
+                          for h in active_horizons)
+            if has_hedge:
+                strategy = 'hedge'
+                position_scale = hedge_scale * forecast_trust * quality_boost
+            else:
+                strategy = 'neutral'
+                position_scale = 0.1
+        else:
+            # Determine overall strategy from strongest signal
+            signal_types = [horizon_analysis[h]['signal_type'] for h in active_horizons]
+
+            if forced_strategy is not None:
+                strategy = forced_strategy
+                position_scale = float(np.clip(forced_position_scale, 0.0, 1.0))
+            elif 'aggressive_trade' in signal_types:
+                strategy = 'aggressive_trade'
+                position_scale = aggressive_scale * forecast_trust * quality_boost
+            elif 'trade' in signal_types:
+                strategy = 'trade'
+                position_scale = trade_scale * forecast_trust * quality_boost
+            elif 'hedge' in signal_types:
+                strategy = 'hedge'
+                position_scale = hedge_scale * forecast_trust * quality_boost
+            else:
+                strategy = 'neutral'
+                position_scale = 0.1
+
+        # Compute overall signal strength
+        weighted_strength = sum(
+            horizon_analysis[h]['strength'] * horizon_analysis[h]['weight']
+            for h in active_horizons
+        )
+        signal_strength = min(weighted_strength / max(total_weight, 1e-6), 1.0)
+
+        # Final direction
+        effective_consensus = consensus or not require_consensus
+        final_direction = int(np.sign(avg_direction)) if effective_consensus else 0
+
+        result = {
+            'strategy': strategy,
+            'position_scale': float(np.clip(position_scale, 0.0, 1.0)),
+            'direction': final_direction,
+            'signal_strength': float(signal_strength),
+            'consensus': bool(consensus),  # Ensure it's a Python bool, not numpy bool
+            'active_horizons': active_horizons,
+            'hedge_signal': bool(strategy == 'hedge'),
+            'trade_signal': bool(strategy in ['trade', 'aggressive_trade']),
+            'horizon_analysis': horizon_analysis,  # For debugging
+            'single_horizon_override_used': bool(forced_strategy is not None)
+        }
+
+        # DIAGNOSTIC LOGGING: Track strategy decisions (sample 1% of calls)
+        import random
+        if random.random() < 0.01:  # Log 1% of strategy computations
+            import logging
+            logging.info(f"[INVESTOR_STRATEGY_ADAPTIVE] strategy={strategy} consensus={consensus} "
+                       f"direction={final_direction} signal_strength={signal_strength:.3f} "
+                       f"active_horizons={active_horizons} position_scale={result['position_scale']:.3f} "
+                       f"avg_mape={avg_mape*100:.2f}% threshold_mode={threshold_mode} quality_boost={quality_boost:.2f} "
+                       f"deltas={[(h, forecast_deltas.get(h, 0.0)) for h in ['short', 'medium', 'long']]} "
+                       f"mapes={[(h, mape_thresholds.get(h, 0.0)) for h in ['short', 'medium', 'long']]}")
+
+        return result

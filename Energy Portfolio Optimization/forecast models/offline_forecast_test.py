@@ -12,8 +12,8 @@ def load_model_and_scalers():
     """Load the trained model and scalers"""
     print("Loading model and scalers...")
 
-    # Load the model
-    model = load_model('saved_models/wind_immediate_model.h5')
+    # Load the model (compile=False to avoid loss function issues)
+    model = load_model('saved_models/wind_immediate_model.h5', compile=False)
 
     # Try loading scalers with different methods
     scaler_X = None
@@ -42,22 +42,25 @@ def load_model_and_scalers():
     return model, scaler_X, scaler_y
 
 def create_dataset_horizon(dataset, look_back, horizon_steps=1):
-    """
-    Create windowed dataset for time series forecasting.
-    This matches the training function from ann.py
-    """
+    """Create windowed samples that predict exactly ``horizon_steps`` ahead."""
+    if horizon_steps < 1:
+        raise ValueError("horizon_steps must be >= 1")
+
     if horizon_steps == 1:
         X, y = [], []
         for i in range(len(dataset) - look_back):
-            X.append(dataset[i:i+look_back, 0])
+            X.append(dataset[i:i + look_back, 0])
             y.append(dataset[i + look_back, 0])
         return np.array(X), np.array(y)
 
     dataX, dataY = [], []
     N = len(dataset)
-    end = N - look_back - (horizon_steps - 1)
+    end = N - look_back - horizon_steps + 1
+    if end <= 0:
+        return np.empty((0, look_back)), np.empty((0,))
+
     for i in range(end):
-        dataX.append(dataset[i:i+look_back, 0])
+        dataX.append(dataset[i:i + look_back, 0])
         dataY.append(dataset[i + look_back + horizon_steps - 1, 0])
     return np.array(dataX), np.array(dataY)
 

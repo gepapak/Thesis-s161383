@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import os
 import json
+import gc
 import joblib
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
@@ -14,19 +15,24 @@ from math import sqrt
 from create_dataset import create_dataset  # used for horizon_steps==1
 
 def _create_dataset_horizon(dataset, look_back, horizon_steps):
-    """
-    Window univariate array 'dataset' (shape [N,1]) to X (look_back) and y as the value
-    at t + look_back + horizon_steps - 1. For horizon_steps==1, falls back to create_dataset.
-    """
+    """Window univariate series to predict exactly ``horizon_steps`` ahead."""
+    if horizon_steps < 1:
+        raise ValueError("horizon_steps must be >= 1")
+
     if horizon_steps == 1:
-        X, y = create_dataset(dataset, look_back)
-        return X, y
+        return create_dataset(dataset, look_back)
+
     dataX, dataY = [], []
     N = len(dataset)
-    end = N - look_back - (horizon_steps - 1)
+    end = N - look_back - horizon_steps + 1
+    if end <= 0:
+        return np.empty((0, look_back)), np.empty((0,))
+
     for i in range(end):
-        dataX.append(dataset[i:i+look_back, 0])
-        dataY.append(dataset[i + look_back + horizon_steps - 1, 0])
+        dataX.append(dataset[i:i + look_back, 0])
+        target_idx = i + look_back + horizon_steps - 1
+        dataY.append(dataset[target_idx, 0])
+
     return np.array(dataX), np.array(dataY)
 
 def _std_mape(y_true, y_pred, eps=0.0):
@@ -131,33 +137,49 @@ def ann_model(
         pass
 
     # ----------------
-    # Build ANN
+    # Build IMPROVED ANN (Option 3: Fix + Improve)
     # ----------------
-    neuron = 128
+    # IMPROVEMENTS:
+    # 1. Increased neurons: 128 → 256
+    # 2. Added 2nd hidden layer (128 neurons)
+    # 3. Added Dropout (0.2) to prevent overfitting
+    # 4. Slightly lower learning rate for stability
+    from tensorflow.keras.layers import Dropout
+
     model = Sequential([
         tf.keras.Input(shape=(X_train.shape[1],)),
-        Dense(neuron, activation='relu'),
+        Dense(256, activation='relu'),
+        Dropout(0.2),
+        Dense(128, activation='relu'),
+        Dropout(0.2),
         Dense(1)
     ])
-    model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=0.001))
+    model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=0.0008))
 
     # ----------------
     # Output dirs & filenames (target + horizon label)
     # ----------------
-    for d in ["saved_models", "saved_scalers", "metadata", "datasets", "history", "seeds"]:
+    for d in ["models", "scalers", "metadata", "datasets", "history", "seeds", "feature_matrices"]:
         os.makedirs(d, exist_ok=True)
 
     prefix = f"{target}_{horizon_label}"
-    model_path_best         = f"saved_models/{prefix}_model_best.h5"
-    model_path              = f"saved_models/{prefix}_model.h5"
-    scaler_x_path           = f"saved_scalers/{prefix}_sc_X.pkl"
-    scaler_y_path           = f"saved_scalers/{prefix}_sc_y.pkl"
+    model_path_best         = f"models/{prefix}_model_best.h5"
+    model_path              = f"models/{prefix}_model.h5"
+    scaler_x_path           = f"scalers/{prefix}_sc_X.pkl"
+    scaler_y_path           = f"scalers/{prefix}_sc_y.pkl"
     original_data_path      = f"datasets/{prefix}_original_series.csv"
     test_data_path          = f"datasets/{prefix}_test_data.csv"
     seed_window_raw_path    = f"seeds/{prefix}_seed_window_raw.npy"
     seed_window_scaled_path = f"seeds/{prefix}_seed_window_scaled.npy"
     history_path            = f"history/{prefix}_history.json"
     metadata_path           = f"metadata/{prefix}_metadata.json"
+    # Feature matrices paths
+    feature_matrix_train_X_path = f"feature_matrices/{prefix}_train_X.npy"
+    feature_matrix_train_y_path = f"feature_matrices/{prefix}_train_y.npy"
+    feature_matrix_val_X_path   = f"feature_matrices/{prefix}_val_X.npy"
+    feature_matrix_val_y_path   = f"feature_matrices/{prefix}_val_y.npy"
+    feature_matrix_test_X_path  = f"feature_matrices/{prefix}_test_X.npy"
+    feature_matrix_test_y_path  = f"feature_matrices/{prefix}_test_y.npy"
 
     # ----------------
     # Callbacks
@@ -250,37 +272,37 @@ def ann_model(
         print("✅ Good generalization (val ≈ test).")
 
     # ----------------
-    # Save artifacts (TensorFlow 2.10.1 compatible format)
+    # Save artifacts (compatible format)
     # ----------------
-    # Save model in TF 2.10.1 compatible way
+    # Save model in more compatible way
     try:
-        # Method 1: Save architecture and weights separately for maximum compatibility
-        model_json = model.to_json()
-        arch_path = model_path.replace('.h5', '_architecture.json')
-        weights_path = model_path.replace('.h5', '_weights.h5')
-
-        with open(arch_path, 'w') as f:
-            f.write(model_json)
-        model.save_weights(weights_path)
-
-        # Also try to save the full model for convenience
-        try:
-            model.save(model_path, save_format='h5', include_optimizer=False, save_traces=False)
-            print(f"✅ Model saved (full + separate): {model_path}")
-        except Exception:
-            print(f"✅ Model saved (separate only): {arch_path} + {weights_path}")
-
+        # Method 1: Save with explicit options for compatibility
+        model.save(model_path, save_format='h5', include_optimizer=False)
+        print(f"✅ Model saved (method 1): {model_path}")
     except Exception as e:
-        print(f"❌ Model save failed: {e}")
-        # Last resort: try basic save
+        print(f"⚠️ Method 1 failed: {e}")
         try:
-            model.save(model_path)
-            print(f"✅ Model saved (basic): {model_path}")
+            # Method 2: Recreate model and save weights only
+            model_json = model.to_json()
+            with open(model_path.replace('.h5', '_architecture.json'), 'w') as f:
+                f.write(model_json)
+            model.save_weights(model_path.replace('.h5', '_weights.h5'))
+            print(f"✅ Model saved (method 2): architecture + weights")
         except Exception as e2:
-            print(f"❌ All save methods failed: {e2}")
+            print(f"❌ Both save methods failed: {e2}")
+            # Fallback: save the model anyway
+            model.save(model_path)
 
     joblib.dump(sc_X, scaler_x_path)
     joblib.dump(sc_y, scaler_y_path)
+
+    # Save feature matrices (scaled X and y for train/val/test)
+    np.save(feature_matrix_train_X_path, X_train)
+    np.save(feature_matrix_train_y_path, y_train)
+    np.save(feature_matrix_val_X_path, X_val)
+    np.save(feature_matrix_val_y_path, y_val)
+    np.save(feature_matrix_test_X_path, X_test)
+    np.save(feature_matrix_test_y_path, y_test)
 
     # original series used for splitting (handy for validation split recreation)
     pd.DataFrame({
@@ -328,8 +350,8 @@ def ann_model(
         'val_size': int(val_size),
         'test_size': int(test_size),
         'total_samples': int(total_samples),
-        'neuron_count': neuron,
-        'model_type': 'ANN_3way_split_multi_horizon',
+        'architecture': '256-128 (2 hidden layers with dropout 0.2)',
+        'model_type': 'ANN_3way_split_multi_horizon_improved',
         'training_start': str(data1['Date'].iloc[0]) if 'Date' in data1.columns else "unknown",
         'training_end': str(data1['Date'].iloc[-1]) if 'Date' in data1.columns else "unknown",
         'input_features': int(X_train.shape[1]),
@@ -342,6 +364,12 @@ def ann_model(
         'seed_window_raw_path': seed_window_raw_path,
         'seed_window_scaled_path': seed_window_scaled_path,
         'history_path': history_path,
+        'feature_matrix_train_X_path': feature_matrix_train_X_path,
+        'feature_matrix_train_y_path': feature_matrix_train_y_path,
+        'feature_matrix_val_X_path': feature_matrix_val_X_path,
+        'feature_matrix_val_y_path': feature_matrix_val_y_path,
+        'feature_matrix_test_X_path': feature_matrix_test_X_path,
+        'feature_matrix_test_y_path': feature_matrix_test_y_path,
         'best_epoch': best_epoch,
         'best_val_loss': best_val_loss,
         'performance': {
@@ -369,13 +397,27 @@ def ann_model(
     print(f"✅ Metadata saved to: {metadata_path}")
     print(f"✅ Seed windows saved to: {seed_window_raw_path}, {seed_window_scaled_path}")
     print(f"✅ Test data saved to: {test_data_path}")
+    print(f"✅ Feature matrices saved to: feature_matrices/{prefix}_*_X.npy and feature_matrices/{prefix}_*_y.npy")
+
+    # MEMORY MANAGEMENT: Clear model and scalers from memory after saving
+    # They are already saved to disk, so we can safely delete them from memory
+    # to prevent memory accumulation when training multiple models
+    del model
+    del sc_X
+    del sc_y
+    # Suppress deprecation warning from clear_session
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        tf.keras.backend.clear_session()
+    gc.collect()
 
     return {
         'MAPE': val_mape,
         'RMSE': val_rmse,
         'MAE': val_mae,
-        'model': model,
-        'scalers': {'sc_X': sc_X, 'sc_y': sc_y},
+        # Don't return model/scalers in memory - they're saved to disk
+        # Access them later via: load_model(model_path) and joblib.load(scaler_path)
         'metadata': metadata,
         'model_path': model_path,
         'model_path_best': model_path_best,

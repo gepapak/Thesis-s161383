@@ -193,6 +193,12 @@ def run(
     weights_records: List[Dict] = []
     step_returns = []
 
+    # Distribution tracking (match MARL's shareholder payout mechanism)
+    total_distributions = 0.0
+    target_cash_ratio = 0.10  # 10% of NAV (match MARL)
+    distribution_rate = 0.10  # 10% of excess cash (match MARL)
+    min_distribution_threshold_ratio = 0.005  # 0.5% of NAV minimum (match MARL)
+
     w = {a: 1.0 / len(opt.risky_assets) for a in opt.risky_assets}
     w["cash"] = 1.0 - sum(w.values())
 
@@ -218,6 +224,19 @@ def run(
 
         step_r = float(risky_weight_vec @ r_vec) + w_cash * opt.rf_step
         nav *= (1.0 + step_r)
+
+        # INFRASTRUCTURE FUND: Distribute excess cash to shareholders (match MARL)
+        # Calculate cash portion of NAV
+        cash_value = nav * w_cash
+        target_cash_level = nav * target_cash_ratio
+        excess_cash = cash_value - target_cash_level
+        distribution_threshold = nav * min_distribution_threshold_ratio
+
+        if excess_cash > distribution_threshold:
+            # Distribute 10% of excess cash (match MARL's distribution_rate)
+            distribution_amount = excess_cash * distribution_rate
+            nav -= distribution_amount  # Reduce NAV by distribution
+            total_distributions += distribution_amount
 
         nav_series.append({"timestamp": row["timestamp"], "nav": nav})
         weights_records.append({"timestamp": row["timestamp"], **w})

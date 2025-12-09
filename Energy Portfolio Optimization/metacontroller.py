@@ -22,14 +22,25 @@ import os
 import threading
 import inspect
 import weakref
-import logging
 from datetime import datetime
 import random
 import json
 import pandas as pd
 import optuna
 from config import EnhancedConfig
+from logger import get_logger
+from utils import UnifiedMemoryManager, UnifiedObservationValidator, ErrorHandler, safe_operation  # UNIFIED: Import from single source of truth
 
+# Centralized logging - ALL logging goes through logger.py
+logger = get_logger(__name__)
+
+# GNN Policy (Tier 2 only)
+try:
+    from gnn_encoder import GNNActorCriticPolicy, get_gnn_policy_kwargs
+    GNN_AVAILABLE = True
+except ImportError:
+    GNN_AVAILABLE = False
+    logger.warning("[GNN] gnn_encoder.py not found - GNN encoder disabled")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -38,195 +49,10 @@ LEARNING_MODES = ["PPO", "SAC", "TD3"]
 __all__ = ["MultiESGAgent", "HyperparameterOptimizer"]
 
 
-# ============================= Memory Tracker ================================
-class EnhancedMemoryTracker:
-    """Enhanced memory tracker with SB3-specific cleanup."""
-
-    def __init__(self, max_memory_mb=None, config=None):
-        # Get memory limit from config if available
-        if config and hasattr(config, 'metacontroller_memory_mb'):
-            max_memory_mb = max_memory_mb or config.metacontroller_memory_mb
-        else:
-            max_memory_mb = max_memory_mb or 6000
-        self.max_memory_mb = max_memory_mb
-        self.cleanup_counter = 0
-        self.memory_history = deque(maxlen=200)
-        self.lock = threading.Lock()
-        self.logger = logging.getLogger(__name__)
-
-        # Track SB3 components that need special cleanup
-        self.tracked_policies: List[weakref.ReferenceType] = []
-        self.tracked_buffers: List[weakref.ReferenceType] = []
-        self.tracked_envs: List[weakref.ReferenceType] = []
-
-        self.cleanup_thresholds = {
-            "light": max_memory_mb * 0.70,
-            "medium": max_memory_mb * 0.85,
-            "heavy": max_memory_mb * 0.95,
-        }
-        self.cleanup_stats = {
-            "light_cleanups": 0,
-            "medium_cleanups": 0,
-            "heavy_cleanups": 0,
-            "memory_freed_mb": 0.0,
-        }
-
-    def register_policy(self, policy):
-        self.tracked_policies.append(weakref.ref(policy))
-
-    def register_buffer(self, buffer):
-        self.tracked_buffers.append(weakref.ref(buffer))
-
-    def register_env(self, env):
-        self.tracked_envs.append(weakref.ref(env))
-
-    def get_memory_usage(self) -> float:
-        try:
-            process = psutil.Process(os.getpid())
-            memory_info = process.memory_info()
-            return float(memory_info.rss) / 1024 / 1024
-        except Exception as e:
-            self.logger.warning(f"Failed to get memory usage: {e}")
-            return 0.0
-
-    def should_cleanup(self, force=False) -> Tuple[Optional[str], float]:
-        with self.lock:
-            current_memory = self.get_memory_usage()
-            self.memory_history.append(current_memory)
-            self.cleanup_counter += 1
-
-            if force:
-                return "heavy", current_memory
-            if current_memory > self.cleanup_thresholds["heavy"]:
-                return "heavy", current_memory
-            if current_memory > self.cleanup_thresholds["medium"]:
-                return "medium", current_memory
-            if current_memory > self.cleanup_thresholds["light"] or (self.cleanup_counter % 100 == 0):
-                return "light", current_memory
-            return None, current_memory
-
-    def cleanup(self, level="light") -> float:
-        with self.lock:
-            memory_before = self.get_memory_usage()
-
-            if level in ("light", "medium", "heavy"):
-                self._cleanup_light()
-            if level in ("medium", "heavy"):
-                self._cleanup_medium()
-            if level == "heavy":
-                self._cleanup_heavy()
-
-            self._cleanup_basic()
-
-            memory_after = self.get_memory_usage()
-            memory_freed = max(0.0, memory_before - memory_after)
-
-            key = f"{level}_cleanups"
-            if key in self.cleanup_stats:
-                self.cleanup_stats[key] += 1
-            self.cleanup_stats["memory_freed_mb"] += memory_freed
-
-            if memory_freed > 50:
-                self.logger.info(
-                    f"Memory cleanup ({level}): {memory_before:.1f}MB → "
-                    f"{memory_after:.1f}MB (freed {memory_freed:.1f}MB)"
-                )
-            return memory_freed
-
-    def _cleanup_light(self):
-        self.tracked_policies = [ref for ref in self.tracked_policies if ref() is not None]
-        self.tracked_buffers = [ref for ref in self.tracked_buffers if ref() is not None]
-        self.tracked_envs = [ref for ref in self.tracked_envs if ref() is not None]
-        gc.collect()
-
-    def _cleanup_medium(self):
-        for buffer_ref in self.tracked_buffers:
-            buffer = buffer_ref()
-            if buffer is None:
-                continue
-            try:
-                if hasattr(buffer, "reset"):
-                    buffer.reset()
-                elif hasattr(buffer, "clear"):
-                    buffer.clear()
-            except Exception as e:
-                self.logger.warning(f"Failed to clear buffer: {e}")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-
-    def _cleanup_heavy(self):
-        for policy_ref in self.tracked_policies:
-            policy = policy_ref()
-            if policy is None:
-                continue
-            try:
-                self._cleanup_policy_memory(policy)
-            except Exception as e:
-                self.logger.warning(f"Failed to cleanup policy memory: {e}")
-
-        for env_ref in self.tracked_envs:
-            env = env_ref()
-            if env is not None and hasattr(env, "reset"):
-                try:
-                    env.reset()
-                except Exception as e:
-                    self.logger.warning(f"Failed to reset environment: {e}")
-
-    def _cleanup_policy_memory(self, policy):
-        # Optimizer state
-        try:
-            optimizer = getattr(getattr(policy, "policy", None), "optimizer", None)
-            if optimizer is not None and hasattr(optimizer, "state"):
-                # Zero out grads and clear optimizer states
-                for group in optimizer.param_groups:
-                    for p in group.get("params", []):
-                        if p.grad is not None:
-                            p.grad.detach_()
-                            p.grad.zero_()
-                optimizer.state.clear()
-        except Exception as e:
-            self.logger.warning(f"Failed to clear optimizer: {e}")
-
-        # Replay / rollout buffers
-        try:
-            if hasattr(policy, "replay_buffer") and policy.replay_buffer is not None:
-                if hasattr(policy.replay_buffer, "reset"):
-                    policy.replay_buffer.reset()
-                elif hasattr(policy.replay_buffer, "_storage"):
-                    policy.replay_buffer._storage = []
-                    policy.replay_buffer.pos = 0
-                    policy.replay_buffer.full = False
-        except Exception as e:
-            self.logger.warning(f"Failed to clear replay buffer: {e}")
-
-        try:
-            if hasattr(policy, "rollout_buffer") and policy.rollout_buffer is not None:
-                policy.rollout_buffer.reset()
-        except Exception as e:
-            self.logger.warning(f"Failed to clear rollout buffer: {e}")
-
-    def _cleanup_basic(self):
-        for _ in range(2):
-            gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def get_memory_stats(self) -> Dict[str, Any]:
-        current_memory = self.get_memory_usage()
-        return {
-            "current_memory_mb": current_memory,
-            "max_memory_mb": self.max_memory_mb,
-            "memory_usage_pct": (current_memory / max(1, self.max_memory_mb)) * 100.0,
-            "tracked_policies": len([ref for ref in self.tracked_policies if ref() is not None]),
-            "tracked_buffers": len([ref for ref in self.tracked_buffers if ref() is not None]),
-            "tracked_envs": len([ref for ref in self.tracked_envs if ref() is not None]),
-            "cleanup_stats": self.cleanup_stats.copy(),
-            "memory_history": list(self.memory_history),
-        }
+# UNIFIED MEMORY MANAGER (NEW)
+# EnhancedMemoryTracker is now replaced by UnifiedMemoryManager from memory_manager.py
+# For backward compatibility, we create an alias
+EnhancedMemoryTracker = UnifiedMemoryManager
 
 
 # ============================= Training Monitor =============================
@@ -255,7 +81,7 @@ class StabilizedTrainingMonitor(BaseCallback):
             if cleanup_level:
                 memory_freed = self.memory_tracker.cleanup(cleanup_level)
                 if self.verbose > 0 and memory_freed > 50:
-                    print(f"Callback memory cleanup ({cleanup_level}): freed {memory_freed:.1f}MB")
+                    logger.debug(f"Callback memory cleanup ({cleanup_level}): freed {memory_freed:.1f}MB")
         return True
 
 
@@ -300,7 +126,7 @@ def safe_multithreaded_processing(function, policies, multithreading=True, max_w
             try:
                 function(polid, policy)
             except Exception as exc:
-                print(f"Policy {polid} error: {exc}")
+                logger.error(f"Policy {polid} error: {exc}")
         return
 
     max_workers = max_workers or min(4, len(policies))
@@ -310,143 +136,17 @@ def safe_multithreaded_processing(function, policies, multithreading=True, max_w
             try:
                 future.result(timeout=90)
             except concurrent.futures.TimeoutError:
-                print(f"Policy {polid} training timeout")
+                logger.warning(f"Policy {polid} training timeout")
             except Exception as exc:
                 print(f"Policy {polid} generated an exception: {exc}")
 
 
 # ======================== Observation Validator =============================
-from wrapper import BaseObservationValidator, ObservationValidatorMixin
+# UNIFIED: Use EnhancedObservationValidator from wrapper.py
+from wrapper import EnhancedObservationValidator
 
-class EnhancedObservationValidator(BaseObservationValidator, ObservationValidatorMixin):
-    """Enhanced observation validator with comprehensive dimension checking."""
-
-    def __init__(self, env, debug=False):
-        # Initialize base class
-        super().__init__(env, debug)
-        self.observation_specs = self._build_enhanced_specs()
-
-    def _build_enhanced_specs(self) -> Dict[str, Dict[str, Any]]:
-        specs = {}
-        for agent in self.env.possible_agents:
-            try:
-                obs_space = self.env.observation_space(agent)
-                expected_dim = int(obs_space.shape[0])
-                low = np.clip(obs_space.low.copy(), -1e6, 1e6).astype(np.float32)
-                high = np.clip(obs_space.high.copy(), -1e6, 1e6).astype(np.float32)
-                if np.any(low >= high):
-                    self.logger.warning(f"Invalid bounds for {agent}, using safe defaults")
-                    low = np.full(expected_dim, -10.0, np.float32)
-                    high = np.full(expected_dim, 10.0, np.float32)
-                specs[agent] = {
-                    "expected_dim": expected_dim,
-                    "low": low,
-                    "high": high,
-                    "dtype": np.float32,
-                    "shape": (expected_dim,),
-                    "original_space": obs_space,
-                }
-                if self.debug:
-                    print(
-                        f"Enhanced specs for {agent}: dim={expected_dim}, "
-                        f"bounds=[{low.min():.2f}, {high.max():.2f}]"
-                    )
-            except Exception as e:
-                self.logger.error(f"Failed to build specs for {agent}: {e}")
-                fallback_dim = self._estimate_agent_dimension(agent)
-                specs[agent] = {
-                    "expected_dim": fallback_dim,
-                    "low": np.full(fallback_dim, -10.0, np.float32),
-                    "high": np.full(fallback_dim, 10.0, np.float32),
-                    "dtype": np.float32,
-                    "shape": (fallback_dim,),
-                    "original_space": None,
-                }
-        return specs
-
-
-
-    def validate_observation_dict(self, obs_dict: Dict[str, np.ndarray]) -> bool:
-        if not isinstance(obs_dict, dict):
-            self.validation_errors.append("obs_dict is not a dictionary")
-            return False
-        for agent in self.env.possible_agents:
-            if agent not in obs_dict:
-                self.validation_errors.append(f"Missing agent {agent} in observation dictionary")
-                return False
-            if not self.validate_single_observation(agent, obs_dict[agent]):
-                return False
-        return True
-
-
-
-    def validate_single_observation(self, agent: str, obs: Any) -> bool:
-        sig = self._obs_signature(agent, obs)
-        if sig in self.validation_cache:
-            return self.validation_cache[sig]
-
-        if agent not in self.observation_specs:
-            self.validation_errors.append(f"No specification for agent {agent}")
-            self.validation_cache[sig] = False
-            return False
-
-        spec = self.observation_specs[agent]
-        # Use base class validation logic
-        ok, problems = self._validate_observation_basic(
-            agent, obs, spec["expected_dim"], spec["low"], spec["high"]
-        )
-
-        # Log issues using base class method
-        self._log_validation_issues(agent, problems)
-
-        self.validation_cache[sig] = ok
-        # Use base class cache cleanup
-        self._cleanup_cache()
-        return ok
-
-    def fix_observation(self, agent: str, obs: Any) -> np.ndarray:
-        """Fix obs to expected shape/type/range."""
-        if agent not in self.observation_specs:
-            expected_dim = self._estimate_agent_dimension(agent)
-            return self.create_fallback_observation(expected_dim)
-
-        spec = self.observation_specs[agent]
-        expected = spec["expected_dim"]
-
-        try:
-            # Use mixin method for shape fixing
-            obs = self.fix_observation_shape(obs, expected)
-
-            # Handle padding with intelligent fill values
-            if obs.shape[0] < expected:
-                if obs.size > 0 and np.any(np.isfinite(obs)):
-                    fill = float(np.median(obs[np.isfinite(obs)]))
-                else:
-                    fill = float((spec["low"][0] + spec["high"][0]) / 2.0)
-                fill = float(np.clip(fill, spec["low"][0], spec["high"][0]))
-                obs = np.concatenate([obs, np.full(expected - obs.shape[0], fill, np.float32)])
-
-            # Use base class sanitization
-            obs = self._sanitize_observation(obs, spec["low"], spec["high"])
-            return obs
-        except Exception:
-            return self.create_fallback_observation(expected, spec["low"], spec["high"])
-
-    def get_validation_stats(self) -> Dict[str, Any]:
-        return {
-            "agents_configured": len(self.observation_specs),
-            "validation_cache_size": len(self.validation_cache),
-            "recent_errors": len(self.validation_errors),
-            "error_summary": list(self.validation_errors)[-10:],
-            "specs_summary": {
-                agent: {
-                    "expected_dim": int(spec["expected_dim"]),
-                    "bounds_range": [float(spec["low"].min()), float(spec["high"].max())],
-                    "has_original_space": spec["original_space"] is not None,
-                }
-                for agent, spec in self.observation_specs.items()
-            },
-        }
+# For backward compatibility, keep the reference
+# (The actual implementation is in wrapper.py)
 
 
 # =========================== Multi Agent Controller =========================
@@ -463,11 +163,13 @@ class MultiESGAgent:
         self.debug = bool(debug)
         self.multithreading = bool(getattr(config, "multithreading", False))
 
-        self._logger = logging.getLogger(__name__)
+        self._logger = logger
         self.logger = self._logger
 
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=int(getattr(config, "max_memory_mb", 5000)))
-        self.obs_validator = EnhancedObservationValidator(env, debug=debug)
+        # Get forecaster from env if available
+        forecaster = getattr(env, 'forecast_generator', None)
+        self.obs_validator = EnhancedObservationValidator(env, forecaster=forecaster, debug=debug)
 
         # Spaces
         self.observation_spaces: Dict[str, spaces.Box] = {}
@@ -500,6 +202,32 @@ class MultiESGAgent:
             "successful_steps": 0,
         }
 
+        # FAMC: Forecast-Aware Meta-Critic state tracking
+        # EMA moments for online λ* computation
+        self._ema_mA = 0.0   # E[A]
+        self._ema_mC = 0.0   # E[C]
+        self._ema_mA2 = 0.0  # E[A²]
+        self._ema_mC2 = 0.0  # E[C²]
+        self._ema_mAC = 0.0  # E[A·C]
+        self._lambda_star_prev = 0.0  # Smoothed λ*
+        self._step_count_famc = 0  # Step counter for FAMC
+
+        # FAMC: Buffers for meta-critic training
+        self._meta_features_buffer = []  # State features for meta head training
+        self._meta_adv_buffer = []       # Advantages for meta head training
+
+        # FAMC: Metrics tracking
+        self._famc_metrics = {
+            'lambda_star': 0.0,
+            'corr_AC': 0.0,
+            'clip_rate': 0.0,
+            'meta_loss': 0.0,
+            'var_adv_before': 0.0,
+            'var_adv_after': 0.0,
+            'num_clipped': 0,
+            'num_total': 0,
+        }
+
         print(f"Enhanced MultiESGAgent initialized with {len(self.policies)} agents")
         if self.debug:
             self._print_initialization_summary()
@@ -510,11 +238,108 @@ class MultiESGAgent:
         except Exception:
             self._global_target_steps = None
 
+    def reset_for_new_episode(self):
+        """
+        FIX: Complete reset of agent internal state for new episode.
+        This prevents state leakage between episodes including:
+        - Optimizer states
+        - Learning rate schedules
+        - Buffer states
+        - Episode tracking variables
+        - FAMC meta buffers (CRITICAL for OOM prevention)
+
+        CRITICAL: Does NOT reset total_steps - this must be preserved for learning continuity!
+        """
+        try:
+            # CRITICAL FIX: DO NOT reset total_steps - it must accumulate across episodes
+            # for proper learning rate schedules and optimizer state
+            # self.total_steps = 0  # ← REMOVED! This was breaking learning continuity
+
+            # Reset observation tracking
+            self._last_obs = None
+            self._episode_starts = [True] * self.num_agents
+            self._consecutive_errors = 0
+
+            # Reset training metrics
+            self._training_metrics = {
+                "memory_cleanups": 0,
+                "observation_fixes": 0,
+                "policy_errors": 0,
+                "successful_steps": 0,
+            }
+
+            # FAMC: Clear meta buffers to prevent OOM across episodes
+            # CRITICAL: These buffers accumulate observations and advantages
+            # Without clearing, they grow unbounded across 20 episodes
+            if hasattr(self, '_meta_features_buffer'):
+                buffer_size_before = len(self._meta_features_buffer)
+                self._meta_features_buffer.clear()
+                self._meta_adv_buffer.clear()
+                if buffer_size_before > 0:
+                    self.logger.info(f"[FAMC] Cleared meta buffers: {buffer_size_before} entries freed")
+
+            # FAMC: Reset EMA moments for new episode
+            # This ensures λ* computation starts fresh
+            self._ema_mA = 0.0
+            self._ema_mC = 0.0
+            self._ema_mA2 = 0.0
+            self._ema_mC2 = 0.0
+            self._ema_mAC = 0.0
+            self._lambda_star_prev = 0.0
+            # Note: Keep _step_count_famc to maintain warmup across episodes
+
+            # Reset each policy's internal state
+            for i, policy in enumerate(self.policies):
+                try:
+                    # Reset buffers
+                    if hasattr(policy, 'replay_buffer') and policy.replay_buffer is not None:
+                        policy.replay_buffer.reset()
+                    if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None:
+                        policy.rollout_buffer.reset()
+
+                    # FAMC: Clear policy-specific FAMC step data
+                    if hasattr(policy, '_famc_step_data'):
+                        policy._famc_step_data.clear()
+
+                    # CRITICAL FIX: DO NOT reset optimizer state
+                    # Resetting optimizer wipes out Adam's momentum/variance estimates
+                    # This causes learning instability and prevents convergence
+                    # The optimizer should maintain state across episodes for stable learning
+                    if hasattr(policy, 'policy') and hasattr(policy.policy, 'optimizer'):
+                        # Just log that optimizer state is preserved
+                        self.logger.debug(f"[OK] Optimizer state preserved for policy {i} (maintains momentum)")
+
+                    # Reset policy-specific tracking
+                    if hasattr(policy, '_last_obs'):
+                        policy._last_obs = None
+                    if hasattr(policy, '_last_episode_starts'):
+                        policy._last_episode_starts = None
+                    if hasattr(policy, 'num_timesteps'):
+                        policy.num_timesteps = 0
+
+                    self.logger.info(f"[OK] Reset policy {i} ({policy.mode}) for new episode")
+                except Exception as e:
+                    self.logger.warning(f"[WARN] Could not fully reset policy {i}: {e}")
+
+            self.logger.info("[OK] Agent reset complete for new episode")
+        except Exception as e:
+            self.logger.error(f"[ERROR] Agent reset failed: {e}")
+            raise
+
     def _initialize_spaces(self):
+        """
+        FIX: Initialize observation and action spaces from environment.
+        CRITICAL: These spaces MUST match exactly what the environment produces during step/reset.
+        No runtime modification of observation space is allowed.
+        """
         for agent in self.possible_agents:
             try:
-                self.observation_spaces[agent] = self.env.observation_space(agent)
+                obs_space_from_env = self.env.observation_space(agent)
+                self.observation_spaces[agent] = obs_space_from_env
                 self.action_spaces[agent] = self.env.action_space(agent)
+                # CRITICAL: Log observation space dimensions for debugging
+                obs_dim = obs_space_from_env.shape[0] if hasattr(obs_space_from_env, 'shape') else None
+                self.logger.info(f"[OBS_SPACE_INIT] {agent}: observation_space={obs_dim}D (from env.observation_space())")
                 if self.debug:
                     obs_space = self.observation_spaces[agent]
                     act_space = self.action_spaces[agent]
@@ -525,6 +350,44 @@ class MultiESGAgent:
                 self.observation_spaces[agent] = spaces.Box(low=-10, high=10, shape=(obs_dim,), dtype=np.float32)
                 self.action_spaces[agent] = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
                 print(f"Created fallback spaces for {agent}")
+
+        # FIX: Validate that observation spaces are consistent
+        self._validate_observation_spaces()
+
+    def _validate_observation_spaces(self):
+        """
+        FIX: Validate that observation spaces match what environment will produce.
+        This prevents runtime mismatches between policy initialization and actual observations.
+        """
+        try:
+            # Test observation space consistency by checking a sample observation
+            obs, _ = self.env.reset()
+
+            for agent in self.possible_agents:
+                if agent in obs:
+                    actual_obs = obs[agent]
+                    expected_space = self.observation_spaces[agent]
+
+                    # Check shape consistency
+                    if isinstance(actual_obs, np.ndarray):
+                        if actual_obs.shape[0] != expected_space.shape[0]:
+                            self.logger.error(
+                                f"[CRITICAL] Observation space mismatch for {agent}: "
+                                f"expected shape {expected_space.shape}, got {actual_obs.shape}. "
+                                f"This will cause training failures. Fix environment or observation space definition."
+                            )
+                            raise ValueError(
+                                f"Observation space mismatch for {agent}: "
+                                f"expected {expected_space.shape}, got {actual_obs.shape}"
+                            )
+                    else:
+                        self.logger.error(f"[CRITICAL] Observation for {agent} is not numpy array: {type(actual_obs)}")
+                        raise TypeError(f"Observation for {agent} must be numpy array, got {type(actual_obs)}")
+
+            self.logger.info("[OK] Observation spaces validated successfully")
+        except Exception as e:
+            self.logger.error(f"[CRITICAL] Observation space validation failed: {e}")
+            raise
 
     def _initialize_policies_enhanced(self, config, device):
         act = getattr(config, "activation_fn", nn.Tanh)
@@ -572,16 +435,45 @@ class MultiESGAgent:
 
             algo_cls = {"PPO": PPO, "SAC": SAC, "TD3": TD3}[policy_mode]
 
-            policy_kwargs = {
-                "net_arch": getattr(config, "net_arch", [64, 32]),
-                "activation_fn": activation_fn,
-                "normalize_images": False,
-                "optimizer_class": torch.optim.Adam,
-                "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0},
-            }
+            # TIER 2B: Check if GNN encoder is enabled (only for PPO agents)
+            # REFACTORED: GNN encoder is independent of forecast integration
+            # It can work on base observations (6D) OR forecast-enhanced observations (9D)
+            # This makes GNN encoder a true add-on that can be used with or without forecasts
+            use_gnn = (
+                policy_mode == "PPO" and
+                GNN_AVAILABLE and
+                getattr(config, "enable_gnn_encoder", False)
+                # REMOVED: enable_forecast_utilisation requirement
+                # GNN encoder works on any observation space (6D base or 9D with forecasts)
+            )
+
+            if use_gnn:
+                # Use GNN policy with custom feature extractor
+                policy_kwargs = get_gnn_policy_kwargs(
+                    features_dim=getattr(config, "gnn_features_dim", 18),
+                    hidden_dim=getattr(config, "gnn_hidden_dim", 32),
+                    num_layers=getattr(config, "gnn_num_layers", 2),
+                    dropout=getattr(config, "gnn_dropout", 0.1),
+                    graph_type=getattr(config, "gnn_graph_type", "full"),
+                    num_heads=getattr(config, "gnn_num_heads", 3),
+                    use_attention_pooling=getattr(config, "gnn_use_attention_pooling", True),
+                    net_arch=getattr(config, "gnn_net_arch", [128, 64])
+                )
+                policy_class = GNNActorCriticPolicy
+                logger.info(f"[GNN] Using GNN policy for {agent} (features_dim={policy_kwargs['features_extractor_kwargs']['features_dim']})")
+            else:
+                # Standard MLP policy
+                policy_kwargs = {
+                    "net_arch": getattr(config, "net_arch", [64, 32]),
+                    "activation_fn": activation_fn,
+                    "normalize_images": False,
+                    "optimizer_class": torch.optim.Adam,
+                    "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0},
+                }
+                policy_class = "MlpPolicy"
 
             algo_kwargs = {
-                "policy": "MlpPolicy",
+                "policy": policy_class,
                 "env": dummy_env,
                 "learning_rate": float(getattr(config, "lr", 3e-4)),
                 "policy_kwargs": policy_kwargs,
@@ -637,6 +529,30 @@ class MultiESGAgent:
             policy.mode = policy_mode
             policy.agent_name = agent
             policy.action_space = act_space  # help with buffer clipping later
+            
+            # CRITICAL FIX: Verify and fix policy observation space to match environment
+            # This ensures the policy always uses the correct observation space, even if it was saved with wrong dimensions
+            if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
+                policy_obs_dim = policy.observation_space.shape[0]
+                env_obs_dim = obs_space.shape[0]
+                if policy_obs_dim != env_obs_dim:
+                    self.logger.warning(f"[OBS_SPACE_FIX] {agent}: Policy initialized with {policy_obs_dim}D, but environment provides {env_obs_dim}D. Fixing...")
+                    policy.observation_space = obs_space
+                    if hasattr(policy, 'policy') and hasattr(policy.policy, 'observation_space'):
+                        policy.policy.observation_space = obs_space
+                    # CRITICAL: Also update the rollout/replay buffer observation space if it exists
+                    if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None:
+                        try:
+                            policy.rollout_buffer.observation_space = obs_space
+                        except Exception:
+                            pass
+                    if hasattr(policy, 'replay_buffer') and policy.replay_buffer is not None:
+                        try:
+                            policy.replay_buffer.observation_space = obs_space
+                        except Exception:
+                            pass
+                    self.logger.info(f"[OBS_SPACE_FIX] {agent}: Policy observation space updated to {env_obs_dim}D")
+            
             return policy
         except Exception as e:
             self.logger.error(f"Single policy creation failed for {agent}: {e}")
@@ -653,6 +569,17 @@ class MultiESGAgent:
             fallback.mode = "PPO"
             fallback.agent_name = agent
             fallback.action_space = act_space
+            
+            # CRITICAL FIX: Verify fallback policy observation space matches environment
+            if hasattr(fallback, 'observation_space') and hasattr(fallback.observation_space, 'shape'):
+                fallback_obs_dim = fallback.observation_space.shape[0]
+                env_obs_dim = obs_space.shape[0]
+                if fallback_obs_dim != env_obs_dim:
+                    self.logger.warning(f"[OBS_SPACE_FIX] {agent}: Fallback policy has {fallback_obs_dim}D, environment has {env_obs_dim}D. Fixing...")
+                    fallback.observation_space = obs_space
+                    if hasattr(fallback, 'policy') and hasattr(fallback.policy, 'observation_space'):
+                        fallback.policy.observation_space = obs_space
+                    self.logger.info(f"[OBS_SPACE_FIX] {agent}: Fallback policy observation space updated to {env_obs_dim}D")
             self.memory_tracker.register_policy(fallback)
             if hasattr(fallback, "rollout_buffer"):
                 self.memory_tracker.register_buffer(fallback.rollout_buffer)
@@ -661,8 +588,106 @@ class MultiESGAgent:
         except Exception as e:
             self.logger.error(f"Fallback policy creation failed for {agent}: {e}")
 
+    def _fix_policy_observation_spaces(self):
+        """
+        CRITICAL FIX: Runtime check to ensure all policies have the correct observation space.
+        This catches cases where a saved policy was loaded with wrong dimensions.
+        
+        IMPORTANT: If the policy's neural network was built with wrong dimensions, we need to
+        recreate the policy, not just update the observation_space attribute.
+        
+        This method should only be called once at the start of training, not every step.
+        """
+        # Use a flag to ensure we only check once per agent
+        if not hasattr(self, '_obs_space_fix_checked'):
+            self._obs_space_fix_checked = set()
+        
+        for idx, (agent_name, policy) in enumerate(zip(self.possible_agents, self.policies)):
+            if policy is None or agent_name in self._obs_space_fix_checked:
+                continue
+            try:
+                env_obs_space = self.observation_spaces.get(agent_name)
+                if env_obs_space is None:
+                    continue
+                
+                env_obs_dim = env_obs_space.shape[0] if hasattr(env_obs_space, 'shape') else None
+                if env_obs_dim is None:
+                    continue
+                
+                # Check policy observation space AND network input dimension
+                policy_needs_recreation = False
+                if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
+                    policy_obs_dim = policy.observation_space.shape[0]
+                    if policy_obs_dim != env_obs_dim:
+                        # Check if the network was actually built with wrong dimensions
+                        network_input_dim = None
+                        try:
+                            if hasattr(policy, 'policy') and hasattr(policy.policy, 'features_extractor'):
+                                # Try to get the input dimension from the features extractor
+                                if hasattr(policy.policy.features_extractor, 'mlp'):
+                                    first_layer = policy.policy.features_extractor.mlp[0]
+                                    if hasattr(first_layer, 'in_features'):
+                                        network_input_dim = first_layer.in_features
+                                elif hasattr(policy.policy.features_extractor, 'linear'):
+                                    # For GNN or other custom extractors
+                                    first_layer = policy.policy.features_extractor.linear[0] if isinstance(policy.policy.features_extractor.linear, nn.ModuleList) else policy.policy.features_extractor.linear
+                                    if hasattr(first_layer, 'in_features'):
+                                        network_input_dim = first_layer.in_features
+                        except Exception:
+                            pass
+                        
+                        if network_input_dim is not None and network_input_dim != env_obs_dim:
+                            policy_needs_recreation = True
+                            self.logger.warning(f"[OBS_SPACE_RECREATE] {agent_name}: Network expects {network_input_dim}D input, but environment provides {env_obs_dim}D. Recreating policy...")
+                        elif network_input_dim is None:
+                            # Can't check network, but observation space doesn't match - assume needs recreation
+                            policy_needs_recreation = True
+                            self.logger.warning(f"[OBS_SPACE_RECREATE] {agent_name}: Policy observation space is {policy_obs_dim}D, environment is {env_obs_dim}D. Recreating policy...")
+                
+                if policy_needs_recreation:
+                    # CRITICAL: Recreate the policy with correct observation space
+                    try:
+                        self.logger.warning(f"[OBS_SPACE_RECREATE] {agent_name}: Recreating policy with {env_obs_dim}D observation space...")
+                        # Get activation function from config
+                        act_map = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU}
+                        act = getattr(self.config, "activation_fn", "tanh")
+                        activation_fn = act_map.get(act.lower(), nn.Tanh)
+                        
+                        new_policy = self._create_single_policy(self.config, self.device, agent_name, idx, activation_fn)
+                        if new_policy is not None:
+                            # Replace the old policy
+                            old_policy = self.policies[idx]
+                            self.policies[idx] = new_policy
+                            # Update memory tracking
+                            if hasattr(self.memory_tracker, '_policies') and old_policy in self.memory_tracker._policies:
+                                self.memory_tracker._policies.remove(old_policy)
+                            self.memory_tracker.register_policy(new_policy)
+                            # Transfer buffers if they exist
+                            if hasattr(old_policy, 'rollout_buffer') and old_policy.rollout_buffer is not None:
+                                if hasattr(self.memory_tracker, '_buffers') and old_policy.rollout_buffer in self.memory_tracker._buffers:
+                                    self.memory_tracker._buffers.remove(old_policy.rollout_buffer)
+                            if hasattr(new_policy, 'rollout_buffer') and new_policy.rollout_buffer is not None:
+                                self.memory_tracker.register_buffer(new_policy.rollout_buffer)
+                            self.logger.info(f"[OBS_SPACE_RECREATE] {agent_name}: Policy recreated successfully with {env_obs_dim}D")
+                        else:
+                            self.logger.error(f"[OBS_SPACE_RECREATE] {agent_name}: Failed to recreate policy, keeping old one")
+                    except Exception as recreate_error:
+                        self.logger.error(f"[OBS_SPACE_RECREATE] {agent_name}: Error recreating policy: {recreate_error}")
+                
+                # Mark as checked
+                self._obs_space_fix_checked.add(agent_name)
+            except Exception as e:
+                self.logger.debug(f"Could not fix observation space for {agent_name}: {e}")
+                self._obs_space_fix_checked.add(agent_name)  # Mark as checked even on error
+
     # ----------------------------- Action guards -----------------------------
     def _ensure_action_shape(self, action, action_space):
+        """
+        PHASE 5.5 PATCH A: Type and Shape Coercion Only
+
+        This function focuses ONLY on type and shape coercion.
+        Final clamping to action space bounds is performed by wrapper._validate_actions_comprehensive.
+        """
         try:
             if isinstance(action_space, Discrete):
                 if isinstance(action, (list, tuple, np.ndarray)) and np.size(action) > 0:
@@ -671,7 +696,8 @@ class MultiESGAgent:
                     a = 0
                 else:
                     a = int(action)
-                return int(np.clip(a, 0, action_space.n - 1))
+                # PHASE 5.5 PATCH A: Remove clamping - wrapper will handle it
+                return int(a)
 
             exp = int(action_space.shape[0]) if hasattr(action_space, "shape") else 1
             if action is None:
@@ -686,10 +712,7 @@ class MultiESGAgent:
                 a = np.concatenate([a, np.zeros(exp - a.size, np.float32)])
             elif a.size > exp:
                 a = a[:exp]
-            low = getattr(action_space, "low", None)
-            high = getattr(action_space, "high", None)
-            if low is not None and high is not None:
-                a = np.clip(a, low, high)
+            # PHASE 5.5 PATCH A: Remove clamping - wrapper will handle it
             a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
             return a.astype(np.float32)
         except Exception:
@@ -698,21 +721,24 @@ class MultiESGAgent:
             return 0
 
     def _process_action_enhanced(self, raw_action, action_space):
-        """Clamp/sanitize actions while preserving distributional variability."""
+        """
+        PHASE 5.5 PATCH A: Type and Shape Coercion Only
+
+        Sanitize actions (type/shape/NaN handling) while preserving distributional variability.
+        Final clamping to action space bounds is performed by wrapper._validate_actions_comprehensive.
+        """
         try:
             if isinstance(action_space, Discrete):
                 if isinstance(raw_action, (list, tuple, np.ndarray)) and np.size(raw_action) > 0:
                     a = int(np.round(np.atleast_1d(raw_action)[0]))
                 else:
                     a = int(np.round(float(raw_action)))
-                return int(np.clip(a, 0, action_space.n - 1))
+                # PHASE 5.5 PATCH A: Remove clamping - wrapper will handle it
+                return int(a)
             a = np.asarray(raw_action, np.float32).reshape(-1)
             if np.any(~np.isfinite(a)):
                 a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-            low = getattr(action_space, "low", None)
-            high = getattr(action_space, "high", None)
-            if low is not None and high is not None:
-                a = np.clip(a, low, high)
+            # PHASE 5.5 PATCH A: Remove clamping - wrapper will handle it
             return a.astype(np.float32)
         except Exception:
             return self._ensure_action_shape(raw_action, action_space)
@@ -758,7 +784,9 @@ class MultiESGAgent:
                     # Truncate to correct size
                     a = a[:target_size]
 
-            # Apply bounds if available - ROBUSTIFIED for complex action space objects
+            # MAINTENANCE: Apply bounds if available - ROBUSTIFIED for complex action space objects
+            # Verify that action clipping for off-policy agents (SAC/TD3) correctly handles
+            # the robustified clipping of the action vector to ensure replay buffer stores valid, bounded actions
             if hasattr(action_space, "low") and hasattr(action_space, "high"):
                 low = getattr(action_space, "low", None)
                 high = getattr(action_space, "high", None)
@@ -767,24 +795,57 @@ class MultiESGAgent:
                         # Ensure low/high are convertible to numpy arrays for clipping
                         low_np = np.asarray(low, dtype=np.float32).flatten()
                         high_np = np.asarray(high, dtype=np.float32).flatten()
+                        a_flat = a.flatten()
+                        target_size = a_flat.size
 
                         # Ensure size matches a
-                        target_size = a.size
-                        if low_np.size < target_size:
-                            low_np = np.pad(low_np, (0, target_size - low_np.size), 'constant', constant_values=-1.0)
+                        if low_np.size == 0:
+                            # Empty bounds - use default safe bounds
+                            low_np = np.full(target_size, -1.0, dtype=np.float32)
+                        elif low_np.size == 1:
+                            # Single value - broadcast to all dimensions
+                            low_np = np.full(target_size, float(low_np[0]), dtype=np.float32)
+                        elif low_np.size < target_size:
+                            # Pad with last value (or first if empty)
+                            pad_val = float(low_np[-1]) if low_np.size > 0 else -1.0
+                            low_np = np.pad(low_np, (0, target_size - low_np.size), 'constant', constant_values=pad_val)
                         elif low_np.size > target_size:
                             low_np = low_np[:target_size]
 
-                        if high_np.size < target_size:
-                            high_np = np.pad(high_np, (0, target_size - high_np.size), 'constant', constant_values=1.0)
+                        if high_np.size == 0:
+                            # Empty bounds - use default safe bounds
+                            high_np = np.full(target_size, 1.0, dtype=np.float32)
+                        elif high_np.size == 1:
+                            # Single value - broadcast to all dimensions
+                            high_np = np.full(target_size, float(high_np[0]), dtype=np.float32)
+                        elif high_np.size < target_size:
+                            # Pad with last value (or first if empty)
+                            pad_val = float(high_np[-1]) if high_np.size > 0 else 1.0
+                            high_np = np.pad(high_np, (0, target_size - high_np.size), 'constant', constant_values=pad_val)
                         elif high_np.size > target_size:
                             high_np = high_np[:target_size]
 
-                        a = np.clip(a, low_np, high_np)
-                    except Exception:
+                        # Ensure bounds are valid (low <= high) - fix any inverted bounds
+                        low_np = np.minimum(low_np, high_np)
+                        high_np = np.maximum(low_np, high_np)
+
+                        # FIX: Final action clipping for off-policy agents (SAC/TD3)
+                        # CRITICAL: This clipped action MUST be the same action executed by wrapper
+                        # The wrapper will use this clipped action, ensuring consistency between
+                        # replay buffer storage and environment execution
+                        a_flat = np.clip(a_flat, low_np, high_np)
+                        a = a_flat.reshape(a.shape)
+
+                        # MAINTENANCE: Verify clipping was successful
+                        if not np.all(np.isfinite(a)):
+                            if hasattr(self, 'logger'):
+                                self.logger.warning(f"Non-finite values after clipping for {agent_name}")
+                            a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    except Exception as e:
                         # Log warning about complex bounds and skip clipping
                         if hasattr(self, 'logger'):
-                            self.logger.warning(f"Complex action space bounds for {agent_name}, skipping clipping")
+                            self.logger.warning(f"Complex action space bounds for {agent_name}, skipping clipping: {e}")
 
             return a.astype(np.float32)
 
@@ -881,6 +942,25 @@ class MultiESGAgent:
                 self.logger.error(f"Setup failed for policy {polid}: {e}")
                 self._training_metrics["policy_errors"] += 1
 
+        # PHASE 3 PATCH C: Synchronize RL Rollouts with environment state (Mid-Episode Guardrail)
+        # When the RL agent resets its buffer mid-episode (env.t is preserved, financial state is preserved),
+        # the environment state is non-stationary across rollouts. This patch links the agent's total_steps
+        # to the environment's current time index to enhance learning efficiency.
+        # NOTE: The primary episodic budget synchronization is handled in main.py:run_episode_training.
+        # This guardrail ensures robustness during mid-episode PPO buffer resets.
+        try:
+            current_env_t = getattr(self.env, 't', 0)
+            if reset_num_timesteps:
+                # True episode reset: agent starts fresh
+                self.total_steps = 0
+            else:
+                # Mid-episode buffer reset: synchronize agent progress to data progress
+                if current_env_t > 0 and self.total_steps < current_env_t:
+                    self.total_steps = current_env_t
+                    self.logger.info(f"[PHASE 3 PATCH C] Synchronized total_steps to env.t={current_env_t:,} (Mid-Episode Buffer Reset)")
+        except Exception as e:
+            self.logger.warning(f"[PHASE 3 PATCH C] Synchronization failed: {e}")
+
     def _run_enhanced_training_loop(self, total_timesteps, callbacks):
         def train_with_memory(polid, policy):
             try:
@@ -936,13 +1016,48 @@ class MultiESGAgent:
         pbar.close()
 
     def _train_ppo_enhanced(self, policy):
-        if hasattr(policy, "rollout_buffer") and getattr(policy.rollout_buffer, "full", False):
+        """
+        Train PPO policy with robust buffer fullness check.
+
+        CRITICAL FIX: Instead of relying on unreliable `buffer.full` flag,
+        explicitly check that buffer.pos >= n_steps to ensure sufficient data.
+        """
+        if not hasattr(policy, "rollout_buffer") or policy.rollout_buffer is None:
+            return
+
+        buffer = policy.rollout_buffer
+
+        # Get n_steps from policy (default to self.n_steps if not available)
+        n_steps = getattr(policy, "n_steps", self.n_steps)
+
+        # ROBUST CHECK: Verify buffer has enough data
+        # Check both buffer.pos (current position) and buffer.full flag
+        buffer_pos = getattr(buffer, "pos", 0)
+        buffer_full = getattr(buffer, "full", False)
+        buffer_size = getattr(buffer, "buffer_size", n_steps)
+
+        # Train if buffer is full OR has at least n_steps of data
+        has_enough_data = buffer_full or (buffer_pos >= n_steps)
+
+        if has_enough_data:
             try:
                 policy.train()
+
+                # FAMC: Train meta-critic head periodically (meta mode only)
+                self._step_count_famc += 1
+                self._train_meta_head_if_needed()
+
                 policy.rollout_buffer.reset()
                 gc.collect()
             except Exception as e:
                 self.logger.warning(f"PPO training failed for {policy.agent_name}: {e}")
+        else:
+            # Only log if we're past warmup phase and buffer is unexpectedly empty
+            if self.total_steps > 100 and buffer_pos == 0:
+                self.logger.debug(
+                    f"PPO buffer for {policy.agent_name} not ready: "
+                    f"pos={buffer_pos}/{buffer_size}, full={buffer_full}, n_steps={n_steps}"
+                )
 
     def _rb_size(self, rb) -> int:
         try:
@@ -1010,6 +1125,8 @@ class MultiESGAgent:
                     self._last_obs = self._fix_observation_dict_enhanced(self._last_obs)
                     self._training_metrics["observation_fixes"] += 1
 
+                # CRITICAL FIX: Before collecting actions, verify and fix observation space mismatches
+                self._fix_policy_observation_spaces()
                 actions_dict, agent_data = self._collect_actions_enhanced()
                 next_obs, rewards, dones, truncs, infos = self._execute_environment_step_enhanced(actions_dict)
                 self._add_experiences_enhanced(agent_data, rewards, dones, truncs, next_obs)
@@ -1017,7 +1134,10 @@ class MultiESGAgent:
 
                 steps_collected += 1
 
-                if self._check_buffers_full():
+                # PHASE 5.6 FIX: Don't exit early during episode training
+                # During episode training, continue collecting steps until max_steps_per_rollout
+                is_episode_training = getattr(self.env, '_episode_training_mode', False)
+                if not is_episode_training and self._check_buffers_full():
                     break
 
                 if steps_collected % 80 == 0:
@@ -1031,6 +1151,10 @@ class MultiESGAgent:
         self._finalize_rollouts_enhanced()
         return steps_collected
 
+    # REMOVED: _blend_with_expert_suggestions() - Legacy action blending removed
+    # Action blending is deprecated and replaced by FGB (Tier 3)
+    # Tier 2 does NOT blend actions - PPO learns directly from observations
+
     def _collect_actions_enhanced(self):
         actions_dict: Dict[str, Any] = {}
         agent_data: Dict[int, Dict[str, Any]] = {}
@@ -1039,6 +1163,13 @@ class MultiESGAgent:
             agent_name = self.possible_agents[polid]
             try:
                 obs = self._last_obs[agent_name].reshape(1, -1)
+
+                # CRITICAL FIX: Truncate observation to expected size before passing to policy
+                # This handles cases where extra dimensions are accidentally added (e.g., bridge vectors)
+                expected_dim = self.observation_spaces[agent_name].shape[0]
+                if obs.shape[1] > expected_dim:
+                    obs = obs[:, :expected_dim]
+
                 with torch.no_grad():
                     obs_tensor = obs_as_tensor(obs, policy.device)
                     if getattr(policy, "mode", None) == "PPO":
@@ -1051,6 +1182,12 @@ class MultiESGAgent:
                         raw = action_t.detach().cpu().numpy().flatten()
                         proc = self._process_action_enhanced(raw, self.action_spaces[agent_name])
                         proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
+
+                        # EXPERT BLENDING: Blend PPO action with DL overlay expert suggestions
+                        # This gives DL overlay more direct control over actions
+                        # if agent_name == "investor_0":
+                        #     proc = self._blend_with_expert_suggestions(proc, agent_name)
+
                         agent_data[polid] = {
                             "obs": self._last_obs[agent_name].copy(),
                             "action": proc.copy(),
@@ -1176,6 +1313,28 @@ class MultiESGAgent:
                 data = agent_data[polid]
                 reward = float(rewards.get(agent_name, 0.0))
                 done = bool(dones.get(agent_name, False))
+
+                # FGB/FAMC: Add forecast signals to data dict for baseline adjustment
+                # These are computed by environment._compute_forecast_signals() each step
+                data['forecast_trust'] = getattr(self.env, '_forecast_trust', 0.0)
+                data['expected_dnav'] = getattr(self.env, '_expected_dnav', 0.0)
+
+                # FAMC: Add meta-critic prediction if available
+                # This comes from the DL overlay's meta_adv head (state-only)
+                if hasattr(self.env, '_last_overlay_output') and self.env._last_overlay_output:
+                    overlay_out = self.env._last_overlay_output
+                    if isinstance(overlay_out, dict) and 'meta_adv' in overlay_out:
+                        # Extract scalar from (1, 1) tensor
+                        meta_adv_raw = overlay_out['meta_adv']
+                        if hasattr(meta_adv_raw, 'shape') and len(meta_adv_raw.shape) > 0:
+                            data['meta_adv_pred'] = float(meta_adv_raw.flatten()[0])
+                        else:
+                            data['meta_adv_pred'] = float(meta_adv_raw)
+                    else:
+                        data['meta_adv_pred'] = 0.0
+                else:
+                    data['meta_adv_pred'] = 0.0
+
                 if getattr(policy, "mode", None) == "PPO":
                     self._add_ppo_experience(policy, data, reward, polid)
                 else:
@@ -1199,6 +1358,10 @@ class MultiESGAgent:
         """
         # RolloutBuffer may not be initialized yet (e.g., during warmup)
         if not hasattr(policy, "rollout_buffer"):
+            return
+
+        # Check if buffer is None
+        if policy.rollout_buffer is None:
             return
 
         try:
@@ -1232,6 +1395,63 @@ class MultiESGAgent:
                 action_fixed = action_fixed.detach().cpu().numpy()
             action_np = np.asarray(action_fixed, dtype=np.float32).reshape(1, -1)
 
+            # --- FGB/FAMC: Forecast-guided baseline adjustment ---
+            # Mode "fixed": Apply reward-level adjustment (legacy FGB)
+            # Mode "online"/"meta": Store data for advantage-level correction (FAMC)
+            fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+
+            if getattr(self.config, 'forecast_baseline_enable', False) and fgb_mode == 'fixed':
+                # LEGACY FGB: Reward-level adjustment with fixed λ
+                try:
+                    lam = getattr(self.config, 'forecast_baseline_lambda', 0.5)
+                    tau = data.get('forecast_trust', 0.0) if isinstance(data, dict) else 0.0
+                    exp_dnav = data.get('expected_dnav', 0.0) if isinstance(data, dict) else 0.0
+
+                    # FGB: Normalize E[ΔNAV] from DKK to return units
+                    # This keeps the baseline adjustment comparable to reward scale
+                    nav_norm = max(1.0, float(getattr(self.config, "init_budget", 0.0)) or 1.0)
+                    baseline_adj = lam * tau * (exp_dnav / nav_norm)
+
+                    # CRITICAL FIX: Increase clip range for meaningful FGB impact
+                    # Previous: ±0.01 (1 bp) was too conservative - only 1% of typical reward
+                    # New: ±0.10 (10 bp) allows 10% adjustment - meaningful variance reduction
+                    # This ensures FGB has bite while still preventing reward swamping
+                    baseline_adj = float(np.clip(baseline_adj, -0.10, 0.10))
+
+                    reward = float(reward) - baseline_adj
+
+                    # Log telemetry (metrics tracked in _famc_metrics dict)
+                    # Note: self.logger is Python logging.Logger, not SB3 logger
+                    # SB3 logger.record() is not available here
+                    if self.debug and self._step_count_famc % 1000 == 0:
+                        self.logger.debug(f"[FGB] trust={tau:.3f}, exp_dnav={exp_dnav:.2f}, baseline_adj={baseline_adj:.4f}")
+                except Exception as e:
+                    self.logger.debug(f"[FGB] Baseline adjustment failed: {e}")
+
+            # FAMC: Store control variate data for advantage-level correction (online/meta modes)
+            # This data will be used in _finalize_rollouts_enhanced after GAE computation
+            if fgb_mode in ['online', 'meta']:
+                # Store forecast signals and meta predictions for this step
+                if not hasattr(policy, '_famc_step_data'):
+                    policy._famc_step_data = []
+
+                # FAMC: Get overlay features (34D) for meta head training
+                # These are the features used for overlay inference, not agent observations
+                overlay_feats = None
+                if hasattr(self.env, '_last_overlay_features') and self.env._last_overlay_features is not None:
+                    overlay_feats = self.env._last_overlay_features.copy()
+                else:
+                    # Fallback: use agent obs (will cause dimension mismatch and skip training)
+                    overlay_feats = obs_np.copy()
+
+                famc_data = {
+                    'tau': data.get('forecast_trust', 0.0),
+                    'expected_dnav': data.get('expected_dnav', 0.0),
+                    'meta_adv_pred': data.get('meta_adv_pred', 0.0),
+                    'obs': overlay_feats,  # Store overlay features (34D) for meta head training
+                }
+                policy._famc_step_data.append(famc_data)
+
             # --- reward/start flags -> numpy (CPU) ---
             reward_np = np.array([reward], dtype=np.float32)
             starts_np = np.array([self._episode_starts[polid]], dtype=bool)
@@ -1240,8 +1460,7 @@ class MultiESGAgent:
             policy.rollout_buffer.add(obs_np, action_np, reward_np, starts_np, value_t, log_prob_t)
 
         except Exception as e:
-            # Keep message identical to your logs so it's easy to grep
-            self.logger.warning(f"PPO buffer add error: {e}")
+            self.logger.warning(f"PPO buffer add error for policy {polid}: {e}")
 
     def _add_offpolicy_experience(self, policy, data, reward, done, truncs, next_obs, agent_name):
         if not hasattr(policy, "replay_buffer") or policy.replay_buffer is None:
@@ -1285,8 +1504,9 @@ class MultiESGAgent:
             obs_b = obs_fixed.reshape(1, -1).astype(np.float32)
             next_obs_b = next_obs_fixed.reshape(1, -1).astype(np.float32)
             action_b = action_fixed.reshape(1, -1).astype(np.float32)
-            reward_b = np.array([reward], np.float32)
-            done_b = np.array([done_flag], np.float32)
+            # MAINTENANCE: Use np.asarray for cleaner tensor conversion
+            reward_b = np.asarray([reward], np.float32)
+            done_b = np.asarray([done_flag], np.float32)
             infos_b = [{}]
 
             if n_params >= 6:
@@ -1305,16 +1525,35 @@ class MultiESGAgent:
         for polid, agent in enumerate(self.possible_agents):
             self._episode_starts[polid] = bool(dones.get(agent, False) or truncs.get(agent, False))
 
+        # PHASE 5.6 FIX: Don't reset environment during episode training
+        # During episode training, the environment should continue until episode_timesteps is reached
         if any(dones.values()) or any(truncs.values()):
-            self._initialize_environment_enhanced()
+            is_episode_training = getattr(self.env, '_episode_training_mode', False)
+            if not is_episode_training:
+                self._initialize_environment_enhanced()
 
     def _check_buffers_full(self):
-        return any(
-            getattr(policy, "mode", None) == "PPO"
-            and hasattr(policy, "rollout_buffer")
-            and getattr(policy.rollout_buffer, "full", False)
-            for policy in self.policies
-        )
+        """
+        Check if any PPO buffer has enough data for training.
+
+        ROBUST: Check buffer.pos >= n_steps instead of just buffer.full flag.
+        """
+        for policy in self.policies:
+            if getattr(policy, "mode", None) != "PPO":
+                continue
+            if not hasattr(policy, "rollout_buffer") or policy.rollout_buffer is None:
+                continue
+
+            buffer = policy.rollout_buffer
+            n_steps = getattr(policy, "n_steps", self.n_steps)
+            buffer_pos = getattr(buffer, "pos", 0)
+            buffer_full = getattr(buffer, "full", False)
+
+            # Return True if any buffer is full or has enough data
+            if buffer_full or buffer_pos >= n_steps:
+                return True
+
+        return False
 
     def _finalize_rollouts_enhanced(self):
         for polid, policy in enumerate(self.policies):
@@ -1322,15 +1561,314 @@ class MultiESGAgent:
                 if getattr(policy, "mode", None) == "PPO" and hasattr(policy, "rollout_buffer"):
                     agent_name = self.possible_agents[polid]
                     if agent_name in self._last_obs:
+                        # MAINTENANCE: Verify rollout buffer state before GAE calculation
+                        buffer = policy.rollout_buffer
+
+                        # Check if buffer is None or empty
+                        if buffer is None:
+                            if self.total_steps > 100:
+                                self.logger.warning(f"PPO rollout buffer for policy {polid} is None!")
+                            continue
+
+                        if buffer.pos == 0:
+                            # Only warn if we're past the initial warmup phase (total_steps > 100)
+                            # During early training, empty buffers are normal and expected
+                            if self.total_steps > 100:
+                                # Add diagnostic info to help debug why buffer is empty
+                                buffer_size = getattr(buffer, 'buffer_size', 'unknown')
+                                full = getattr(buffer, 'full', 'unknown')
+                                self.logger.warning(
+                                    f"PPO rollout buffer for policy {polid} is empty or invalid "
+                                    f"(total_steps={self.total_steps}, buffer.pos=0/{buffer_size}, "
+                                    f"full={full})"
+                                )
+                                # Check if this is due to action collection errors
+                                self.logger.warning(
+                                    f"  → This usually means experiences aren't being added to the buffer. "
+                                    f"Check for 'PPO buffer add error' or 'Action collection error' messages above."
+                                )
+                            continue
+
+                        # PHASE 3 PATCH B: PPO Rollout Stability Guard
+                        # Prevent GAE calculation crashes when buffer is under-filled
+                        # This can occur after premature environment termination or buffer reset
+                        n_steps = getattr(policy, 'n_steps', 128)
+                        min_gae_len = max(1, n_steps // 4)  # Require at least 25% of n_steps
+
+                        if buffer.pos < min_gae_len:
+                            if self.total_steps > 100:
+                                self.logger.warning(
+                                    f"[PATCH B] PPO GAE skipped for {policy.agent_name}: "
+                                    f"pos={buffer.pos}/{buffer.buffer_size} < min_gae_len={min_gae_len} "
+                                    f"(n_steps={n_steps}). Buffer under-filled, skipping GAE to prevent crashes."
+                                )
+                            continue
+
                         final_obs = self._last_obs[agent_name].reshape(1, -1)
                         with torch.no_grad():
                             obs_tensor = obs_as_tensor(final_obs, policy.device)
                             final_value = policy.policy.predict_values(obs_tensor)
-                        # Use true episode-start (terminal) flag for correct GAE
-                        dones_b = np.array([self._episode_starts[polid]], dtype=bool)
+
+                        # CRITICAL FIX: GAE Terminal Flag
+                        # Because the environment immediately resets on done=True, the final_obs
+                        # collected in the buffer is the post-reset state, which is non-terminal.
+                        # Therefore, dones_b must be explicitly set to np.array([False], dtype=bool)
+                        # to align with custom loop logic and prevent GAE corruption.
+                        dones_b = np.array([False], dtype=bool)
+
+                        # Verify no next_observation is accidentally passed (not in signature)
                         policy.rollout_buffer.compute_returns_and_advantage(final_value, dones_b)
+
+                        # FAMC: Apply advantage-level correction (online/meta modes)
+                        fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+                        if fgb_mode in ['online', 'meta'] and getattr(self.config, 'forecast_baseline_enable', False):
+                            self._apply_famc_correction(policy, polid)
+
+                        # MAINTENANCE: Log buffer state for verification
+                        self.logger.debug(f"GAE computed for policy {polid}: buffer_size={buffer.buffer_size}, pos={buffer.pos}")
             except Exception as e:
                 self.logger.warning(f"Rollout finalization error for policy {polid}: {e}")
+
+    def _apply_famc_correction(self, policy, polid):
+        """
+        FAMC: Apply learned control-variate baseline correction to advantages.
+
+        This implements variance-optimal advantage correction:
+        A'_t = A_t - λ* * C_t
+
+        where:
+        - C_t is the control variate (meta-critic prediction or expected_dnav)
+        - λ* = Cov(A,C) / Var(C) is computed online via EMA
+
+        Args:
+            policy: PPO policy with rollout_buffer containing computed advantages
+            polid: Policy index
+        """
+        try:
+            buffer = policy.rollout_buffer
+            if buffer is None or buffer.pos == 0:
+                return
+
+            # Get FAMC configuration
+            fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+            warmup_steps = getattr(self.config, 'fgb_warmup_steps', 2000)
+            lambda_max = getattr(self.config, 'fgb_lambda_max', 0.8)
+            clip_bps = getattr(self.config, 'fgb_clip_bps', 0.01)
+            moment_beta = getattr(self.config, 'fgb_moment_beta', 0.01)
+
+            # Skip if still in warmup
+            if self._step_count_famc < warmup_steps:
+                return
+
+            # Get stored FAMC data
+            if not hasattr(policy, '_famc_step_data') or len(policy._famc_step_data) == 0:
+                return
+
+            famc_data_list = policy._famc_step_data
+            n_steps = min(buffer.pos, len(famc_data_list))
+
+            if n_steps == 0:
+                return
+
+            # Extract advantages from buffer (shape: (buffer_size, 1))
+            advantages = buffer.advantages[:n_steps].flatten()  # (n_steps,)
+
+            # Build control variate C_t based on mode
+            C_t = np.zeros(n_steps, dtype=np.float32)
+            nav_norm = max(1.0, float(getattr(self.config, "init_budget", 0.0)) or 1.0)
+
+            for i in range(n_steps):
+                tau = famc_data_list[i]['tau']
+                exp_dnav = famc_data_list[i]['expected_dnav']
+                meta_pred = famc_data_list[i]['meta_adv_pred']
+
+                if fgb_mode == 'online':
+                    # Use expected_dnav as control variate (gated by trust)
+                    C_t[i] = tau * (exp_dnav / nav_norm)
+                elif fgb_mode == 'meta':
+                    # Use meta-critic prediction as control variate (gated by trust)
+                    C_t[i] = tau * meta_pred
+
+            # Standardize advantages and control variates for stable moment estimation
+            A_mean = np.mean(advantages)
+            A_std = np.std(advantages) + 1e-8
+            A_std_norm = (advantages - A_mean) / A_std
+
+            C_mean = np.mean(C_t)
+            C_std = np.std(C_t) + 1e-8
+            C_std_norm = (C_t - C_mean) / C_std
+
+            # Update EMA moments (on standardized values)
+            for i in range(n_steps):
+                a = A_std_norm[i]
+                c = C_std_norm[i]
+
+                # Update first moments
+                self._ema_mA = (1 - moment_beta) * self._ema_mA + moment_beta * a
+                self._ema_mC = (1 - moment_beta) * self._ema_mC + moment_beta * c
+
+                # Update second moments
+                self._ema_mA2 = (1 - moment_beta) * self._ema_mA2 + moment_beta * (a ** 2)
+                self._ema_mC2 = (1 - moment_beta) * self._ema_mC2 + moment_beta * (c ** 2)
+                self._ema_mAC = (1 - moment_beta) * self._ema_mAC + moment_beta * (a * c)
+
+            # Compute variance and covariance from EMA moments
+            var_A = self._ema_mA2 - self._ema_mA ** 2
+            var_C = self._ema_mC2 - self._ema_mC ** 2
+            cov_AC = self._ema_mAC - self._ema_mA * self._ema_mC
+
+            # Compute optimal λ* = Cov(A,C) / Var(C)
+            if var_C > 1e-6:
+                lambda_star_raw = cov_AC / var_C
+                # Clip to [0, lambda_max] (only positive correlation reduces variance)
+                lambda_star = np.clip(lambda_star_raw, 0.0, lambda_max)
+            else:
+                lambda_star = 0.0
+
+            # Smooth λ* to reduce jitter
+            self._lambda_star_prev = 0.9 * self._lambda_star_prev + 0.1 * lambda_star
+            lambda_star_smooth = self._lambda_star_prev
+
+            # Apply correction in standardized space (correct scale)
+            # A'_std = A_std - λ* * C_std
+            A_corrected_std = A_std_norm - lambda_star_smooth * C_std_norm
+
+            # De-standardize back to original scale
+            # A' = A'_std * σ_A + μ_A
+            advantages_corrected = A_corrected_std * A_std + A_mean
+
+            # Clip the CHANGE (not the correction itself)
+            # This preserves the advantage scale while limiting per-step adjustments
+            delta = advantages_corrected - advantages
+            delta_clipped = np.clip(delta, -clip_bps, clip_bps)
+            advantages_corrected = advantages + delta_clipped
+
+            # Compute variance for metrics
+            var_before = np.var(advantages)
+            var_after = np.var(advantages_corrected)
+            num_clipped = np.sum(np.abs(delta) > clip_bps)
+
+            # CRITICAL FIX: Write back to buffer BEFORE SB3 normalization
+            # SB3's compute_returns_and_advantage already computed advantages
+            # We're modifying them here, which is fine as long as we don't trigger
+            # another normalization pass. The buffer is ready for training after this.
+            #
+            # RISK MITIGATION: This modification happens AFTER GAE computation but
+            # BEFORE the PPO update. SB3 will NOT re-normalize advantages during
+            # the update step, so our corrections are preserved.
+            buffer.advantages[:n_steps] = advantages_corrected.reshape(-1, 1)
+
+            # Compute correlation for diagnostics
+            if np.std(advantages) > 1e-6 and np.std(C_t) > 1e-6:
+                corr_AC = np.corrcoef(advantages, C_t)[0, 1]
+            else:
+                corr_AC = 0.0
+
+            # Update metrics
+            self._famc_metrics['lambda_star'] = float(lambda_star_smooth)
+            self._famc_metrics['corr_AC'] = float(corr_AC)
+            self._famc_metrics['clip_rate'] = float(num_clipped) / max(1, n_steps)
+            self._famc_metrics['var_adv_before'] = float(var_before)
+            self._famc_metrics['var_adv_after'] = float(var_after)
+            self._famc_metrics['num_clipped'] = int(num_clipped)
+            self._famc_metrics['num_total'] = int(n_steps)
+            self._famc_metrics['var_reduction'] = float(1.0 - var_after / max(var_before, 1e-8))
+
+            # Periodic detailed logging
+            if self._step_count_famc % 500 == 0:
+                var_red_pct = (1.0 - var_after / max(var_before, 1e-8)) * 100
+                clip_rate_pct = (float(num_clipped) / max(1, n_steps)) * 100
+                self.logger.info(f"[FAMC] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} | VarRed={var_red_pct:.1f}% | Clip={clip_rate_pct:.1f}%")
+
+            # Store features and advantages for meta head training (meta mode only)
+            if fgb_mode == 'meta' and getattr(self.config, 'meta_baseline_enable', False):
+                for i in range(n_steps):
+                    self._meta_features_buffer.append(famc_data_list[i]['obs'])
+                    self._meta_adv_buffer.append(A_std_norm[i])  # Store standardized advantage
+
+                # Limit buffer size
+                max_buffer_size = 10000
+                if len(self._meta_features_buffer) > max_buffer_size:
+                    self._meta_features_buffer = self._meta_features_buffer[-max_buffer_size:]
+                    self._meta_adv_buffer = self._meta_adv_buffer[-max_buffer_size:]
+
+            # Clear FAMC step data for next rollout
+            policy._famc_step_data = []
+
+        except Exception as e:
+            self.logger.warning(f"[FAMC] Correction failed for policy {polid}: {e}")
+
+    def _train_meta_head_if_needed(self):
+        """
+        FAMC: Train meta-critic head periodically on accumulated advantages.
+
+        This trains the meta head g_φ(x_t) to predict standardized advantages
+        from state features only (no action leakage).
+        """
+        try:
+            # Check if meta head training is enabled
+            fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+            if fgb_mode != 'meta' or not getattr(self.config, 'meta_baseline_enable', False):
+                return
+
+            # Check if it's time to train
+            meta_train_every = getattr(self.config, 'meta_train_every', 512)
+            if self._step_count_famc % meta_train_every != 0:
+                return
+
+            # Check if we have enough data
+            if len(self._meta_features_buffer) < 128:
+                return
+
+            # Get overlay trainer from environment
+            if not hasattr(self.env, 'overlay_trainer') or self.env.overlay_trainer is None:
+                self.logger.warning("[FAMC] Overlay trainer not found, skipping meta head training")
+                return
+
+            overlay_trainer = self.env.overlay_trainer
+
+            # Sample a batch from buffer
+            batch_size = min(256, len(self._meta_features_buffer))
+            indices = np.random.choice(len(self._meta_features_buffer), batch_size, replace=False)
+
+            # Extract features and advantages
+            features_batch = np.array([self._meta_features_buffer[i] for i in indices], dtype=np.float32)
+            adv_batch = np.array([self._meta_adv_buffer[i] for i in indices], dtype=np.float32)
+
+            # Ensure features are (batch, 34) - extract from (batch, 1, obs_dim) if needed
+            if len(features_batch.shape) == 3:
+                features_batch = features_batch.squeeze(1)
+
+            # For meta head training, we need the 34D overlay features
+            # If obs is larger (e.g., investor_0 has 23 base dims), we need to extract overlay features
+            # This is tricky - we need to know which part of the observation is the overlay input
+            # For now, assume the environment stores overlay features separately
+            # TODO: This needs to be coordinated with wrapper.py to store overlay features
+
+            # CRITICAL CHECK: Verify feature dimension matches overlay input (34D)
+            if features_batch.shape[1] != 34:
+                self.logger.warning(f"[FAMC] ❌ SKIPPING meta head training: feature dim mismatch (got {features_batch.shape[1]}, expected 34)")
+                self.logger.warning(f"[FAMC] This means overlay features are not being cached properly!")
+                return
+
+            # SUCCESS: Features are correct dimension
+            if self._step_count_famc % (meta_train_every * 10) == 0:
+                self.logger.info(f"[FAMC] ✅ Meta head training with correct 34D features (buffer_size={len(self._meta_features_buffer)})")
+
+            # Train meta head
+            loss_type = getattr(self.config, 'meta_baseline_loss', 'mse')
+            meta_loss = overlay_trainer.train_meta_baseline(features_batch, adv_batch, loss_type)
+
+            # Update metrics
+            self._famc_metrics['meta_loss'] = float(meta_loss)
+            self._famc_metrics['meta_buffer_size'] = len(self._meta_features_buffer)
+
+            # Log
+            if self.verbose:
+                self.logger.info(f"[FAMC] Meta head trained: loss={meta_loss:.6f}, buffer_size={len(self._meta_features_buffer)}")
+
+        except Exception as e:
+            self.logger.warning(f"[FAMC] Meta head training failed: {e}")
 
     def _finalize_training(self):
         for polid, policy in enumerate(self.policies):
@@ -1470,10 +2008,88 @@ class MultiESGAgent:
                 # reattach a dummy env with correct spaces
                 obs_space = self.observation_spaces[agent_name]
                 act_space = self.action_spaces[agent_name]
+                
+                # CRITICAL FIX: Check if saved policy's observation space matches current environment
+                # Load policy metadata first to check observation space dimension
+                # This prevents loading policies with incompatible observation spaces (e.g., Tier 3 13D policy into Tier 2 9D environment)
+                pre_check_passed = False
+                try:
+                    import zipfile
+                    import json
+                    with zipfile.ZipFile(path, 'r') as zip_ref:
+                        if 'data' in zip_ref.namelist():
+                            data_str = zip_ref.read('data').decode('utf-8')
+                            data = json.loads(data_str)
+                            saved_obs_shape = data.get('observation_space', {}).get('shape', None)
+                            if saved_obs_shape is not None:
+                                # Handle different shape formats: [dim] or dim or (dim,)
+                                if isinstance(saved_obs_shape, (list, tuple)):
+                                    saved_obs_dim = int(saved_obs_shape[0]) if len(saved_obs_shape) > 0 else None
+                                elif isinstance(saved_obs_shape, (int, float)):
+                                    saved_obs_dim = int(saved_obs_shape)
+                                else:
+                                    saved_obs_dim = None
+                                
+                                if saved_obs_dim is not None:
+                                    current_obs_dim = int(obs_space.shape[0])
+                                    if saved_obs_dim != current_obs_dim:
+                                        self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Saved policy has {saved_obs_dim}D observations, "
+                                                           f"but current environment expects {current_obs_dim}D. Skipping load - will use existing policy.")
+                                        load_errors.append(f"Observation space mismatch: saved={saved_obs_dim}D, current={current_obs_dim}D")
+                                        continue
+                                    else:
+                                        pre_check_passed = True
+                                        self.logger.debug(f"[OBS_SPACE_CHECK] {agent_name}: Pre-check passed ({saved_obs_dim}D matches {current_obs_dim}D)")
+                except Exception as check_error:
+                    # If we can't check, proceed with load and verify after loading
+                    # This handles edge cases like corrupted metadata or different SB3 versions
+                    self.logger.debug(f"Could not pre-check observation space for {agent_name}: {check_error}. Will verify after load.")
+                
                 dummy_env = DummyVecEnv([partial(DummyGymEnv, obs_space, act_space)])
 
                 before = self.memory_tracker.get_memory_usage()
                 loaded = algo_cls.load(path, device=self.device, env=dummy_env)
+                
+                # Double-check: Verify loaded policy's observation space matches (critical safety check)
+                # This catches cases where pre-check failed or policy was saved with different format
+                observation_space_valid = False
+                try:
+                    if hasattr(loaded, 'observation_space') and hasattr(loaded.observation_space, 'shape'):
+                        loaded_obs_dim = int(loaded.observation_space.shape[0])
+                        current_obs_dim = int(obs_space.shape[0])
+                        if loaded_obs_dim != current_obs_dim:
+                            self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Loaded policy has {loaded_obs_dim}D observations, "
+                                               f"but current environment expects {current_obs_dim}D. Skipping load - will use existing policy.")
+                            load_errors.append(f"Observation space mismatch after load: loaded={loaded_obs_dim}D, current={current_obs_dim}D")
+                            continue
+                        else:
+                            observation_space_valid = True
+                            # CRITICAL FIX: Update policy's observation space to match environment
+                            # This ensures the policy uses the correct observation space even if it was saved with a different one
+                            loaded.observation_space = obs_space
+                            if hasattr(loaded, 'policy') and hasattr(loaded.policy, 'observation_space'):
+                                loaded.policy.observation_space = obs_space
+                            # Also check and update network input dimension if accessible
+                            if hasattr(loaded, 'policy') and hasattr(loaded.policy, 'features_extractor'):
+                                try:
+                                    # Verify network input dimension matches (if accessible)
+                                    if hasattr(loaded.policy.features_extractor, 'features_dim'):
+                                        net_input_dim = loaded.policy.features_extractor.features_dim
+                                        if net_input_dim != current_obs_dim:
+                                            self.logger.warning(f"[NETWORK_MISMATCH] {agent_name}: Policy network expects {net_input_dim}D input, "
+                                                               f"but environment provides {current_obs_dim}D. This may cause runtime errors.")
+                                except Exception:
+                                    pass  # Network dimension check is optional
+                    else:
+                        # Policy doesn't have observation_space attribute - this is unusual but not necessarily fatal
+                        self.logger.warning(f"[OBS_SPACE_WARNING] {agent_name}: Loaded policy missing observation_space attribute. Proceeding with caution.")
+                        observation_space_valid = True  # Assume valid if we can't check
+                except Exception as verify_error:
+                    # If verification fails, don't load the policy to be safe
+                    self.logger.error(f"[OBS_SPACE_VERIFY_ERROR] {agent_name}: Failed to verify observation space: {verify_error}. Skipping load.")
+                    load_errors.append(f"Observation space verification failed: {str(verify_error)}")
+                    continue
+                
                 # keep metadata expected elsewhere
                 loaded.mode = algo_name
                 loaded.agent_name = agent_name
@@ -1599,7 +2215,7 @@ class OptunaHyperparameterOptimizer:
         self.timeout = timeout
         self.training_steps_per_trial = training_steps_per_trial
         self.eval_steps_per_trial = eval_steps_per_trial
-        self.logger = logging.getLogger(__name__)
+        self.logger = logger
 
     def _calculate_performance_metric(self, portfolio_values: List[float]) -> float:
         """
@@ -1731,6 +2347,60 @@ class OptunaHyperparameterOptimizer:
             print(f"  - {key}: {value}")
 
         return best_params, performance_summary
+
+
+# ============================= DL Overlay Tuning ================================
+def tune_overlay(env, window_size: int = 100, adjustment_factor: float = 0.05) -> None:
+    """
+    Periodic meta-controller tuning for DL overlay intensity.
+
+    Adjusts overlay_intensity based on recent P&L and drawdown:
+    - If recent P&L is positive and drawdown is low: increase intensity (more aggressive)
+    - If recent P&L is negative or drawdown is high: decrease intensity (more defensive)
+
+    Args:
+        env: The environment with reward_calculator and config
+        window_size: Number of recent steps to consider (default: 100)
+        adjustment_factor: How much to adjust intensity per call (default: 0.05)
+    """
+    try:
+        if not hasattr(env, 'reward_calculator') or env.reward_calculator is None:
+            return
+
+        if not hasattr(env, 'config') or env.config is None:
+            return
+
+        # Get recent performance metrics
+        recent_gains = float(getattr(env.reward_calculator, 'recent_trading_gains', 0.0))
+        current_dd = float(getattr(env.reward_calculator, 'current_drawdown', 0.0))
+
+        # Get current overlay intensity
+        current_intensity = getattr(env.config, 'overlay_intensity', 1.0)
+
+        # Determine adjustment direction
+        adjustment = 0.0
+
+        # Positive P&L and low drawdown: increase intensity
+        if recent_gains > 50_000 and current_dd < 0.02:
+            adjustment = adjustment_factor
+        # Negative P&L or high drawdown: decrease intensity
+        elif recent_gains < -50_000 or current_dd > 0.05:
+            adjustment = -adjustment_factor
+
+        # Apply adjustment with bounds [0.5, 1.5]
+        new_intensity = np.clip(current_intensity + adjustment, 0.5, 1.5)
+
+        # Update config
+        env.config.overlay_intensity = new_intensity
+
+        # Log if significant change
+        if abs(new_intensity - current_intensity) > 1e-6:
+            logger.info(f"[OVERLAY-TUNE] t={env.t} recent_gains={recent_gains:.0f} dd={current_dd:.3f} "
+                        f"intensity: {current_intensity:.2f} -> {new_intensity:.2f}")
+
+    except Exception as e:
+        logger.debug(f"Overlay tuning failed: {e}")
+
 
 # Keep this alias for backward compatibility with main.py
 HyperparameterOptimizer = OptunaHyperparameterOptimizer

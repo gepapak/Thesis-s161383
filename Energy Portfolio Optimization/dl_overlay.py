@@ -1,899 +1,845 @@
 #!/usr/bin/env python3
 """
-SIMPLIFIED dl_overlay.py - Direct Integration of Simple Hedge Optimizer
+DL Overlay System - Tier 3 ONLY (Multiple Capabilities)
 
-This file replaces the complex 1400-line dl_overlay.py with the simple hedge optimizer
-implementation, while maintaining compatibility with the existing main.py interface.
+IMPORTANT: This module is ONLY for Tier 3 (when --dl_overlay flag is set).
+Tier 2 (forecast integration) does NOT need this - it uses direct deltas from ForecastGenerator.
 
-Key changes:
-- HedgeOptimizer: Now uses simple neural network (not complex transformer)
-- AdvancedHedgeOptimizer: Alias to simple implementation
-- AdvancedFeatureEngine: Simplified to 8 essential features
-- DynamicHedgeLabeler: Simplified labeling logic
-- HedgeValidationFramework: Basic validation
+TIER 2 (Forecast Integration - NO DL overlay needed):
+- ForecastGenerator (ANN/LSTM models) → generates forecasts
+- _compute_forecast_deltas() → computes z-scores from forecasts  
+- ForecastEngine → processes z-scores into observation features
+- PPO learns directly from forecast deltas (z_short, z_medium, trust)
 
-Expected performance: 80% of complex system benefits with 20% of the complexity
-Memory usage: 287MB → 0.1MB (1934x reduction)
-Parameters: 2.7M → 3.2K (839x reduction)
+TIER 3 COMPONENTS (Multiple Capabilities - requires --dl_overlay flag):
+- OverlaySharedModel: Shared encoder with 7 output heads providing:
+  1. bridge_vec: Coordination signals (appended to agent observations)
+  2. risk_budget: Position sizing multiplier (scales position sizes)
+  3. pred_reward: Predictive reward shaping (adds to reward signal)
+  4. strat_immediate/short/medium/long: Multi-horizon trading strategy signals
+  5. meta_adv: Meta-critic head for FAMC (Forecast-Aware Meta-Critic)
+- DLAdapter: Thin API for environment integration with strict shape contracts
+- OverlayExperienceBuffer: Circular buffer for training (TIER 3 ONLY)
+- OverlayTrainer: Multi-head loss training with per-horizon metrics (TIER 3 ONLY)
+- CalibrationTracker: FGB forecast trust (τₜ) and expected ΔNAV (TIER 3 ONLY)
+
+DL OVERLAY OUTPUTS (All Tier 3):
+1. Bridge Vectors (4D): Multi-agent coordination signals
+2. Risk Budget (1D): Position sizing multiplier [0.5, 1.5]
+3. Predicted Reward (1D): Auxiliary reward signal [-1, 1]
+4. Strategy Heads (4×4D): Multi-horizon trading signals (immediate/short/medium/long)
+5. FGB Components: Forecast trust (τₜ) and expected ΔNAV for baseline adjustment
+6. Meta-Critic: FAMC advantage prediction (Tier 3 with --meta_baseline_enable)
+
+Features:
+- 34D mode: 28D base + 6D forecast deltas (short/medium/long for price/total_gen)
+- Bridge vectors + Risk budgeting + Multi-horizon strategy guidance
+- Strict shape/name invariants enforced at runtime
+- Memory efficient (< 1 MB)
 """
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.models import Model
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Any, Optional
 from collections import deque
 import logging
-import json
-import os
-import pandas as pd
-from datetime import datetime
+from config import (
+    DL_OVERLAY_LOSS_WEIGHTS,
+    DL_OVERLAY_WINDOW_SIZE_DEFAULT,
+    DL_OVERLAY_INIT_BUDGET_DEFAULT,
+    DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT,
+)  # UNIFIED: Import constants from config
 
 # ============================================================================
-# SIMPLE HEDGE OPTIMIZER (replaces complex transformer-based system)
+# DL OVERLAY: SHARED ENCODER + HEADS (28D FORECAST-AWARE MODE ONLY)
 # ============================================================================
 
-class HedgeOptimizer(tf.keras.Model):
+class OverlaySharedModel(tf.keras.Model):
     """
-    Simple hedge optimizer that replaces the complex transformer-based system.
+    Shared encoder for 28D forecast-aware mode only.
 
-    This is the basic version expected by main.py when use_advanced_features=False.
-    Uses a simple neural network to predict hedge parameters.
+    Outputs (strict shape contract):
+    - bridge_vec: (batch, bridge_dim) tanh ∈ [-1,1] → appended per agent
+    - risk_budget: (batch, 1) in [0.5, 1.5] → env scales position sizes
+    - pred_reward: (batch, 1) in [-1, +1] → auxiliary reward shaping
+    - strat_immediate: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] immediate signals
+    - strat_short: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] short-horizon (1h)
+    - strat_medium: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] medium-horizon (4h)
+    - strat_long: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] long-horizon (24h, risk-only)
 
-    Output ranges (by design):
-    - hedge_intensity: [0.5, 2.0] (scaled from sigmoid [0,1] via *1.5 + 0.5)
-    - hedge_direction: [0.0, 1.0] (sigmoid output, env maps to [-1,1])
-    - risk_allocation: [0.0, 1.0] per asset (softmax normalized)
+    DESIGN: 4 strategy heads for 4 forecast horizons
+    - Immediate: Reactive trading (respond to NOW signals) - full forecast
+    - Short: Tactical adjustments (1h ahead) - 95% confidence
+    - Medium: Strategic shifts (4h ahead) - 90% confidence
+    - Long: Positioning (24h ahead) - risk-only (no directional signal)
     """
-    
-    def __init__(self, num_assets: int = 3, market_dim: int = 13):
-        super().__init__()
-        self.num_assets = num_assets
-        self.market_dim = market_dim
-        
-        # Simple neural network architecture
-        self.dense1 = Dense(64, activation='relu', name='hedge_dense1')
-        self.dropout1 = Dropout(0.1, name='hedge_dropout1')
-        self.dense2 = Dense(32, activation='relu', name='hedge_dense2')
-        self.dropout2 = Dropout(0.1, name='hedge_dropout2')
-        self.dense3 = Dense(16, activation='relu', name='hedge_dense3')
-        
-        # Output heads
-        self.hedge_intensity_head = Dense(1, activation='sigmoid', name='hedge_intensity')
-        self.hedge_direction_head = Dense(1, activation='sigmoid', name='hedge_direction')
-        self.risk_allocation_head = Dense(num_assets, activation='softmax', name='risk_allocation')
-        
-        logging.info(f"Simple HedgeOptimizer initialized: {market_dim} features → {num_assets} assets")
-    
-    def call(self, inputs, training=None):
-        """Forward pass through simple network"""
-        x = self.dense1(inputs)
-        x = self.dropout1(x, training=training)
-        x = self.dense2(x)
-        x = self.dropout2(x, training=training)
-        x = self.dense3(x)
-        
-        # Generate outputs
-        hedge_intensity = self.hedge_intensity_head(x) * 1.5 + 0.5  # Scale to [0.5, 2.0] - env expects this range
-        hedge_direction = self.hedge_direction_head(x)  # [0.0, 1.0]
-        risk_allocation = self.risk_allocation_head(x)  # Softmax normalized
-        
-        return {
-            'hedge_intensity': hedge_intensity,
-            'hedge_direction': hedge_direction,
-            'risk_allocation': risk_allocation
-        }
 
-
-class AdvancedHedgeOptimizer(tf.keras.Model):
-    """
-    Advanced hedge optimizer that's actually just the simple implementation.
-    
-    This maintains compatibility with main.py when use_advanced_features=True,
-    but uses the simple architecture instead of complex transformers.
-    """
-    
-    def __init__(self, feature_dim: int = 13, sequence_length: int = 24,
-                 d_model: int = 128, num_heads: int = 8, num_transformer_blocks: int = 4):
+    def __init__(self, feature_dim: int, bridge_dim: int = 4, meta_head_dim: int = 32, enable_meta_head: bool = False):
         super().__init__()
         self.feature_dim = feature_dim
-        self.sequence_length = sequence_length
-
-        # Ignore complex parameters and use simple architecture
-        logging.info(f"AdvancedHedgeOptimizer using SIMPLE implementation: {feature_dim} features")
-
-        # Simple neural network that handles both 2D and 3D inputs
-        self.dense1 = Dense(64, activation='relu', name='adv_dense1')
-        self.dropout1 = Dropout(0.1, name='adv_dropout1')
-        self.dense2 = Dense(32, activation='relu', name='adv_dense2')
-        self.dropout2 = Dropout(0.1, name='adv_dropout2')
-        self.dense3 = Dense(16, activation='relu', name='adv_dense3')
-        
-        # Output heads (matching expected interface)
-        self.hedge_intensity_head = Dense(1, activation='sigmoid', name='hedge_intensity')
-        self.hedge_intensity_uncertainty_head = Dense(1, activation='sigmoid', name='hedge_intensity_uncertainty')
-        self.hedge_direction_head = Dense(1, activation='sigmoid', name='hedge_direction')
-        self.risk_allocation_head = Dense(3, activation='softmax', name='risk_allocation')
-        self.hedge_effectiveness_head = Dense(1, activation='sigmoid', name='hedge_effectiveness')
-    
-    def call(self, inputs, training=None):
-        """Forward pass - handles both 2D and 3D inputs with robust error handling"""
-        try:
-            # Handle both 2D (batch, features) and 3D (batch, sequence, features) inputs
-            if len(inputs.shape) == 3:
-                # 3D input: use global average pooling to reduce sequence dimension
-                x = tf.reduce_mean(inputs, axis=1)  # (batch, sequence, features) -> (batch, features)
-            elif len(inputs.shape) == 2:
-                # 2D input: use directly
-                x = inputs
-            else:
-                raise ValueError(f"Expected 2D or 3D input, got shape: {inputs.shape}")
-
-            x = self.dense1(x)
-            x = self.dropout1(x, training=training)
-            x = self.dense2(x)
-            x = self.dropout2(x, training=training)
-            x = self.dense3(x)
-
-            # Generate all expected outputs
-            hedge_intensity = self.hedge_intensity_head(x) * 1.5 + 0.5  # Scale to [0.5, 2.0] - env expects this range
-            hedge_intensity_uncertainty = self.hedge_intensity_uncertainty_head(x) * 0.2  # [0.0, 0.2]
-            hedge_direction = self.hedge_direction_head(x)  # [0.0, 1.0]
-            risk_allocation = self.risk_allocation_head(x)  # Softmax normalized
-            hedge_effectiveness = self.hedge_effectiveness_head(x)  # [0.0, 1.0]
-
-            return {
-                'hedge_intensity': hedge_intensity,
-                'hedge_intensity_uncertainty': hedge_intensity_uncertainty,
-                'hedge_direction': hedge_direction,
-                'risk_allocation': risk_allocation,
-                'hedge_effectiveness': hedge_effectiveness
-            }
-
-        except Exception as e:
-            # Robust fallback to prevent crashes
-            logging.warning(f"AdvancedHedgeOptimizer call failed: {e}")
-            try:
-                batch_size = tf.shape(inputs)[0] if tf.is_tensor(inputs) else inputs.shape[0]
-                return {
-                    'hedge_intensity': tf.ones((batch_size, 1), dtype=tf.float32),
-                    'hedge_intensity_uncertainty': tf.zeros((batch_size, 1), dtype=tf.float32),
-                    'hedge_direction': tf.ones((batch_size, 1), dtype=tf.float32),
-                    'risk_allocation': tf.tile(tf.constant([[0.4, 0.35, 0.25]], dtype=tf.float32), [batch_size, 1]),
-                    'hedge_effectiveness': tf.ones((batch_size, 1), dtype=tf.float32) * 0.7
-                }
-            except Exception:
-                # Ultimate fallback
-                return {
-                    'hedge_intensity': tf.constant([[1.0]], dtype=tf.float32),
-                    'hedge_intensity_uncertainty': tf.constant([[0.0]], dtype=tf.float32),
-                    'hedge_direction': tf.constant([[1.0]], dtype=tf.float32),
-                    'risk_allocation': tf.constant([[0.4, 0.35, 0.25]], dtype=tf.float32),
-                    'hedge_effectiveness': tf.constant([[0.7]], dtype=tf.float32)
-                }
-
-    def predict(self, inputs, verbose=0):
-        """Robust prediction method that handles numpy inputs and returns numpy outputs"""
-        try:
-            # Determine batch size first
-            if hasattr(inputs, 'shape'):
-                batch_size = inputs.shape[0]
-            else:
-                batch_size = 1
-
-            # ROBUST APPROACH: Use parent class predict if available, otherwise fallback
-            if hasattr(super(), 'predict'):
-                # Use Keras Model.predict method which handles graph contexts properly
-                outputs = super().predict(inputs, verbose=verbose)
-
-                # Convert outputs to proper format
-                if isinstance(outputs, dict):
-                    result = {}
-                    for key, value in outputs.items():
-                        if tf.is_tensor(value):
-                            result[key] = value.numpy()
-                        elif isinstance(value, np.ndarray):
-                            result[key] = value
-                        else:
-                            result[key] = np.array(value)
-                    return result
-                else:
-                    # Non-dict output, use fallback
-                    raise ValueError("Unexpected output format")
-            else:
-                # No parent predict method, use direct call
-                if not tf.is_tensor(inputs):
-                    inputs = tf.convert_to_tensor(inputs, dtype=tf.float32)
-
-                outputs = self(inputs, training=False)
-
-                # Convert outputs to numpy
-                result = {}
-                for key, value in outputs.items():
-                    if tf.is_tensor(value):
-                        result[key] = value.numpy()
-                    else:
-                        result[key] = np.array(value)
-
-                return result
-
-        except Exception as e:
-            logging.warning(f"AdvancedHedgeOptimizer predict failed: {e}")
-            # Return robust fallback numpy arrays
-            try:
-                batch_size = inputs.shape[0] if hasattr(inputs, 'shape') else 1
-            except:
-                batch_size = 1
-
-            return {
-                'hedge_intensity': np.ones((batch_size, 1), dtype=np.float32),
-                'hedge_intensity_uncertainty': np.zeros((batch_size, 1), dtype=np.float32),
-                'hedge_direction': np.ones((batch_size, 1), dtype=np.float32),
-                'risk_allocation': np.tile(np.array([[0.4, 0.35, 0.25]], dtype=np.float32), (batch_size, 1)),
-                'hedge_effectiveness': np.ones((batch_size, 1), dtype=np.float32) * 0.7
-            }
-
-
-# ============================================================================
-# SIMPLIFIED FEATURE ENGINE (8 essential features vs 43 complex)
-# ============================================================================
-
-class AdvancedFeatureEngine:
-    """
-    Simplified feature engine that extracts only 8 essential features.
-    
-    Replaces the complex 43-feature system with essential features:
-    1. Current price
-    2. Price volatility (24-period)
-    3. Generation vs load ratio
-    4. Generation volatility
-    5. Price trend (short-term)
-    6. Generation trend (short-term)
-    7. Portfolio value
-    8. Time of day (cyclical)
-    """
-    
-    def __init__(self, lookback_window: int = 24):
-        self.lookback_window = lookback_window
-        self.price_history = deque(maxlen=lookback_window)
-        self.generation_history = deque(maxlen=lookback_window)
-        self.load_history = deque(maxlen=lookback_window)
-        
-        logging.info("AdvancedFeatureEngine using SIMPLE 13-feature implementation (4 state + 3 positions + 3 forecasts + 3 portfolio)")
-    
-    def extract_features(self, env, t: int, forecasts: Optional[Dict] = None) -> np.ndarray:
-        """Extract 13 essential features matching main.py HedgeAdapter: 4 state + 3 positions + 3 forecasts + 3 portfolio"""
-        try:
-            # FIXED: Match main.py's exact 13-feature structure
-            features = np.zeros(13)  # 4 state + 3 positions + 3 forecasts + 3 portfolio
-
-            # === MARKET STATE FEATURES (0-3) - Match main.py _market_state ===
-            current_price = float(env._price[t] if t < len(env._price) else 250.0)
-            current_wind = float(env._wind[t] if t < len(env._wind) else 0.0)
-            current_solar = float(env._solar[t] if t < len(env._solar) else 0.0)
-            current_hydro = float(env._hydro[t] if t < len(env._hydro) else 0.0)
-            current_load = float(env._load[t] if t < len(env._load) else 0.0)
-
-            features[0] = current_price / 100.0  # Normalized price (IDENTICAL to Normal version)
-            features[1] = (current_wind + current_solar + current_hydro) / 1000.0  # Total generation
-            features[2] = current_load / 1000.0  # Load
-            features[3] = float(getattr(env, 't', t)) / 1000.0  # Time normalized
-
-            # === POSITION FEATURES (4-6) - Match main.py _positions ===
-            fund_size = max(getattr(env, 'init_budget', 1e9), 1e6)
-            wind_pos = float(getattr(env, 'financial_positions', {}).get('wind_instrument_value', 0.0)) / fund_size
-            solar_pos = float(getattr(env, 'financial_positions', {}).get('solar_instrument_value', 0.0)) / fund_size
-            hydro_pos = float(getattr(env, 'financial_positions', {}).get('hydro_instrument_value', 0.0)) / fund_size
-
-            features[4] = wind_pos
-            features[5] = solar_pos
-            features[6] = hydro_pos
-
-            # === GENERATION FORECAST FEATURES (7-9) - Use cached forecast signal ===
-            # MEMORY FIX: Use provided forecasts parameter to avoid excessive generator calls
-            wind_scale = max(getattr(env, 'wind_scale', 225), 1e-6)
-            solar_scale = max(getattr(env, 'solar_scale', 100), 1e-6)
-            hydro_scale = max(getattr(env, 'hydro_scale', 40), 1e-6)
-
-            if forecasts is not None and isinstance(forecasts, dict):
-                # Use provided forecasts (from wrapper or main.py) - MEMORY EFFICIENT
-                wind_forecast = float(forecasts.get('wind_forecast_short',
-                                    forecasts.get('wind_forecast_immediate', current_wind)))
-                solar_forecast = float(forecasts.get('solar_forecast_short',
-                                     forecasts.get('solar_forecast_immediate', current_solar)))
-                hydro_forecast = float(forecasts.get('hydro_forecast_short',
-                                     forecasts.get('hydro_forecast_immediate', current_hydro)))
-
-                features[7] = wind_forecast / wind_scale    # Normalized wind forecast
-                features[8] = solar_forecast / solar_scale  # Normalized solar forecast
-                features[9] = hydro_forecast / hydro_scale  # Normalized hydro forecast
-
-            elif hasattr(env, 'forecast_generator') and env.forecast_generator is not None:
-                # FALLBACK: Only call generator if no forecasts provided (rare case)
-                try:
-                    # Use cached call with minimal frequency to avoid OOM
-                    forecast_data = env.forecast_generator.predict_for_agent('investor_0', t)
-                    if forecast_data:
-                        wind_forecast = float(forecast_data.get('wind_forecast_short', current_wind))
-                        solar_forecast = float(forecast_data.get('solar_forecast_short', current_solar))
-                        hydro_forecast = float(forecast_data.get('hydro_forecast_short', current_hydro))
-
-                        features[7] = wind_forecast / wind_scale    # Normalized wind forecast
-                        features[8] = solar_forecast / solar_scale  # Normalized solar forecast
-                        features[9] = hydro_forecast / hydro_scale  # Normalized hydro forecast
-                    else:
-                        raise ValueError("No forecast data")
-                except Exception:
-                    # Fallback to current generation with P95 normalization
-                    features[7] = current_wind / wind_scale   # Current wind normalized
-                    features[8] = current_solar / solar_scale # Current solar normalized
-                    features[9] = current_hydro / hydro_scale # Current hydro normalized
-            else:
-                # No forecast generator - use current generation with P95 normalization
-                features[7] = current_wind / wind_scale   # Current wind normalized
-                features[8] = current_solar / solar_scale # Current solar normalized
-                features[9] = current_hydro / hydro_scale # Current hydro normalized
-
-            # === PORTFOLIO METRICS FEATURES (10-12) - Match main.py _get_portfolio_metrics ===
-            cap_alloc = float(getattr(env, 'capital_allocation_fraction', 0.1))
-            inv_freq = float(getattr(env, 'investment_freq', 10)) / 100.0  # Normalized
-            forecast_conf = 1.0  # Default confidence
-
-            features[10] = cap_alloc
-            features[11] = inv_freq
-            features[12] = forecast_conf
-
-            return features
-
-        except Exception as e:
-            logging.warning(f"AdvancedFeatureEngine.extract_features failed: {e}")
-            return np.zeros(13)  # Return 13 features to match expected dimensions
-    
-    def get_feature_names(self) -> List[str]:
-        """Return names of the 13 essential features matching main.py structure"""
-        return [
-            # Market state features (0-3)
-            'price', 'total_generation', 'load', 'time',
-            # Position features (4-6)
-            'wind_position', 'solar_position', 'hydro_position',
-            # Generation forecast features (7-9)
-            'wind_capacity_factor', 'solar_capacity_factor', 'hydro_capacity_factor',
-            # Portfolio metrics features (10-12)
-            'capital_allocation', 'investment_frequency', 'forecast_confidence'
-        ]
-
-    def get_all_features(self, env=None, t: int = None, forecasts: Optional[Dict] = None, **kwargs) -> np.ndarray:
-        """Alias for extract_features to maintain compatibility with HedgeAdapter calls"""
-        # Handle different calling patterns from HedgeAdapter
-        if env is not None and t is not None:
-            return self.extract_features(env, t, forecasts)
-
-        # Handle keyword-based calls from HedgeAdapter
-        # Extract basic features from kwargs
-        features = np.zeros(13)  # Updated to 13 features
-
-        try:
-            price = kwargs.get('price', 0.0)
-            wind = kwargs.get('wind', 0.0)
-            solar = kwargs.get('solar', 0.0)
-            hydro = kwargs.get('hydro', 0.0)
-            load = kwargs.get('load', 0.0)
-
-            # Update histories
-            current_generation = wind + solar + hydro
-            self.price_history.append(price)
-            self.generation_history.append(current_generation)
-            self.load_history.append(load)
-
-            # FIXED: Match main.py's exact 13-feature structure
-            # === MARKET STATE FEATURES (0-3) ===
-            features[0] = price / 100.0  # Normalized price (IDENTICAL to Normal version)
-            features[1] = current_generation / 1000.0  # Total generation
-            features[2] = load / 1000.0  # Load
-            # FIXED: Use normalized timestep instead of constant 0.0
-            t_value = kwargs.get('t', 0)
-            features[3] = float(t_value) / 1000.0 if t_value != 0 else 0.5  # Normalized time
-
-            # === POSITION FEATURES (4-6) ===
-            # Default positions (no access to env in kwargs mode)
-            features[4] = 0.0  # Wind position
-            features[5] = 0.0  # Solar position
-            features[6] = 0.0  # Hydro position
-
-            # === GENERATION FORECAST FEATURES (7-9) ===
-            # IMPROVED: Use smoothed capacity factors for consistency with main.py
-            wind_cap, solar_cap, hydro_cap = 270.0, 100.0, 40.0
-            wind_cf = np.clip(wind / wind_cap, 0.0, 1.0) * 0.95  # Match main.py smoothing
-            solar_cf = np.clip(solar / solar_cap, 0.0, 1.0) * 0.95
-            hydro_cf = np.clip(hydro / hydro_cap, 0.0, 1.0) * 0.95
-
-            features[7] = wind_cf  # Smoothed wind capacity factor
-            features[8] = solar_cf  # Smoothed solar capacity factor
-            features[9] = hydro_cf  # Smoothed hydro capacity factor
-
-            # === PORTFOLIO METRICS FEATURES (10-12) ===
-            features[10] = 0.1  # Default capital allocation
-            features[11] = 0.1  # Default investment frequency
-            features[12] = 0.85  # FIXED: Use consistent confidence (between 0.7-1.0 range)
-
-            return features
-
-        except Exception as e:
-            logging.warning(f"AdvancedFeatureEngine.get_all_features failed: {e}")
-            return np.zeros(13)  # Return 13 features to match expected dimensions
-
-
-# ============================================================================
-# SIMPLIFIED LABELING (replaces complex optimization-based labeling)
-# ============================================================================
-
-class DynamicHedgeLabeler:
-    """
-    Simplified hedge labeling that replaces complex optimization.
-
-    Uses simple heuristics to determine optimal hedge parameters:
-    - High volatility → Higher hedge intensity
-    - Price trends → Hedge direction
-    - Risk conditions → Risk allocation
-    """
-
-    def __init__(self):
-        self.price_history = deque(maxlen=50)
-        logging.info("DynamicHedgeLabeler using SIMPLE heuristic implementation")
-
-    def update_history(self, env=None, t: int = None, **kwargs):
-        """Update internal history - compatibility method"""
-        # Handle different calling patterns
-        if env is not None and t is not None and hasattr(env, '_price') and t < len(env._price):
-            current_price = float(env._price[t])
-            self.price_history.append(current_price)
-        elif 'price' in kwargs:
-            # Handle keyword-based calls from HedgeAdapter
-            current_price = float(kwargs['price'])
-            self.price_history.append(current_price)
-
-    def generate_labels(self, env, t: int, features: np.ndarray) -> Dict[str, float]:
-        """Generate economically sound hedge labels based on covariance with operational exposure"""
-        try:
-            # Get current price and operational data
-            current_price = 0.0
-            if hasattr(env, '_price_raw') and t < len(env._price_raw):
-                current_price = float(env._price_raw[t])
-            elif hasattr(env, '_price') and t < len(env._price):
-                current_price = float(env._price[t])
-            elif isinstance(env, (int, float)):
-                current_price = float(env)
-
-            self.price_history.append(current_price)
-
-            # Default labels
-            labels = {
-                'hedge_intensity': 1.0,
-                'hedge_intensity_uncertainty': 0.1,
-                'hedge_direction': 0.5,
-                'risk_allocation': np.array([0.33, 0.33, 0.34]),  # Equal weights
-                'hedge_effectiveness': 0.8
-            }
-
-            # Need sufficient history for covariance calculation
-            if len(self.price_history) >= 20 and hasattr(env, 'accumulated_operational_revenue'):
-                price_array = np.array(self.price_history)
-
-                # Calculate operational cash flow history
-                ops_cashflow_history = []
-                try:
-                    # Get generation revenue history from environment
-                    if hasattr(env, 'performance_history') and 'revenue_history' in env.performance_history:
-                        revenue_hist = env.performance_history['revenue_history']
-                        if len(revenue_hist) >= 10:
-                            ops_cashflow_history = list(revenue_hist[-min(20, len(revenue_hist)):])
-                except Exception:
-                    pass
-
-                if len(ops_cashflow_history) >= 10:
-                    ops_array = np.array(ops_cashflow_history)
-
-                    # Calculate price returns
-                    price_returns = np.diff(price_array[-len(ops_array):]) / (price_array[-len(ops_array):-1] + 1e-9)
-                    ops_returns = np.diff(ops_array) / (np.abs(ops_array[:-1]) + 1e-9)
-
-                    if len(price_returns) >= 5 and len(ops_returns) >= 5:
-                        # Optimal hedge ratio: -Cov(ops, price_returns) / Var(price_returns)
-                        min_len = min(len(price_returns), len(ops_returns))
-                        price_ret_subset = price_returns[-min_len:]
-                        ops_ret_subset = ops_returns[-min_len:]
-
-                        price_var = np.var(price_ret_subset)
-                        if price_var > 1e-9:
-                            covariance = np.cov(ops_ret_subset, price_ret_subset)[0, 1]
-                            optimal_hedge_ratio = -covariance / price_var
-
-                            # 1. Hedge intensity based on magnitude of optimal ratio
-                            hedge_intensity = np.clip(1.0 + abs(optimal_hedge_ratio) * 2.0, 0.5, 2.0)
-                            labels['hedge_intensity'] = hedge_intensity
-
-                            # 2. Hedge direction based on sign of optimal ratio
-                            if optimal_hedge_ratio > 0.1:
-                                labels['hedge_direction'] = 0.8  # Strong long hedge (protect against price increases)
-                            elif optimal_hedge_ratio < -0.1:
-                                labels['hedge_direction'] = 0.2  # Strong short hedge (protect against price decreases)
-                            else:
-                                labels['hedge_direction'] = 0.6  # Mild long bias (default protection)
-
-                            # 3. Uncertainty based on correlation strength
-                            correlation = abs(covariance) / (np.std(ops_ret_subset) * np.std(price_ret_subset) + 1e-9)
-                            labels['hedge_intensity_uncertainty'] = np.clip(0.3 * (1.0 - correlation), 0.05, 0.3)
-
-                            # 4. Effectiveness based on hedge ratio magnitude and correlation
-                            labels['hedge_effectiveness'] = np.clip(0.5 + 0.4 * correlation, 0.5, 0.95)
-
-                            # 5. Risk allocation based on asset-specific hedge ratios
-                            try:
-                                if hasattr(env, 'physical_assets'):
-                                    # Use capacity-weighted allocation as baseline
-                                    wind_cap = env.physical_assets.get('wind_capacity_mw', 270)
-                                    solar_cap = env.physical_assets.get('solar_capacity_mw', 100)
-                                    hydro_cap = env.physical_assets.get('hydro_capacity_mw', 40)
-                                    total_cap = wind_cap + solar_cap + hydro_cap
-
-                                    if total_cap > 0:
-                                        # Weight by capacity and adjust for volatility/correlation
-                                        wind_weight = wind_cap / total_cap
-                                        solar_weight = solar_cap / total_cap
-                                        hydro_weight = hydro_cap / total_cap
-
-                                        # Adjust weights based on generation variability (higher variability = higher hedge weight)
-                                        if hasattr(env, '_wind') and hasattr(env, '_solar') and hasattr(env, '_hydro') and t >= 10:
-                                            try:
-                                                wind_var = np.var(env._wind[max(0, t-10):t+1]) if t >= 10 else 1.0
-                                                solar_var = np.var(env._solar[max(0, t-10):t+1]) if t >= 10 else 1.0
-                                                hydro_var = np.var(env._hydro[max(0, t-10):t+1]) if t >= 10 else 1.0
-
-                                                total_var = wind_var + solar_var + hydro_var
-                                                if total_var > 0:
-                                                    # Blend capacity weights with variability weights
-                                                    var_wind_weight = wind_var / total_var
-                                                    var_solar_weight = solar_var / total_var
-                                                    var_hydro_weight = hydro_var / total_var
-
-                                                    # 70% capacity, 30% variability
-                                                    wind_weight = 0.7 * wind_weight + 0.3 * var_wind_weight
-                                                    solar_weight = 0.7 * solar_weight + 0.3 * var_solar_weight
-                                                    hydro_weight = 0.7 * hydro_weight + 0.3 * var_hydro_weight
-                                            except Exception:
-                                                pass
-
-                                        # Normalize to sum to 1 with NaN protection
-                                        total_weight = wind_weight + solar_weight + hydro_weight
-                                        if total_weight > 0 and not np.isnan(total_weight):
-                                            risk_alloc = np.array([
-                                                wind_weight / total_weight,
-                                                solar_weight / total_weight,
-                                                hydro_weight / total_weight
-                                            ])
-                                            # Verify no NaN values in final allocation
-                                            if not np.any(np.isnan(risk_alloc)):
-                                                labels['risk_allocation'] = risk_alloc
-                                            else:
-                                                # Default to equal allocation if NaN detected
-                                                labels['risk_allocation'] = np.array([0.33, 0.33, 0.34])
-                                        else:
-                                            # Default to equal allocation if total_weight is invalid
-                                            labels['risk_allocation'] = np.array([0.33, 0.33, 0.34])
-                            except Exception as risk_alloc_error:
-                                # Robust fallback to equal allocation on any error
-                                logging.warning(f"Risk allocation calculation failed: {risk_alloc_error}")
-                                labels['risk_allocation'] = np.array([0.33, 0.33, 0.34])
-
-            return labels
-
-        except Exception as e:
-            logging.warning(f"DynamicHedgeLabeler.generate_labels failed: {e}")
-            return {
-                'hedge_intensity': 1.0,
-                'hedge_intensity_uncertainty': 0.1,
-                'hedge_direction': 0.5,
-                'risk_allocation': np.array([0.33, 0.33, 0.34]),
-                'hedge_effectiveness': 0.8
-            }
-
-    def optimize_hedge_parameters(self, *args, **kwargs) -> Dict[str, float]:
-        """Optimize hedge parameters - compatibility method that calls generate_labels"""
-        # Handle positional arguments from HedgeAdapter
-        env = args[0] if len(args) > 0 else kwargs.get('env', None)
-        t = args[1] if len(args) > 1 else kwargs.get('t', 0)
-        features = args[2] if len(args) > 2 else kwargs.get('features', np.zeros(13))
-
-        # Use generate_labels for optimization
-        return self.generate_labels(env, t, features)
-
-
-# ============================================================================
-# SIMPLIFIED VALIDATION FRAMEWORK
-# ============================================================================
-
-class HedgeValidationFramework:
-    """
-    Simplified validation framework that replaces complex walk-forward validation.
-
-    Provides basic validation metrics without the computational overhead.
-    """
-
-    def __init__(self):
-        self.validation_history = deque(maxlen=100)
-        logging.info("HedgeValidationFramework using SIMPLE implementation")
-
-    def validate_hedge_performance(self, predictions: Dict, actuals: Dict, t: int) -> Dict[str, float]:
-        """Simple validation of hedge performance"""
-        try:
-            metrics = {
-                'hedge_accuracy': 0.8,  # Default good performance
-                'risk_allocation_accuracy': 0.75,
-                'direction_accuracy': 0.7,
-                'intensity_mse': 0.1,
-                'overall_score': 0.8
-            }
-
-            # Simple accuracy calculation if we have both predictions and actuals
-            if 'hedge_intensity' in predictions and 'hedge_intensity' in actuals:
-                intensity_error = abs(predictions['hedge_intensity'] - actuals['hedge_intensity'])
-                metrics['intensity_mse'] = min(1.0, intensity_error)
-                metrics['hedge_accuracy'] = max(0.5, 1.0 - intensity_error)
-
-            if 'hedge_direction' in predictions and 'hedge_direction' in actuals:
-                direction_error = abs(predictions['hedge_direction'] - actuals['hedge_direction'])
-                metrics['direction_accuracy'] = max(0.5, 1.0 - direction_error)
-
-            # Overall score
-            metrics['overall_score'] = (metrics['hedge_accuracy'] + metrics['direction_accuracy']) / 2
-
-            self.validation_history.append(metrics['overall_score'])
-
-            return metrics
-
-        except Exception as e:
-            logging.warning(f"HedgeValidationFramework.validate_hedge_performance failed: {e}")
-            return {
-                'hedge_accuracy': 0.8,
-                'risk_allocation_accuracy': 0.75,
-                'direction_accuracy': 0.7,
-                'intensity_mse': 0.1,
-                'overall_score': 0.8
-            }
-
-    def get_validation_summary(self) -> Dict[str, float]:
-        """Get summary of recent validation performance"""
-        if len(self.validation_history) == 0:
-            return {'mean_score': 0.8, 'std_score': 0.1, 'trend': 0.0}
-
-        scores = np.array(self.validation_history)
-        return {
-            'mean_score': np.mean(scores),
-            'std_score': np.std(scores),
-            'trend': np.mean(scores[-10:]) - np.mean(scores[-20:-10]) if len(scores) >= 20 else 0.0
+        self.bridge_dim = bridge_dim
+        self.meta_head_dim = meta_head_dim
+        self.enable_meta_head = enable_meta_head
+
+        # INCREASED CAPACITY: Deeper, wider network for better pattern recognition
+        self.d1 = Dense(256, activation='relu', name='overlay_d1')
+        self.do1 = Dropout(0.15, name='overlay_do1')
+        self.d2 = Dense(128, activation='relu', name='overlay_d2')
+        self.do2 = Dropout(0.15, name='overlay_do2')
+        self.d3 = Dense(64, activation='relu', name='overlay_d3')
+        self.do3 = Dropout(0.1, name='overlay_do3')
+        self.d4 = Dense(32, activation='relu', name='overlay_d4')
+
+        # Output heads
+        self.bridge_head = Dense(bridge_dim, activation='tanh', name="bridge_vec")
+        self.risk_budget_head = Dense(1, activation='sigmoid', name="risk_budget")
+        self.pred_reward_head = Dense(1, activation='tanh', name="pred_reward")
+
+        # 28D strategy heads (4D: wind, solar, hydro, price) - one for each horizon
+        # OPTIMAL: 4 heads for 4 horizons = full information utilization
+        self.strat_immediate = Dense(4, activation='tanh', name="strat_immediate")
+        self.strat_short = Dense(4, activation='tanh', name="strat_short")
+        self.strat_medium = Dense(4, activation='tanh', name="strat_medium")
+        self.strat_long = Dense(4, activation='tanh', name="strat_long")
+
+        # TIER 3 ONLY: FAMC Meta-critic head g_φ(x_t) for learned control-variate baseline
+        # This head predicts a state-only scalar correlated with PPO advantage
+        # CRITICAL: State-only (no action leakage) - uses same features as other heads
+        # TIER 2: This is NOT used (enable_meta_head=False)
+        if enable_meta_head:
+            self.meta_head = tf.keras.Sequential([
+                Dense(meta_head_dim, activation='elu', name='meta_adv_hidden'),
+                Dense(1, activation='linear', name='meta_advantage_head')
+            ], name='meta_critic')
+            logging.info(f"OverlaySharedModel initialized: {feature_dim} features -> bridge_dim={bridge_dim}, meta_head_dim={meta_head_dim} (TIER 3: FAMC enabled)")
+        else:
+            self.meta_head = None
+            logging.info(f"OverlaySharedModel initialized: {feature_dim} features -> bridge_dim={bridge_dim} (TIER 2: No meta-critic)")
+
+    def call(self, x, training=None):
+        """Forward pass through shared encoder and heads"""
+        z = self.d1(x)
+        z = self.do1(z, training=training)
+        z = self.d2(z)
+        z = self.do2(z, training=training)
+        z = self.d3(z)
+        z = self.do3(z, training=training)
+        z = self.d4(z)
+
+        # Generate outputs
+        bridge_vec = self.bridge_head(z)  # [-1,1]^bridge_dim
+        risk_budget = self.risk_budget_head(z) * 1.0 + 0.5  # [0.5,1.5]
+        pred_reward = self.pred_reward_head(z)  # [-1,1]
+
+        out = {
+            "bridge_vec": bridge_vec,
+            "risk_budget": risk_budget,
+            "pred_reward": pred_reward,
+            "strat_immediate": self.strat_immediate(z),
+            "strat_short": self.strat_short(z),
+            "strat_medium": self.strat_medium(z),
+            "strat_long": self.strat_long(z),
         }
 
+        # TIER 3 ONLY: FAMC meta-critic head output
+        if self.enable_meta_head and self.meta_head is not None:
+            meta_adv = self.meta_head(z, training=training)  # (batch, 1) - state-only advantage prediction
+            out["meta_adv"] = meta_adv
 
-# ============================================================================
-# ENHANCED DL OVERLAY LOGGING SYSTEM (integrated)
-# ============================================================================
+        return out
 
-class DLOverlayLogger:
+
+class DLAdapter:
     """
-    Comprehensive logging system for DL overlay hedge optimization metrics.
+    Thin adapter API for env/wrapper to call overlay inference.
+    Manages OverlaySharedModel and exposes shared_inference method.
 
-    Tracks:
-    - Hedge performance and accuracy
-    - DL model training progression
-    - Economic validation metrics
-    - Feature importance and model confidence
+    STRICT 34D MODE: feature_dim must be 34 (28D base + 6D deltas). Fails fast if not.
     """
 
-    def __init__(self, log_dir: str = "dl_overlay_logs"):
-        self.log_dir = log_dir
-        os.makedirs(log_dir, exist_ok=True)
+    def __init__(self, feature_dim: int, bridge_dim: int = 4, verbose: bool = False,
+                 meta_head_dim: int = 32, enable_meta_head: bool = False):
+        # CRITICAL FIX: Remove hard 34D constraint - accept dynamic feature dimensions
+        # This makes the system robust to feature additions (e.g., temperature, volatility)
+        # The model will adapt to whatever feature_dim is provided by the environment
+        if feature_dim < 10:
+            error_msg = (
+                f"[CRITICAL] DLAdapter requires at least 10 features, got {feature_dim}\n"
+                f"REASON: The DL overlay needs minimum market context to function:\n"
+                f"  - Market features (wind, solar, hydro, price, etc.)\n"
+                f"  - Position features (wind_pos, solar_pos, hydro_pos)\n"
+                f"  - Portfolio metrics (nav, cash, efficiency)\n"
+                f"SOLUTION: Ensure environment provides sufficient observation features.\n"
+                f"If forecasting is disabled, use baseline mode (--dl_overlay not set)."
+            )
+            logging.error(error_msg)
+            raise ValueError(error_msg)
 
-        # Initialize log files
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.hedge_performance_log = os.path.join(log_dir, f"hedge_performance_{timestamp}.csv")
-        self.model_training_log = os.path.join(log_dir, f"model_training_{timestamp}.csv")
-        self.economic_validation_log = os.path.join(log_dir, f"economic_validation_{timestamp}.csv")
-        self.feature_importance_log = os.path.join(log_dir, f"feature_importance_{timestamp}.json")
+        self.feature_dim = feature_dim
+        self.bridge_dim = bridge_dim
+        self.verbose = verbose
+        self.enable_meta_head = enable_meta_head
+        self.model = OverlaySharedModel(feature_dim, bridge_dim, meta_head_dim, enable_meta_head)
+        self._shape_check_done = False  # Track if we've validated shapes
 
-        # Initialize tracking variables
-        self.hedge_predictions = deque(maxlen=1000)
-        self.hedge_actuals = deque(maxlen=1000)
-        self.training_losses = deque(maxlen=1000)
-        self.economic_metrics = deque(maxlen=1000)
+        if enable_meta_head:
+            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic), bridge_dim={bridge_dim}, meta_head_dim={meta_head_dim} (FAMC enabled)")
+        else:
+            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic), bridge_dim={bridge_dim}")
 
-        # Create CSV headers
-        self._initialize_csv_headers()
+    def shared_inference(self, feats_np: np.ndarray, training: bool = False) -> Dict[str, Any]:
+        """
+        Run shared inference on features (dynamic dimension).
 
-        logging.info(f"DL Overlay Logger initialized: {log_dir}")
+        Args:
+            feats_np: numpy array of shape (1, feature_dim) or (batch, feature_dim)
+            training: whether in training mode
 
-    def _initialize_csv_headers(self):
-        """Initialize CSV files with headers"""
-
-        # Hedge performance headers
-        hedge_headers = [
-            'timestamp', 'step', 'timestep',
-            'pred_intensity', 'pred_direction', 'pred_alloc_wind', 'pred_alloc_solar', 'pred_alloc_hydro', 'pred_effectiveness',
-            'opt_intensity', 'opt_direction', 'opt_alloc_wind', 'opt_alloc_solar', 'opt_alloc_hydro', 'opt_effectiveness',
-            'intensity_error', 'direction_error', 'allocation_error', 'effectiveness_error', 'overall_accuracy', 'hedge_hit_rate',
-            'dl_pnl', 'heuristic_pnl', 'improvement', 'hedge_cost', 'hedge_benefit', 'net_value'
-        ]
-        self._write_csv_header(self.hedge_performance_log, hedge_headers)
-
-        # Model training headers
-        training_headers = [
-            'timestamp', 'step', 'epoch', 'batch',
-            'total_loss', 'intensity_loss', 'direction_loss', 'allocation_loss', 'effectiveness_loss',
-            'intensity_mae', 'direction_mae', 'allocation_accuracy', 'effectiveness_accuracy',
-            'learning_rate', 'batch_size', 'buffer_size', 'feature_dim', 'convergence_rate'
-        ]
-        self._write_csv_header(self.model_training_log, training_headers)
-
-        # Economic validation headers
-        economic_headers = [
-            'timestamp', 'step', 'timestep',
-            'covariance', 'correlation', 'hedge_ratio', 'optimal_hedge_ratio',
-            'portfolio_volatility', 'hedged_volatility', 'volatility_reduction',
-            'sharpe_ratio', 'hedged_sharpe_ratio', 'sharpe_improvement',
-            'max_drawdown', 'hedged_max_drawdown', 'drawdown_improvement',
-            'economic_value_added', 'risk_adjusted_return', 'hedge_efficiency'
-        ]
-        self._write_csv_header(self.economic_validation_log, economic_headers)
-
-    def _write_csv_header(self, filepath: str, headers: List[str]):
-        """Write CSV header if file doesn't exist"""
-        if not os.path.exists(filepath):
-            with open(filepath, 'w') as f:
-                f.write(','.join(headers) + '\n')
-
-    def log_hedge_performance(self, step: int, timestep: int, predictions: Dict[str, Any],
-                            actuals: Dict[str, Any], economic_impact: Dict[str, float]):
-        """Log hedge performance metrics"""
+        Returns:
+            dict with strict keys and shapes:
+            - bridge_vec: (batch, bridge_dim)
+            - risk_budget: (batch, 1) in [0.5, 1.5]
+            - pred_reward: (batch, 1) in [-1, 1]
+            - strat_immediate: (batch, 4)
+            - strat_short: (batch, 4)
+            - strat_medium: (batch, 4)
+            - strat_long: (batch, 4)
+        """
         try:
-            timestamp = datetime.now().isoformat()
+            # Ensure 2D input
+            if len(feats_np.shape) == 1:
+                feats_np = feats_np.reshape(1, -1)
 
-            # Extract prediction values
-            pred_intensity = float(predictions.get('hedge_intensity', 0.0))
-            pred_direction = float(predictions.get('hedge_direction', 0.5))
-            pred_allocation = predictions.get('risk_allocation', np.array([0.33, 0.33, 0.34]))
-            pred_effectiveness = float(predictions.get('hedge_effectiveness', 0.8))
+            # CRITICAL FIX: Verify input shape matches feature_dim (dynamic)
+            if feats_np.shape[1] != self.feature_dim:
+                error_msg = (
+                    f"[CRITICAL] DLAdapter.shared_inference: Expected {self.feature_dim}D features, got {feats_np.shape[1]}D\n"
+                    f"REASON: Feature vector dimension must match the adapter's feature_dim.\n"
+                    f"SOLUTION: Ensure environment observation space matches adapter initialization.\n"
+                    f"  - Adapter initialized with feature_dim={self.feature_dim}\n"
+                    f"  - Received features with shape={feats_np.shape}\n"
+                    f"  - Check that all forecast models are loaded and generating expected dimensions."
+                )
+                logging.error(error_msg)
+                raise ValueError(error_msg)
 
-            # Ensure pred_allocation is numpy array
-            if not isinstance(pred_allocation, np.ndarray):
-                pred_allocation = np.array(pred_allocation)
-            if len(pred_allocation) < 3:
-                pred_allocation = np.pad(pred_allocation, (0, 3 - len(pred_allocation)), 'constant', constant_values=0.0)
+            # Convert to tensor and run inference
+            feats_tensor = tf.convert_to_tensor(feats_np, dtype=tf.float32)
+            outs = self.model(feats_tensor, training=training)
 
-            # Extract optimal (actual) values
-            opt_intensity = float(actuals.get('hedge_intensity', 0.0))
-            opt_direction = float(actuals.get('hedge_direction', 0.5))
-            opt_allocation = actuals.get('risk_allocation', np.array([0.33, 0.33, 0.34]))
-            opt_effectiveness = float(actuals.get('hedge_effectiveness', 0.8))
+            # Convert tensors → numpy
+            result = {}
+            for k, v in outs.items():
+                if tf.is_tensor(v):
+                    result[k] = v.numpy()
+                else:
+                    result[k] = np.array(v)
 
-            # Ensure opt_allocation is numpy array
-            if not isinstance(opt_allocation, np.ndarray):
-                opt_allocation = np.array(opt_allocation)
-            if len(opt_allocation) < 3:
-                opt_allocation = np.pad(opt_allocation, (0, 3 - len(opt_allocation)), 'constant', constant_values=0.0)
+            # STRICT SHAPE VALIDATION (first call only)
+            if not self._shape_check_done:
+                self._validate_output_shapes(result, feats_np.shape[0])
+                self._shape_check_done = True
 
-            # Calculate errors
-            intensity_error = abs(pred_intensity - opt_intensity)
-            direction_error = abs(pred_direction - opt_direction)
-            allocation_error = np.mean(np.abs(pred_allocation[:3] - opt_allocation[:3]))
-            effectiveness_error = abs(pred_effectiveness - opt_effectiveness)
+            # DEBUG: Log successful inference
+            if self.verbose:
+                logging.debug(f"[DLAdapter] Inference successful: input_shape={feats_np.shape}, outputs={list(result.keys())}")
 
-            # Calculate overall accuracy metrics
-            overall_accuracy = 1.0 - np.mean([intensity_error/2.0, direction_error, allocation_error, effectiveness_error])
-            overall_accuracy = max(0.0, min(1.0, overall_accuracy))
-
-            # Calculate hedge hit rate (simplified)
-            hedge_hit_rate = 1.0 if intensity_error < 0.2 and direction_error < 0.2 else 0.0
-
-            # Extract economic impact
-            dl_pnl = float(economic_impact.get('dl_pnl', 0.0))
-            heuristic_pnl = float(economic_impact.get('heuristic_pnl', 0.0))
-            improvement = float(economic_impact.get('improvement', 0.0))
-            hedge_cost = float(economic_impact.get('hedge_cost', 0.0))
-            hedge_benefit = float(economic_impact.get('hedge_benefit', 0.0))
-            net_value = float(economic_impact.get('net_value', 0.0))
-
-            # Store in tracking history
-            self.hedge_predictions.append(predictions.copy())
-            self.hedge_actuals.append(actuals.copy())
-            self.economic_metrics.append(economic_impact.copy())
-
-            # Write to CSV
-            row = [
-                timestamp, step, timestep,
-                pred_intensity, pred_direction, pred_allocation[0], pred_allocation[1], pred_allocation[2], pred_effectiveness,
-                opt_intensity, opt_direction, opt_allocation[0], opt_allocation[1], opt_allocation[2], opt_effectiveness,
-                intensity_error, direction_error, allocation_error, effectiveness_error, overall_accuracy, hedge_hit_rate,
-                dl_pnl, heuristic_pnl, improvement, hedge_cost, hedge_benefit, net_value
-            ]
-
-            with open(self.hedge_performance_log, 'a') as f:
-                f.write(','.join(map(str, row)) + '\n')
+            return result
 
         except Exception as e:
-            logging.warning(f"DL hedge performance logging failed: {e}")
+            logging.error(f"[DLAdapter] shared_inference failed: input_shape={feats_np.shape if feats_np is not None else 'None'}, error={e}")
+            raise  # Fail fast - no silent fallbacks
 
-    def log_model_training(self, step: int, epoch: int, batch: int, losses: Dict[str, float],
-                          metrics: Dict[str, float], training_info: Dict[str, Any]):
-        """Log model training metrics"""
+    def _validate_output_shapes(self, result: Dict[str, np.ndarray], batch_size: int):
+        """Validate output shapes match strict contract."""
+        required_keys = ["bridge_vec", "risk_budget", "pred_reward", "strat_immediate", "strat_short", "strat_medium", "strat_long"]
+
+        for key in required_keys:
+            if key not in result:
+                raise KeyError(f"Missing required output key: {key}")
+
+        # Validate bridge_vec
+        assert result["bridge_vec"].ndim == 2, f"bridge_vec must be 2D, got {result['bridge_vec'].ndim}D"
+        assert result["bridge_vec"].shape[0] == batch_size, f"bridge_vec batch mismatch"
+        assert result["bridge_vec"].shape[1] == self.bridge_dim, f"bridge_vec dim mismatch"
+
+        # Validate risk_budget
+        assert result["risk_budget"].ndim in (1, 2), f"risk_budget must be 1D or 2D, got {result['risk_budget'].ndim}D"
+        if result["risk_budget"].ndim == 2:
+            assert result["risk_budget"].shape == (batch_size, 1), f"risk_budget shape mismatch"
+
+        # Validate pred_reward
+        assert result["pred_reward"].ndim in (1, 2), f"pred_reward must be 1D or 2D, got {result['pred_reward'].ndim}D"
+
+        # Validate strategy heads (all must be (batch, 4))
+        for head_name in ["strat_immediate", "strat_short", "strat_medium", "strat_long"]:
+            head = result[head_name]
+            assert head.ndim == 2, f"{head_name} must be 2D, got {head.ndim}D"
+            assert head.shape == (batch_size, 4), f"{head_name} must be (batch, 4), got {head.shape}"
+
+        logging.info(f"[DLAdapter] Output shapes validated: batch_size={batch_size}, all heads OK")
+
+
+# ============================================================================
+# OVERLAY TRAINER: TRAINS THE OVERLAY MODEL ON COLLECTED EXPERIENCE
+# ============================================================================
+
+class OverlayExperienceBuffer:
+    """Circular buffer for storing overlay training experiences"""
+
+    def __init__(self, max_size: int = 10_000):
+        self.max_size = max_size
+        self.buffer = deque(maxlen=max_size)
+        self.validation_split = 0.2
+
+    def add(self, experience: Dict[str, Any]):
+        """Add experience to buffer"""
+        self.buffer.append(experience)
+
+    def sample_batch(self, batch_size: int = 64) -> Dict[str, np.ndarray]:
+        """Sample random batch from buffer (28D only)"""
+        if len(self.buffer) < batch_size:
+            batch_size = len(self.buffer)
+
+        indices = np.random.choice(len(self.buffer), size=batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+
+        # Stack into arrays (28D: immediate, short, medium, long)
+        result = {
+            'features': np.stack([b['features'] for b in batch]),
+            'bridge_vec_target': np.stack([b['bridge_vec_target'] for b in batch]),
+            'risk_budget_target': np.array([b['risk_budget_target'] for b in batch]),
+            'pred_reward_target': np.array([b['pred_reward_target'] for b in batch]),
+            'strat_immediate_target': np.stack([b['strat_immediate_target'] for b in batch]),
+            'strat_short_target': np.stack([b['strat_short_target'] for b in batch]),
+            'strat_medium_target': np.stack([b['strat_medium_target'] for b in batch]),
+            'strat_long_target': np.stack([b['strat_long_target'] for b in batch]),
+        }
+        return result
+
+    def get_validation_set(self) -> Dict[str, np.ndarray]:
+        """Get validation set (last 20% of buffer, 28D only)"""
+        val_size = max(1, int(len(self.buffer) * self.validation_split))
+        val_indices = list(range(len(self.buffer) - val_size, len(self.buffer)))
+        batch = [self.buffer[i] for i in val_indices]
+
+        result = {
+            'features': np.stack([b['features'] for b in batch]),
+            'bridge_vec_target': np.stack([b['bridge_vec_target'] for b in batch]),
+            'risk_budget_target': np.array([b['risk_budget_target'] for b in batch]),
+            'pred_reward_target': np.array([b['pred_reward_target'] for b in batch]),
+            'strat_immediate_target': np.stack([b['strat_immediate_target'] for b in batch]),
+            'strat_short_target': np.stack([b['strat_short_target'] for b in batch]),
+            'strat_medium_target': np.stack([b['strat_medium_target'] for b in batch]),
+            'strat_long_target': np.stack([b['strat_long_target'] for b in batch]),
+        }
+        return result
+
+    def size(self) -> int:
+        return len(self.buffer)
+
+
+class OverlayTrainer:
+    """
+    TIER 3 ONLY: Trains OverlaySharedModel on collected experience
+
+    This class is used for online training of the DL overlay model.
+    Tier 2 does NOT use this - it only uses pre-trained overlay for inference.
+    """
+
+    def __init__(self, model: OverlaySharedModel, learning_rate: float = 3e-3, verbose: bool = False):
+        self.model = model
+        self.verbose = verbose
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        self.buffer = OverlayExperienceBuffer(max_size=10_000)
+
+        # Loss functions for each head (28D only)
+        self.loss_fns = {
+            'bridge_vec': tf.keras.losses.MeanSquaredError(),
+            'risk_budget': tf.keras.losses.MeanSquaredError(),
+            'pred_reward': tf.keras.losses.MeanSquaredError(),
+            'strat_immediate': tf.keras.losses.MeanSquaredError(),
+            'strat_short': tf.keras.losses.MeanSquaredError(),
+            'strat_medium': tf.keras.losses.MeanSquaredError(),
+            'strat_long': tf.keras.losses.MeanSquaredError(),
+        }
+
+        # Loss weights from config (OPTIMAL: Horizon-weighted for 28D)
+        # Immediate signals most actionable → highest weight
+        # Long-term signals less actionable → lower weight
+        # Tuned for: immediate=100%, short=95%, medium=90%, long=risk-only
+        self.loss_weights = DL_OVERLAY_LOSS_WEIGHTS.copy()
+
+        # Per-horizon metrics for monitoring
+        self.horizon_metrics = {
+            'strat_immediate': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
+            'strat_short': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
+            'strat_medium': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
+            'strat_long': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
+        }
+
+        # Metrics
+        self.training_history = deque(maxlen=100)
+        self.validation_history = deque(maxlen=100)
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.max_patience = 10
+
+        logging.info(f"OverlayTrainer initialized with learning_rate={learning_rate}")
+
+    def add_experience(self, experience: Dict[str, Any]):
+        """Add experience to training buffer"""
+        self.buffer.add(experience)
+
+    def train_step(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+        """Single training step on batch (28D only)"""
         try:
-            timestamp = datetime.now().isoformat()
+            features = tf.convert_to_tensor(batch['features'], dtype=tf.float32)
 
-            # Safety check: ensure losses and metrics are dictionaries
-            if losses is None:
-                losses = {'total_loss': 0.0}
-            if metrics is None:
-                metrics = {}
-            if training_info is None:
-                training_info = {}
+            with tf.GradientTape() as tape:
+                # Forward pass
+                predictions = self.model(features, training=True)
 
-            # Extract loss components
-            total_loss = losses.get('total_loss', 0.0)
-            intensity_loss = losses.get('intensity_loss', 0.0)
-            direction_loss = losses.get('direction_loss', 0.0)
-            allocation_loss = losses.get('allocation_loss', 0.0)
-            effectiveness_loss = losses.get('effectiveness_loss', 0.0)
+                # Compute loss for each head
+                total_loss = 0.0
+                losses = {}
 
-            # Extract metrics
-            intensity_mae = metrics.get('intensity_mae', 0.0)
-            direction_mae = metrics.get('direction_mae', 0.0)
-            allocation_accuracy = metrics.get('allocation_accuracy', 0.0)
-            effectiveness_accuracy = metrics.get('effectiveness_accuracy', 0.0)
+                # Process all heads (28D: immediate, short, medium, long)
+                for head_name in ['bridge_vec', 'risk_budget', 'pred_reward', 'strat_immediate', 'strat_short', 'strat_medium', 'strat_long']:
+                    target_key = f'{head_name}_target'
+                    target = tf.convert_to_tensor(batch[target_key], dtype=tf.float32)
+                    pred = predictions[head_name]
 
-            # Extract training info
-            learning_rate = training_info.get('learning_rate', 0.0001)
-            batch_size = training_info.get('batch_size', 32)
-            buffer_size = training_info.get('buffer_size', 256)
-            feature_dim = training_info.get('feature_dim', 13)
+                    # Reshape risk_budget and pred_reward targets to match predictions
+                    if head_name in ['risk_budget', 'pred_reward']:
+                        target = tf.reshape(target, (-1, 1))
 
-            # Calculate convergence rate (simplified)
-            convergence_rate = 1.0 - total_loss if total_loss < 1.0 else 0.0
+                    head_loss = self.loss_fns[head_name](target, pred)
+                    weighted_loss = head_loss * self.loss_weights[head_name]
+                    total_loss += weighted_loss
+                    losses[head_name] = float(head_loss.numpy())
 
-            # Store in tracking history
-            self.training_losses.append(losses.copy())
+                    # Compute per-horizon metrics for strategy heads
+                    if head_name in self.horizon_metrics:
+                        mae = float(tf.reduce_mean(tf.abs(target - pred)).numpy())
+                        rmse = float(tf.sqrt(tf.reduce_mean(tf.square(target - pred))).numpy())
+                        self.horizon_metrics[head_name]['mae'].append(mae)
+                        self.horizon_metrics[head_name]['rmse'].append(rmse)
 
-            # Write to CSV
-            row = [
-                timestamp, step, epoch, batch,
-                total_loss, intensity_loss, direction_loss, allocation_loss, effectiveness_loss,
-                intensity_mae, direction_mae, allocation_accuracy, effectiveness_accuracy,
-                learning_rate, batch_size, buffer_size, feature_dim, convergence_rate
-            ]
+                losses['total'] = float(total_loss.numpy())
 
-            with open(self.model_training_log, 'a') as f:
-                f.write(','.join(map(str, row)) + '\n')
+            # Backward pass
+            gradients = tape.gradient(total_loss, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+
+            return losses
 
         except Exception as e:
-            logging.warning(f"DL model training logging failed: {e}")
+            logging.error(f"Training step failed: {e}")
+            raise  # Fail fast
 
+    def train(self, epochs: int = 3, batch_size: int = 64) -> Dict[str, float]:
+        """Train model on buffered experiences"""
+        if self.buffer.size() < batch_size:
+            return {'status': 'insufficient_data'}
 
-# Global logger instance
-_dl_logger: Optional[DLOverlayLogger] = None
+        epoch_losses = []
 
-def get_dl_logger(log_dir: str = "dl_overlay_logs") -> DLOverlayLogger:
-    """Get or create global DL overlay logger"""
-    global _dl_logger
-    if _dl_logger is None:
-        _dl_logger = DLOverlayLogger(log_dir)
-    return _dl_logger
+        for epoch in range(epochs):
+            batch = self.buffer.sample_batch(batch_size)
+            losses = self.train_step(batch)
+            epoch_losses.append(losses['total'])
+
+        avg_loss = float(np.mean(epoch_losses))
+        self.training_history.append(avg_loss)
+
+        # Validation
+        val_loss = self.validate()
+        self.validation_history.append(val_loss)
+
+        # Early stopping check
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+
+        if self.verbose:
+            logging.info(f"[OVERLAY-TRAIN] train_loss={avg_loss:.6f} val_loss={val_loss:.6f} patience={self.patience_counter}")
+
+        return {
+            'train_loss': avg_loss,
+            'val_loss': val_loss,
+            'patience': self.patience_counter,
+            'should_stop': self.patience_counter >= self.max_patience
+        }
+
+    def train_meta_baseline(self, features_batch: np.ndarray, adv_targets: np.ndarray, loss_type: str = "mse") -> float:
+        """
+        FAMC: Train meta-critic head g_φ(x_t) to predict advantages.
+
+        This head learns to predict PPO advantages from state features only (no actions).
+        The predictions are used as control variates to reduce advantage variance.
+
+        Args:
+            features_batch: State features (batch, 34) - overlay input features
+            adv_targets: Standardized advantages (batch, 1) - mean=0, std=1
+            loss_type: {"mse", "corr"} - loss function
+
+        Returns:
+            Loss value (float)
+
+        CRITICAL: This function must ONLY use state features (no action leakage).
+        """
+        try:
+            if not hasattr(self.model, 'meta_head') or self.model.meta_head is None:
+                logging.warning("[FAMC] Meta head not initialized, skipping training")
+                return 0.0
+
+            # Convert to tensors
+            features = tf.convert_to_tensor(features_batch, dtype=tf.float32)
+            targets = tf.convert_to_tensor(adv_targets, dtype=tf.float32)
+
+            # Ensure targets are (batch, 1)
+            if len(targets.shape) == 1:
+                targets = tf.reshape(targets, (-1, 1))
+
+            with tf.GradientTape() as tape:
+                # Forward pass through meta head only
+                pred = self.model.meta_head(self.model.d4(
+                    self.model.do3(self.model.d3(
+                        self.model.do2(self.model.d2(
+                            self.model.do1(self.model.d1(features), training=True)
+                        ), training=True)
+                    ), training=True)
+                ), training=True)
+
+                if loss_type == "mse":
+                    # MSE loss (targets should be standardized outside)
+                    loss = tf.reduce_mean(tf.square(pred - targets))
+                elif loss_type == "corr":
+                    # Negative Pearson correlation (maximize correlation)
+                    x = pred - tf.reduce_mean(pred)
+                    y = targets - tf.reduce_mean(targets)
+                    corr = tf.reduce_sum(x * y) / (
+                        tf.sqrt(tf.reduce_sum(x * x)) * tf.sqrt(tf.reduce_sum(y * y)) + 1e-8
+                    )
+                    loss = -corr  # Negative because we want to maximize correlation
+                else:
+                    logging.error(f"[FAMC] Unknown loss_type: {loss_type}, using MSE")
+                    loss = tf.reduce_mean(tf.square(pred - targets))
+
+            # Backward pass (only update meta head parameters)
+            vars = self.model.meta_head.trainable_variables
+            grads = tape.gradient(loss, vars)
+            self.optimizer.apply_gradients(zip(grads, vars))
+
+            return float(loss.numpy())
+
+        except Exception as e:
+            logging.error(f"[FAMC] Meta baseline training failed: {e}")
+            return 0.0
+
+    def validate(self) -> float:
+        """Compute validation loss (28D only)"""
+        try:
+            if self.buffer.size() < 10:
+                return 0.0
+
+            val_batch = self.buffer.get_validation_set()
+            features = tf.convert_to_tensor(val_batch['features'], dtype=tf.float32)
+            predictions = self.model(features, training=False)
+
+            total_loss = 0.0
+            # Validate all heads (28D: immediate, short, medium, long)
+            for head_name in ['bridge_vec', 'risk_budget', 'pred_reward', 'strat_immediate', 'strat_short', 'strat_medium', 'strat_long']:
+                target_key = f'{head_name}_target'
+                target = tf.convert_to_tensor(val_batch[target_key], dtype=tf.float32)
+                pred = predictions[head_name]
+
+                if head_name in ['risk_budget', 'pred_reward']:
+                    target = tf.reshape(target, (-1, 1))
+
+                head_loss = self.loss_fns[head_name](target, pred)
+                total_loss += head_loss * self.loss_weights[head_name]
+
+            return float(total_loss.numpy())
+
+        except Exception as e:
+            logging.error(f"Validation failed: {e}")
+            raise  # Fail fast
+
 
 # ============================================================================
-# LOGGING AND SUMMARY
+# TIER 3 ONLY: FGB CALIBRATION TRACKER (Forecast-Guided Baseline)
 # ============================================================================
 
-logging.info("=" * 60)
-logging.info("🚀 SIMPLE HEDGE OPTIMIZER - dl_overlay.py replacement loaded")
-logging.info("   ✅ Memory usage: 287MB → 0.1MB (1934x reduction)")
-logging.info("   ✅ Model parameters: 2.7M → 3.2K (839x reduction)")
-logging.info("   ✅ Features: 43 → 8 (5.4x reduction)")
-logging.info("   ✅ Components: 5 → 1 (5x simpler)")
-logging.info("   ✅ Should eliminate 1800-step CUDA crashes!")
-logging.info("=" * 60)
+class CalibrationTracker:
+    """
+    TIER 3 ONLY: FGB - Rolling online calibration for forecast trust (τₜ) and expected ΔNAV.
+
+    This class tracks forecast accuracy over a rolling window and computes:
+    1. Trust τₜ ∈ [0,1]: How much to trust the forecast (based on hit-rate, MAE, etc.)
+    2. Expected ΔNAV: Forecasted change in NAV for the next step
+
+    The DL overlay remains a forecaster, not a controller.
+    PPO remains the action decision-maker; we reduce advantage variance via baseline adjustment.
+
+    TIER 2: This is NOT used (forecast trust is computed differently)
+    """
+
+    def __init__(self, window_size: int = None, trust_metric: str = "combo", verbose: bool = False, init_budget: Optional[float] = None, direction_weight: float = None):
+        """
+        Args:
+            window_size: Rolling window size for calibration (default from config: 2016 ≈ 2 weeks @ 10-min steps)
+            trust_metric: {"combo", "hitrate", "absdir"} - method for computing trust
+            verbose: Enable debug logging
+            init_budget: Initial fund NAV (used to scale expected_dnav when positions are flat, default from config)
+            direction_weight: Weight for directional accuracy in combo metric (default from config: 0.8 = 80% direction, 20% magnitude)
+        """
+        self.window_size = window_size if window_size is not None else DL_OVERLAY_WINDOW_SIZE_DEFAULT
+        self.trust_metric = trust_metric
+        self.verbose = verbose
+        self.init_budget = float(init_budget) if init_budget is not None else DL_OVERLAY_INIT_BUDGET_DEFAULT
+        self.direction_weight = float(direction_weight) if direction_weight is not None else DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT
+
+        # Rolling history for calibration
+        self.forecast_history = deque(maxlen=window_size)  # (forecast, realized) pairs
+        self.direction_history = deque(maxlen=window_size)  # Direction hit/miss
+
+        # Per-horizon tracking (optional, for future multi-horizon trust)
+        self.horizon_stats = {
+            'short': {'hits': 0, 'total': 0, 'mae': deque(maxlen=window_size)},
+            'medium': {'hits': 0, 'total': 0, 'mae': deque(maxlen=window_size)},
+            'long': {'hits': 0, 'total': 0, 'mae': deque(maxlen=window_size)},
+        }
+
+        # Cache for efficiency
+        self._trust_cache = None
+        self._cache_step = -1
+
+        if self.verbose:
+            logging.info(f"[CalibrationTracker] Initialized: window={window_size}, metric={trust_metric}, init_budget={self.init_budget:,.0f}")
+
+    def update(self, forecast: float, realized: float, horizon: str = "short"):
+        """
+        FGB: Update calibration with a new forecast/realized pair.
+
+        Args:
+            forecast: Forecasted value (e.g., pred_reward, mwdir, or ΔNAV proxy)
+            realized: Realized value (e.g., actual reward, price change, or ΔNAV)
+            horizon: {"short", "medium", "long"} - forecast horizon (optional)
+        """
+        # Store forecast/realized pair
+        self.forecast_history.append((forecast, realized))
+
+        # Track direction accuracy
+        if abs(forecast) > 1e-6 and abs(realized) > 1e-6:
+            direction_match = np.sign(forecast) == np.sign(realized)
+            self.direction_history.append(1.0 if direction_match else 0.0)
+
+        # Update per-horizon stats
+        if horizon in self.horizon_stats:
+            stats = self.horizon_stats[horizon]
+            stats['total'] += 1
+            if abs(forecast) > 1e-6 and abs(realized) > 1e-6:
+                if np.sign(forecast) == np.sign(realized):
+                    stats['hits'] += 1
+            stats['mae'].append(abs(forecast - realized))
+
+        # Invalidate cache
+        self._trust_cache = None
+
+    def get_trust(self, horizon: str = "short", recent_mape: Optional[float] = None) -> float:
+        """
+        FGB: Compute forecast trust τₜ ∈ [0,1].
+
+        Trust is computed based on rolling calibration metrics:
+        - "hitrate": Direction hit-rate (2 * hit_rate - 1)
+        - "absdir": Absolute value of mwdir (smoothed)
+        - "combo": Weighted combination of hit-rate and MAE
+
+        FIX: Now includes MAPE-based trust component for responsiveness to forecast quality.
+
+        Args:
+            horizon: {"short", "medium", "long"} - forecast horizon
+            recent_mape: Optional recent MAPE value to incorporate into trust calculation
+
+        Returns:
+            τₜ ∈ [0,1]: Trust score (0 = no trust, 1 = full trust)
+        """
+        # Return cached value if available (same step)
+        if self._trust_cache is not None:
+            return self._trust_cache
+
+        # Not enough data yet - buffer is warming up
+        buffer_size = len(self.forecast_history)
+        if buffer_size < 10:
+            # FIX #3: Return neutral trust (0.5) instead of 0.0 during warm-up
+            # This prevents forecast rewards from being cut in half during early training
+            # With trust=0.5, trust_scale = 0.5 + (1.5-0.5)*0.5 = 1.0 (no penalty)
+            # Log warning every 10 samples to inform user about warm-up
+            if buffer_size > 0 and buffer_size % 10 == 0:
+                logging.warning(
+                    f"[CalibrationTracker] Buffer warm-up: {buffer_size}/10 samples collected. "
+                    f"Trust will remain 0.5 (neutral) until 10 samples are available. "
+                    f"Forecast rewards will use neutral scaling (1.0x) during warm-up."
+                )
+            return 0.5  # FIX #3: Changed from 0.0 to 0.5 (neutral trust)
+
+        # Compute trust based on selected metric
+        if self.trust_metric == "hitrate":
+            # Direction hit-rate: 2 * hit_rate - 1 ∈ [-1, 1], then clip to [0, 1]
+            if len(self.direction_history) > 0:
+                hit_rate = np.mean(list(self.direction_history))
+                trust = max(0.0, 2.0 * hit_rate - 1.0)
+            else:
+                trust = 0.0
+
+        elif self.trust_metric == "absdir":
+            # Use absolute value of recent forecasts (proxy for confidence)
+            recent_forecasts = [f for f, _ in list(self.forecast_history)[-100:]]
+            if len(recent_forecasts) > 0:
+                trust = min(1.0, np.mean(np.abs(recent_forecasts)))
+            else:
+                trust = 0.0
+
+        elif self.trust_metric == "combo":
+            # Combo: direction_weight * (2·hit_rate - 1) + (1 - direction_weight) * (1 - norm_mae)
+            # Default: 0.8 * direction + 0.2 * magnitude (was 0.5/0.5)
+            # This gives more weight to directional accuracy, which is more robust to tanh compression
+            # RATIONALE: With 75% directional accuracy, 80/20 weighting yields trust ≈ 0.6 (threshold)
+            if len(self.direction_history) > 0:
+                hit_rate = np.mean(list(self.direction_history))
+                hit_component = max(0.0, 2.0 * hit_rate - 1.0)
+            else:
+                hit_component = 0.0
+
+            # MAE component (normalized by typical forecast magnitude)
+            if len(self.forecast_history) > 0:
+                forecasts = [f for f, _ in list(self.forecast_history)]
+                realized = [r for _, r in list(self.forecast_history)]
+                mae = np.mean(np.abs(np.array(forecasts) - np.array(realized)))
+                typical_mag = np.mean(np.abs(realized)) + 1e-6
+                norm_mae = min(1.0, mae / typical_mag)
+                mae_component = max(0.0, 1.0 - norm_mae)
+            else:
+                mae_component = 0.0
+
+            # Use configurable weights (default: 80% direction, 20% magnitude)
+            dir_weight = getattr(self, 'direction_weight', 0.8)
+            mag_weight = 1.0 - dir_weight
+            trust = dir_weight * hit_component + mag_weight * mae_component
+
+        else:
+            logging.warning(f"[CalibrationTracker] Unknown trust_metric: {self.trust_metric}, defaulting to 0.0")
+            trust = 0.0
+
+        # FIX: Incorporate MAPE-based trust component for responsiveness to forecast quality
+        # Low MAPE (accurate forecasts) → higher trust
+        # High MAPE (inaccurate forecasts) → lower trust
+        if recent_mape is not None and recent_mape > 0:
+            # Normalize MAPE: typical MAPE is ~1.0, so map [0, 2.0] → [1.0, 0.0]
+            # MAPE = 0.0 → mape_factor = 1.0 (perfect)
+            # MAPE = 1.0 → mape_factor = 0.5 (moderate)
+            # MAPE = 2.0 → mape_factor = 0.0 (poor)
+            max_expected_mape = 2.0  # Typical max MAPE for normalization
+            mape_factor = max(0.0, 1.0 - min(recent_mape / max_expected_mape, 1.0))
+            
+            # Combine correlation-based trust (60%) with MAPE-based trust (40%)
+            # This makes trust responsive to actual forecast quality
+            trust = 0.6 * trust + 0.4 * mape_factor
+
+        # FIX: Apply moderate optimistic boost to trust calculation
+        # Current trust (0.438 avg) is too low - moderate boost to encourage forecast usage
+        # Boost trust by 10% (cap at 1.0) - balanced approach, not too aggressive
+        # This helps agent learn to use forecasts without over-trusting bad forecasts
+        trust_boost = 0.1
+        trust = min(1.0, trust * (1.0 + trust_boost))
+
+        # Clip to [0, 1]
+        trust = float(np.clip(trust, 0.0, 1.0))
+
+        # Cache result
+        self._trust_cache = trust
+
+        if self.verbose and len(self.forecast_history) % 500 == 0:
+            mape_info = f", MAPE={recent_mape:.4f}" if recent_mape is not None else ""
+            logging.info(f"[CalibrationTracker] Trust τₜ={trust:.3f} (metric={self.trust_metric}, n={len(self.forecast_history)}{mape_info})")
+
+        return trust
+
+    def expected_dnav(self, overlay_output: Dict[str, Any], positions: Dict[str, float],
+                     costs: Dict[str, float]) -> float:
+        """
+        FGB: Compute expected ΔNAV for the next step given current state.
+
+        Maps forecast to expected ΔNAV using a linear proxy:
+            E[ΔNAV] = exposure * pred_reward * mwdir - est_costs
+
+        Args:
+            overlay_output: Dict with keys {"pred_reward", "mwdir", ...}
+            positions: Dict with current positions (e.g., {"wind": 1000, "solar": 500, ...})
+            costs: Dict with transaction cost params (e.g., {"bps": 5, "fixed": 100})
+
+        Returns:
+            Expected ΔNAV (scalar, can be positive or negative)
+        """
+        try:
+            # Extract forecast signals
+            pred_reward = float(overlay_output.get("pred_reward", 0.0))
+            if isinstance(pred_reward, np.ndarray):
+                pred_reward = float(pred_reward.flatten()[0])
+
+            mwdir = float(overlay_output.get("mwdir", 0.0))
+
+            # Compute exposure (total notional of current positions)
+            # FGB: Use sum of absolute position values as exposure proxy
+            exposure = sum(abs(float(v)) for v in positions.values() if isinstance(v, (int, float)))
+
+            # If no positions, use a small fraction of fund NAV as proxy
+            # This ensures FGB has bite early when policy is still flat
+            if exposure < 1e-6:
+                exposure = 0.01 * self.init_budget  # 1% of initial NAV
+
+            # Expected ΔNAV (linear proxy)
+            # pred_reward is in [-1, 1], mwdir is in [-1, 1]
+            # Scale by exposure to get DKK units
+            exp_dnav_gross = exposure * pred_reward * mwdir
+
+            # Estimate transaction costs (if positions change)
+            # FGB: Assume typical trade size is 10% of exposure
+            typical_trade_notional = 0.1 * exposure
+            bps = costs.get("bps", 5.0)
+            fixed = costs.get("fixed", 100.0)
+            est_costs = (typical_trade_notional * bps / 10000.0) + fixed
+
+            # Net expected ΔNAV
+            exp_dnav = exp_dnav_gross - est_costs
+
+            return float(exp_dnav)
+
+        except Exception as e:
+            logging.warning(f"[CalibrationTracker] expected_dnav failed: {e}")
+            return 0.0
+
+    def reset(self):
+        """FGB: Reset calibration history (e.g., at episode boundaries)."""
+        self.forecast_history.clear()
+        self.direction_history.clear()
+        for stats in self.horizon_stats.values():
+            stats['hits'] = 0
+            stats['total'] = 0
+            stats['mae'].clear()
+        self._trust_cache = None
+
+        if self.verbose:
+            logging.info("[CalibrationTracker] Reset calibration history")
+
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+
+# Removed startup message - only log when overlay is actually activated

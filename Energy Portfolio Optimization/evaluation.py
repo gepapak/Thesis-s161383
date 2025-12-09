@@ -1200,10 +1200,18 @@ def create_evaluation_environment(data: pd.DataFrame,
     if enable_forecasting:
         print_progress("🔮 Loading forecaster models and scalers...")
         try:
+            # Auto-detect metadata directory if using Forecast_ANN structure
+            metadata_dir = None
+            if "Forecast_ANN" in model_dir or os.path.exists(os.path.join(os.path.dirname(model_dir), "metadata")):
+                potential_metadata = os.path.join(os.path.dirname(model_dir), "metadata")
+                if os.path.exists(potential_metadata):
+                    metadata_dir = potential_metadata
+            
             forecaster = MultiHorizonForecastGenerator(
                 model_dir=model_dir,
                 scaler_dir=scaler_dir,
-                look_back=6,
+                metadata_dir=metadata_dir,  # NEW: Auto-detected metadata directory
+                look_back=24,  # IMPROVED: Default to 24 (will be overridden by metadata if available)
                 verbose=False
             )
             print_progress("✅ Forecaster loaded successfully")
@@ -1242,8 +1250,8 @@ def create_evaluation_environment(data: pd.DataFrame,
                 dl_adapter = create_evaluation_dl_adapter(base_env, dl_overlay_weights_path)
 
                 if dl_adapter:
-                    # Attach DL adapter to base environment
-                    base_env.dl_adapter = dl_adapter
+                    # Attach DL adapter to base environment (use canonical dl_adapter_overlay naming)
+                    base_env.dl_adapter_overlay = dl_adapter
                     print_progress("✅ DL overlay attached to evaluation environment")
                 else:
                     print_progress("⚠️ Failed to create DL adapter")
@@ -1976,10 +1984,10 @@ def main():
                        help="Base directory for checkpoints (for 'checkpoint' mode)")
 
     # Forecasting options
-    parser.add_argument("--model_dir", type=str, default="saved_models",
-                       help="Forecast model directory")
-    parser.add_argument("--scaler_dir", type=str, default="saved_scalers",
-                       help="Forecast scaler directory")
+    parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models",
+                       help="Forecast model directory (NEW: Updated to Forecast_ANN structure)")
+    parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers",
+                       help="Forecast scaler directory (NEW: Updated to Forecast_ANN structure)")
     parser.add_argument("--no_forecast", action="store_true",
                        help="Disable forecasting for baseline comparison")
 

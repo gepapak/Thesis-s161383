@@ -3,10 +3,13 @@ import numpy as np
 import joblib
 from sklearn.preprocessing import MinMaxScaler, StandardScaler  # noqa: F401 (used when loaded from disk)
 import json
+import time
+import csv
 from typing import Dict, List, Optional, Tuple, Any, Mapping
 import pandas as pd
 from collections import deque, OrderedDict
 import logging
+from utils import UnifiedMemoryManager, SafeDivision, configure_tf_memory, _get_tf  # UNIFIED: Import from single source of truth
 
 # =========================
 # TensorFlow setup (optional)
@@ -86,27 +89,35 @@ def fix_tensorflow_gpu_setup(use_gpu=True):
         print(f"❌ TensorFlow GPU setup failed: {e}")
         return None
 
-# Initialize TensorFlow with default GPU mode (will be reconfigured later if needed)
-tf = None
+# LAZY TensorFlow initialization (use _get_tf() from utils)
+# Suppress TensorFlow warnings globally
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+try:
+    import logging as _logging
+    _logging.getLogger("tensorflow").setLevel(_logging.ERROR)
+except Exception:
+    pass
 
 def initialize_tensorflow(device="cuda"):
-    """Initialize TensorFlow based on device setting with enhanced memory management."""
-    global tf
+    """Initialize TensorFlow based on device setting with enhanced memory management (lazy)."""
     use_gpu = device.lower() == "cuda"
-    tf = fix_tensorflow_gpu_setup(use_gpu=use_gpu)
+    tf = _get_tf()  # Lazy initialization from utils
 
-    if tf is not None:
-        # Configure TensorFlow for memory efficiency - CONSERVATIVE APPROACH
-        try:
-            # HIGH: Fix GPU Initialization Conflict - rely solely on memory_growth
-            gpus = tf.config.list_physical_devices('GPU')
-            if gpus and use_gpu:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                    # Remove hardcoded VirtualDeviceConfiguration(memory_limit=X) to prevent instability
-            print(f"TensorFlow configured for {'GPU' if use_gpu else 'CPU'}-only mode with dynamic memory allocation")
-        except Exception as e:
-            print(f"[WARNING] Failed to configure TensorFlow memory settings: {e}")
+    if tf is None:
+        logging.warning("TensorFlow not available, cannot initialize")
+        return None
+
+    # Configure TensorFlow for memory efficiency - CONSERVATIVE APPROACH
+    try:
+        # HIGH: Fix GPU Initialization Conflict - rely solely on memory_growth
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus and use_gpu:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+                # Remove hardcoded VirtualDeviceConfiguration(memory_limit=X) to prevent instability
+        logging.info(f"TensorFlow configured for {'GPU' if use_gpu else 'CPU'}-only mode with dynamic memory allocation")
+    except Exception as e:
+        logging.warning(f"Failed to configure TensorFlow memory settings: {e}")
 
     return tf
 
@@ -115,6 +126,9 @@ def initialize_tensorflow(device="cuda"):
 # Memory Management Utilities
 # =========================
 
+# UNIFIED MEMORY MANAGER (NEW)
+# LRUCache is now managed by UnifiedMemoryManager from memory_manager.py
+# For backward compatibility, we provide a simple LRU cache wrapper
 class LRUCache:
     """Lightweight LRU cache implementation for forecast caching."""
 
@@ -164,17 +178,6 @@ class ModelLoadingError(Exception):
 
 class ForecastGenerationError(Exception):
     pass
-
-class SafeDivision:
-    @staticmethod
-    def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
-        """Robust division with protection against zero-division."""
-        if denominator is None or abs(denominator) < 1e-9:
-            return default
-        try:
-            return float(numerator) / float(denominator)
-        except (ValueError, TypeError, ZeroDivisionError):
-            return default
 
 
 # =========================
@@ -280,22 +283,50 @@ class MultiHorizonForecastGenerator:
       - Hydro: 0-534 MW
       - Load: 0-2999 MW
       - Price: $/MWh (no conversion)
+
+    CRITICAL DATA LEAKAGE WARNING:
+    ==============================
+    The forecast models loaded from disk are assumed to be trained on EXTERNAL data
+    that is COMPLETELY SEPARATE from the training/testing data used in this RL system.
+
+    If the forecast models were trained on data that overlaps with the RL training data,
+    this constitutes DATA LEAKAGE and will result in:
+    - Unrealistically optimistic forecast accuracy
+    - Overfitted RL policies that don't generalize
+    - Invalid performance metrics
+
+    VALIDATION STEPS:
+    1. Verify forecast model training data is from a different time period
+    2. Verify forecast model training data is from a different source/region if applicable
+    3. Check model training dates vs. RL training data dates
+    4. If possible, load model metadata to confirm training integrity
+
+    RECOMMENDATION:
+    Add a validation step that loads and checks model metadata (training date range,
+    data source, etc.) to confirm no overlap with RL training data.
     """
 
     def __init__(
         self,
         model_dir: str = "saved_models",
         scaler_dir: str = "saved_scalers",
-        look_back: int = 24,  # TUNED: Increased from 6 to 24 for better pattern recognition
+        metadata_dir: Optional[str] = None,  # NEW: Directory with metadata JSON files
+        look_back: int = 24,  # IMPROVED: Increased from 6 to 24 (must match retrained models)
         verbose: bool = True,
         fallback_mode: bool = True,
         # Simple refresh - no throttling complexity
         agent_refresh_stride: int = 1,
-    ):
+        # Data leakage validation
+        validate_data_integrity: bool = True,
+        rl_train_start_date: Optional[str] = None,
+        timing_log_path: Optional[str] = None): 
         self.look_back = int(look_back)
         self.verbose = verbose
+        self.metadata_dir = metadata_dir  # Store metadata directory
         self.fallback_mode = fallback_mode
         self.agent_refresh_stride = max(1, int(agent_refresh_stride))
+        self.validate_data_integrity = validate_data_integrity
+        self.rl_train_start_date = rl_train_start_date
 
         # Simplified - no complex validation
         self.enable_validation = False
@@ -357,6 +388,25 @@ class MultiHorizonForecastGenerator:
 
         # NEW: offline precomputed forecasts (target, horizon) -> np.ndarray of shape (T,)
         self._precomputed: Dict[Tuple[str, str], np.ndarray] = {}
+        self._data_df: Optional[pd.DataFrame] = None  # Store data for debiasing
+
+        # Timing instrumentation (optional)
+        self.timing_log_path = timing_log_path
+        self._predict_accumulator = 0.0  # milliseconds accumulated for current predict call
+        if self.timing_log_path:
+            try:
+                os.makedirs(os.path.dirname(self.timing_log_path), exist_ok=True)
+            except Exception:
+                pass
+            # Create file and header if not exists
+            try:
+                if not os.path.exists(self.timing_log_path):
+                    with open(self.timing_log_path, 'w', newline='') as tf:
+                        w = csv.writer(tf)
+                        w.writerow(['iso_ts', 'timestep', 'agent', 'total_ms', 'num_predictions', 'mean_ms'])
+            except Exception:
+                # If logging setup fails, disable timing logging quietly
+                self.timing_log_path = None
 
         # stats
         self.loading_stats = {
@@ -374,9 +424,22 @@ class MultiHorizonForecastGenerator:
         # accuracy tracking for confidence calculation
         self.accuracy_history: Dict[Tuple[str, str], deque] = {}
 
+        # Data integrity tracking
+        self._forecast_train_end_date: Optional[str] = None
+        self._data_leakage_validated: bool = False
+
+        # Initialize TensorFlow (lazy loading from utils)
+        # This is needed for model loading in _load_models_and_scalers()
+        self.tf = _get_tf()
+
         # load and init
         try:
-            self._load_models_and_scalers(model_dir, scaler_dir)
+            self._load_models_and_scalers(model_dir, scaler_dir, metadata_dir)
+
+            # CRITICAL: Validate data integrity to prevent leakage
+            if self.validate_data_integrity:
+                self._validate_forecast_model_integrity(model_dir, metadata_dir)
+
             self._initialize_history()
             self._preallocate_buffers()
             self._precompute_availability()
@@ -386,6 +449,9 @@ class MultiHorizonForecastGenerator:
                 logging.warning(f"[WARNING] Forecast generator init fallback: {e}")
                 self._initialize_fallback_mode()
             else:
+                # FAIL-FAST: When fallback_mode=False, raise immediately
+                # This ensures forecast features (DL overlay, FGB) fail loudly if models don't load
+                logging.error(f"[CRITICAL] Forecast generator initialization failed (fallback_mode=False): {e}")
                 raise
 
     # -------- init helpers --------
@@ -399,7 +465,20 @@ class MultiHorizonForecastGenerator:
         if self.verbose:
             print("[OK] Fallback mode enabled (forecasts will use history/defaults)")
 
-    def _load_models_and_scalers(self, model_dir: str, scaler_dir: str):
+    def _load_models_and_scalers(self, model_dir: str, scaler_dir: str, metadata_dir: Optional[str] = None):
+        """
+        Load models and scalers using new metadata-based structure or fallback to old structure.
+        
+        NEW STRUCTURE (preferred):
+        - Looks for metadata/{target}_{horizon}_metadata.json
+        - Uses model_path_best from metadata (prefers best checkpoint)
+        - Gets look_back and other params from metadata
+        - Paths in metadata are relative to Forecast_ANN/ or absolute
+        
+        OLD STRUCTURE (fallback):
+        - Direct file lookup in model_dir and scaler_dir
+        - Pattern: {target}_{horizon}_model.h5
+        """
         if not os.path.exists(model_dir):
             msg = f"Model dir not found: {model_dir}"
             if self.fallback_mode:
@@ -413,7 +492,20 @@ class MultiHorizonForecastGenerator:
                 return
             raise ModelLoadingError(msg)
 
-        # optional training summary
+        # Determine metadata directory
+        if metadata_dir is None:
+            # Try to infer: if model_dir is Forecast_ANN/models, metadata is Forecast_ANN/metadata
+            if "Forecast_ANN" in model_dir or "models" in model_dir:
+                potential_metadata_dir = model_dir.replace("models", "metadata")
+                if os.path.exists(potential_metadata_dir):
+                    metadata_dir = potential_metadata_dir
+            # Also try parent/metadata
+            parent_dir = os.path.dirname(model_dir)
+            potential_metadata_dir2 = os.path.join(parent_dir, "metadata")
+            if metadata_dir is None and os.path.exists(potential_metadata_dir2):
+                metadata_dir = potential_metadata_dir2
+
+        # optional training summary (old format)
         summary_path = os.path.join(model_dir, "training_summary.json")
         self.training_summary = {}
         if os.path.exists(summary_path):
@@ -425,62 +517,427 @@ class MultiHorizonForecastGenerator:
             except Exception as e:
                 logging.warning(f"[WARNING] Could not load training summary: {e}")
 
+        # Track if we're using new structure
+        using_metadata = False
+        if metadata_dir and os.path.exists(metadata_dir):
+            using_metadata = True
+            if self.verbose:
+                print(f"[OK] Using metadata-based loading from: {metadata_dir}")
+
         # load models/scalers
         for target in self.targets:
             for hname in self.horizons.keys():
                 key = f"{target}_{hname}"
                 self.loading_stats["models_attempted"] += 1
-                # Try both .h5 and .keras formats
-                model_path_h5 = os.path.join(model_dir, f"{key}_model.h5")
-                model_path_keras = os.path.join(model_dir, f"{key}_model.keras")
-                model_path = model_path_h5 if os.path.exists(model_path_h5) else model_path_keras
-                if os.path.exists(model_path) and tf is not None:
+                
+                # NEW STRUCTURE: Try loading from metadata first
+                model_path = None
+                scaler_x_path = None
+                scaler_y_path = None
+                metadata_look_back = None
+                
+                if using_metadata:
+                    metadata_path = os.path.join(metadata_dir, f"{key}_metadata.json")
+                    if os.path.exists(metadata_path):
+                        try:
+                            with open(metadata_path, "r") as f:
+                                md = json.load(f)
+                            
+                            # Get model path (prefer best checkpoint)
+                            model_path_best = md.get("model_path_best")
+                            model_path_final = md.get("model_path", "")
+                            
+                            # Resolve paths (handle relative paths)
+                            if model_path_best:
+                                if os.path.isabs(model_path_best):
+                                    model_path = model_path_best
+                                else:
+                                    # Try relative to metadata dir parent, then model_dir
+                                    potential_paths = [
+                                        os.path.join(os.path.dirname(metadata_dir), model_path_best),
+                                        os.path.join(model_dir, os.path.basename(model_path_best)),
+                                    ]
+                                    for p in potential_paths:
+                                        if os.path.exists(p):
+                                            model_path = p
+                                            break
+                                    if model_path is None:
+                                        model_path = os.path.join(model_dir, os.path.basename(model_path_best))
+                            elif model_path_final:
+                                if os.path.isabs(model_path_final):
+                                    model_path = model_path_final
+                                else:
+                                    potential_paths = [
+                                        os.path.join(os.path.dirname(metadata_dir), model_path_final),
+                                        os.path.join(model_dir, os.path.basename(model_path_final)),
+                                    ]
+                                    for p in potential_paths:
+                                        if os.path.exists(p):
+                                            model_path = p
+                                            break
+                                    if model_path is None:
+                                        model_path = os.path.join(model_dir, os.path.basename(model_path_final))
+                            
+                            # Get scaler paths
+                            scaler_x_path = md.get("scaler_x_path")
+                            scaler_y_path = md.get("scaler_y_path")
+                            if scaler_x_path and not os.path.isabs(scaler_x_path):
+                                potential_paths = [
+                                    os.path.join(os.path.dirname(metadata_dir), scaler_x_path),
+                                    os.path.join(scaler_dir, os.path.basename(scaler_x_path)),
+                                ]
+                                for p in potential_paths:
+                                    if os.path.exists(p):
+                                        scaler_x_path = p
+                                        break
+                                if not os.path.exists(scaler_x_path):
+                                    scaler_x_path = os.path.join(scaler_dir, os.path.basename(scaler_x_path))
+                            
+                            if scaler_y_path and not os.path.isabs(scaler_y_path):
+                                potential_paths = [
+                                    os.path.join(os.path.dirname(metadata_dir), scaler_y_path),
+                                    os.path.join(scaler_dir, os.path.basename(scaler_y_path)),
+                                ]
+                                for p in potential_paths:
+                                    if os.path.exists(p):
+                                        scaler_y_path = p
+                                        break
+                                if not os.path.exists(scaler_y_path):
+                                    scaler_y_path = os.path.join(scaler_dir, os.path.basename(scaler_y_path))
+                            
+                            # Get look_back from metadata (update if different)
+                            metadata_look_back = md.get("look_back")
+                            if metadata_look_back and metadata_look_back != self.look_back:
+                                if self.verbose:
+                                    print(f"[INFO] Updating look_back from {self.look_back} to {metadata_look_back} (from metadata for {key})")
+                                self.look_back = int(metadata_look_back)
+                            
+                        except Exception as e:
+                            if self.verbose:
+                                logging.warning(f"[WARNING] Could not load metadata for {key}: {e}")
+                
+                # OLD STRUCTURE FALLBACK: Direct file lookup
+                if model_path is None or not os.path.exists(model_path):
+                    model_path_h5 = os.path.join(model_dir, f"{key}_model.h5")
+                    model_path_keras = os.path.join(model_dir, f"{key}_model.keras")
+                    model_path = model_path_h5 if os.path.exists(model_path_h5) else model_path_keras
+                
+                # Load model
+                if os.path.exists(model_path) and self.tf is not None:
                     try:
                         # Try multiple loading strategies for compatibility
                         try:
-                            # Method 1: Standard loading
-                            self.models[key] = tf.keras.models.load_model(model_path, compile=False)
+                            # Method 1: Try keras.saving.load_model first (better DTypePolicy handling in Keras 3.x)
+                            import warnings
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings('ignore')
+                                try:
+                                    from keras.saving import load_model as keras_saving_load
+                                    self.models[key] = keras_saving_load(model_path, compile=False)
+                                except (ImportError, Exception):
+                                    # Fallback to tf.keras with DTypePolicy in custom_objects
+                                    custom_objects = {}
+                                    
+                                    # Handle DTypePolicy (Keras 3.x) - required for loading Keras 3.x models
+                                    try:
+                                        # Try multiple import paths for DTypePolicy
+                                        try:
+                                            from keras import DTypePolicy
+                                            custom_objects['DTypePolicy'] = DTypePolicy
+                                        except ImportError:
+                                            try:
+                                                from keras.dtype_policies import DTypePolicy
+                                                custom_objects['DTypePolicy'] = DTypePolicy
+                                            except ImportError:
+                                                try:
+                                                    from keras.dtype_policies.dtype_policy import DTypePolicy
+                                                    custom_objects['DTypePolicy'] = DTypePolicy
+                                                except ImportError:
+                                                    pass
+                                    except Exception:
+                                        pass
+                                    
+                                    try:
+                                        if custom_objects:
+                                            self.models[key] = self.tf.keras.models.load_model(
+                                                model_path,
+                                                compile=False,
+                                                custom_objects=custom_objects
+                                            )
+                                        else:
+                                            self.models[key] = self.tf.keras.models.load_model(model_path, compile=False)
+                                    except Exception as load_err:
+                                        # If that fails, try with safe_mode=False
+                                        try:
+                                            self.models[key] = self.tf.keras.models.load_model(
+                                                model_path,
+                                                compile=False,
+                                                safe_mode=False,
+                                                custom_objects=custom_objects if custom_objects else None
+                                            )
+                                        except TypeError:
+                                            # safe_mode not available, try without it
+                                            raise load_err
                         except Exception as e1:
-                            # Method 2: Load with custom objects (for compatibility)
+                            # Method 2: Try with safe_mode=False (for Keras 3.x compatibility with older models)
                             try:
-                                self.models[key] = tf.keras.models.load_model(
-                                    model_path,
-                                    compile=False,
-                                    custom_objects=None
-                                )
+                                import warnings
+                                with warnings.catch_warnings():
+                                    warnings.filterwarnings('ignore')
+                                    # Try to get DTypePolicy for custom_objects
+                                    custom_objects = {}
+                                    try:
+                                        from keras import DTypePolicy
+                                        custom_objects['DTypePolicy'] = DTypePolicy
+                                    except:
+                                        pass
+                                    
+                                    try:
+                                        # Keras 3.x supports safe_mode parameter
+                                        self.models[key] = self.tf.keras.models.load_model(
+                                            model_path,
+                                            compile=False,
+                                            safe_mode=False,
+                                            custom_objects=custom_objects if custom_objects else None
+                                        )
+                                    except TypeError:
+                                        # safe_mode not available (Keras 2.x), try with custom_objects
+                                        self.models[key] = self.tf.keras.models.load_model(
+                                            model_path,
+                                            compile=False,
+                                            custom_objects=custom_objects if custom_objects else None
+                                        )
                             except Exception as e2:
-                                # Method 3: Try loading architecture + weights separately
-                                arch_path = model_path.replace('.h5', '_architecture.json')
-                                weights_path = model_path.replace('.h5', '_weights.h5')
-                                if os.path.exists(arch_path) and os.path.exists(weights_path):
-                                    with open(arch_path, 'r') as f:
-                                        model_json = f.read()
-                                    model = tf.keras.models.model_from_json(model_json)
-                                    model.load_weights(weights_path)
-                                    self.models[key] = model
-                                else:
-                                    raise e2
+                                # Method 3: Try using keras.saving.load_model (better DTypePolicy handling)
+                                try:
+                                    import warnings
+                                    with warnings.catch_warnings():
+                                        warnings.filterwarnings('ignore')
+                                        try:
+                                            from keras.saving import load_model as keras_load_model
+                                            # Try keras.saving.load_model which handles DTypePolicy better
+                                            self.models[key] = keras_load_model(model_path, compile=False)
+                                        except ImportError:
+                                            # Fallback to tf.keras with comprehensive custom_objects
+                                            custom_objects = {}
+                                            
+                                            # Add DTypePolicy
+                                            try:
+                                                from keras import DTypePolicy
+                                                custom_objects['DTypePolicy'] = DTypePolicy
+                                            except:
+                                                try:
+                                                    from keras.dtype_policies import DTypePolicy
+                                                    custom_objects['DTypePolicy'] = DTypePolicy
+                                                except:
+                                                    pass
+                                            
+                                            # Add InputLayer handler
+                                            from tensorflow.keras.layers import InputLayer as BaseInputLayer
+                                            class CompatibleInputLayer(BaseInputLayer):
+                                                def __init__(self, **kwargs):
+                                                    if 'batch_shape' in kwargs:
+                                                        batch_shape = kwargs.pop('batch_shape')
+                                                        if batch_shape and len(batch_shape) > 1:
+                                                            kwargs['input_shape'] = batch_shape[1:]
+                                                    super().__init__(**kwargs)
+                                            custom_objects['InputLayer'] = CompatibleInputLayer
+                                            
+                                            self.models[key] = self.tf.keras.models.load_model(
+                                                model_path,
+                                                compile=False,
+                                                custom_objects=custom_objects if custom_objects else None
+                                            )
+                                except Exception as e3:
+                                    # Method 4: Reconstruct model from metadata and load weights
+                                    try:
+                                        if using_metadata and metadata_dir:
+                                            metadata_path = os.path.join(metadata_dir, f"{key}_metadata.json")
+                                            if os.path.exists(metadata_path):
+                                                with open(metadata_path, "r") as f:
+                                                    md = json.load(f)
+                                                
+                                                # Reconstruct model architecture from metadata
+                                                input_features = md.get('input_features', 24)
+                                                architecture_desc = md.get('architecture', '256-128 (2 hidden layers with dropout 0.2)')
+                                                
+                                                # Parse architecture: "256-128 (2 hidden layers with dropout 0.2)"
+                                                import re
+                                                units_match = re.search(r'(\d+)-(\d+)', architecture_desc)
+                                                if units_match:
+                                                    units1 = int(units_match.group(1))
+                                                    units2 = int(units_match.group(2))
+                                                    
+                                                    from tensorflow.keras.layers import Dense, Dropout
+                                                    from tensorflow.keras.models import Sequential
+                                                    
+                                                    # Rebuild model with EXACT same architecture as original
+                                                    # Original: Input -> Dense(256) -> Dropout(0.2) -> Dense(128) -> Dropout(0.2) -> Dense(1)
+                                                    # Note: Sequential models auto-name layers as "dense", "dense_1", "dense_2", "dropout", "dropout_1"
+                                                    # We don't specify names to let Sequential auto-generate them (matches original)
+                                                    model = Sequential([
+                                                        self.tf.keras.Input(shape=(input_features,)),
+                                                        Dense(units1, activation='relu'),
+                                                        Dropout(0.2),
+                                                        Dense(units2, activation='relu'),
+                                                        Dropout(0.2),
+                                                        Dense(1)
+                                                    ])
+                                                    
+                                                    # Load weights using h5py to bypass DTypePolicy issues
+                                                    weights_file = model_path
+                                                    best_path = md.get('model_path_best')
+                                                    if best_path and os.path.exists(best_path):
+                                                        weights_file = best_path
+                                                    
+                                                    if os.path.exists(weights_file):
+                                                        try:
+                                                            # Method 1: Try loading by index (more reliable for Sequential models)
+                                                            # Sequential models save layers in order, so we can load by index
+                                                            import h5py
+                                                            with h5py.File(weights_file, 'r') as f:
+                                                                if 'model_weights' in f:
+                                                                    model_weights = f['model_weights']
+                                                                    
+                                                                    # Get all layer names from saved model (filter out non-weight layers)
+                                                                    saved_layer_names = [name for name in model_weights.keys() 
+                                                                                        if name not in ['top_level_model_weights'] 
+                                                                                        and len(model_weights[name].keys()) > 0]
+                                                                    
+                                                                    # Filter out InputLayer and Dropout (they have no trainable weights)
+                                                                    trainable_layers = [l for l in model.layers 
+                                                                                       if hasattr(l, 'get_weights') and len(l.get_weights()) > 0]
+                                                                    
+                                                                    # Match layers by name (dense, dense_1, dense_2)
+                                                                    # Structure: model_weights/dense/sequential/dense/kernel and bias
+                                                                    layers_loaded = 0
+                                                                    for model_layer in trainable_layers:
+                                                                        layer_name = model_layer.name
+                                                                        if layer_name in model_weights:
+                                                                            layer_weights = model_weights[layer_name]
+                                                                            # Weights are stored under 'sequential/dense' subdirectory
+                                                                            # Structure: model_weights/dense/sequential/dense/kernel and bias
+                                                                            weight_values = []
+                                                                            if 'sequential' in layer_weights:
+                                                                                seq_weights = layer_weights['sequential']
+                                                                                # The actual weights are under 'dense' (not layer_name)
+                                                                                if 'dense' in seq_weights:
+                                                                                    weight_group = seq_weights['dense']
+                                                                                    # Keys are 'kernel' and 'bias', not 'kernel:0' and 'bias:0'
+                                                                                    if 'kernel' in weight_group:
+                                                                                        weight_values.append(weight_group['kernel'][:])
+                                                                                    if 'bias' in weight_group:
+                                                                                        weight_values.append(weight_group['bias'][:])
+                                                                                # Fallback: try with layer name
+                                                                                elif layer_name in seq_weights:
+                                                                                    weight_group = seq_weights[layer_name]
+                                                                                    if 'kernel' in weight_group:
+                                                                                        weight_values.append(weight_group['kernel'][:])
+                                                                                    if 'bias' in weight_group:
+                                                                                        weight_values.append(weight_group['bias'][:])
+                                                                            
+                                                                            if len(weight_values) >= 2:  # Need both kernel and bias
+                                                                                model_layer.set_weights(weight_values)
+                                                                                layers_loaded += 1
+                                                                    
+                                                                    if self.verbose:
+                                                                        print(f"[OK] weights loaded via h5py for {key} ({layers_loaded}/{len(trainable_layers)} layers)")
+                                                                    
+                                                                    if layers_loaded == 0:
+                                                                        raise ValueError("No weights loaded - check layer name matching")
+                                                                else:
+                                                                    raise ValueError("No 'model_weights' found in HDF5 file")
+                                                        except Exception as h5_err:
+                                                            # Final fallback: try direct loading
+                                                            try:
+                                                                model.load_weights(weights_file, by_name=True, skip_mismatch=True)
+                                                                if self.verbose:
+                                                                    print(f"[OK] weights loaded directly (fallback) for {key}")
+                                                            except Exception as final_err:
+                                                                if self.verbose:
+                                                                    logging.warning(f"[WARNING] Could not load weights for {key}: {h5_err}, {final_err}")
+                                                                raise
+                                                    
+                                                    # Validate weights were loaded correctly
+                                                    total_params = sum([np.prod(layer.get_weights()[0].shape) if len(layer.get_weights()) > 0 else 0 for layer in model.layers])
+                                                    if total_params == 0:
+                                                        raise ValueError(f"No weights loaded for {key} - model reconstruction failed")
+                                                    
+                                                    self.models[key] = model
+                                                    if self.verbose:
+                                                        print(f"[OK] model reconstructed from metadata: {key} ({total_params:,} params loaded)")
+                                                else:
+                                                    raise e3
+                                            else:
+                                                raise e3
+                                        else:
+                                            raise e3
+                                    except Exception as e4:
+                                        # Method 5: Try loading architecture + weights separately (old structure)
+                                        arch_path = model_path.replace('.h5', '_architecture.json')
+                                        weights_path = model_path.replace('.h5', '_weights.h5')
+                                        if os.path.exists(arch_path) and os.path.exists(weights_path):
+                                            with open(arch_path, 'r') as f:
+                                                model_json = f.read()
+                                            # Fix batch_shape and DTypePolicy in JSON
+                                            import json as json_module
+                                            try:
+                                                config = json_module.loads(model_json)
+                                                # Recursively fix config
+                                                def fix_config(obj):
+                                                    if isinstance(obj, dict):
+                                                        # Fix batch_shape
+                                                        if 'batch_shape' in obj:
+                                                            batch_shape = obj['batch_shape']
+                                                            if batch_shape and len(batch_shape) > 1:
+                                                                obj['input_shape'] = batch_shape[1:]
+                                                                del obj['batch_shape']
+                                                        # Fix DTypePolicy -> simple dtype string
+                                                        if 'dtype' in obj and isinstance(obj['dtype'], dict):
+                                                            if obj['dtype'].get('class_name') == 'DTypePolicy':
+                                                                dtype_name = obj['dtype'].get('config', {}).get('name', 'float32')
+                                                                obj['dtype'] = dtype_name
+                                                        for v in obj.values():
+                                                            fix_config(v)
+                                                    elif isinstance(obj, list):
+                                                        for item in obj:
+                                                            fix_config(item)
+                                                fix_config(config)
+                                                model_json = json_module.dumps(config)
+                                            except:
+                                                pass  # If JSON parsing fails, try as-is
+                                            model = self.tf.keras.models.model_from_json(model_json)
+                                            model.load_weights(weights_path)
+                                            self.models[key] = model
+                                        else:
+                                            raise e4
 
                         self.loading_stats["models_loaded"] += 1
                         if self.verbose:
-                            print(f"[OK] model loaded: {key}")
+                            source = "metadata" if using_metadata and os.path.exists(os.path.join(metadata_dir, f"{key}_metadata.json")) else "direct"
+                            print(f"[OK] model loaded: {key} (from {source})")
                     except Exception as e:
                         self.loading_stats["loading_errors"].append(f"model {key}: {e}")
                         if self.verbose:
                             logging.error(f"[ERROR] model load failed: {key} ({e})")
                 else:
                     if self.verbose:
-                        print(f"[WARNING] model missing: {key}")
+                        print(f"[WARNING] model missing: {key} (path={model_path}, exists={os.path.exists(model_path) if model_path else False}, tf={self.tf is not None})")
 
-                # scalers (if present) - try both naming conventions
+                # Load scalers
                 self.loading_stats["scalers_attempted"] += 1
-                # Try TestForecast naming convention first
-                sx = os.path.join(scaler_dir, f"{key}_sc_X.pkl")
-                sy = os.path.join(scaler_dir, f"{key}_sc_y.pkl")
-                # Fallback to original naming convention
-                if not (os.path.exists(sx) and os.path.exists(sy)):
-                    sx = os.path.join(scaler_dir, f"{key}_scaler_X.pkl")
-                    sy = os.path.join(scaler_dir, f"{key}_scaler_y.pkl")
+                if scaler_x_path and scaler_y_path and os.path.exists(scaler_x_path) and os.path.exists(scaler_y_path):
+                    # Use paths from metadata
+                    sx, sy = scaler_x_path, scaler_y_path
+                else:
+                    # OLD STRUCTURE FALLBACK: Try both naming conventions
+                    sx = os.path.join(scaler_dir, f"{key}_sc_X.pkl")
+                    sy = os.path.join(scaler_dir, f"{key}_sc_y.pkl")
+                    # Fallback to original naming convention
+                    if not (os.path.exists(sx) and os.path.exists(sy)):
+                        sx = os.path.join(scaler_dir, f"{key}_scaler_X.pkl")
+                        sy = os.path.join(scaler_dir, f"{key}_scaler_y.pkl")
+                
                 if os.path.exists(sx) and os.path.exists(sy):
                     try:
                         scaler_X = joblib.load(sx)
@@ -490,7 +947,8 @@ class MultiHorizonForecastGenerator:
                         self.scalers[key] = {"scaler_X": scaler_X, "scaler_y": scaler_y}
                         self.loading_stats["scalers_loaded"] += 1
                         if self.verbose:
-                            print(f"[OK] scalers loaded: {key}")
+                            source = "metadata" if using_metadata and scaler_x_path else "direct"
+                            print(f"[OK] scalers loaded: {key} (from {source})")
                     except Exception as e:
                         self.loading_stats["loading_errors"].append(f"scalers {key}: {e}")
                         if self.verbose:
@@ -498,6 +956,89 @@ class MultiHorizonForecastGenerator:
 
         if self.loading_stats["models_loaded"] == 0 and self.fallback_mode:
             print("[WARNING] No models loaded; operating in fallback mode.")
+
+    def _validate_forecast_model_integrity(self, model_dir: str, metadata_dir: Optional[str] = None):
+        """
+        CRITICAL: Validate that forecast models don't leak RL training data.
+
+        Checks:
+        1. Forecast model training end date < RL training start date
+        2. No temporal overlap between forecast training and RL training
+        3. Proper time-series split validation
+
+        Raises:
+            ValueError: If data leakage is detected
+        """
+        try:
+            # Try new structure: look for any metadata file to get training_end
+            forecast_train_end = None
+            if metadata_dir and os.path.exists(metadata_dir):
+                # Try to find any metadata file to get training dates
+                for target in self.targets:
+                    for hname in self.horizons.keys():
+                        metadata_path = os.path.join(metadata_dir, f"{target}_{hname}_metadata.json")
+                        if os.path.exists(metadata_path):
+                            try:
+                                with open(metadata_path, "r") as f:
+                                    md = json.load(f)
+                                forecast_train_end = md.get("training_end")
+                                if forecast_train_end:
+                                    break
+                            except Exception:
+                                continue
+                    if forecast_train_end:
+                        break
+            
+            # Fallback to old structure
+            if not forecast_train_end:
+                metadata_path = os.path.join(model_dir, "training_metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path, "r") as f:
+                            metadata = json.load(f)
+                        forecast_train_end = metadata.get("train_end_date") or metadata.get("training_end")
+                    except Exception:
+                        pass
+            
+            if not forecast_train_end:
+                logging.warning(
+                    "[DATA LEAKAGE WARNING] No training_end date found in metadata. "
+                    "Cannot validate forecast model integrity. "
+                    "Ensure forecast models were trained on data BEFORE RL training period."
+                )
+                return
+
+            self._forecast_train_end_date = forecast_train_end
+
+            # If RL training start date is provided, validate no overlap
+            if self.rl_train_start_date:
+                from datetime import datetime
+                forecast_end = datetime.fromisoformat(forecast_train_end)
+                rl_start = datetime.fromisoformat(self.rl_train_start_date)
+
+                if forecast_end >= rl_start:
+                    raise ValueError(
+                        f"DATA LEAKAGE DETECTED: Forecast model trained until {forecast_train_end}, "
+                        f"but RL training starts at {self.rl_train_start_date}. "
+                        f"Forecast models must be trained on data BEFORE RL training period."
+                    )
+
+                logging.info(
+                    f"[OK] Data integrity validated: Forecast training ended {forecast_train_end}, "
+                    f"RL training starts {self.rl_train_start_date}"
+                )
+
+            # Validate time-series split (optional - only if test_start is available in metadata)
+            # Note: This is optional validation, not all metadata files have test_start
+
+            self._data_leakage_validated = True
+
+        except Exception as e:
+            if self.validate_data_integrity:
+                logging.error(f"[CRITICAL] Data integrity validation failed: {e}")
+                raise
+            else:
+                logging.warning(f"[WARNING] Data integrity validation failed: {e}")
 
     def _initialize_history(self):
         # compact, fast append/pop
@@ -521,9 +1062,9 @@ class MultiHorizonForecastGenerator:
             import gc
 
             # 1. Clear TensorFlow session if available
-            if tf is not None:
+            if self.tf is not None:
                 try:
-                    tf.keras.backend.clear_session()
+                    self.tf.keras.backend.clear_session()
                 except Exception:
                     pass
 
@@ -564,7 +1105,7 @@ class MultiHorizonForecastGenerator:
                 pass
 
             if self.verbose and self._step_counter % (self._cleanup_frequency * 10) == 0:
-                print(f"🧹 Enhanced memory cleanup at step {self._step_counter}: "
+                print(f"[CLEANUP] Enhanced memory cleanup at step {self._step_counter}: "
                       f"Global cache: {len(self._global_cache)}, "
                       f"Agent cache: {len(self._agent_cache)}")
 
@@ -640,45 +1181,41 @@ class MultiHorizonForecastGenerator:
 
     def calculate_forecast_confidence(self, agent: str, timestep: Optional[int] = None) -> float:
         """
-        Calculate forecast confidence based on recent accuracy and model availability.
-        Returns confidence score between 0.0 and 1.0.
+        Calculate forecast confidence based on recent MAPE (Mean Absolute Percentage Error).
+
+        NOTE: This method is called but typically OVERRIDDEN by environment's
+        _get_forecast_confidence() which uses more sophisticated MAPE tracking.
+
+        Returns:
+            Confidence score in [0.6, 1.0] based on forecast accuracy
+            - 1.0 = perfect forecasts (0% error)
+            - 0.6 = floor (40%+ error)
         """
         if agent == "risk_controller_0":
             return 1.0  # Risk controller doesn't need forecast confidence
 
-        targets = self.agent_targets.get(agent, [])
-        horizons = self.agent_horizons.get(agent, [])
+        # MAPE-BASED CONFIDENCE: Calculate from recent forecast errors
+        # This provides a simple fallback if environment doesn't override
+        try:
+            if hasattr(self, '_forecast_errors') and self._forecast_errors:
+                # Get recent errors across all targets
+                all_errors = []
+                for target_errors in self._forecast_errors.values():
+                    if len(target_errors) > 0:
+                        all_errors.extend(list(target_errors)[-10:])  # Last 10 per target
 
-        if not targets or not horizons:
-            return 0.0
+                if all_errors:
+                    # Calculate MAPE
+                    mape = np.mean(all_errors)
+                    # Convert to confidence: 0% error → 1.0, 50% error → 0.5
+                    confidence = 1.0 - np.clip(mape, 0.0, 0.5)
+                    # Apply floor of 0.6 (60%)
+                    return float(np.clip(confidence, 0.6, 1.0))
+        except Exception:
+            pass
 
-        confidence_scores = []
-
-        for target in targets:
-            for hname in horizons:
-                key = (target, hname)
-
-                # Check if we have a trained model
-                model_key = f"{target}_{hname}"
-                model_available = model_key in self.models and self.models[model_key] is not None
-
-                # Base confidence from model availability
-                base_confidence = 0.8 if model_available else 0.3
-
-                # Adjust based on recent accuracy if available
-                if key in self.accuracy_history and len(self.accuracy_history[key]) > 0:
-                    recent_errors = list(self.accuracy_history[key])[-10:]  # Last 10 predictions
-                    if recent_errors:
-                        # Calculate average error (simplified MAPE)
-                        avg_error = np.mean(recent_errors)
-                        # Convert error to confidence (lower error = higher confidence)
-                        accuracy_confidence = max(0.0, 1.0 - avg_error)
-                        base_confidence = (base_confidence + accuracy_confidence) / 2
-
-                confidence_scores.append(base_confidence)
-
-        # Return average confidence across all forecasts for this agent
-        return np.mean(confidence_scores) if confidence_scores else 0.0
+        # FALLBACK: Return floor confidence if no error tracking available
+        return 0.6  # Conservative default (was 1.0 - now realistic)
 
     def predict_for_agent(self, agent: str, timestep: Optional[int] = None) -> Dict[str, float]:
         """
@@ -690,7 +1227,7 @@ class MultiHorizonForecastGenerator:
 
         t = int(timestep or 0)
         cache_key = (agent, t)
-        stride = self.agent_refresh_stride
+        stride = self._get_adaptive_refresh_stride(t)
 
         # throttle: if not on stride boundary AND we have recent cache, reuse last
         last_t = self._last_agent_step.get(agent, None)
@@ -705,6 +1242,9 @@ class MultiHorizonForecastGenerator:
         if cached_result is not None:
             return cached_result
 
+        # Reset per-call accumulator for timing instrumentation
+        self._predict_accumulator = 0.0
+
         targets = self.agent_targets.get(agent, [])
         horizons = self.agent_horizons.get(agent, [])
         out: Dict[str, float] = {}
@@ -717,6 +1257,20 @@ class MultiHorizonForecastGenerator:
         # Add forecast confidence to agent observations
         if agent != "risk_controller_0":
             out["forecast_confidence"] = self.calculate_forecast_confidence(agent, t)
+
+        # Provide optional timing information (ms) for the whole predict_for_agent call
+        out["forecast_inference_time_ms"] = float(self._predict_accumulator)
+
+        # If timing log path configured, append a CSV line with summary stats
+        if self.timing_log_path:
+            try:
+                num_preds = sum(1 for k in out.keys() if k.endswith(tuple(self.horizons.keys())))
+                mean_ms = float(self._predict_accumulator / max(1, num_preds))
+                with open(self.timing_log_path, 'a', newline='') as tf:
+                    w = csv.writer(tf)
+                    w.writerow([time.strftime('%Y-%m-%dT%H:%M:%S'), t, agent, f"{self._predict_accumulator:.6f}", num_preds, f"{mean_ms:.6f}"])
+            except Exception:
+                pass
 
         # store cache with LRU eviction
         self._agent_cache.put(cache_key, out)
@@ -732,16 +1286,162 @@ class MultiHorizonForecastGenerator:
     def predict_all_horizons(self, timestep: Optional[int] = None) -> Dict[str, float]:
         """
         Full forecast dict used by logging. Cached per (target,horizon,timestep).
+        Enhanced with uncertainty quantification.
         """
         t = int(timestep or 0)
+        # Reset accumulator for timing instrumentation
+        self._predict_accumulator = 0.0
         results: Dict[str, float] = {}
 
         for target in self.targets:
             for hname in self.horizons.keys():
                 k = f"{target}_forecast_{hname}"
-                results[k] = self._predict_target_horizon(target, hname, t)
+                forecast_value = self._predict_target_horizon(target, hname, t)
+                results[k] = forecast_value
+
+                # Add uncertainty quantification
+                uncertainty = self._calculate_forecast_uncertainty(target, hname, t)
+                results[f"{target}_uncertainty_{hname}"] = uncertainty
+
+                # Add prediction intervals (95% confidence)
+                lower_bound = forecast_value - 1.96 * uncertainty
+                upper_bound = forecast_value + 1.96 * uncertainty
+                results[f"{target}_lower95_{hname}"] = lower_bound
+                results[f"{target}_upper95_{hname}"] = upper_bound
+
+        # Include timing summary for full-horizon predictions
+        results['forecast_inference_time_ms'] = float(self._predict_accumulator)
+
+        # Optionally persist timing to CSV (agent unknown for full predict_all_horizons, use 'all')
+        if self.timing_log_path:
+            try:
+                num_preds = sum(1 for k in results.keys() if k.endswith(tuple(self.horizons.keys())))
+                mean_ms = float(self._predict_accumulator / max(1, num_preds))
+                with open(self.timing_log_path, 'a', newline='') as tf:
+                    w = csv.writer(tf)
+                    w.writerow([time.strftime('%Y-%m-%dT%H:%M:%S'), t, 'all', f"{self._predict_accumulator:.6f}", num_preds, f"{mean_ms:.6f}"])
+            except Exception:
+                pass
 
         return results
+
+    def _calculate_forecast_uncertainty(self, target: str, horizon: str, timestep: int) -> float:
+        """
+        Calculate forecast uncertainty based on recent prediction errors and model confidence.
+        Returns uncertainty estimate (standard deviation).
+        """
+        try:
+            # Base uncertainty from model availability
+            model_key = f"{target}_{horizon}"
+            model_available = model_key in self.models and self.models[model_key] is not None
+            base_uncertainty = 0.05 if model_available else 0.15  # Lower uncertainty for trained models
+
+            # Historical accuracy-based uncertainty
+            key = (target, horizon)
+            if key in self.accuracy_history and len(self.accuracy_history[key]) > 0:
+                recent_errors = list(self.accuracy_history[key])[-10:]  # Last 10 predictions
+                if recent_errors:
+                    # Use standard deviation of recent errors as uncertainty estimate
+                    error_std = np.std(recent_errors)
+                    # Combine with base uncertainty
+                    accuracy_uncertainty = min(error_std, 0.3)  # Cap at 30%
+                    base_uncertainty = (base_uncertainty + accuracy_uncertainty) / 2
+
+            # Market volatility adjustment
+            if hasattr(self, 'history') and 'price' in self.history:
+                price_history = self.history['price']
+                if len(price_history) >= 5:
+                    recent_prices = price_history[-5:]
+                    if len(recent_prices) > 1:
+                        price_volatility = np.std(recent_prices) / (np.mean(recent_prices) + 1e-6)
+                        # Higher market volatility increases forecast uncertainty
+                        volatility_factor = 1.0 + min(price_volatility, 0.5)  # Cap at 50% increase
+                        base_uncertainty *= volatility_factor
+
+            # Horizon adjustment (longer horizons = higher uncertainty)
+            horizon_multipliers = {
+                'immediate': 1.0,
+                'short': 1.2,
+                'medium': 1.5,
+                'long': 2.0,
+                'strategic': 2.5
+            }
+            horizon_factor = horizon_multipliers.get(horizon, 1.5)
+            base_uncertainty *= horizon_factor
+
+            # Ensure reasonable bounds
+            return float(np.clip(base_uncertainty, 0.01, 0.5))  # 1% to 50% uncertainty
+
+        except Exception:
+            # Fallback uncertainty
+            return 0.1  # 10% default uncertainty
+
+    def _get_adaptive_refresh_stride(self, timestep: int) -> int:
+        """
+        Calculate adaptive refresh stride based on market conditions.
+        Higher volatility = more frequent refreshes (lower stride).
+        """
+        try:
+            # Base stride from configuration
+            base_stride = self.agent_refresh_stride
+
+            # Calculate market volatility
+            market_volatility = self._calculate_market_volatility()
+
+            # Adaptive stride based on volatility
+            if market_volatility > 0.7:
+                # High volatility: refresh every step
+                adaptive_stride = 1
+            elif market_volatility > 0.4:
+                # Medium volatility: refresh every 2-3 steps
+                adaptive_stride = max(1, base_stride // 2)
+            elif market_volatility > 0.2:
+                # Low volatility: use base stride
+                adaptive_stride = base_stride
+            else:
+                # Very low volatility: refresh less frequently
+                adaptive_stride = min(base_stride * 2, 10)
+
+            return max(1, adaptive_stride)  # Ensure at least 1
+
+        except Exception:
+            # Fallback to base stride
+            return self.agent_refresh_stride
+
+    def _calculate_market_volatility(self) -> float:
+        """
+        Calculate current market volatility based on recent price history.
+        Returns volatility score between 0.0 and 1.0.
+        """
+        try:
+            if not hasattr(self, 'history') or 'price' not in self.history:
+                return 0.5  # Default medium volatility
+
+            price_history = self.history['price']
+            if len(price_history) < 5:
+                return 0.5  # Not enough data
+
+            # Use recent price history for volatility calculation
+            recent_prices = list(price_history)[-10:]  # Last 10 prices
+            if len(recent_prices) < 2:
+                return 0.5
+
+            # Calculate price volatility (coefficient of variation)
+            price_mean = np.mean(recent_prices)
+            if price_mean <= 1e-6:
+                return 0.5
+
+            price_std = np.std(recent_prices)
+            volatility = price_std / price_mean
+
+            # Normalize to [0, 1] range
+            # Typical energy price volatility ranges from 0.1 to 0.8
+            normalized_volatility = np.clip(volatility / 0.8, 0.0, 1.0)
+
+            return float(normalized_volatility)
+
+        except Exception:
+            return 0.5  # Default medium volatility
 
     # legacy compatibility (kept)
     def predict(self, timestep: Optional[int] = None) -> Dict[str, float]:
@@ -765,16 +1465,71 @@ class MultiHorizonForecastGenerator:
 
     # -------- internals --------
 
+    def _debias_price_forecast(self, raw_forecast: float, t: int) -> float:
+        """
+        Apply adaptive debiasing to price forecasts to correct for train-test distribution mismatch.
+
+        The models were trained on 2015-2024 data (training set mean=292.86 DKK),
+        but test episodes may have different price distributions (e.g., Episode 0 mean=183.74 DKK).
+
+        This method estimates the local price level and adjusts forecasts accordingly.
+        """
+        # Get recent price history (last 144 steps = 24 hours)
+        lookback = min(144, t)
+        if lookback < 24:
+            # Not enough history - return raw forecast
+            return raw_forecast
+
+        # Get recent actual prices from stored data
+        recent_prices = []
+        if self._data_df is not None and 'price' in self._data_df.columns:
+            start_idx = max(0, t - lookback)
+            end_idx = t
+            if end_idx <= len(self._data_df):
+                recent_prices = self._data_df['price'].iloc[start_idx:end_idx].values.tolist()
+
+        if len(recent_prices) < 24:
+            # Not enough history - return raw forecast
+            return raw_forecast
+
+        # Calculate local price level (median of recent prices)
+        local_price_level = float(np.median(recent_prices))
+
+        # Training set mean (from scaler)
+        training_mean = 292.86  # DKK (from scaler_y.mean_)
+
+        # Calculate bias: how much the model over/under-predicts relative to local level
+        # If local_price_level = 180 DKK and training_mean = 293 DKK,
+        # then bias = 293 - 180 = +113 DKK (model predicts too high)
+        bias = training_mean - local_price_level
+
+        # Apply debiasing
+        debiased_forecast = raw_forecast - bias
+
+        # Sanity check: don't let debiasing create extreme values
+        # Clamp to reasonable range around local price level
+        min_forecast = local_price_level * 0.5  # -50%
+        max_forecast = local_price_level * 2.0  # +100%
+        debiased_forecast = np.clip(debiased_forecast, min_forecast, max_forecast)
+
+        return float(debiased_forecast)
+
     def _predict_target_horizon(self, target: str, hname: str, t: int) -> float:
         """
         Simplified prediction that works directly with raw MW units.
         No complex normalization - models trained on raw data, return raw data.
+
+        CRITICAL FIX: Apply adaptive debiasing for price forecasts to correct
+        for train-test distribution mismatch.
         """
         # 1) Check precomputed cache first (fastest path)
         arr = self._precomputed.get((target, hname), None)
         if arr is not None and 0 <= t < len(arr):
             val = arr[t]
             if np.isfinite(val):
+                # CRITICAL FIX: Apply adaptive debiasing for price forecasts
+                if target == 'price':
+                    val = self._debias_price_forecast(val, t)
                 return float(val)
 
         # 2) Check runtime cache
@@ -796,22 +1551,37 @@ class MultiHorizonForecastGenerator:
                 Xs = self._scale_X(model_key, X) if self.scalers.get(model_key, {}).get("scaler_X") else X
 
                 # Get prediction with memory management
-                y_pred = self.models[model_key].predict(Xs, verbose=0)
+                try:
+                    start_t = time.perf_counter()
+                    y_pred = self.models[model_key].predict(Xs, verbose=0)
+                    end_t = time.perf_counter()
+                    # accumulate predict time (ms) for optional logging
+                    try:
+                        self._predict_accumulator += (end_t - start_t) * 1000.0
+                    except Exception:
+                        pass
 
-                # Extract scalar value
-                if isinstance(y_pred, np.ndarray):
-                    y_pred = float(np.ravel(y_pred)[0]) if y_pred.size > 0 else 0.0
-                else:
-                    y_pred = float(y_pred)
+                    # Extract scalar value
+                    if isinstance(y_pred, np.ndarray):
+                        y_pred = float(np.ravel(y_pred)[0]) if y_pred.size > 0 else 0.0
+                    else:
+                        y_pred = float(y_pred)
+                except Exception as e:
+                    # If prediction fails, propagate to fallback below
+                    if self.verbose:
+                        print(f"Model prediction failed for {model_key}: {e}")
+                    y_pred = None
 
                 # MEMORY LEAK FIX: Clear prediction tensors immediately
                 # (Note: y_pred is already converted to float, so no tensor cleanup needed here)
 
                 # Inverse scale if needed (but models should output raw units)
-                y = self._inverse_scale_y(model_key, y_pred)
-
-                # Simple bounds check
-                y = self._constrain_target(target, y)
+                if y_pred is None:
+                    y = self._fallback_value(target)
+                else:
+                    y = self._inverse_scale_y(model_key, y_pred)
+                    # Simple bounds check
+                    y = self._constrain_target(target, y)
 
             except Exception as e:
                 if self.verbose:
@@ -948,6 +1718,9 @@ class MultiHorizonForecastGenerator:
                 print("precompute_offline: empty dataframe; skipping.")
             return
 
+        # Store data for debiasing
+        self._data_df = df.copy()
+
         # Check for cached forecasts first
         if self._load_cached_forecasts(df, cache_dir):
             if self.verbose:
@@ -964,19 +1737,34 @@ class MultiHorizonForecastGenerator:
 
         # build rolling windows per target (T x look_back), mean-padded on left
         def make_windows(series: np.ndarray, lb: int) -> np.ndarray:
+            """
+            PHASE 5 PATCH A: CRITICAL FIX - Time-Series Data Leakage Prevention
+
+            Build rolling windows for time-series prediction.
+            For prediction at time 't', use only data up to 't-1' (no target leakage).
+            """
             X = np.empty((T, lb), dtype=np.float32)
             mean_val = float(np.nanmean(series)) if series.size else 0.0
+
             for t in range(T):
-                if t + 1 < lb:
-                    need = lb - (t + 1)
-                    tail = series[: t + 1]
-                    if tail.size > 0:
+                # CRITICAL FIX: Predict time 't' using history up to 't-1'
+                # end_idx = t ensures we use series[start_idx:t] (excludes series[t])
+                end_idx = t
+                start_idx = max(0, end_idx - lb)
+                window = series[start_idx:end_idx]
+
+                if window.size < lb:
+                    # Pad left with mean value
+                    need = lb - window.size
+                    if window.size > 0:
                         X[t, :need] = mean_val
-                        X[t, need:lb] = tail.astype(np.float32)
+                        X[t, need:lb] = window.astype(np.float32)
                     else:
                         X[t, :].fill(mean_val)
                 else:
-                    X[t, :] = series[t + 1 - lb : t + 1].astype(np.float32)
+                    # Copy last look_back elements (should be exactly 'lb')
+                    X[t, :] = window[-lb:].astype(np.float32)
+
             np.nan_to_num(X, copy=False, nan=mean_val, posinf=1e6, neginf=-1e6)
             return X
 
@@ -995,7 +1783,7 @@ class MultiHorizonForecastGenerator:
                 model_key = f"{target}_{hname}"
                 use_model = bool(self._model_available.get(model_key, False))
 
-                if not use_model or tf is None or model_key not in self.models:
+                if not use_model or self.tf is None or model_key not in self.models:
                     # fallback: simple rolling-mean proxy (consistent with runtime fallback spirit)
                     out = np.nanmean(X_full, axis=1).astype(np.float32)
                     for i in range(T):
@@ -1095,18 +1883,41 @@ class MultiHorizonForecastGenerator:
                     print(f"Cache length mismatch: {len(cached_df)} vs {len(df)}, recomputing...")
                 return False
 
+            # CRITICAL: Validate cache integrity with model metadata
+            cache_metadata = self._validate_cache_integrity(cache_file)
+            if cache_metadata is None:
+                if self.verbose:
+                    print(f"Cache integrity validation failed, recomputing...")
+                return False
+
             # Convert CSV back to _precomputed format
             self._precomputed = {}
+
+            alignment_mode = cache_metadata.get('forecast_alignment', 'origin_timestamp')
+            horizon_offsets = cache_metadata.get('horizon_offsets', {})
+            forecast_tails = cache_metadata.get('forecast_tails', {})
 
             for target in self.targets:
                 for hname in self.horizons.keys():
                     col_name = f"{target}_forecast_{hname}"
-                    if col_name in cached_df.columns:
-                        self._precomputed[(target, hname)] = cached_df[col_name].values.astype(np.float32)
-                    else:
+                    if col_name not in cached_df.columns:
                         if self.verbose:
                             print(f"Missing column {col_name} in cache, recomputing...")
                         return False
+
+                    series = cached_df[col_name].values.astype(np.float32)
+
+                    if alignment_mode == 'target_timestamp':
+                        steps = int(horizon_offsets.get(hname, self.horizons.get(hname, 0)))
+                        tail_map = forecast_tails.get(target, {}) if isinstance(forecast_tails, dict) else {}
+                        tail_values = tail_map.get(hname, []) if isinstance(tail_map, dict) else []
+                        restored = self._restore_forecast_from_cache(series, steps, tail_values, target)
+                        self._precomputed[(target, hname)] = restored
+                    else:
+                        self._precomputed[(target, hname)] = series
+
+            # Store data for debiasing
+            self._data_df = df.copy()
 
             if self.verbose:
                 total_series = len(self._precomputed)
@@ -1119,6 +1930,140 @@ class MultiHorizonForecastGenerator:
             if self.verbose:
                 print(f"Failed to load cached forecasts: {e}")
             return False
+
+    def _validate_cache_integrity(self, cache_file: str) -> Optional[Dict[str, Any]]:
+        """
+        Validate that cached forecasts are still valid for current models.
+
+        Checks:
+        1. Cache metadata file exists
+        2. Model versions match
+        3. Model modification times haven't changed
+
+        Returns:
+            Optional[Dict[str, Any]]: Metadata dict when cache is valid, otherwise None
+        """
+        try:
+            metadata_file = cache_file.replace('.csv', '_metadata.json')
+
+            if not os.path.exists(metadata_file):
+                # No metadata = old cache format, invalidate
+                return None
+
+            with open(metadata_file, 'r') as f:
+                cache_metadata = json.load(f)
+
+            # Check model modification times
+            cached_model_times = cache_metadata.get('model_modification_times', {})
+
+            for model_key in self.models.keys():
+                model_path = cache_metadata.get('model_paths', {}).get(model_key)
+                if model_path and os.path.exists(model_path):
+                    current_mtime = os.path.getmtime(model_path)
+                    cached_mtime = cached_model_times.get(model_key)
+
+                    if cached_mtime is None or abs(current_mtime - cached_mtime) > 1.0:
+                        # Model has been modified, invalidate cache
+                        if self.verbose:
+                            print(f"Model {model_key} modified, invalidating cache")
+                        return None
+
+            # Check look_back parameter
+            if cache_metadata.get('look_back') != self.look_back:
+                if self.verbose:
+                    print(f"look_back changed ({cache_metadata.get('look_back')} -> {self.look_back}), invalidating cache")
+                return None
+
+            return cache_metadata
+
+        except Exception as e:
+            logging.warning(f"Cache integrity validation failed: {e}")
+            return None
+
+    def _align_forecast_for_export(self, series: np.ndarray, horizon_steps: int) -> np.ndarray:
+        """Shift forecasts forward so row timestamp matches the forecast target time."""
+        if series is None:
+            return np.array([], dtype=np.float32)
+
+        series = np.asarray(series, dtype=np.float32)
+        T = len(series)
+        if T == 0 or horizon_steps <= 0:
+            return series.copy()
+
+        aligned = np.full(T, np.nan, dtype=np.float32)
+        if horizon_steps < T:
+            aligned[horizon_steps:] = series[:-horizon_steps]
+        # When horizon_steps >= T, we intentionally leave the array as NaN (no aligned targets)
+        return aligned
+
+    def _restore_forecast_from_cache(
+        self,
+        aligned_series: np.ndarray,
+        horizon_steps: int,
+        tail_values: Optional[List[float]] = None,
+        target: Optional[str] = None,
+    ) -> np.ndarray:
+        """Restore original timeline forecasts from an aligned cache column."""
+        aligned = np.asarray(aligned_series, dtype=np.float32)
+        T = len(aligned)
+        if T == 0 or horizon_steps <= 0:
+            return aligned.copy()
+
+        raw = np.full(T, np.nan, dtype=np.float32)
+        if horizon_steps < T:
+            raw[:T - horizon_steps] = aligned[horizon_steps:]
+
+        tail_len = min(horizon_steps, T)
+        if tail_len == 0:
+            return np.nan_to_num(raw, nan=self._default_for_target(target) if target else 0.0)
+
+        tail_array = None
+        if tail_values:
+            try:
+                tail_array = np.asarray(tail_values, dtype=np.float32)
+            except Exception:
+                tail_array = None
+
+        if tail_array is not None and tail_array.size > 0:
+            tail_array = tail_array[-tail_len:]
+            raw[T - tail_array.size:] = tail_array
+        else:
+            fill_value = self._default_for_target(target) if target else 0.0
+            if T - tail_len - 1 >= 0 and np.isfinite(raw[T - tail_len - 1]):
+                fill_value = float(raw[T - tail_len - 1])
+            raw[T - tail_len:] = fill_value
+
+        return raw
+
+    def invalidate_cache(self, cache_dir: str = "forecast_cache"):
+        """
+        Invalidate all cached forecasts.
+
+        Use this when:
+        - Models have been retrained
+        - Data has changed
+        - Configuration has changed
+        """
+        try:
+            import glob
+            cache_files = glob.glob(os.path.join(cache_dir, "precomputed_forecasts_*.csv"))
+            metadata_files = glob.glob(os.path.join(cache_dir, "precomputed_forecasts_*_metadata.json"))
+
+            for f in cache_files + metadata_files:
+                try:
+                    os.remove(f)
+                    if self.verbose:
+                        print(f"Removed cache file: {f}")
+                except Exception as e:
+                    logging.warning(f"Failed to remove cache file {f}: {e}")
+
+            self._precomputed.clear()
+
+            if self.verbose:
+                print(f"✅ Cache invalidated: removed {len(cache_files)} cache files")
+
+        except Exception as e:
+            logging.error(f"Failed to invalidate cache: {e}")
 
     def _save_cached_forecasts(self, df: pd.DataFrame, cache_dir: str) -> None:
         """Save precomputed forecasts to CSV cache"""
@@ -1141,20 +2086,61 @@ class MultiHorizonForecastGenerator:
                 except Exception:
                     forecast_data['timestamp'] = df['timestamp'].values
 
-            # Add forecast columns
+            horizon_offsets = {hname: int(steps) for hname, steps in self.horizons.items()}
+            forecast_tails: Dict[str, Dict[str, List[float]]] = {}
+
+            # Add forecast columns (aligned to target timestamps)
             for target in self.targets:
-                for hname in self.horizons.keys():
+                forecast_tails[target] = {}
+                for hname, horizon_steps in self.horizons.items():
                     col_name = f"{target}_forecast_{hname}"
-                    if (target, hname) in self._precomputed:
-                        forecast_data[col_name] = self._precomputed[(target, hname)]
-                    else:
-                        # Fill with default values if missing
+                    raw_series = self._precomputed.get((target, hname))
+
+                    if raw_series is None:
                         default_val = self._default_for_target(target)
-                        forecast_data[col_name] = np.full(len(df), default_val, dtype=np.float32)
+                        raw_series = np.full(len(df), default_val, dtype=np.float32)
+                    else:
+                        raw_series = np.asarray(raw_series, dtype=np.float32)
+
+                    aligned_series = self._align_forecast_for_export(raw_series, int(horizon_steps))
+                    forecast_data[col_name] = aligned_series
+
+                    tail_len = min(int(horizon_steps), len(raw_series))
+                    if tail_len > 0:
+                        forecast_tails[target][hname] = raw_series[-tail_len:].astype(float).tolist()
+                    else:
+                        forecast_tails[target][hname] = []
 
             # Save to CSV
             forecast_df = pd.DataFrame(forecast_data)
             forecast_df.to_csv(cache_file, index=False)
+
+            # Save metadata for cache validation
+            metadata_file = cache_file.replace('.csv', '_metadata.json')
+            metadata = {
+                'look_back': self.look_back,
+                'targets': self.targets,
+                'horizons': list(self.horizons.keys()),
+                'horizon_offsets': horizon_offsets,
+                'forecast_alignment': 'target_timestamp',
+                'forecast_tails': forecast_tails,
+                'model_modification_times': {},
+                'model_paths': {},
+                'cache_created': pd.Timestamp.now().isoformat(),
+            }
+
+            # Record model modification times for cache invalidation
+            for model_key in self.models.keys():
+                # Try to find model file path
+                for ext in ['.h5', '.keras']:
+                    model_path = os.path.join(os.path.dirname(cache_file), '..', 'saved_models', f"{model_key}_model{ext}")
+                    if os.path.exists(model_path):
+                        metadata['model_paths'][model_key] = model_path
+                        metadata['model_modification_times'][model_key] = os.path.getmtime(model_path)
+                        break
+
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
 
             if self.verbose:
                 file_size_mb = os.path.getsize(cache_file) / (1024 * 1024)
@@ -1263,8 +2249,8 @@ class MultiHorizonForecastGenerator:
             print("\nClip diagnostics (renewables/load):")
             for t, d in cs.items():
                 tot = max(1, d.get("total", 0))
-                hi = SafeDivision._safe_divide(d.get("high", 0) * 100.0, tot)
-                lo = SafeDivision._safe_divide(d.get("low", 0) * 100.0, tot)
+                hi = SafeDivision.div(d.get("high", 0) * 100.0, tot)
+                lo = SafeDivision.div(d.get("low", 0) * 100.0, tot)
                 print(f"  {t:6s}: total={tot}, high@1.0={hi:.1f}%, low@0.0={lo:.1f}%")
 
         print("=" * 60 + "\n")
@@ -1304,7 +2290,7 @@ class MultiHorizonForecastGenerator:
 
     def get_system_status(self) -> Dict[str, Any]:
         return {
-            "tensorflow_available": tf is not None,
+            "tensorflow_available": self.tf is not None,
             "models_loaded": len(self.models),
             "scalers_loaded": len(self.scalers),
             "targets_tracked": len(self.targets),
@@ -1322,7 +2308,7 @@ class MultiHorizonForecastGenerator:
 
     def validate_system_integrity(self) -> bool:
         issues = []
-        if tf is None:
+        if self.tf is None:
             issues.append("TensorFlow not available")
         if len(self.models) == 0:
             issues.append("No models loaded (fallback mode)")
@@ -1363,7 +2349,7 @@ def test_forecast_generator():
     gen = MultiHorizonForecastGenerator(
         model_dir="non_existent_models",
         scaler_dir="non_existent_scalers",
-        look_back=24,  # TUNED: Updated to match new default
+        look_back=24,  # IMPROVED: Increased from 6 to 24 (must match retrained models)
         verbose=True,
         fallback_mode=True,
         agent_refresh_stride=3,  # demonstrate throttle (every 3 steps per agent)

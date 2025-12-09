@@ -6,8 +6,11 @@ import sys
 from datetime import datetime
 import json
 import random
+import csv
 from collections import deque
 import logging
+import traceback
+import gc
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
@@ -17,6 +20,13 @@ import torch  # for device availability check
 # ---- Optional SB3 bits (callback base) ----
 from stable_baselines3.common.callbacks import BaseCallback
 
+# ===== CENTRALIZED LOGGING (from logger.py) =====
+from logger import configure_logging, get_logger, TeeOutput, RewardLogger
+
+# Configure logging (will be reconfigured with file handler in main())
+configure_logging()
+logger = get_logger(__name__)
+
 
 
 
@@ -24,7 +34,9 @@ from stable_baselines3.common.callbacks import BaseCallback
 from environment import RenewableMultiAgentEnv
 from generator import MultiHorizonForecastGenerator
 from wrapper import MultiHorizonWrapperEnv
-from dl_overlay import HedgeOptimizer, AdvancedHedgeOptimizer
+from dl_overlay import DLAdapter
+from utils import load_overlay_weights, clear_tf_session, configure_tf_memory  # UNIFIED: Import from single source of truth
+from config import normalize_price  # UNIFIED: Import from single source of truth
 
 # CVXPY is optional; if unavailable we use a heuristic labeler.
 try:
@@ -39,7 +51,6 @@ try:
 except Exception:
     from metacontroller import MultiESGAgent
     HyperparameterOptimizer = None
-
 
 # =====================================================================
 # Inlined utilities so utils.py is no longer needed
@@ -88,11 +99,11 @@ def load_energy_data(csv_path: str, convert_to_raw_units: bool = True, config=No
 
     # Convert capacity factors to raw MW values for direct forecasting
     if convert_to_raw_units and _is_capacity_factor_data(df):
-        print("[INFO] Converting capacity factors to raw MW values for direct forecasting...")
+        logger.info("[INFO] Converting capacity factors to raw MW values for direct forecasting...")
         df = _convert_to_raw_mw_values(df, config=config, mw_scale_overrides=mw_scale_overrides)
-        print("[OK] Raw MW conversion completed - forecasts will work directly with these units")
+        logger.info("[OK] Raw MW conversion completed - forecasts will work directly with these units")
     else:
-        print("[INFO] Data already in raw MW units - ready for direct forecasting")
+        logger.info("[INFO] Data already in raw MW units - ready for direct forecasting")
 
     return df
 
@@ -139,11 +150,11 @@ def _convert_to_raw_mw_values(df: pd.DataFrame, config=None, mw_scale_overrides=
         for key, value in mw_scale_overrides.items():
             if value is not None and key in capacity_mw:
                 capacity_mw[key] = float(value)
-                print(f"[OVERRIDE] Using CLI override for {key}: {value} MW")
+                logger.info(f"[OVERRIDE] Using CLI override for {key}: {value} MW")
 
     df_converted = df.copy()
 
-    print("[INFO] Converting to raw MW values (no normalization):")
+    logger.info("[INFO] Converting to raw MW values (no normalization):")
 
     # Convert capacity factors to raw MW values
     for col, capacity in capacity_mw.items():
@@ -151,14 +162,14 @@ def _convert_to_raw_mw_values(df: pd.DataFrame, config=None, mw_scale_overrides=
             original_range = f"[{df[col].min():.3f}, {df[col].max():.3f}]"
             df_converted[col] = df[col] * capacity
             new_range = f"[{df_converted[col].min():.1f}, {df_converted[col].max():.1f}] MW"
-            print(f"  {col}: {original_range} -> {new_range}")
+            logger.info(f"  {col}: {original_range} -> {new_range}")
 
     # Price: Already in $/MWh (no conversion needed)
     if 'price' in df_converted.columns:
         price_range = f"[{df_converted['price'].min():.1f}, {df_converted['price'].max():.1f}] $/MWh"
-        print(f"  price: {price_range} (no conversion)")
+        logger.info(f"  price: {price_range} (no conversion)")
 
-    print("[OK] Raw MW conversion complete - ready for direct forecasting")
+    logger.info("[OK] Raw MW conversion complete - ready for direct forecasting")
 
     return df_converted
 
@@ -209,11 +220,11 @@ def _perf_to_float(best_performance: Any) -> float:
 
 
 def run_hyperparameter_optimization(env, device: str = "cpu", n_trials: int = 30, timeout: int = 1800):
-    print("Starting Enhanced Hyperparameter Optimization")
-    print("=" * 55)
+    logger.info("Starting Enhanced Hyperparameter Optimization")
+    logger.info("=" * 55)
 
     if HyperparameterOptimizer is None:
-        print("(Skipping HPO: HyperparameterOptimizer not available)")
+        logger.warning("(Skipping HPO: HyperparameterOptimizer not available)")
         return None, None
 
     optimizer = HyperparameterOptimizer(
@@ -223,24 +234,24 @@ def run_hyperparameter_optimization(env, device: str = "cpu", n_trials: int = 30
         timeout=timeout
     )
 
-    print("Configuration:")
-    print(f"   Number of trials: {n_trials}")
-    print(f"   Timeout: {timeout} seconds ({timeout/60:.1f} minutes)")
-    print(f"   Device: {device}")
-    print(f"   Environment: {env.__class__.__name__}")
+    logger.info("Configuration:")
+    logger.info(f"   Number of trials: {n_trials}")
+    logger.info(f"   Timeout: {timeout} seconds ({timeout/60:.1f} minutes)")
+    logger.info(f"   Device: {device}")
+    logger.info(f"   Environment: {env.__class__.__name__}")
 
     try:
         best_params, best_performance = optimizer.optimize()
         perf_value = _perf_to_float(best_performance)
-        print("\nOptimization Results:")
-        print(f"   Best heuristic score: {perf_value:.4f}")
+        logger.info("\nOptimization Results:")
+        logger.info(f"   Best heuristic score: {perf_value:.4f}")
         if isinstance(best_performance, dict):
-            print(f"   Raw performance: {best_performance}")
-        print("   Optimization completed successfully!")
+            logger.info(f"   Raw performance: {best_performance}")
+        logger.info("   Optimization completed successfully!")
         return best_params, best_performance
     except Exception as e:
-        print(f"Optimization failed: {e}")
-        print("Falling back to default parameters")
+        logger.error(f"Optimization failed: {e}")
+        logger.warning("Falling back to default parameters")
         return None, None
 
 
@@ -271,9 +282,9 @@ def save_optimization_results(best_params: Dict[str, Any], best_performance: Any
         for key, value in best_params.items():
             f.write(f"   {key}: {value}\n")
 
-    print("Optimization results saved:")
-    print(f"   Parameters: {params_file}")
-    print(f"   Summary: {results_file}")
+    logger.info("Optimization results saved:")
+    logger.info(f"   Parameters: {params_file}")
+    logger.info(f"   Summary: {results_file}")
 
     return params_file
 
@@ -294,10 +305,10 @@ def load_previous_optimization(optimization_dir: str = "optimization_results"):
     try:
         with open(os.path.join(optimization_dir, latest_file), 'r') as f:
             best_params = json.load(f)
-        print(f"Loaded previous optimization results from: {latest_file}")
+        logger.info(f"Loaded previous optimization results from: {latest_file}")
         return best_params, latest_file
     except Exception as e:
-        print(f"Failed to load previous optimization: {e}")
+        logger.warning(f"Failed to load previous optimization: {e}")
         return None, None
 
 
@@ -311,10 +322,10 @@ def setup_enhanced_training_monitoring(log_path: str, save_dir: str) -> Dict[str
     for _, dir_path in monitoring_dirs.items():
         os.makedirs(dir_path, exist_ok=True)
 
-    print("Enhanced monitoring setup:")
-    print(f"   Metrics log: {log_path}")
-    print(f"   Checkpoints: {monitoring_dirs['checkpoints']}")
-    print(f"   Model saves: {monitoring_dirs['models']}")
+    logger.info("Enhanced monitoring setup:")
+    logger.info(f"   Metrics log: {log_path}")
+    logger.info(f"   Checkpoints: {monitoring_dirs['checkpoints']}")
+    logger.info(f"   Model saves: {monitoring_dirs['models']}")
     return monitoring_dirs
 
 
@@ -349,44 +360,60 @@ def print_portfolio_summary(env, step_count):
         mtm_positions = getattr(base_env, 'cumulative_mtm_pnl', 0)
         mtm_usd = mtm_positions * dkk_to_usd / 1_000  # Convert to thousands USD
 
-        # Get trading gains (from financial instruments)
-        trading_gains = 0
-        if hasattr(base_env, 'financial_positions'):
-            for pos_value in base_env.financial_positions.values():
-                trading_gains += pos_value
+        # Get trading gains (from cumulative mark-to-market PnL)
+        # FIX: Changed from sum(financial_positions.values()) to cumulative_mtm_pnl
+        # Rationale: financial_positions is current position values (misleading), 
+        # cumulative_mtm_pnl is actual cumulative trading performance
+        trading_gains = getattr(base_env, 'cumulative_mtm_pnl', 0)
         trading_gains_usd = trading_gains * dkk_to_usd / 1_000  # Convert to thousands USD
 
         # Get operational gains (generation revenue)
         operational_gains = getattr(base_env, 'cumulative_generation_revenue', 0)
         operational_gains_usd = operational_gains * dkk_to_usd / 1_000  # Convert to thousands USD
 
-        print(f"\n📊 PORTFOLIO SUMMARY - Step {step_count:,} (Env: {current_timestep:,})")
-        print(f"   Portfolio Value: ${fund_nav_usd:.1f}M")
-        print(f"   Cash: {cash_dkk:,.0f} DKK")
-        print(f"   MtM Positions: ${mtm_usd:+.1f}k")
-        print(f"   Trading Gains: ${trading_gains_usd:+.1f}k")
-        print(f"   Operating Gains: ${operational_gains_usd:+.1f}k")
+        logger.info(f"\n[STATS] PORTFOLIO SUMMARY - Step {step_count:,} (Env: {current_timestep:,})")
+        logger.info(f"   Portfolio Value: ${fund_nav_usd:.1f}M")
+        logger.info(f"   Cash: {cash_dkk:,.0f} DKK")
+        logger.info(f"   MtM Positions: ${mtm_usd:+.1f}k")
+        logger.info(f"   Trading Gains: ${trading_gains_usd:+.1f}k")
+        logger.info(f"   Operating Gains: ${operational_gains_usd:+.1f}k")
 
     except Exception as e:
-        print(f"\n📊 PORTFOLIO SUMMARY - Step {step_count:,}")
-        print(f"   Error calculating portfolio: {e}")
+        logger.error(f"\n[STATS] PORTFOLIO SUMMARY - Step {step_count:,}")
+        logger.error(f"   Error calculating portfolio: {e}")
 
-def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, monitoring_dirs: Dict[str, str], callbacks=None, resume_from: str = None) -> int:
+# REMOVED: save_checkpoint_summary_to_csv function
+# Portfolio metrics are now logged at every timestep in the debug CSV (first columns)
+# No separate checkpoint summary file needed - all data is in the per-episode CSV files
+
+def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, monitoring_dirs: Dict[str, str], callbacks=None, resume_from: str = None, dl_train_every: int = 60, preserve_agent_state: bool = False) -> int:
     """
     Train in intervals, but measure *actual* steps each time.
     Works with a meta-controller whose learn(total_timesteps=N) means "do N more steps".
     Enhanced with comprehensive memory monitoring and leak prevention.
+
+    Args:
+        agent: MultiESGAgent instance
+        env: Environment (with optional overlay_trainer)
+        timesteps: Total timesteps to train
+        checkpoint_freq: Frequency of checkpoints
+        monitoring_dirs: Monitoring directories
+        callbacks: Training callbacks
+        resume_from: Resume from checkpoint path
+        dl_train_every: Frequency to train overlay model (every N steps)
+        preserve_agent_state: If True, don't reset agent state even on first interval (for episode continuity)
     """
-    print("Starting Enhanced Training Loop with Memory Monitoring")
-    print(f"   Total timesteps: {timesteps:,}")
-    print(f"   Checkpoint frequency: {checkpoint_freq:,}")
+    logger.info("Starting Enhanced Training Loop with Memory Monitoring")
+    logger.info(f"   Total timesteps: {timesteps:,}")
+    logger.info(f"   Checkpoint frequency: {checkpoint_freq:,}")
+    logger.info(f"   DL overlay training frequency: every {dl_train_every:,} steps")
 
     # Initialize memory monitoring
     try:
         import psutil
         process = psutil.Process()
         initial_memory = process.memory_info().rss / 1024 / 1024
-        print(f"   Initial memory usage: {initial_memory:.1f}MB")
+        logger.info(f"   Initial memory usage: {initial_memory:.1f}MB")
         memory_history = []
     except Exception:
         initial_memory = 0
@@ -395,43 +422,51 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
     # Handle resume from checkpoint
     total_trained = 0
     checkpoint_count = 0
+    steps_since_last_overlay_train = 0  # Track steps for overlay training frequency
 
     if resume_from and os.path.exists(resume_from):
-        print(f"\n🔄 RESUMING from checkpoint: {resume_from}")
+        logger.info(f"\n[CYCLE] RESUMING from checkpoint: {resume_from}")
 
         # Load agent policies
         loaded_count = agent.load_policies(resume_from)
         if loaded_count > 0:
-            print(f"✅ Loaded {loaded_count} agent policies")
+            logger.info(f"[OK] Loaded {loaded_count} agent policies")
 
             # Load training state
             checkpoint_state = load_checkpoint_state(resume_from)
             if checkpoint_state:
                 total_trained = checkpoint_state.get('total_trained', 0)
                 checkpoint_count = checkpoint_state.get('checkpoint_count', 0)
-                print(f"✅ Resuming from step {total_trained:,} (checkpoint {checkpoint_count})")
+                logger.info(f"[OK] Resuming from step {total_trained:,} (checkpoint {checkpoint_count})")
 
                 # HIGH: Improve DL Checkpoint Loading - robustly load DL weights
-                if hasattr(env, 'dl_adapter') and env.dl_adapter is not None:
-                    dl_weights_path = os.path.join(resume_from, "hedge_optimizer_online.h5")  # Correctly construct relative to resume_from
-                    if os.path.exists(dl_weights_path):
-                        try:
-                            # Rely only on the presence of load_weights method, remove overly complex nested hasattr checks
-                            if hasattr(env.dl_adapter.model, "load_weights"):
-                                env.dl_adapter.model.load_weights(dl_weights_path)
-                                print(f"✅ Loaded DL overlay weights from {dl_weights_path}")
-                            else:
-                                print(f"⚠️ DL adapter model does not have load_weights method")
-                        except Exception as e:
-                            print(f"⚠️ Could not load DL overlay weights: {e}")
+                if hasattr(env, 'dl_adapter_overlay') and env.dl_adapter_overlay is not None:
+                    clear_tf_session()
+
+                    # ROBUST: Try dimension-specific filename first, then fall back to generic
+                    feature_dim = env.dl_adapter_overlay.feature_dim
+                    dl_weights_candidates = [
+                        os.path.join(resume_from, f"dl_overlay_online_{feature_dim}d.h5"),  # Dimension-specific
+                        os.path.join(resume_from, "hedge_optimizer_online.h5")  # Legacy generic
+                    ]
+
+                    loaded = False
+                    for dl_weights_path in dl_weights_candidates:
+                        if load_overlay_weights(env.dl_adapter_overlay, dl_weights_path, feature_dim):
+                            logger.info(f"[OK] Loaded DL overlay weights ({feature_dim}D) from {dl_weights_path}")
+                            loaded = True
+                            break
+
+                    if not loaded:
+                        logger.warning(f"[WARN] No compatible DL overlay weights found, starting with fresh weights")
             else:
-                print("⚠️ No training state found, starting from step 0")
+                logger.warning("[WARN] No training state found, starting from step 0")
         else:
-            print("❌ Failed to load policies, starting fresh")
+            logger.error("[ERROR] Failed to load policies, starting fresh")
             resume_from = None
     elif resume_from:
-        print(f"❌ Resume checkpoint not found: {resume_from}")
-        print("Starting fresh training...")
+        logger.error(f"[ERROR] Resume checkpoint not found: {resume_from}")
+        logger.info("Starting fresh training...")
         resume_from = None
 
     try:
@@ -439,19 +474,69 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
             remaining = timesteps - total_trained
             interval = min(checkpoint_freq, remaining)
 
-            print(f"\nTraining interval {checkpoint_count + 1}")
-            print(f"   Steps: {total_trained:,} -> {total_trained + interval:,}")
-            print(f"   Progress: {total_trained/timesteps*100:.1f}%")
+            logger.info(f"\nTraining interval {checkpoint_count + 1}")
+            logger.info(f"   Steps: {total_trained:,} -> {total_trained + interval:,}")
+            logger.info(f"   Progress: {total_trained/timesteps*100:.1f}%")
 
             start_time = datetime.now()
             start_steps = getattr(agent, "total_steps", 0)
 
+            # PHASE 5.6 FIX: Don't reset agent state between checkpoint intervals
+            # Only reset on the first interval (checkpoint_count == 0)
+            # For subsequent intervals, keep agent state to continue training
+            # CRITICAL FIX: If preserve_agent_state=True (episode continuity), NEVER reset
+            reset_agent_state = (checkpoint_count == 0) and not preserve_agent_state
+
             # NOTE: assumes meta-controller treats this as a *relative* budget.
-            agent.learn(total_timesteps=interval, callbacks=callbacks)
+            agent.learn(total_timesteps=interval, callbacks=callbacks, reset_num_timesteps=reset_agent_state)
 
             end_time = datetime.now()
             end_steps = getattr(agent, "total_steps", start_steps)
             trained_now = max(0, int(end_steps) - int(start_steps))
+
+            # ===== TRAIN OVERLAY MODEL (PER-STEP FREQUENCY WITH CADENCE FIX) =====
+            # Train the overlay model every dl_train_every steps to allow continuous learning
+            # This enables the bridge/strategy heads to develop non-trivial representations early
+            # CADENCE FIX: Use while loop to catch all missed multiples of dl_train_every
+            steps_since_last_overlay_train += trained_now
+
+            if hasattr(env, 'overlay_trainer') and env.overlay_trainer is not None:
+                try:
+                    # CADENCE FIX: While loop ensures all missed training opportunities are caught
+                    max_trains_per_interval = 32  # Safety cap to avoid stalls
+                    train_count = 0
+                    batch_size = 64  # Default, will be updated in loop
+                    buffer_size = 0  # Will be updated in loop
+
+                    while steps_since_last_overlay_train >= dl_train_every and train_count < max_trains_per_interval:
+                        buffer_size = env.overlay_trainer.buffer.size()
+                        # OPTIMIZED: Reduce minimum buffer to 16 for earlier learning
+                        if buffer_size < 16:
+                            # DEBUG: Log buffer status
+                            if steps_since_last_overlay_train % (dl_train_every * 2) == 0:
+                                logger.debug(f"   [overlay/train] Waiting for buffer (size={buffer_size}/32) at step {total_trained + trained_now:,}")
+                            break  # Not enough data to train
+
+                        # OPTIMIZED: Smaller batch sizes (32-128) for more frequent updates
+                        batch_size = min(128, max(32, buffer_size // 3))
+                        train_metrics = env.overlay_trainer.train(epochs=1, batch_size=batch_size)
+
+                        steps_since_last_overlay_train -= dl_train_every
+                        train_count += 1
+
+                    # Log cadence summary
+                    if train_count > 0:
+                        if 'train_loss' in train_metrics:
+                            logger.info(f"   [overlay/train] ✓ {train_count} updates (batch_size={batch_size}) | train_loss={train_metrics['train_loss']:.6f} val_loss={train_metrics['val_loss']:.6f} | buffer={buffer_size}")
+                            logger.info(f"[overlay/train] Training successful: train_loss={train_metrics['train_loss']:.6f} val_loss={train_metrics['val_loss']:.6f}")
+                        else:
+                            logger.info(f"   [overlay/train] ✓ {train_count} updates (batch_size={batch_size}) | buffer={buffer_size}")
+                            logger.info(f"[overlay/train] Training completed: buffer={buffer_size}")
+
+                except Exception as e:
+                    logger.warning(f"[overlay/train] Training failed at step {total_trained + trained_now:,}: {e}")
+                    logger.debug(f"[overlay/train] Full traceback: {traceback.format_exc()}")
+                    logger.error(f"   [overlay/train] ✗ Training failed: {e}")
 
             # Print portfolio summary at each checkpoint
             print_portfolio_summary(agent.env, end_steps)
@@ -477,17 +562,18 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                     recent_growth = 0
                     avg_growth = 0
 
-                print(f"   Training time: {training_time:.1f}s ({sps:.1f} steps/s)")
-                print(f"   Memory: {current_memory:.1f}MB (+{memory_growth:.1f}MB total, +{recent_growth:.1f}MB this interval)")
-                print(f"   Actual steps collected this interval: {trained_now:,} (agent.total_steps = {end_steps:,})")
+                logger.info(f"   Training time: {training_time:.1f}s ({sps:.1f} steps/s)")
+                logger.info(f"   Memory: {current_memory:.1f}MB (+{memory_growth:.1f}MB total, +{recent_growth:.1f}MB this interval)")
+                logger.info(f"   Actual steps collected this interval: {trained_now:,} (agent.total_steps = {end_steps:,})")
 
                 # Trigger aggressive cleanup if memory growth is concerning
                 if memory_growth > 2000:  # More than 2GB growth
-                    print(f"⚠️  High memory usage detected ({current_memory:.1f}MB), triggering cleanup...")
+                    logger.warning(f"[WARN]  High memory usage detected ({current_memory:.1f}MB), triggering cleanup...")
                     try:
-                        # Force cleanup on environment if it has DL adapter
-                        if hasattr(env, 'dl_adapter') and env.dl_adapter is not None:
-                            env.dl_adapter._comprehensive_memory_cleanup(total_trained)
+                        # Force cleanup on environment if it has DL overlay adapter
+                        if hasattr(env, 'dl_adapter_overlay') and env.dl_adapter_overlay is not None:
+                            # Note: DLAdapter doesn't have _comprehensive_memory_cleanup method
+                            pass
 
                         # Force cleanup on wrapper
                         if hasattr(env, '_cleanup_memory_enhanced'):
@@ -497,24 +583,24 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                         if hasattr(agent, 'memory_tracker'):
                             agent.memory_tracker.cleanup('heavy')
 
-                        import gc
+                        # gc already imported at module level
                         for _ in range(3):
                             gc.collect()
 
                         # Check memory after cleanup
                         after_cleanup = process.memory_info().rss / 1024 / 1024
                         freed = current_memory - after_cleanup
-                        print(f"   Cleanup freed {freed:.1f}MB, new usage: {after_cleanup:.1f}MB")
+                        logger.info(f"   Cleanup freed {freed:.1f}MB, new usage: {after_cleanup:.1f}MB")
 
                     except Exception as cleanup_error:
-                        print(f"   Cleanup failed: {cleanup_error}")
+                        logger.warning(f"   Cleanup failed: {cleanup_error}")
 
             except Exception:
-                print(f"   Training time: {training_time:.1f}s ({sps:.1f} steps/s)")
-                print(f"   Actual steps collected this interval: {trained_now:,} (agent.total_steps = {end_steps:,})")
+                logger.info(f"   Training time: {training_time:.1f}s ({sps:.1f} steps/s)")
+                logger.info(f"   Actual steps collected this interval: {trained_now:,} (agent.total_steps = {end_steps:,})")
 
             if trained_now == 0:
-                print("No steps were collected in this interval. "
+                logger.warning("No steps were collected in this interval. "
                       "Check that the meta-controller's learn() uses a relative budget or increase n_steps.")
                 # Avoid infinite loop; break so we can at least save progress.
                 break
@@ -523,7 +609,7 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
             if total_trained < timesteps and trained_now > 0:
                 checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"checkpoint_{total_trained}")
                 os.makedirs(checkpoint_dir, exist_ok=True)
-                print(f"Saving checkpoint at {total_trained:,} steps...")
+                logger.info(f"Saving checkpoint at {total_trained:,} steps...")
                 saved_count = agent.save_policies(checkpoint_dir)
 
                 state_file = os.path.join(checkpoint_dir, "training_state.json")
@@ -535,7 +621,8 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                         'timestamp': datetime.now().isoformat(),
                         'performance_summary': {'steps_per_second': sps, 'training_time': training_time}
                     }, f, indent=2)
-                print(f"   Checkpoint saved: {saved_count} policies")
+                logger.info(f"   Checkpoint saved: {saved_count} policies")
+                # Note: Portfolio metrics are logged at every timestep in debug CSV - no separate checkpoint summary needed
 
             # Opportunistic metrics flush to avoid buffer loss if the process stops unexpectedly
             try:
@@ -544,29 +631,29 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
             except Exception:
                 pass
 
-        print("\nEnhanced training completed!")
-        print(f"   Total steps (budget accumulation): {total_trained:,}")
-        print(f"   Agent-reported total steps: {getattr(agent, 'total_steps', 'unknown')}")
-        print(f"   Checkpoints created: {checkpoint_count}")
+        logger.info("\nEnhanced training completed!")
+        logger.info(f"   Total steps (budget accumulation): {total_trained:,}")
+        logger.info(f"   Agent-reported total steps: {getattr(agent, 'total_steps', 'unknown')}")
+        logger.info(f"   Checkpoints created: {checkpoint_count}")
         return total_trained
 
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
-        print(f"   Progress: {total_trained:,}/{timesteps:,} ({total_trained/timesteps*100:.1f}%)")
+        logger.warning("\nTraining interrupted by user")
+        logger.info(f"   Progress: {total_trained:,}/{timesteps:,} ({total_trained/timesteps*100:.1f}%)")
         emergency_dir = os.path.join(monitoring_dirs['checkpoints'], f"emergency_{total_trained}")
         os.makedirs(emergency_dir, exist_ok=True)
         agent.save_policies(emergency_dir)
-        print(f"Emergency checkpoint saved to: {emergency_dir}")
+        logger.info(f"Emergency checkpoint saved to: {emergency_dir}")
         return total_trained
 
     except Exception as e:
-        print(f"\nTraining failed: {e}")
+        logger.error(f"\nTraining failed: {e}")
         raise
 
 
 def analyze_training_performance(env, log_path: str, monitoring_dirs: Dict[str, str]) -> None:
-    print("\nTraining Performance Analysis")
-    print("=" * 40)
+    logger.info("\nTraining Performance Analysis")
+    logger.info("=" * 40)
     try:
         # If env exposes a reward analysis method
         if hasattr(env, 'get_reward_analysis'):
@@ -579,1014 +666,47 @@ def analyze_training_performance(env, log_path: str, monitoring_dirs: Dict[str, 
                 late = metrics['meta_reward'].tail(100).mean()
                 improvement = late - early
                 pct = (improvement / abs(early) * 100) if abs(early) > 1e-12 else 0.0
-                print("Training Metrics Summary:")
-                print(f"   Rows logged (wrapper): {len(metrics):,}")
-                print(f"   Early performance: {early:.4f}")
-                print(f"   Late performance:  {late:.4f}")
-                print(f"   Improvement:       {improvement:+.4f} ({pct:+.1f}%)")
+                logger.info("Training Metrics Summary:")
+                logger.info(f"   Rows logged (wrapper): {len(metrics):,}")
+                logger.info(f"   Early performance: {early:.4f}")
+                logger.info(f"   Late performance:  {late:.4f}")
+                logger.info(f"   Improvement:       {improvement:+.4f} ({pct:+.1f}%)")
 
         ckpt_dir = monitoring_dirs.get('checkpoints', '')
         if os.path.exists(ckpt_dir):
             ckpts = [d for d in os.listdir(ckpt_dir) if d.startswith('checkpoint_')]
-            print(f"   Checkpoints available: {len(ckpts)}")
+            logger.info(f"   Checkpoints available: {len(ckpts)}")
 
     except Exception as e:
-        print(f"Performance analysis failed: {e}")
+        logger.error(f"Performance analysis failed: {e}")
 
 
 # =====================================================================
 # Deep Learning Hedge Optimization Overlay (ONLINE)
 # =====================================================================
 
-class HedgeAdapter:
-    """
-    Online hedge strategy optimization:
-      - Build market state features each step for hedge decision making
-      - Every 'label_every' steps, compute optimal hedge parameters based on market conditions
-      - Push (features, target_hedge_params) into a buffer for learning
-      - Every 'train_every' steps, train the HedgeOptimizer on hedge effectiveness
-
-    Replaces portfolio optimization with hedge strategy optimization for single-price coherence
-    """
-    def __init__(self, base_env, feature_dim=None, buffer_size=1024, label_every=20, train_every=100,
-                 window=24, batch_size=64, epochs=1, log_dir=None):
-        self.e = base_env
-
-        # Fixed feature dimensions for DL overlay (independent of observation space)
-        # Core features: 4 state + 3 positions + 3 forecasts + 3 portfolio = 13 features
-        # This ensures DL overlay works consistently regardless of other add-ons
-        if feature_dim is None:
-            feature_dim = 13  # Fixed dimension for DL overlay consistency
-
-        self.feature_dim = feature_dim
-        self.model = AdvancedHedgeOptimizer(feature_dim=feature_dim)
-
-        # Online training hyperparams
-        self.buffer = deque(maxlen=buffer_size)
-        self.label_every = int(label_every)
-        self.train_every = int(train_every)
-        self.window = int(window)
-        self.batch_size = int(batch_size)
-        self.epochs = int(epochs)
-
-        # 🚨 ENHANCED DL LOGGING INTEGRATION (now from dl_overlay.py)
-        self.enhanced_logging_enabled = True
-        self.dl_logger = None
-        try:
-            from dl_overlay import get_dl_logger
-            # Use provided log directory or default to project folder
-            if log_dir is None:
-                log_dir = "dl_overlay_logs"
-            else:
-                log_dir = os.path.join(log_dir, "dl_overlay_logs")
-            os.makedirs(log_dir, exist_ok=True)
-            self.dl_logger = get_dl_logger(log_dir)
-            print(f"   ✅ Enhanced DL logging integrated: {log_dir}")
-        except ImportError:
-            print("   ⚠️ Enhanced DL logging not available - using basic logging")
-            self.enhanced_logging_enabled = False
-        except Exception as e:
-            print(f"   ⚠️ Enhanced DL logging setup failed: {e} - using basic logging")
-            self.enhanced_logging_enabled = False
-
-        # Enhanced tracking for logging
-        self.training_step_count = 0
-        self.prediction_history = deque(maxlen=1000)
-        self.actual_history = deque(maxlen=1000)
-        self.economic_impact_history = deque(maxlen=1000)
-        self.last_predictions = None
-        self.last_actuals = None
-
-        # MEMORY FIX: Cache forecasts to avoid excessive generator calls
-        self._forecast_cache = {}
-        self._forecast_cache_ttl = 10  # Cache for 10 steps to reduce calls
-
-        # Compile HedgeOptimizer for training with memory-safe settings
-        try:
-            # Clear any existing session before compilation
-            import tensorflow as tf
-            tf.keras.backend.clear_session()
-
-            # ROBUST SOLUTION: Custom training loop to maintain full training quality
-            dummy_input = tf.zeros((1, self.feature_dim), dtype=tf.float32)
-            _ = self.model(dummy_input, training=False)
-
-            # Setup custom training components (avoids compilation issues)
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, clipnorm=1.0)
-
-            # Define all loss functions (maintains original training quality)
-            self.loss_functions = {
-                "hedge_intensity": tf.keras.losses.MeanSquaredError(),
-                "risk_allocation": tf.keras.losses.CategoricalCrossentropy(),
-                "hedge_direction": tf.keras.losses.MeanSquaredError(),
-                "hedge_effectiveness": tf.keras.losses.BinaryCrossentropy()
-            }
-
-            self.loss_weights = {
-                "hedge_intensity": 1.0,
-                "risk_allocation": 1.0,
-                "hedge_direction": 1.0,
-                "hedge_effectiveness": 0.5
-            }
-
-            # Flag to use custom training
-            self._use_custom_training = True
-
-            # Track compilation for memory monitoring
-            self._model_compiled = True
-            logging.info("HedgeOptimizer configured with custom training (robust, maintains quality)")
-
-        except Exception as e:
-            logging.warning(f"HedgeOptimizer setup failed: {e}")
-            self._model_compiled = False
-            self._use_custom_training = False
-
-    def update_feature_dimensions(self, new_feature_dim: int):
-        """DL overlay uses fixed feature dimensions - no update needed"""
-        # DL overlay maintains consistent 13-feature input regardless of observation space
-        # This ensures the add-on works independently of forecasting or other features
-        logging.info(f"DL overlay maintains fixed feature dimensions: {self.feature_dim} (ignoring observation space: {new_feature_dim})")
-        # No model recreation needed - DL overlay is self-contained
-
-        # Optional: try load previous online-trained hedge optimizer weights to warm-start
-        for candidate in ["hedge_optimizer_online.h5", "hedge_optimizer_weights.h5"]:
-            try:
-                if hasattr(self.model, "load_weights"):
-                    self.model.load_weights(candidate)
-                    print(f"Loaded hedge optimizer weights: {candidate}")
-                    break
-                elif hasattr(self.model, "model") and hasattr(self.model.model, "load_weights"):
-                    self.model.model.load_weights(candidate)
-                    print(f"Loaded hedge optimizer weights: {candidate}")
-                    break
-            except Exception:
-                continue
-
-    # ---------- feature builder ----------
-    def _market_state(self, t: int) -> np.ndarray:
-        e = self.e
-
-        def get(arr_name, default=0.0):
-            try:
-                arr = getattr(e, arr_name)
-                return float(arr[t]) if (hasattr(arr, "__len__") and t < len(arr)) else float(default)
-            except Exception:
-                return float(default)
-
-        # Basic market data
-        price = get("_price", 0.0)
-        load = get("_load", 0.0)
-        wind = get("_wind", 0.0)
-        solar = get("_solar", 0.0)
-        hydro = get("_hydro", 0.0)
-
-        # Enhanced features for PPA-based economics
-        try:
-            budget_ratio = float(e.budget / max(1e-6, e.init_budget))
-        except Exception:
-            budget_ratio = 1.0
-        cap_frac = float(getattr(e, "capital_allocation_fraction", 0.5))
-
-        try:
-            fmin = float(getattr(e, "META_FREQ_MIN", 1))
-            fmax = float(getattr(e, "META_FREQ_MAX", 288))
-            freq_norm = (float(getattr(e, "investment_freq", fmin)) - fmin) / max(1e-6, (fmax - fmin))
-            freq_norm = float(np.clip(freq_norm, 0.0, 1.0))
-        except Exception:
-            freq_norm = 0.5
-
-        # Capacity factor features (normalized renewable resource availability)
-        try:
-            wind_cf = float(wind / max(getattr(e, "wind_scale", 1.0), 1e-6))
-            solar_cf = float(solar / max(getattr(e, "solar_scale", 1.0), 1e-6))
-            hydro_cf = float(hydro / max(getattr(e, "hydro_scale", 1.0), 1e-6))
-        except Exception:
-            wind_cf = solar_cf = hydro_cf = 0.0
-
-        # True physical capacity utilization (generation/capacity)
-        try:
-            # Get current generation levels (capacity factors)
-            current_generation = wind_cf + solar_cf + hydro_cf  # Sum of capacity factors
-
-            # Get total physical capacity in MW
-            total_physical_mw = (getattr(e, "wind_capacity_mw", 0.0) +
-                               getattr(e, "solar_capacity_mw", 0.0) +
-                               getattr(e, "hydro_capacity_mw", 0.0))
-
-            # Calculate true utilization: if we have 100MW total and generating at 30% average = 0.3
-            if total_physical_mw > 0:
-                avg_capacity_factor = current_generation / 3.0  # Average across 3 technologies
-                capacity_utilization = float(np.clip(avg_capacity_factor, 0.0, 1.0))
-            else:
-                capacity_utilization = 0.0  # No physical assets deployed
-        except Exception:
-            capacity_utilization = 0.0
-
-        # Market volatility and risk indicators
-        try:
-            market_vol = float(getattr(e, "market_volatility", 0.0))
-            market_stress = float(getattr(e, "market_stress", 0.5))
-        except Exception:
-            market_vol = market_stress = 0.5
-
-        # CRITICAL FIX: Remove scaling to match environment raw [0,1] values
-        # Environment provides market_volatility and market_stress in [0,1] range
-        # Training and inference must use same scaling for consistent predictions
-        market_vol_scaled = market_vol      # Keep raw [0,1] values
-        market_stress_scaled = market_stress # Keep raw [0,1] values
-
-        # FIXED: Return only 4 state features to match environment (4+3+3+3=13 total)
-        # This ensures DL overlay training uses same feature dimensions as prediction
-        feats = np.array([
-            budget_ratio,            # 0: budget ratio (matches environment state_feats[0])
-            cap_frac,                # 1: equity ratio (matches environment state_feats[1])
-            market_vol_scaled,       # 2: market volatility raw [0,1] (matches environment state_feats[2])
-            market_stress_scaled     # 3: market stress raw [0,1] (matches environment state_feats[3])
-        ], dtype=np.float32)
-        return feats
-
-    # ---------- position snapshot ----------
-    def _positions(self) -> np.ndarray:
-        """Get position features to match environment (3 features)"""
-        e = self.e
-        # Get normalized financial instrument values (matches environment position_feats)
-        try:
-            # CRITICAL FIX: Use consistent fund_size calculation to match environment
-            # Environment uses init_budget directly, so we should too for consistency
-            fund_size = getattr(e, 'init_budget', 1e9)  # Remove max() wrapper
-            wind_pos = float(getattr(e, 'financial_positions', {}).get('wind_instrument_value', 0.0)) / fund_size
-            solar_pos = float(getattr(e, 'financial_positions', {}).get('solar_instrument_value', 0.0)) / fund_size
-            hydro_pos = float(getattr(e, 'financial_positions', {}).get('hydro_instrument_value', 0.0)) / fund_size
-            return np.array([wind_pos, solar_pos, hydro_pos], dtype=np.float32)
-        except Exception:
-            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
-
-    # ---------- hedge parameter labeler ----------
-    def _target_hedge_params(self, t: int) -> dict:
-        """
-        Calculate optimal hedge parameters based on current market conditions.
-        Returns target hedge intensity, risk allocation, and direction for training.
-        """
-        try:
-            # Get current market conditions for hedge parameter calculation
-            e = self.e
-
-            # Current generation and price data
-            current_price = float(getattr(e, '_price', [0])[t] if hasattr(e, '_price') and t < len(e._price) else 0)
-            current_wind = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
-            current_solar = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
-            current_hydro = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
-
-            # Portfolio metrics
-            nav = e._calculate_fund_nav() if hasattr(e, '_calculate_fund_nav') else 1e9
-            drawdown = getattr(e.reward_calculator, 'current_drawdown', 0.0) if hasattr(e, 'reward_calculator') else 0.0
-
-            # Calculate optimal hedge intensity based on market volatility and drawdown
-            if drawdown > 0.3:
-                hedge_intensity = 1.8  # High hedging during stress
-            elif drawdown > 0.15:
-                hedge_intensity = 1.4  # Medium hedging
-            elif current_price > 300:  # High price volatility
-                hedge_intensity = 1.2  # Moderate hedging
-            else:
-                hedge_intensity = 1.0  # Normal hedging
-
-
-            # Calculate risk allocation based on generation patterns and volatility
-            # Higher generation variability = higher risk budget allocation
-            wind_capacity = float(getattr(e, 'wind_capacity_mw', 225))
-            solar_capacity = float(getattr(e, 'solar_capacity_mw', 100))
-            hydro_capacity = float(getattr(e, 'hydro_capacity_mw', 40))
-
-            # Base allocation on capacity and volatility
-            wind_vol = 0.35  # Wind has higher volatility
-            solar_vol = 0.25  # Solar has medium volatility
-            hydro_vol = 0.15  # Hydro has lower volatility
-
-            # Weight by capacity and volatility for risk allocation
-            wind_risk_weight = wind_capacity * wind_vol
-            solar_risk_weight = solar_capacity * solar_vol
-            hydro_risk_weight = hydro_capacity * hydro_vol
-
-            total_risk_weight = wind_risk_weight + solar_risk_weight + hydro_risk_weight
-
-            if total_risk_weight > 0:
-                risk_allocation = np.array([
-                    wind_risk_weight / total_risk_weight,
-                    solar_risk_weight / total_risk_weight,
-                    hydro_risk_weight / total_risk_weight
-                ])
-            else:
-                risk_allocation = np.array([0.4, 0.35, 0.25])  # Default allocation
-
-            # Calculate hedge direction based on generation vs expected
-            # If generation is low, go LONG (hedge against high prices when we can't generate)
-            # If generation is high, go SHORT (hedge against low prices when we generate a lot)
-            total_generation = current_wind + current_solar + current_hydro
-            expected_generation = wind_capacity * 0.35 + solar_capacity * 0.20 + hydro_capacity * 0.45  # Expected based on capacity factors
-
-            if total_generation < expected_generation * 0.8:
-                hedge_direction = 1.0  # LONG hedge (protect against high prices)
-            elif total_generation > expected_generation * 1.2:
-                hedge_direction = -1.0  # SHORT hedge (protect against low prices)
-            else:
-                hedge_direction = 0.5  # Mild LONG bias (default protection)
-
-            # Calculate hedge effectiveness target (for training feedback)
-            # Higher effectiveness when hedging reduces portfolio volatility
-            hedge_effectiveness = 0.7  # Target 70% effectiveness
-
-            return {
-                'hedge_intensity': np.array([hedge_intensity], dtype=np.float32),
-                'risk_allocation': risk_allocation.astype(np.float32),
-                'hedge_direction': np.array([hedge_direction], dtype=np.float32),
-                'hedge_effectiveness': np.array([hedge_effectiveness], dtype=np.float32),
-                'hedge_intensity_uncertainty': np.array([0.1], dtype=np.float32)  # CRITICAL: Add fifth target
-            }
-
-        except Exception as e:
-            # Fallback to default hedge parameters
-            return {
-                'hedge_intensity': np.array([1.0], dtype=np.float32),
-                'risk_allocation': np.array([0.4, 0.35, 0.25], dtype=np.float32),
-                'hedge_direction': np.array([1.0], dtype=np.float32),
-                'hedge_effectiveness': np.array([0.7], dtype=np.float32),
-                'hedge_intensity_uncertainty': np.array([0.1], dtype=np.float32)  # CRITICAL: Add fifth target
-            }
-
-    # ---------- hedge parameter inference ----------
-    def infer_hedge_params(self, t: int) -> dict:
-        """Get optimal hedge parameters from the trained model"""
-        try:
-            # Prepare inputs for hedge optimization model
-            market_state = self._market_state(t)
-            current_positions = self._positions()
-            generation_forecast = self._get_generation_forecast(t)
-            portfolio_metrics = self._get_portfolio_metrics(t)
-
-            # Combine all input features into single numpy array
-            X_combined = np.concatenate([market_state, current_positions, generation_forecast, portfolio_metrics])
-            X_combined = X_combined.reshape(1, -1).astype(np.float32)
-
-            # ROBUST FIX: Use model prediction with proper error handling
-            if hasattr(self.model, 'predict') and self._model_compiled:
-                try:
-                    # Use predict method which handles graph contexts properly
-                    out = self.model.predict(X_combined, verbose=0)
-
-                    # Handle different output formats
-                    if isinstance(out, dict):
-                        # Extract results safely with proper type conversion
-                        result = {
-                            'hedge_intensity': float(np.array(out.get('hedge_intensity', [[1.0]]))[0][0]),
-                            'risk_allocation': np.array(out.get('risk_allocation', [[0.4, 0.35, 0.25]])[0]),
-                            'hedge_direction': float(np.array(out.get('hedge_direction', [[1.0]]))[0][0]),
-                            'hedge_effectiveness': float(np.array(out.get('hedge_effectiveness', [[0.7]]))[0][0])
-                        }
-                    else:
-                        # Fallback for non-dict outputs
-                        result = {
-                            'hedge_intensity': 1.0,
-                            'risk_allocation': np.array([0.4, 0.35, 0.25]),
-                            'hedge_direction': 1.0,
-                            'hedge_effectiveness': 0.7
-                        }
-
-                    # 🚨 ENHANCED DL LOGGING: Store predictions for performance tracking
-                    if self.enhanced_logging_enabled and self.dl_logger:
-                        self.last_predictions = {
-                            'hedge_intensity': result['hedge_intensity'],
-                            'hedge_direction': result['hedge_direction'],
-                            'risk_allocation': result['risk_allocation'].copy(),
-                            'hedge_effectiveness': result['hedge_effectiveness']
-                        }
-                        self.prediction_history.append(self.last_predictions.copy())
-
-                    # Clean up
-                    del out
-
-                except Exception as model_error:
-                    logging.warning(f"Model prediction failed: {model_error}")
-                    result = {
-                        'hedge_intensity': 1.0,
-                        'risk_allocation': np.array([0.4, 0.35, 0.25]),
-                        'hedge_direction': 1.0,
-                        'hedge_effectiveness': 0.7
-                    }
-            else:
-                # Model not available or not compiled, use fallback
-                result = {
-                    'hedge_intensity': 1.0,
-                    'risk_allocation': np.array([0.4, 0.35, 0.25]),
-                    'hedge_direction': 1.0,
-                    'hedge_effectiveness': 0.7
-                }
-
-            # Clean up input array
-            del X_combined
-            return result
-
-        except Exception as e:
-            logging.warning(f"Hedge parameter inference failed: {e}")
-            # Fallback to default hedge parameters
-            return {
-                'hedge_intensity': 1.0,
-                'risk_allocation': np.array([0.4, 0.35, 0.25]),
-                'hedge_direction': 1.0,
-                'hedge_effectiveness': 0.7
-            }
-
-    def _get_generation_forecast(self, t: int) -> np.ndarray:
-        """CRITICAL: Get generation forecast for hedge decision making (not current generation)"""
-        try:
-            e = self.e
-
-            # CRITICAL: Fix data source - extract forecast signal, not current generation
-            # 1. Determine the investment_freq-aligned horizon (RESTORED: Multi-horizon design)
-            investment_freq = getattr(e, 'investment_freq', 10)
-            if investment_freq <= 50:
-                horizon = 'short'
-            else:
-                horizon = 'medium'
-
-            # 2. MEMORY FIX: Use cached forecasts to avoid excessive generator calls
-            cache_key = (horizon, t // self._forecast_cache_ttl)  # Cache by horizon and time bucket
-
-            if cache_key in self._forecast_cache:
-                # Use cached forecasts
-                wind_forecast, solar_forecast, hydro_forecast = self._forecast_cache[cache_key]
-            elif hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
-                try:
-                    # FIXED: Correct forecast extraction using proper key format
-                    forecast_data = e.forecast_generator.predict_for_agent('investor_0', t)
-                    if forecast_data:
-                        # Generator returns keys like "wind_forecast_short", not nested dict
-                        wind_key = f"wind_forecast_{horizon}"
-                        solar_key = f"solar_forecast_{horizon}"
-                        hydro_key = f"hydro_forecast_{horizon}"
-
-                        if wind_key in forecast_data and solar_key in forecast_data and hydro_key in forecast_data:
-                            wind_forecast = float(forecast_data[wind_key])
-                            solar_forecast = float(forecast_data[solar_key])
-                            hydro_forecast = float(forecast_data[hydro_key])
-                        else:
-                            # Fallback to predict_all_horizons
-                            all_forecasts = e.forecast_generator.predict_all_horizons(t)
-                            if all_forecasts:
-                                wind_forecast = float(all_forecasts.get(wind_key, 0.0))
-                                solar_forecast = float(all_forecasts.get(solar_key, 0.0))
-                                hydro_forecast = float(all_forecasts.get(hydro_key, 0.0))
-                            else:
-                                raise ValueError("No forecast data available")
-
-                        # Cache the results
-                        self._forecast_cache[cache_key] = (wind_forecast, solar_forecast, hydro_forecast)
-
-                        # Limit cache size to prevent memory growth
-                        if len(self._forecast_cache) > 100:
-                            # Remove oldest entries
-                            oldest_keys = sorted(self._forecast_cache.keys())[:50]
-                            for old_key in oldest_keys:
-                                del self._forecast_cache[old_key]
-
-                    else:
-                        raise ValueError("No forecast data available")
-                except Exception:
-                    # IMPROVED: Use smoothed current generation to reduce forecast noise impact
-                    # Apply light smoothing to current generation to make it more forecast-like
-                    wind_raw = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
-                    solar_raw = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
-                    hydro_raw = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
-
-                    # Apply capacity factor smoothing to reduce noise
-                    wind_cap, solar_cap, hydro_cap = 270.0, 100.0, 40.0
-                    wind_cf = np.clip(wind_raw / wind_cap, 0.0, 1.0)
-                    solar_cf = np.clip(solar_raw / solar_cap, 0.0, 1.0)
-                    hydro_cf = np.clip(hydro_raw / hydro_cap, 0.0, 1.0)
-
-                    # Convert back to MW with slight smoothing
-                    wind_forecast = wind_cf * wind_cap * 0.95  # Slight conservative bias
-                    solar_forecast = solar_cf * solar_cap * 0.95
-                    hydro_forecast = hydro_cf * hydro_cap * 0.95
-            else:
-                # Fallback to current generation if no forecast_generator
-                wind_forecast = float(getattr(e, '_wind', [0])[t] if hasattr(e, '_wind') and t < len(e._wind) else 0)
-                solar_forecast = float(getattr(e, '_solar', [0])[t] if hasattr(e, '_solar') and t < len(e._solar) else 0)
-                hydro_forecast = float(getattr(e, '_hydro', [0])[t] if hasattr(e, '_hydro') and t < len(e._hydro) else 0)
-
-            # 3. Normalize using environment's P95 scales to achieve [0, 1] range (RESTORED)
-            # Use data-driven P95 scales, not theoretical capacity values
-            wind_scale = max(getattr(e, 'wind_scale', 225), 1e-6)
-            solar_scale = max(getattr(e, 'solar_scale', 100), 1e-6)
-            hydro_scale = max(getattr(e, 'hydro_scale', 40), 1e-6)
-
-            return np.array([
-                wind_forecast / wind_scale,
-                solar_forecast / solar_scale,
-                hydro_forecast / hydro_scale
-            ], dtype=np.float32)
-        except Exception:
-            return np.array([0.35, 0.20, 0.45], dtype=np.float32)  # Default capacity factors
-
-    def _get_portfolio_metrics(self, t: int) -> np.ndarray:
-        """Get portfolio metrics for hedge decision making (3 features to match environment)"""
-        try:
-            e = self.e
-            # Match environment portfolio_metrics: capital_allocation_fraction, investment_freq, forecast_confidence
-            cap_alloc = float(getattr(e, 'capital_allocation_fraction', 0.1))
-            inv_freq = float(getattr(e, 'investment_freq', 10)) / 100.0  # Normalized
-
-            # FIXED: Stabilize Forecast Confidence for DL overlay consistency
-            forecast_conf = 1.0  # Default confidence
-            if hasattr(e, 'forecast_generator') and e.forecast_generator is not None:
-                try:
-                    # Extract calculated Forecast Confidence score directly from forecast_generator
-                    raw_conf = e.forecast_generator.calculate_forecast_confidence('investor', t)
-                    if isinstance(raw_conf, (int, float)) and np.isfinite(raw_conf):
-                        # CRITICAL FIX: Apply minimum confidence threshold to prevent DL model degradation
-                        # Low confidence (<0.5) hurts DL performance, so clamp to reasonable range
-                        forecast_conf = float(np.clip(raw_conf, 0.7, 1.0))  # Clamp to [0.7, 1.0] for stability
-                    else:
-                        forecast_conf = 1.0
-                except Exception:
-                    forecast_conf = 1.0  # Fallback to default
-
-            return np.array([cap_alloc, inv_freq, forecast_conf], dtype=np.float32)
-        except Exception:
-            return np.array([0.1, 0.1, 1.0], dtype=np.float32)
-
-    # ---------- online hedge learning hook ----------
-    def maybe_learn(self, t: int):
-        # COMPREHENSIVE MEMORY LEAK FIX: Aggressive cleanup every 500 steps
-        if t % 500 == 0 and t > 0:
-            self._comprehensive_memory_cleanup(t)
-
-        # Additional lightweight cleanup every 100 steps
-        if t % 100 == 0 and t > 0:
-            self._lightweight_memory_cleanup()
-
-        # (1) label hedge parameters periodically
-        if self.e is None:
-            return
-        if t % self.label_every == 0:
-            # Capture market state, positions, and target hedge parameters
-            X = self._market_state(t)    # Market features (4 elements)
-            P = self._positions()        # Current positions (3 elements)
-            G = self._get_generation_forecast(t)  # Generation forecast (3 elements)
-            M = self._get_portfolio_metrics(t)    # Portfolio metrics (3 elements)
-            Y = self._target_hedge_params(t)      # Target hedge parameters (dict)
-
-
-
-            # Ensure all arrays have correct shapes before storing
-            X = np.array(X).flatten().astype(np.float32)
-            P = np.array(P).flatten().astype(np.float32)
-            G = np.array(G).flatten().astype(np.float32)
-            M = np.array(M).flatten().astype(np.float32)
-
-            # Validate shapes
-            assert len(X) == 4, f"Market state should have 4 features, got {len(X)}"
-            assert len(P) == 3, f"Positions should have 3 features, got {len(P)}"
-            assert len(G) == 3, f"Generation forecast should have 3 features, got {len(G)}"
-            assert len(M) == 3, f"Portfolio metrics should have 3 features, got {len(M)}"
-
-            self.buffer.append((X, P, G, M, Y))   # Store all components
-
-            # 🚨 ENHANCED DL LOGGING: Store actual hedge parameters for performance tracking
-            if self.enhanced_logging_enabled and self.dl_logger:
-                self.last_actuals = {
-                    'hedge_intensity': Y['hedge_intensity'][0] if hasattr(Y['hedge_intensity'], '__len__') else Y['hedge_intensity'],
-                    'hedge_direction': Y['hedge_direction'][0] if hasattr(Y['hedge_direction'], '__len__') else Y['hedge_direction'],
-                    'risk_allocation': Y['risk_allocation'].copy() if hasattr(Y['risk_allocation'], 'copy') else np.array(Y['risk_allocation']),
-                    'hedge_effectiveness': Y['hedge_effectiveness'][0] if hasattr(Y['hedge_effectiveness'], '__len__') else Y['hedge_effectiveness']
-                }
-                self.actual_history.append(self.last_actuals.copy())
-
-                # Log hedge performance if we have both predictions and actuals
-                if self.last_predictions is not None and self.last_actuals is not None:
-                    # Calculate economic impact (simplified)
-                    economic_impact = {
-                        'dl_pnl': 0.0,  # Would need actual P&L calculation
-                        'heuristic_pnl': 0.0,  # Would need actual P&L calculation
-                        'improvement': 0.0,  # Would need actual comparison
-                        'hedge_cost': abs(self.last_predictions['hedge_intensity'] - 1.0) * 0.01,  # Simplified cost
-                        'hedge_benefit': self.last_predictions['hedge_effectiveness'] * 0.1,  # Simplified benefit
-                        'net_value': self.last_predictions['hedge_effectiveness'] * 0.1 - abs(self.last_predictions['hedge_intensity'] - 1.0) * 0.01
-                    }
-
-                    # Log hedge performance
-                    self.dl_logger.log_hedge_performance(
-                        step=t,
-                        timestep=t,
-                        predictions=self.last_predictions,
-                        actuals=self.last_actuals,
-                        economic_impact=economic_impact
-                    )
-
-        # (2) train hedge optimizer periodically
-        if len(self.buffer) >= self.batch_size and t % self.train_every == 0:
-            idx = np.random.choice(len(self.buffer), size=self.batch_size, replace=False)
-
-            # Retrieve all stored components for the training batch with robust shape handling
-            # Market state (should be 4 features)
-            X_list = []
-            for i in idx:
-                x = self.buffer[i][0]
-                if np.isscalar(x):
-                    x = np.array([x, 0.0, 0.0, 0.0])  # Default 4 features
-                else:
-                    x = np.array(x).flatten()
-                    if len(x) != 4:
-                        x = np.pad(x, (0, max(0, 4 - len(x))), 'constant')[:4]
-                X_list.append(x.astype(np.float32))
-            Xb = np.array(X_list, dtype=np.float32)
-
-            # Positions (should be 3 features)
-            P_list = []
-            for i in idx:
-                p = self.buffer[i][1]
-                if np.isscalar(p):
-                    p = np.array([p, 0.0, 0.0])  # Default 3 features
-                else:
-                    p = np.array(p).flatten()
-                    if len(p) != 3:
-                        p = np.pad(p, (0, max(0, 3 - len(p))), 'constant')[:3]
-                P_list.append(p.astype(np.float32))
-            Pb = np.array(P_list, dtype=np.float32)
-
-            # Generation forecast (should be 3 features)
-            G_list = []
-            for i in idx:
-                g = self.buffer[i][2]
-                if np.isscalar(g):
-                    g = np.array([g, 0.0, 0.0])  # Default 3 features
-                else:
-                    g = np.array(g).flatten()
-                    if len(g) != 3:
-                        g = np.pad(g, (0, max(0, 3 - len(g))), 'constant')[:3]
-                G_list.append(g.astype(np.float32))
-            Gb = np.array(G_list, dtype=np.float32)
-
-            # Portfolio metrics (should be 3 features)
-            M_list = []
-            for i in idx:
-                m = self.buffer[i][3]
-                if np.isscalar(m):
-                    m = np.array([m, 0.0, 0.0])  # Default 3 features
-                else:
-                    m = np.array(m).flatten()
-                    if len(m) != 3:
-                        m = np.pad(m, (0, max(0, 3 - len(m))), 'constant')[:3]
-                M_list.append(m.astype(np.float32))
-            Mb = np.array(M_list, dtype=np.float32)
-
-            # Extract hedge parameter targets from stored dictionaries
-            # Handle scalars and arrays properly to avoid axis dimension issues
-            hedge_intensity_list = []
-            risk_allocation_list = []
-            hedge_direction_list = []
-            hedge_effectiveness_list = []
-            hedge_intensity_uncertainty_list = []  # CRITICAL: Add fifth target list
-
-            for i in idx:
-                hedge_params = self.buffer[i][4]
-
-                # Ensure scalars are properly shaped
-                intensity = hedge_params['hedge_intensity']
-                hedge_intensity_list.append(float(intensity) if np.isscalar(intensity) else float(intensity.item()))
-
-                direction = hedge_params['hedge_direction']
-                hedge_direction_list.append(float(direction) if np.isscalar(direction) else float(direction.item()))
-
-                effectiveness = hedge_params['hedge_effectiveness']
-                hedge_effectiveness_list.append(float(effectiveness) if np.isscalar(effectiveness) else float(effectiveness.item()))
-
-                # CRITICAL: Add fifth target extraction
-                uncertainty = hedge_params.get('hedge_intensity_uncertainty', np.array([0.1], dtype=np.float32))
-                hedge_intensity_uncertainty_list.append(float(uncertainty) if np.isscalar(uncertainty) else float(uncertainty.item()))
-
-                # Risk allocation is an array - ensure it's properly shaped
-                allocation = hedge_params['risk_allocation']
-                if np.isscalar(allocation):
-                    allocation = np.array([allocation, 0.0, 0.0])  # Default allocation
-                elif hasattr(allocation, 'shape') and allocation.shape == ():
-                    allocation = np.array([float(allocation), 0.0, 0.0])
-                else:
-                    allocation = np.array(allocation).flatten()
-                    if len(allocation) != 3:
-                        allocation = np.pad(allocation, (0, max(0, 3 - len(allocation))), 'constant')[:3]
-                risk_allocation_list.append(allocation)
-
-            # Convert to numpy arrays and CRITICAL: Reshape scalar targets to (batch_size, 1)
-            hedge_intensity_targets = np.array(hedge_intensity_list, dtype=np.float32).reshape(-1, 1)
-            hedge_direction_targets = np.array(hedge_direction_list, dtype=np.float32).reshape(-1, 1)
-            hedge_effectiveness_targets = np.array(hedge_effectiveness_list, dtype=np.float32).reshape(-1, 1)
-            hedge_intensity_uncertainty_targets = np.array(hedge_intensity_uncertainty_list, dtype=np.float32).reshape(-1, 1)  # CRITICAL: Add fifth target
-            risk_allocation_targets = np.array(risk_allocation_list, dtype=np.float32)  # Keep as (batch_size, 3)
-
-            # Combine all input features
-            X_combined = np.concatenate([Xb, Pb, Gb, Mb], axis=1)
-
-            try:
-                # 🚨 ENHANCED DL LOGGING: Log training metrics before training
-                if self.enhanced_logging_enabled and self.dl_logger:
-                    # Calculate pre-training losses for comparison
-                    pre_training_losses = self._calculate_training_losses(X_combined, {
-                        "hedge_intensity": hedge_intensity_targets,
-                        "risk_allocation": risk_allocation_targets,
-                        "hedge_direction": hedge_direction_targets,
-                        "hedge_effectiveness": hedge_effectiveness_targets,
-                        "hedge_intensity_uncertainty": hedge_intensity_uncertainty_targets  # CRITICAL: Add fifth target
-                    })
-
-                # ROBUST SOLUTION: Use custom training to avoid compilation issues
-                if hasattr(self, '_use_custom_training') and self._use_custom_training:
-                    # Custom training loop maintains full training quality
-                    targets = {
-                        "hedge_intensity": hedge_intensity_targets,
-                        "risk_allocation": risk_allocation_targets,
-                        "hedge_direction": hedge_direction_targets,
-                        "hedge_effectiveness": hedge_effectiveness_targets,
-                        "hedge_intensity_uncertainty": hedge_intensity_uncertainty_targets  # CRITICAL: Add fifth target
-                    }
-                    training_losses = self._custom_train_step(X_combined, targets)
-                else:
-                    # Fallback: Use simplified model.fit (single output to avoid compilation errors)
-                    history = self.model.fit(
-                        X_combined,
-                        hedge_intensity_targets,  # Use only primary output
-                        epochs=self.epochs,
-                        batch_size=min(self.batch_size, len(X_combined)),
-                        verbose=0,
-                        shuffle=True
-                    )
-                    training_losses = {'total_loss': history.history.get('loss', [0.0])[-1]}
-
-                # 🚨 ENHANCED DL LOGGING: Log training completion
-                if self.enhanced_logging_enabled and self.dl_logger:
-                    self.training_step_count += 1
-
-                    # Calculate training metrics (with safe prediction handling)
-                    try:
-                        model_pred = self.model.predict(X_combined, verbose=0)
-                        if isinstance(model_pred, dict):
-                            pred_intensity = model_pred.get('hedge_intensity', hedge_intensity_targets)
-                            pred_direction = model_pred.get('hedge_direction', hedge_direction_targets)
-                        else:
-                            # Single output model - use as intensity prediction
-                            pred_intensity = model_pred
-                            pred_direction = hedge_direction_targets
-
-                        training_metrics = {
-                            'intensity_mae': np.mean(np.abs(hedge_intensity_targets.flatten() - pred_intensity.flatten())),
-                            'direction_mae': np.mean(np.abs(hedge_direction_targets.flatten() - pred_direction.flatten())),
-                            'allocation_accuracy': 0.8,  # Placeholder - would need proper calculation
-                            'effectiveness_accuracy': 0.75  # Placeholder - would need proper calculation
-                        }
-                    except Exception as pred_error:
-                        # Fallback metrics if prediction fails
-                        training_metrics = {
-                            'intensity_mae': 0.1,
-                            'direction_mae': 0.08,
-                            'allocation_accuracy': 0.8,
-                            'effectiveness_accuracy': 0.75
-                        }
-
-                    # Log model training metrics
-                    self.dl_logger.log_model_training(
-                        step=self.training_step_count,
-                        epoch=1,  # Single epoch training
-                        batch=1,
-                        losses=training_losses,
-                        metrics=training_metrics,
-                        training_info={
-                            'batch_size': len(X_combined),
-                            'buffer_size': len(self.buffer),
-                            'feature_dim': self.feature_dim
-                        }
-                    )
-
-                # MEMORY LEAK FIX: Clear TensorFlow computational graphs and force garbage collection
-                import tensorflow as tf
-                import gc
-                tf.keras.backend.clear_session()  # Clear TensorFlow session
-                gc.collect()  # Force Python garbage collection
-
-                # MEMORY LEAK FIX: Periodically clear old buffer entries to prevent accumulation
-                if len(self.buffer) > self.batch_size * 2:
-                    # Keep only recent entries (last batch_size * 1.5 entries)
-                    keep_size = int(self.batch_size * 1.5)
-                    recent_entries = list(self.buffer)[-keep_size:]
-                    self.buffer.clear()
-                    self.buffer.extend(recent_entries)
-
-                # Log training progress occasionally
-                if t % (self.train_every * 10) == 0:
-                    logging.info(f"HedgeOptimizer training at step {t}: batch_size={len(X_combined)}, "
-                               f"features_dim={Xb.shape[1]}, buffer_size={len(self.buffer)}")
-
-            except Exception as e:
-                logging.warning(f"HedgeOptimizer fitting failed at step {t}: {e}")
-
-    def _custom_train_step(self, X_batch, y_batch):
-        """
-        Custom training step that maintains full training quality while avoiding compilation issues.
-        This implements the same multi-output training as the original model.fit() but manually.
-        """
-        try:
-            import tensorflow as tf
-
-            # Convert inputs to tensors
-            X_tensor = tf.convert_to_tensor(X_batch, dtype=tf.float32)
-
-            # Convert targets to tensors
-            y_tensors = {}
-            for key, value in y_batch.items():
-                y_tensors[key] = tf.convert_to_tensor(value, dtype=tf.float32)
-
-            # Perform multiple training epochs (same as original)
-            for epoch in range(self.epochs):
-                with tf.GradientTape() as tape:
-                    # Forward pass
-                    predictions = self.model(X_tensor, training=True)
-
-                    # Calculate losses for all outputs (maintains training quality)
-                    total_loss = 0.0
-                    for output_name, loss_fn in self.loss_functions.items():
-                        if output_name in predictions and output_name in y_tensors:
-                            output_loss = loss_fn(y_tensors[output_name], predictions[output_name])
-                            weighted_loss = output_loss * self.loss_weights[output_name]
-                            total_loss += weighted_loss
-
-                # Backward pass
-                gradients = tape.gradient(total_loss, self.model.trainable_variables)
-                self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-
-            # Clean up tensors
-            del X_tensor, y_tensors, predictions
-            if 'gradients' in locals():
-                del gradients
-
-            # Return training losses for logging
-            return {'total_loss': float(total_loss)}
-
-        except Exception as e:
-            logging.warning(f"Custom training step failed: {e}")
-            # Fallback: skip this training step but don't crash
-            return {'total_loss': 0.0}
-
-    def _calculate_training_losses(self, X_combined, targets):
-        """Calculate training losses for enhanced logging"""
-        try:
-            if hasattr(self.model, 'predict'):
-                predictions = self.model.predict(X_combined, verbose=0)
-
-                losses = {}
-                if isinstance(predictions, dict):
-                    # Calculate individual losses
-                    if 'hedge_intensity' in predictions and 'hedge_intensity' in targets:
-                        intensity_pred = predictions['hedge_intensity'].flatten()
-                        intensity_true = targets['hedge_intensity'].flatten()
-                        losses['intensity_loss'] = np.mean((intensity_pred - intensity_true) ** 2)
-
-                    if 'hedge_direction' in predictions and 'hedge_direction' in targets:
-                        direction_pred = predictions['hedge_direction'].flatten()
-                        direction_true = targets['hedge_direction'].flatten()
-                        losses['direction_loss'] = np.mean((direction_pred - direction_true) ** 2)
-
-                    if 'risk_allocation' in predictions and 'risk_allocation' in targets:
-                        allocation_pred = predictions['risk_allocation']
-                        allocation_true = targets['risk_allocation']
-                        losses['allocation_loss'] = np.mean((allocation_pred - allocation_true) ** 2)
-
-                    if 'hedge_effectiveness' in predictions and 'hedge_effectiveness' in targets:
-                        effectiveness_pred = predictions['hedge_effectiveness'].flatten()
-                        effectiveness_true = targets['hedge_effectiveness'].flatten()
-                        losses['effectiveness_loss'] = np.mean((effectiveness_pred - effectiveness_true) ** 2)
-
-                # Calculate total loss
-                losses['total_loss'] = sum(losses.values())
-                return losses
-
-        except Exception as e:
-            logging.warning(f"Loss calculation failed: {e}")
-
-        # Fallback
-        return {'total_loss': 0.0, 'intensity_loss': 0.0, 'direction_loss': 0.0,
-                'allocation_loss': 0.0, 'effectiveness_loss': 0.0}
-
-    def _comprehensive_memory_cleanup(self, t: int):
-        """
-        Comprehensive memory cleanup to prevent memory leaks during long training runs.
-        Called every 500 steps to aggressively clean up accumulated memory.
-        """
-        try:
-            import tensorflow as tf
-            import gc
-            import psutil
-
-            # Get memory usage before cleanup
-            process = psutil.Process()
-            memory_before = process.memory_info().rss / 1024 / 1024
-
-            # 1. Clear TensorFlow computational graphs and sessions
-            tf.keras.backend.clear_session()
-
-            # 2. Clear model prediction caches if they exist
-            if hasattr(self.model, '_prediction_cache'):
-                self.model._prediction_cache.clear()
-
-            # 3. Aggressively trim buffer to prevent accumulation
-            if len(self.buffer) > self.batch_size:
-                # Keep only the most recent batch_size entries
-                recent_entries = list(self.buffer)[-self.batch_size:]
-                self.buffer.clear()
-                self.buffer.extend(recent_entries)
-
-            # 4. Clear any accumulated gradients or optimizer states
-            if hasattr(self.model, 'optimizer') and self.model.optimizer is not None:
-                try:
-                    # Clear optimizer state if possible
-                    if hasattr(self.model.optimizer, 'get_weights'):
-                        # Reset optimizer state by recreating it
-                        optimizer_config = self.model.optimizer.get_config()
-                        self.model.compile(
-                            optimizer=tf.keras.optimizers.Adam.from_config(optimizer_config),
-                            loss=self.model.loss,
-                            loss_weights=getattr(self.model, 'loss_weights', None),
-                            metrics=getattr(self.model, 'compiled_metrics', None)
-                        )
-                except Exception as e:
-                    logging.warning(f"Failed to reset optimizer state: {e}")
-
-            # 5. Force multiple garbage collection cycles
-            for _ in range(3):
-                gc.collect()
-
-            # 6. Clear CUDA cache if available
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-            except Exception:
-                pass
-
-            # 7. Clear TensorFlow GPU memory
-            try:
-                gpus = tf.config.list_physical_devices('GPU')
-                if gpus:
-                    # Force TensorFlow to release GPU memory
-                    tf.config.experimental.reset_memory_stats(gpus[0])
-            except Exception:
-                pass
-
-            # Get memory usage after cleanup
-            memory_after = process.memory_info().rss / 1024 / 1024
-            memory_freed = memory_before - memory_after
-
-            if memory_freed > 10:  # Only log if significant memory was freed
-                logging.info(f"Comprehensive memory cleanup at step {t}: "
-                           f"{memory_before:.1f}MB → {memory_after:.1f}MB "
-                           f"(freed {memory_freed:.1f}MB)")
-
-        except Exception as e:
-            logging.warning(f"Comprehensive memory cleanup failed at step {t}: {e}")
-
-    def _lightweight_memory_cleanup(self):
-        """
-        Lightweight memory cleanup called every 100 steps.
-        Performs basic cleanup without expensive operations.
-        """
-        try:
-            import gc
-
-            # 1. Basic garbage collection
-            gc.collect()
-
-            # 2. Trim buffer if it's getting large
-            if len(self.buffer) > self.batch_size * 3:
-                # Keep only recent entries
-                keep_size = int(self.batch_size * 2)
-                recent_entries = list(self.buffer)[-keep_size:]
-                self.buffer.clear()
-                self.buffer.extend(recent_entries)
-
-            # 2.1. MEMORY FIX: Clear forecast cache periodically
-            if hasattr(self, '_forecast_cache') and len(self._forecast_cache) > 50:
-                self._forecast_cache.clear()
-
-            # 3. Clear CUDA cache lightly
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-        except Exception as e:
-            logging.warning(f"Lightweight memory cleanup failed: {e}")
-
+# =====================================================================
+# OLD HEDGE ADAPTER CLASS REMOVED
+# =====================================================================
+# The HedgeAdapter class has been removed as it was not used in the
+# current DL overlay implementation. The new DLAdapter is used instead.
+
+
+# =====================================================================
+# HEDGE ADAPTER METHODS REMOVED
+# =====================================================================
+# All HedgeAdapter methods have been removed as the class is no longer used.
+# The new DLAdapter is used instead for DL overlay functionality.
+
+# =====================================================================
+# Memory Management Utilities
+# =====================================================================
+
+# =====================================================================
+# LEFTOVER HEDGE ADAPTER CODE REMOVED
+# =====================================================================
+# All remaining HedgeAdapter methods and code have been removed.
+# The new DLAdapter is used instead for DL overlay functionality.
 
 # =====================================================================
 # Memory Management Utilities
@@ -1605,10 +725,9 @@ def get_memory_status():
 def force_memory_cleanup(context="general"):
     """Force comprehensive memory cleanup"""
     try:
-        import gc
-        import os
+        # gc and os already imported at module level
 
-        print(f"   🧹 Force cleanup ({context})...")
+        logger.info(f"   [SWEEP] Force cleanup ({context})...")
 
         # Multiple garbage collection passes
         collected_total = 0
@@ -1631,11 +750,11 @@ def force_memory_cleanup(context="general"):
         except Exception:
             pass
 
-        print(f"   ✅ Cleanup freed {collected_total} objects")
+        logger.info(f"   [OK] Cleanup freed {collected_total} objects")
         return collected_total
 
     except Exception as e:
-        print(f"   ⚠️ Cleanup failed: {e}")
+        logger.warning(f"   [WARN] Cleanup failed: {e}")
         return 0
 
 # =====================================================================
@@ -1679,21 +798,21 @@ def load_episode_data(episode_data_dir, episode_num, config=None, mw_scale_overr
     for filename in possible_files:
         filepath = os.path.join(episode_data_dir, filename)
         if os.path.exists(filepath):
-            print(f"   [DATA] Loading episode data: {filepath}")
+            logger.info(f"   [DATA] Loading episode data: {filepath}")
 
             # Use load_energy_data for consistent processing including MW conversion
             data = load_energy_data(filepath, convert_to_raw_units=True, config=config, mw_scale_overrides=mw_scale_overrides)
 
-            print(f"   📊 Episode {episode_num} data: {len(data)} rows")
+            logger.info(f"   [STATS] Episode {episode_num} data: {len(data)} rows")
             return data
 
     # If no file found, list available files
     if os.path.exists(episode_data_dir):
         available_files = [f for f in os.listdir(episode_data_dir) if f.endswith('.csv')]
-        print(f"   ❌ Episode {episode_num} data not found")
-        print(f"   [FILES] Available files in {episode_data_dir}: {available_files}")
+        logger.error(f"   [ERROR] Episode {episode_num} data not found")
+        logger.info(f"   [FILES] Available files in {episode_data_dir}: {available_files}")
     else:
-        print(f"   ❌ Episode data directory not found: {episode_data_dir}")
+        logger.error(f"   [ERROR] Episode data directory not found: {episode_data_dir}")
 
     raise FileNotFoundError(f"Episode {episode_num} data not found in {episode_data_dir}")
 
@@ -1701,15 +820,15 @@ def cooling_period(minutes, episode_num):
     """Thermal cooling period between episodes with enhanced memory monitoring"""
     import time
     import psutil
-    import gc
+    # gc already imported at module level
 
-    print(f"\n🌡️ Cooling period after Episode {episode_num}: {minutes} minutes")
-    print("   Allowing CPU to cool down and system to stabilize...")
+    logger.info(f"\n[TEMP] Cooling period after Episode {episode_num}: {minutes} minutes")
+    logger.info("   Allowing CPU to cool down and system to stabilize...")
 
     # Initial memory reading
     try:
         initial_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        print(f"   📊 Initial cooling memory: {initial_memory:.1f}MB")
+        logger.info(f"   [STATS] Initial cooling memory: {initial_memory:.1f}MB")
     except Exception:
         initial_memory = 0
 
@@ -1724,14 +843,14 @@ def cooling_period(minutes, episode_num):
             cpu_percent = psutil.cpu_percent(interval=1)
             memory = psutil.virtual_memory()
             process_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-            print(f"   ⏰ {remaining_min:.1f}min | CPU: {cpu_percent:.1f}% | RAM: {memory.percent:.1f}% | Process: {process_memory:.1f}MB", end='\r')
+            logger.info(f"   [TIME] {remaining_min:.1f}min | CPU: {cpu_percent:.1f}% | RAM: {memory.percent:.1f}% | Process: {process_memory:.1f}MB", end='\r')
 
             # Perform gentle cleanup during cooling if memory is high
             if process_memory > 4000:  # More than 4GB
                 gc.collect()
 
         except:
-            print(f"   ⏰ {remaining_min:.1f}min remaining", end='\r')
+            logger.info(f"   [TIME] {remaining_min:.1f}min remaining", end='\r')
 
         time.sleep(30)  # Check every 30 seconds
 
@@ -1740,9 +859,9 @@ def cooling_period(minutes, episode_num):
         final_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
         memory_change = final_memory - initial_memory
         change_sign = "+" if memory_change > 0 else ""
-        print(f"\n   ✅ Cooling complete | Final memory: {final_memory:.1f}MB ({change_sign}{memory_change:.1f}MB)")
+        logger.info(f"\n   [OK] Cooling complete | Final memory: {final_memory:.1f}MB ({change_sign}{memory_change:.1f}MB)")
     except Exception:
-        print(f"\n   ✅ Cooling period complete")
+        logger.info(f"\n   [OK] Cooling period complete")
 
 def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw_scale_overrides, forecaster=None):
     """Run training across multiple 6-month episodes"""
@@ -1750,14 +869,14 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
     import time
     from datetime import datetime
 
-    print(f"\n🎯 Episode Training Configuration:")
-    print(f"   Episodes: {args.start_episode} → {args.end_episode}")
-    print(f"   Data directory: {args.episode_data_dir}")
-    print(f"   Cooling period: {args.cooling_period} minutes")
+    logger.info(f"\n[GOAL] Episode Training Configuration:")
+    logger.info(f"   Episodes: {args.start_episode} -> {args.end_episode}")
+    logger.info(f"   Data directory: {args.episode_data_dir}")
+    logger.info(f"   Cooling period: {args.cooling_period} minutes")
 
     # Handle episode restart
     if args.resume_episode is not None:
-        print(f"   🔄 Resume mode: Starting from Episode {args.resume_episode}")
+        logger.info(f"   [CYCLE] Resume mode: Starting from Episode {args.resume_episode}")
 
         # Load checkpoint from specified episode
         episode_checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"episode_{args.resume_episode}")
@@ -1765,9 +884,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             try:
                 loaded_count = agent.load_policies(episode_checkpoint_dir)
                 if loaded_count > 0:
-                    print(f"   ✅ Loaded model from Episode {args.resume_episode} checkpoint")
+                    logger.info(f"   [OK] Loaded model from Episode {args.resume_episode} checkpoint")
 
-                    # 🚨 CRITICAL: Load agent training state to preserve learning continuity
+                    # [ALERT] CRITICAL: Load agent training state to preserve learning continuity
                     agent_state_path = os.path.join(episode_checkpoint_dir, "agent_training_state.json")
                     if os.path.exists(agent_state_path):
                         try:
@@ -1777,12 +896,12 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                             # Restore agent's training progress
                             if hasattr(agent, 'total_steps'):
                                 agent.total_steps = agent_state.get('total_steps', 0)
-                                print(f"   ✅ Restored agent.total_steps: {agent.total_steps:,}")
+                                logger.info(f"   [OK] Restored agent.total_steps: {agent.total_steps:,}")
 
                             # Restore training metrics if available
                             if hasattr(agent, '_training_metrics') and 'training_metrics' in agent_state:
                                 agent._training_metrics.update(agent_state['training_metrics'])
-                                print(f"   ✅ Restored training metrics")
+                                logger.info(f"   [OK] Restored training metrics")
 
                             # Restore error tracking
                             if hasattr(agent, '_consecutive_errors'):
@@ -1790,71 +909,125 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 
                             # Store for later use in episode loop
                             restored_total_trained = agent_state.get('total_trained_all_episodes', 0)
-                            print(f"   ✅ Restored cumulative training: {restored_total_trained:,} steps")
+                            logger.info(f"   [OK] Restored cumulative training: {restored_total_trained:,} steps")
+
+                            # PHASE 3 PATCH C: Global Training Budget Synchronization
+                            # Ensure agent's internal step counter is synchronized with external cumulative counter
+                            # This prevents learning rate decay or exploration schedule desync across episodes
+                            if hasattr(agent, 'total_steps') and restored_total_trained > 0:
+                                # Verify consistency: agent.total_steps should match the cumulative budget
+                                if agent.total_steps != restored_total_trained:
+                                    logger.info(f"   [PATCH C] Synchronizing agent.total_steps: {agent.total_steps:,} -> {restored_total_trained:,}")
+                                    agent.total_steps = restored_total_trained
+                                else:
+                                    logger.debug(f"   [PATCH C] Agent budget already synchronized: {agent.total_steps:,} steps")
 
                         except Exception as state_error:
-                            print(f"   ⚠️ Could not load agent training state: {state_error}")
-                            print(f"   ⚠️ Agent will start with total_steps=0 (learning continuity may be affected)")
+                            logger.warning(f"   [WARN] Could not load agent training state: {state_error}")
+                            logger.warning(f"   [WARN] Agent will start with total_steps=0 (learning continuity may be affected)")
                     else:
-                        print(f"   ⚠️ No agent training state found - this checkpoint may be from before the fix")
-                        print(f"   ⚠️ Agent will start with total_steps=0 (learning continuity may be affected)")
+                        logger.warning(f"   [WARN] No agent training state found - this checkpoint may be from before the fix")
+                        logger.warning(f"   [WARN] Agent will start with total_steps=0 (learning continuity may be affected)")
 
-                    # 🚨 CRITICAL: Load DL overlay weights from episode checkpoint (only if DL overlay is enabled)
-                    if args.dl_overlay and hasattr(base_env, 'dl_adapter') and base_env.dl_adapter is not None:
-                        dl_weights_path = os.path.join(episode_checkpoint_dir, "hedge_optimizer_online.h5")
-                        if os.path.exists(dl_weights_path):
-                            try:
-                                if hasattr(base_env.dl_adapter.model, "load_weights"):
-                                    base_env.dl_adapter.model.load_weights(dl_weights_path)
-                                    print(f"   ✅ Loaded DL overlay weights from Episode {args.resume_episode}: {dl_weights_path}")
-                                elif hasattr(base_env.dl_adapter.model, "model") and hasattr(base_env.dl_adapter.model.model, "load_weights"):
-                                    base_env.dl_adapter.model.model.load_weights(dl_weights_path)
-                                    print(f"   ✅ Loaded DL overlay weights from Episode {args.resume_episode}: {dl_weights_path}")
-                            except Exception as e:
-                                print(f"   ⚠️ Could not load DL overlay weights from Episode {args.resume_episode}: {e}")
-                        else:
-                            print(f"   ⚠️ DL overlay weights not found for Episode {args.resume_episode}: {dl_weights_path}")
+                    # [ALERT] CRITICAL: Load DL overlay weights from episode checkpoint (only if DL overlay is enabled)
+                    if args.dl_overlay and hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay is not None:
+                        clear_tf_session()
+
+                        # ROBUST: Try dimension-specific filename first, then fall back to generic
+                        feature_dim = base_env.dl_adapter_overlay.feature_dim
+                        dl_weights_candidates = [
+                            os.path.join(episode_checkpoint_dir, f"dl_overlay_online_{feature_dim}d.h5"),  # Current naming
+                            os.path.join(episode_checkpoint_dir, f"hedge_optimizer_online_{feature_dim}d.h5"),  # Legacy dimension-specific
+                            os.path.join(episode_checkpoint_dir, "dl_overlay_online.h5"),  # Legacy generic
+                            os.path.join(episode_checkpoint_dir, "hedge_optimizer_online.h5")  # Legacy generic
+                        ]
+
+                        loaded = False
+                        for dl_weights_path in dl_weights_candidates:
+                            if load_overlay_weights(base_env.dl_adapter_overlay, dl_weights_path, feature_dim):
+                                logger.info(f"   [OK] Loaded DL overlay weights ({feature_dim}D) from Episode {args.resume_episode}: {dl_weights_path}")
+                                loaded = True
+                                break
+
+                        if not loaded:
+                            logger.warning(f"   [WARN] No compatible DL overlay weights found for Episode {args.resume_episode}, starting with fresh weights")
                     elif args.dl_overlay:
-                        print(f"   ⚠️ DL overlay enabled but no dl_adapter found for Episode {args.resume_episode} resume")
+                        logger.warning(f"   [WARN] DL overlay enabled but no dl_adapter found for Episode {args.resume_episode} resume")
 
                     # Adjust start episode to resume from next episode
                     args.start_episode = args.resume_episode + 1
                 else:
-                    print(f"   ⚠️ Failed to load Episode {args.resume_episode} checkpoint, starting fresh")
+                    logger.warning(f"   [WARN] Failed to load Episode {args.resume_episode} checkpoint, starting fresh")
             except Exception as e:
-                print(f"   ⚠️ Error loading Episode {args.resume_episode} checkpoint: {e}")
-                print(f"   Starting fresh from Episode {args.start_episode}")
+                logger.warning(f"   [WARN] Error loading Episode {args.resume_episode} checkpoint: {e}")
+                logger.info(f"   Starting fresh from Episode {args.start_episode}")
         else:
-            print(f"   ❌ Episode {args.resume_episode} checkpoint not found: {episode_checkpoint_dir}")
-            print(f"   Starting fresh from Episode {args.start_episode}")
+            logger.error(f"   [ERROR] Episode {args.resume_episode} checkpoint not found: {episode_checkpoint_dir}")
+            logger.info(f"   Starting fresh from Episode {args.start_episode}")
 
     # Initialize episode tracking (may be overridden by resume)
     total_trained_all_episodes = locals().get('restored_total_trained', 0)
     successful_episodes = 0
 
+    # CRITICAL FIX: Track if we resumed from a checkpoint
+    # When resuming from episode N, we've already loaded policies from episode N
+    # So the first episode (N+1) should load from episode N, not start fresh
+    resumed_from_checkpoint = args.resume_episode is not None
+
     for episode_num in range(args.start_episode, args.end_episode + 1):
+        # CRITICAL FIX: More aggressive cleanup for episodes 10+ to prevent OOM
+        if episode_num >= 10:
+            logger.warning(f"   [ALERT] Episode {episode_num} - EXTRA AGGRESSIVE CLEANUP")
+            # Clear forecast generator caches
+            if forecaster is not None and hasattr(forecaster, '_cleanup_memory'):
+                forecaster._cleanup_memory()
+            # Additional GC passes
+            for i in range(10):
+                gc.collect()
+            # Clear any environment caches
+            if hasattr(base_env, '_forecast_history'):
+                if hasattr(base_env._forecast_history, 'clear'):
+                    base_env._forecast_history.clear()
+            if hasattr(base_env, '_z_score_history'):
+                base_env._z_score_history.clear()
+
         episode_info = get_episode_info(episode_num)
 
-        print(f"\n" + "="*70)
-        print(f"🚀 EPISODE {episode_num}: {episode_info['description']}")
-        print(f"   Period: {episode_info['start_date']} → {episode_info['end_date']}")
-        print(f"   Progress: Episode {episode_num + 1}/{args.end_episode + 1}")
-        print("="*70)
+        logger.info(f"\n" + "="*70)
+        logger.info(f"[LAUNCH] EPISODE {episode_num}: {episode_info['description']}")
+        logger.info(f"   Period: {episode_info['start_date']} -> {episode_info['end_date']}")
+        logger.info(f"   Progress: Episode {episode_num + 1}/{args.end_episode + 1}")
+        logger.info("="*70)
 
-        # 🚨 CRITICAL: AGGRESSIVE PRE-EPISODE MEMORY MANAGEMENT
-        print(f"   🚨 AGGRESSIVE MEMORY CLEANUP BEFORE EPISODE {episode_num}")
+        # [ALERT] CRITICAL: AGGRESSIVE PRE-EPISODE MEMORY MANAGEMENT
+        logger.warning(f"   [ALERT] AGGRESSIVE MEMORY CLEANUP BEFORE EPISODE {episode_num}")
         try:
             import psutil
-            import gc
-            import os
+            # NOTE: gc and os are already imported at module level (lines 4, 13), don't re-import here
 
             # Get initial memory
             initial_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-            print(f"   📊 Pre-episode memory: {initial_mem:.1f}MB")
+            logger.info(f"   [STATS] Pre-episode memory: {initial_mem:.1f}MB")
 
-            # FORCE CLEAR ALL POSSIBLE MEMORY LEAKS
+            # FIX: NUCLEAR CLEANUP - Aggressive memory management between episodes
+            # REASON: Multi-agent RL with replay buffers, forecast caches, and TensorFlow graphs
+            # can accumulate significant memory across episodes. This cleanup is necessary because:
+            # 1. SB3 replay buffers hold large experience batches
+            # 2. TensorFlow maintains computation graphs and cached tensors
+            # 3. PyTorch maintains CUDA memory pools
+            # 4. Python's garbage collector may not immediately release large objects
+            # 5. Episode-based training creates new environments each iteration
+            #
+            # ALTERNATIVE APPROACHES (considered but not sufficient):
+            # - Incremental buffer trimming: Insufficient for multi-episode training
+            # - Lazy garbage collection: Causes memory pressure during episode
+            # - Environment pooling: Complex and error-prone with state management
+            #
+            # This aggressive cleanup is a pragmatic solution for production stability.
 
             # 1. Clear TensorFlow completely
+            # REASON: TensorFlow maintains computation graphs and cached tensors between episodes
+            # NOTE: This clears the session but weights will be reloaded from previous episode checkpoint
             try:
                 import tensorflow as tf
                 tf.keras.backend.clear_session()
@@ -1867,6 +1040,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 pass
 
             # 2. Clear PyTorch completely
+            # REASON: PyTorch maintains CUDA memory pools and cached tensors
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -1878,21 +1052,26 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 pass
 
             # 3. Force agent cleanup
+            # REASON: Agent may hold references to large buffers and cached data
             if hasattr(agent, 'memory_tracker'):
                 agent.memory_tracker.cleanup('heavy')
 
             # 4. Clear any existing environment references
+            # REASON: Previous episode's environment may hold large state arrays
             if hasattr(agent, 'env') and agent.env is not None:
                 if hasattr(agent.env, '_cleanup_memory_enhanced'):
                     agent.env._cleanup_memory_enhanced(force=True)
 
             # 5. NUCLEAR GARBAGE COLLECTION (multiple passes)
+            # REASON: Python's garbage collector may need multiple passes to break circular references
+            # and release large objects held by replay buffers and forecast caches
             for i in range(5):
                 collected = gc.collect()
                 if i == 0:
-                    print(f"   🗑️ GC Pass {i+1}: {collected} objects")
+                    logger.debug(f"   [CLEANUP] GC Pass {i+1}: {collected} objects")
 
             # 6. Force OS memory release
+            # REASON: Some memory may be held by the OS memory allocator
             try:
                 if hasattr(os, 'sync'):
                     os.sync()
@@ -1902,41 +1081,41 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # Check memory after cleanup
             after_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
             freed = initial_mem - after_mem
-            print(f"   ✅ Aggressive cleanup freed {freed:.1f}MB | Current: {after_mem:.1f}MB")
+            logger.info(f"   [OK] Aggressive cleanup freed {freed:.1f}MB | Current: {after_mem:.1f}MB")
 
             # ABORT if memory is still too high
             if after_mem > 3500:  # More than 3.5GB
-                print(f"   🚨 WARNING: High memory ({after_mem:.1f}MB) before episode start!")
-                print(f"   🚨 Performing EMERGENCY cleanup...")
+                logger.warning(f"   [ALERT] WARNING: High memory ({after_mem:.1f}MB) before episode start!")
+                logger.warning(f"   [ALERT] Performing EMERGENCY cleanup...")
 
                 # Emergency cleanup
                 for i in range(10):
                     gc.collect()
 
                 final_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-                print(f"   📊 Post-emergency memory: {final_mem:.1f}MB")
+                logger.info(f"   [STATS] Post-emergency memory: {final_mem:.1f}MB")
 
                 if final_mem > 4000:  # Still too high
-                    print(f"   ❌ CRITICAL: Memory too high ({final_mem:.1f}MB) - SKIPPING EPISODE {episode_num}")
-                    print(f"   💡 Suggestion: Restart the process or reduce episode size")
+                    logger.error(f"   [ERROR] CRITICAL: Memory too high ({final_mem:.1f}MB) - SKIPPING EPISODE {episode_num}")
+                    logger.warning(f"   [SUGGESTION] Restart the process or reduce episode size")
                     continue
 
         except Exception as cleanup_error:
-            print(f"   ⚠️ Pre-episode cleanup error: {cleanup_error}")
+            logger.warning(f"   [WARN] Pre-episode cleanup error: {cleanup_error}")
             # Continue anyway but warn
-            print(f"   ⚠️ Continuing with episode despite cleanup failure...")
+            logger.warning(f"   [WARN] Continuing with episode despite cleanup failure...")
 
         try:
             # 0. Pre-episode memory check and cleanup
             try:
                 import psutil
                 pre_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-                print(f"   📊 Memory before Episode {episode_num}: {pre_memory:.1f}MB")
+                logger.info(f"   [STATS] Memory before Episode {episode_num}: {pre_memory:.1f}MB")
 
                 # Force cleanup if memory is high before starting episode
                 if pre_memory > 3000:  # More than 3GB
-                    print(f"   🧹 High memory detected, performing pre-episode cleanup...")
-                    import gc
+                    logger.info(f"   [SWEEP] High memory detected, performing pre-episode cleanup...")
+                    # gc already imported at module level
                     for _ in range(2):
                         gc.collect()
 
@@ -1949,7 +1128,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 
                     after_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
                     freed = pre_memory - after_memory
-                    print(f"   ✅ Pre-episode cleanup freed {freed:.1f}MB")
+                    logger.info(f"   [OK] Pre-episode cleanup freed {freed:.1f}MB")
 
             except Exception:
                 pass
@@ -1957,10 +1136,10 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 1. Load episode data
             episode_data = load_episode_data(args.episode_data_dir, episode_num, config=config, mw_scale_overrides=mw_scale_overrides)
 
-            # 2. Precompute forecasts for this episode (if forecasting enabled)
-            if args.enable_forecasts and forecaster is not None:
+            # 2. Precompute forecasts for this episode (required for 28D DL overlay mode)
+            if forecaster is not None:
                 try:
-                    print(f"   🔮 Precomputing forecasts for Episode {episode_num}...")
+                    logger.info(f"   [FORECAST] Precomputing forecasts for Episode {episode_num}...")
                     episode_cache_dir = os.path.join(args.forecast_cache_dir, f"episode_{episode_num}")
                     forecaster.precompute_offline(
                         df=episode_data,
@@ -1968,93 +1147,231 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         batch_size=max(1, int(args.precompute_batch_size)),
                         cache_dir=episode_cache_dir
                     )
-                    print(f"   ✅ Episode {episode_num} forecasts precomputed")
+                    logger.info(f"   [OK] Episode {episode_num} forecasts precomputed")
                 except Exception as pe:
-                    print(f"   ⚠️ Episode {episode_num} forecast precomputation failed: {pe}")
-                    print(f"   → Continuing without forecasts for this episode")
+                    logger.error(f"   [ERROR] Episode {episode_num} forecast precomputation failed: {pe}")
+                    raise  # Fail fast - forecasts are mandatory for 28D mode
 
             # 3. Determine timesteps for this episode
             episode_timesteps = args.episode_timesteps if args.episode_timesteps else len(episode_data)
-            print(f"   🎯 Episode timesteps: {episode_timesteps:,}")
+            logger.info(f"   [GOAL] Episode timesteps: {episode_timesteps:,}")
 
             # 4. Create new environment with episode data (memory-aware)
-            print(f"   🔄 Creating environment for Episode {episode_num}...")
+            logger.info(f"   [CYCLE] Creating environment for Episode {episode_num}...")
+            logger.debug(f"   [DEBUG] forecaster = {forecaster}")
+            logger.debug(f"   [DEBUG] forecaster type = {type(forecaster).__name__ if forecaster else 'None'}")
 
             # MEMORY FIX: Ensure clean environment creation
             try:
                 # Create episode-specific environment with proper initialization
+                # NEW: Pass logs as log_dir so debug logs are saved in logs folder
+                logs_dir = os.path.join(args.save_dir, 'logs')
+                os.makedirs(logs_dir, exist_ok=True)
                 episode_base_env = RenewableMultiAgentEnv(
                     episode_data,
                     forecast_generator=forecaster,
-                    dl_adapter=getattr(base_env, 'dl_adapter', None),
+                    dl_adapter=None,  # DLAdapter will be set after environment creation
                     config=getattr(base_env, 'config', None),
                     investment_freq=getattr(base_env, 'investment_freq', 12),
                     init_budget=getattr(base_env, 'init_budget', None),
-                    enhanced_risk_controller=True
+                    enhanced_risk_controller=True,
+                    log_dir=logs_dir  # NEW: Save debug logs in logs folder
                 )
+                
+                # CRITICAL FIX: Set episode number for debug logging
+                # In episode-based training, each episode creates a new environment
+                # so _episode_counter resets. We need to set it from the training loop.
+                if hasattr(episode_base_env, '_episode_counter'):
+                    episode_base_env._episode_counter = episode_num
+                    if hasattr(episode_base_env, 'debug_tracker'):
+                        episode_base_env.debug_tracker.start_episode(episode_num)
+                        logger.debug(f"   [DEBUG] Set episode counter to {episode_num} for debug logging")
+
+                # CRITICAL FIX: Transfer calibration tracker from base_env to episode_base_env
+                # This was missing - calibration tracker was initialized on base_env but never transferred to episode environments
+                if hasattr(base_env, 'calibration_tracker') and base_env.calibration_tracker is not None:
+                    episode_base_env.calibration_tracker = base_env.calibration_tracker
+                    logger.info(f"   [OK] Calibration tracker transferred to episode environment")
+                else:
+                    episode_base_env.calibration_tracker = None
+                    logger.warning(f"   [WARN] No calibration tracker available to transfer")
+
+                logger.debug(f"   [DEBUG] episode_base_env.forecast_generator = {episode_base_env.forecast_generator}")
+                logger.debug(f"   [DEBUG] DL adapter feature_dim = {getattr(base_env, 'dl_adapter_overlay', None).feature_dim if hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay else 'N/A'}")
 
                 # MEMORY FIX: Explicitly clear episode data from memory after env creation
                 # Keep only essential references
                 episode_data_size = len(episode_data)
                 del episode_data  # Free the DataFrame memory
-                import gc
+                # gc already imported at module level
                 gc.collect()
-                print(f"   🗑️ Freed episode data ({episode_data_size} rows) from memory")
+                logger.info(f"   [CLEANUP] Freed episode data ({episode_data_size} rows) from memory")
 
             except Exception as env_error:
-                print(f"   ❌ Environment creation failed: {env_error}")
+                logger.error(f"   [ERROR] Environment creation failed: {env_error}")
                 raise
 
             # Initialize environment properly
             episode_base_env.reset()
-            print(f"   ✅ Episode environment initialized")
+            logger.info(f"   [OK] Episode environment initialized")
+
+            # CRITICAL: Initialize DLAdapter for episode if overlay is enabled
+            # Reuse the same DLAdapter from base_env for consistency
+            if args.dl_overlay and hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay is not None:
+                try:
+                    episode_base_env.dl_adapter_overlay = base_env.dl_adapter_overlay
+                    episode_base_env.overlay_trainer = base_env.overlay_trainer
+                    episode_base_env.feature_dim = base_env.feature_dim
+                    logger.info(f"   [OK] DL Overlay adapter linked to episode environment (feature_dim={episode_base_env.feature_dim})")
+                except Exception as e:
+                    logger.warning(f"Failed to link DL overlay to episode: {e}")
 
             # Wrap with forecasting if needed
             if forecaster is not None:
                 episode_env = MultiHorizonWrapperEnv(
                     episode_base_env,
                     forecaster,
-                    log_path=f"{monitoring_dirs['logs']}/episode_{episode_num}.csv",
-                    total_timesteps=episode_timesteps,
-                    log_interval=args.log_interval
+                    total_timesteps=episode_timesteps
                 )
                 # Initialize wrapper environment
                 episode_env.reset()
-                print(f"   ✅ Episode wrapper environment initialized")
+                # PHASE 5.6 FIX: Set episode training mode flag to prevent environment reset
+                episode_env._episode_training_mode = True
+                # UPGRADE: Connect wrapper reference for profit-seeking expert guidance
+                # episode_base_env.set_wrapper_reference(episode_env)
+                logger.info(f"   [OK] Episode wrapper environment initialized")
             else:
-                # Use BaselineCSVWrapper for episode-specific logging
-                from wrapper import BaselineCSVWrapper
-                episode_log_path = f"{monitoring_dirs['logs']}/episode_{episode_num}.csv"
-                episode_env = BaselineCSVWrapper(
-                    episode_base_env,
-                    log_path=episode_log_path,
-                    total_timesteps=episode_timesteps,
-                    log_interval=args.log_interval
-                )
-                print(f"   ✅ Episode baseline wrapper initialized (logging every {args.log_interval} timesteps)")
+                # Use base environment without forecasting (28D mode requires forecasts)
+                episode_env = episode_base_env
+                # PHASE 5.6 FIX: Set episode training mode flag to prevent environment reset
+                episode_env._episode_training_mode = True
+                logger.info(f"   [OK] Episode environment initialized")
 
             # 5. Update agent's environment reference to use episode data
-            print(f"   🔄 Updating agent environment reference...")
+            logger.info(f"   [CYCLE] Updating agent environment reference...")
             agent.env = episode_env
 
-            # CRITICAL FIX: Reset RL agent buffers for new episode data
-            print(f"   🧹 Resetting RL agent buffers for new episode...")
+            # [ALERT] CRITICAL: Load policies from PREVIOUS episode to continue learning (for ALL modes)
+            # CRITICAL FIX: When resuming, the first episode after resume should load from the resume episode
+            # Example: --resume_episode 8 --start_episode 9 → Episode 9 should load from Episode 8
+            should_load_previous = (episode_num > args.start_episode) or (resumed_from_checkpoint and episode_num == args.start_episode)
+
+            if should_load_previous:
+                prev_episode_num = episode_num - 1
+                prev_episode_checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"episode_{prev_episode_num}")
+
+                if os.path.exists(prev_episode_checkpoint_dir):
+                    # CRITICAL: Load agent policies from previous episode
+                    logger.info(f"   [LOAD] Loading agent policies from Episode {prev_episode_num}...")
+                    loaded_policies = agent.load_policies(prev_episode_checkpoint_dir)
+                    if loaded_policies > 0:
+                        logger.info(f"   [OK] Loaded {loaded_policies} agent policies from Episode {prev_episode_num}")
+                    else:
+                        logger.warning(f"   [WARN] No agent policies loaded from Episode {prev_episode_num}")
+
+                    # CRITICAL FIX: Load agent training state to preserve total_steps and learning continuity
+                    agent_state_path = os.path.join(prev_episode_checkpoint_dir, "agent_training_state.json")
+                    if os.path.exists(agent_state_path):
+                        try:
+                            with open(agent_state_path, 'r') as f:
+                                agent_state = json.load(f)
+
+                            # Restore agent's training progress
+                            if hasattr(agent, 'total_steps'):
+                                restored_total_steps = agent_state.get('total_steps', 0)
+                                agent.total_steps = restored_total_steps
+                                logger.info(f"   [OK] Restored agent.total_steps: {agent.total_steps:,}")
+
+                            # Restore training metrics if available
+                            if hasattr(agent, '_training_metrics') and 'training_metrics' in agent_state:
+                                agent._training_metrics.update(agent_state['training_metrics'])
+                                logger.info(f"   [OK] Restored training metrics")
+
+                            # Restore error tracking
+                            if hasattr(agent, '_consecutive_errors'):
+                                agent._consecutive_errors = agent_state.get('consecutive_errors', 0)
+                                logger.info(f"   [OK] Restored consecutive_errors: {agent._consecutive_errors}")
+                        except Exception as e:
+                            logger.warning(f"   [WARN] Could not restore agent training state: {e}")
+                    else:
+                        logger.warning(f"   [WARN] No agent training state found at: {agent_state_path}")
+                else:
+                    logger.warning(f"   [WARN] Previous episode checkpoint not found: {prev_episode_checkpoint_dir}")
+            else:
+                logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh policies")
+
+            # CRITICAL FIX: Verify DL adapter's feature_dim matches environment (34D only)
+            if hasattr(episode_base_env, 'dl_adapter_overlay') and episode_base_env.dl_adapter_overlay is not None:
+                # Verify feature_dim is correct (always 34D in forecast-aware mode: 28D base + 6D deltas)
+                new_feature_dim = 34  # HARD CONSTRAINT: 34D (28D base + 6D deltas)
+                episode_base_env.feature_dim = new_feature_dim
+
+                if new_feature_dim != episode_base_env.dl_adapter_overlay.feature_dim:
+                    # Note: DLAdapter feature_dim is set at initialization and doesn't change
+                    logger.warning(f"Feature dimension mismatch: expected {new_feature_dim}, got {episode_base_env.dl_adapter_overlay.feature_dim}")
+
+                # [ALERT] CRITICAL: Load DL weights from PREVIOUS episode to continue learning
+                # CRITICAL FIX: When resuming, the first episode after resume should load from the resume episode
+                if should_load_previous:
+                    prev_episode_num = episode_num - 1
+                    prev_episode_checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"episode_{prev_episode_num}")
+
+                    if os.path.exists(prev_episode_checkpoint_dir):
+                        feature_dim = episode_base_env.dl_adapter_overlay.feature_dim
+                        logger.debug(f"   [DEBUG] Current episode {episode_num} feature_dim: {feature_dim}D")
+                        logger.debug(f"   [DEBUG] Looking for DL weights in: {prev_episode_checkpoint_dir}")
+
+                        dl_weights_candidates = [
+                            os.path.join(prev_episode_checkpoint_dir, f"dl_overlay_online_{feature_dim}d.h5"),
+                            os.path.join(prev_episode_checkpoint_dir, "dl_overlay_online.h5")
+                        ]
+
+                        loaded = False
+                        for dl_weights_path in dl_weights_candidates:
+                            if load_overlay_weights(episode_base_env.dl_adapter_overlay, dl_weights_path, feature_dim):
+                                logger.info(f"   [OK] Loaded DL overlay weights ({feature_dim}D) from Episode {prev_episode_num}: {dl_weights_path}")
+                                loaded = True
+                                break
+
+                        if not loaded:
+                            logger.info(f"   [INFO] Starting Episode {episode_num} with fresh DL model ({feature_dim}D) - no compatible weights from Episode {prev_episode_num}")
+                    else:
+                        logger.warning(f"   [WARN] Previous episode checkpoint not found: {prev_episode_checkpoint_dir}")
+                else:
+                    logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh DL weights")
+
+            # CRITICAL FIX: Reset RL agent buffers AND internal state for new episode data
+            # FIX: Use comprehensive reset method that handles optimizer states and learning rate schedules
+            logger.info(f"   [SWEEP] Resetting RL agent buffers and state for new episode...")
             try:
-                for i, policy in enumerate(agent.policies):
-                    if hasattr(policy, 'replay_buffer') and policy.replay_buffer is not None:
-                        policy.replay_buffer.reset()
-                        print(f"     ✅ Reset replay buffer for policy {i}")
-                    if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None:
-                        policy.rollout_buffer.reset()
-                        print(f"     ✅ Reset rollout buffer for policy {i}")
-                    # Reset any other internal state
-                    if hasattr(policy, '_last_obs'):
-                        policy._last_obs = None
-                    if hasattr(policy, '_last_episode_starts'):
-                        policy._last_episode_starts = None
-                print(f"   ✅ All RL agent buffers reset for Episode {episode_num}")
+                # FIX: Call comprehensive reset method that handles all internal state
+                agent.reset_for_new_episode()
+                logger.info(f"   [OK] All RL agent buffers and state reset for Episode {episode_num}")
             except Exception as buffer_error:
-                print(f"   ⚠️ Buffer reset warning: {buffer_error}")
+                logger.warning(f"   [WARN] Buffer reset warning: {buffer_error}")
+
+            # PHASE 5.8 FIX: Clear TensorFlow/PyTorch caches to prevent state leakage
+            logger.info(f"   [CLEANUP] Clearing TensorFlow/PyTorch caches...")
+            try:
+                import tensorflow as tf
+                import torch
+
+                # Clear TensorFlow session and backend
+                tf.keras.backend.clear_session()
+                logger.info(f"     [OK] Cleared TensorFlow session")
+
+                # Clear PyTorch CUDA cache if available
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info(f"     [OK] Cleared PyTorch CUDA cache")
+
+                # Force garbage collection
+                # gc already imported at module level
+                gc.collect()
+                logger.info(f"     [OK] Forced garbage collection")
+
+            except Exception as cache_error:
+                logger.warning(f"   [WARN] Cache clearing warning: {cache_error}")
 
             # 6. Setup callbacks for this episode
             callbacks = None
@@ -2065,14 +1382,27 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 7. Run training for this episode
             episode_start_time = datetime.now()
 
+            # CRITICAL FIX: Preserve agent state across episodes for learning continuity
+            # Episode 0: preserve_agent_state=False (fresh start)
+            # Episode 1+: preserve_agent_state=True (continue learning from previous episode)
+            preserve_state = (episode_num > 0)
+
+            # FIX: If checkpoint_freq is -1 (default), save at end of episode
+            checkpoint_freq = args.checkpoint_freq
+            if checkpoint_freq == -1:
+                checkpoint_freq = episode_timesteps
+                logger.info(f"   [CHECKPOINT] Using episode length ({episode_timesteps:,} steps) as checkpoint frequency")
+
             episode_trained = enhanced_training_loop(
                 agent=agent,
                 env=episode_env,
                 timesteps=episode_timesteps,
-                checkpoint_freq=args.checkpoint_freq,
+                checkpoint_freq=checkpoint_freq,
                 monitoring_dirs=monitoring_dirs,
                 callbacks=callbacks,
-                resume_from=None  # Each episode starts fresh with data
+                resume_from=None,  # Each episode starts fresh with data
+                dl_train_every=args.dl_train_every,  # Pass overlay training frequency
+                preserve_agent_state=preserve_state  # CRITICAL: Preserve learning continuity across episodes
             )
 
             episode_end_time = datetime.now()
@@ -2082,10 +1412,13 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             total_trained_all_episodes += episode_trained
             successful_episodes += 1
 
-            print(f"\n✅ Episode {episode_num} COMPLETED!")
-            print(f"   Duration: {episode_duration:.1f} minutes")
-            print(f"   Steps trained: {episode_trained:,}")
-            print(f"   Total progress: {successful_episodes}/{args.end_episode - args.start_episode + 1} episodes")
+            logger.info(f"\n[OK] Episode {episode_num} COMPLETED!")
+            logger.info(f"   Duration: {episode_duration:.1f} minutes")
+            logger.info(f"   Steps trained: {episode_trained:,}")
+            logger.info(f"   Total progress: {successful_episodes}/{args.end_episode - args.start_episode + 1} episodes")
+
+            # [ALERT] CRITICAL: Print final NAV at end of episode
+            print_portfolio_summary(episode_env, episode_trained)
 
             # 7. Save episode checkpoint
             episode_checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"episode_{episode_num}")
@@ -2093,26 +1426,28 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             agent.save_policies(episode_checkpoint_dir)
 
             # 7.1 CRITICAL: Save DL overlay weights for episode checkpoint
-            # Check both episode_env (wrapper) and episode_base_env for dl_adapter
+            # Check both episode_env (wrapper) and episode_base_env for dl_adapter_overlay
             dl_env = None
-            if hasattr(episode_env, 'dl_adapter') and episode_env.dl_adapter is not None:
+            if hasattr(episode_env, 'dl_adapter_overlay') and episode_env.dl_adapter_overlay is not None:
                 dl_env = episode_env
-            elif 'episode_base_env' in locals() and hasattr(episode_base_env, 'dl_adapter') and episode_base_env.dl_adapter is not None:
+            elif 'episode_base_env' in locals() and hasattr(episode_base_env, 'dl_adapter_overlay') and episode_base_env.dl_adapter_overlay is not None:
                 dl_env = episode_base_env
 
             if dl_env is not None:
                 try:
-                    dl_weights_path = os.path.join(episode_checkpoint_dir, "hedge_optimizer_online.h5")
-                    if hasattr(dl_env.dl_adapter.model, "save_weights"):
-                        dl_env.dl_adapter.model.save_weights(dl_weights_path)
-                        print(f"   💾 DL overlay weights saved: {dl_weights_path}")
-                    elif hasattr(dl_env.dl_adapter.model, "model") and hasattr(dl_env.dl_adapter.model.model, "save_weights"):
-                        dl_env.dl_adapter.model.model.save_weights(dl_weights_path)
-                        print(f"   💾 DL overlay weights saved: {dl_weights_path}")
+                    # ROBUST: Save with dimension-specific filename
+                    feature_dim = dl_env.dl_adapter_overlay.feature_dim
+                    dl_weights_path = os.path.join(episode_checkpoint_dir, f"dl_overlay_online_{feature_dim}d.h5")
+                    if hasattr(dl_env.dl_adapter_overlay.model, "save_weights"):
+                        dl_env.dl_adapter_overlay.model.save_weights(dl_weights_path)
+                        logger.info(f"   [SAVE] DL overlay weights ({feature_dim}D) saved: {dl_weights_path}")
+                    elif hasattr(dl_env.dl_adapter_overlay.model, "model") and hasattr(dl_env.dl_adapter_overlay.model.model, "save_weights"):
+                        dl_env.dl_adapter_overlay.model.model.save_weights(dl_weights_path)
+                        logger.info(f"   [SAVE] DL overlay weights ({feature_dim}D) saved: {dl_weights_path}")
                 except Exception as e:
-                    print(f"   ⚠️ Could not save DL overlay weights: {e}")
+                    logger.warning(f"   [WARN] Could not save DL overlay weights: {e}")
             else:
-                print(f"   ⚠️ No DL adapter found for episode checkpoint")
+                logger.warning(f"   [WARN] No DL adapter found for episode checkpoint")
 
             # 7.2 CRITICAL: Save agent training state (total_steps, etc.)
             try:
@@ -2128,22 +1463,24 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 }
                 with open(agent_state_path, 'w') as f:
                     json.dump(agent_state, f, indent=2)
-                print(f"   💾 Agent training state saved: {agent_state_path}")
+                logger.info(f"   [SAVE] Agent training state saved: {agent_state_path}")
             except Exception as e:
-                print(f"   ⚠️ Could not save agent training state: {e}")
+                logger.warning(f"   [WARN] Could not save agent training state: {e}")
 
-            print(f"   💾 Episode checkpoint saved: {episode_checkpoint_dir}")
+            logger.info(f"   [SAVE] Episode checkpoint saved: {episode_checkpoint_dir}")
 
-            # 8. 🚨 CRITICAL: NUCLEAR MEMORY CLEANUP BETWEEN EPISODES
-            print(f"   🚨 NUCLEAR MEMORY CLEANUP AFTER EPISODE {episode_num}")
+            # Note: Portfolio metrics are logged at every timestep in debug CSV - no separate checkpoint summary needed
+
+            # 8. [ALERT] CRITICAL: NUCLEAR MEMORY CLEANUP BETWEEN EPISODES
+            logger.warning(f"   [ALERT] NUCLEAR MEMORY CLEANUP AFTER EPISODE {episode_num}")
             try:
                 import psutil
-                import gc
                 import shutil
+                # gc already imported at module level
 
                 # Get memory before cleanup
                 before_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-                print(f"   📊 Memory before cleanup: {before_mem:.1f}MB")
+                logger.info(f"   [STATS] Memory before cleanup: {before_mem:.1f}MB")
 
                 # 1. DESTROY episode environment references completely
                 if 'episode_env' in locals():
@@ -2153,9 +1490,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         if hasattr(episode_env, 'close'):
                             episode_env.close()
                         del episode_env
-                        print(f"   💥 Destroyed episode_env")
+                        logger.debug(f"   [NUCLEAR] Destroyed episode_env")
                     except Exception as e:
-                        print(f"   ⚠️ episode_env cleanup error: {e}")
+                        logger.warning(f"   [WARN] episode_env cleanup error: {e}")
 
                 if 'episode_base_env' in locals():
                     try:
@@ -2164,9 +1501,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         if hasattr(episode_base_env, 'close'):
                             episode_base_env.close()
                         del episode_base_env
-                        print(f"   💥 Destroyed episode_base_env")
+                        logger.debug(f"   [NUCLEAR] Destroyed episode_base_env")
                     except Exception as e:
-                        print(f"   ⚠️ episode_base_env cleanup error: {e}")
+                        logger.warning(f"   [WARN] episode_base_env cleanup error: {e}")
 
                 # 2. FORECASTER MEMORY CLEANUP (PRESERVE DISK CACHE)
                 if forecaster is not None:
@@ -2179,14 +1516,14 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         if hasattr(forecaster, '_agent_cache'):
                             forecaster._agent_cache.clear()
 
-                        # 🎯 PRESERVE episode forecast cache on disk for reuse across episodes
+                        # [GOAL] PRESERVE episode forecast cache on disk for reuse across episodes
                         # The cached forecasts can be reused by future episodes with same data
                         episode_cache_dir = os.path.join(args.forecast_cache_dir, f"episode_{episode_num}")
                         if os.path.exists(episode_cache_dir):
-                            print(f"   💾 PRESERVED episode {episode_num} forecast cache for reuse")
+                            logger.info(f"   [SAVE] PRESERVED episode {episode_num} forecast cache for reuse")
 
                     except Exception as e:
-                        print(f"   ⚠️ Forecaster cleanup error: {e}")
+                        logger.warning(f"   [WARN] Forecaster cleanup error: {e}")
 
                 # 3. NUCLEAR AGENT CLEANUP
                 try:
@@ -2199,9 +1536,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                             if hasattr(policy, 'rollout_buffer') and hasattr(policy.rollout_buffer, 'reset'):
                                 policy.rollout_buffer.reset()
 
-                    print(f"   💥 Agent nuclear cleanup completed")
+                    logger.debug(f"   [NUCLEAR] Agent nuclear cleanup completed")
                 except Exception as e:
-                    print(f"   ⚠️ Agent cleanup error: {e}")
+                    logger.warning(f"   [WARN] Agent cleanup error: {e}")
 
                 # 4. NUCLEAR TENSORFLOW CLEANUP
                 try:
@@ -2215,9 +1552,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                                 tf.config.experimental.reset_memory_growth(gpu)
                             except Exception:
                                 pass
-                    print(f"   💥 TensorFlow nuclear cleanup")
+                    logger.debug(f"   [NUCLEAR] TensorFlow nuclear cleanup")
                 except Exception as e:
-                    print(f"   ⚠️ TensorFlow cleanup error: {e}")
+                    logger.warning(f"   [WARN] TensorFlow cleanup error: {e}")
 
                 # 5. NUCLEAR PYTORCH CLEANUP
                 try:
@@ -2227,16 +1564,16 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         torch.cuda.synchronize()
                         torch.cuda.reset_peak_memory_stats()
                         torch.cuda.reset_accumulated_memory_stats()
-                    print(f"   💥 PyTorch nuclear cleanup")
+                    logger.debug(f"   [NUCLEAR] PyTorch nuclear cleanup")
                 except Exception as e:
-                    print(f"   ⚠️ PyTorch cleanup error: {e}")
+                    logger.warning(f"   [WARN] PyTorch cleanup error: {e}")
 
                 # 6. NUCLEAR GARBAGE COLLECTION (10 passes!)
                 total_collected = 0
                 for i in range(10):
                     collected = gc.collect()
                     total_collected += collected
-                print(f"   💥 NUCLEAR GC: {total_collected} objects destroyed")
+                logger.debug(f"   [NUCLEAR] NUCLEAR GC: {total_collected} objects destroyed")
 
                 # 7. Force OS memory sync
                 try:
@@ -2249,45 +1586,45 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 # 8. Final memory check
                 after_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
                 freed = before_mem - after_mem
-                print(f"   ✅ NUCLEAR CLEANUP: {freed:.1f}MB freed | Final: {after_mem:.1f}MB")
+                logger.info(f"   [OK] NUCLEAR CLEANUP: {freed:.1f}MB freed | Final: {after_mem:.1f}MB")
 
                 # CRITICAL CHECK: If memory is still high, FORCE more cleanup
                 if after_mem > 3000:  # More than 3GB
-                    print(f"   🚨 MEMORY STILL HIGH ({after_mem:.1f}MB) - EMERGENCY MEASURES")
+                    logger.warning(f"   [ALERT] MEMORY STILL HIGH ({after_mem:.1f}MB) - EMERGENCY MEASURES")
                     for i in range(20):  # 20 more GC passes
                         gc.collect()
 
                     final_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-                    print(f"   📊 Post-emergency memory: {final_mem:.1f}MB")
+                    logger.info(f"   [STATS] Post-emergency memory: {final_mem:.1f}MB")
 
             except Exception as cleanup_error:
-                print(f"   ❌ NUCLEAR CLEANUP FAILED: {cleanup_error}")
-                print(f"   🚨 CONTINUING ANYWAY - MONITOR MEMORY CLOSELY")
+                logger.error(f"   [ERROR] NUCLEAR CLEANUP FAILED: {cleanup_error}")
+                logger.warning(f"   [ALERT] CONTINUING ANYWAY - MONITOR MEMORY CLOSELY")
 
             # 9. Cooling period (except after last episode)
             if episode_num < args.end_episode:
                 cooling_period(args.cooling_period, episode_num)
 
         except Exception as e:
-            print(f"\n❌ Episode {episode_num} FAILED: {e}")
-            print(f"   Completed episodes: {successful_episodes}")
-            print(f"   Total steps trained: {total_trained_all_episodes:,}")
+            logger.error(f"\n[ERROR] Episode {episode_num} FAILED: {e}")
+            logger.info(f"   Completed episodes: {successful_episodes}")
+            logger.info(f"   Total steps trained: {total_trained_all_episodes:,}")
 
             # Check if this is an OOM error
             is_oom_error = any(keyword in str(e).lower() for keyword in ['memory', 'oom', 'out of memory', 'allocation'])
             if is_oom_error:
-                print(f"   🚨 DETECTED: Out of Memory (OOM) Error")
+                logger.error(f"   [ALERT] DETECTED: Out of Memory (OOM) Error")
 
                 # Report current memory status
                 try:
                     import psutil
                     current_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-                    print(f"   📊 Current memory usage: {current_memory:.1f}MB")
+                    logger.info(f"   [STATS] Current memory usage: {current_memory:.1f}MB")
                 except Exception:
                     pass
 
                 # Perform emergency memory cleanup
-                print(f"   🧹 Performing emergency memory cleanup...")
+                logger.warning(f"   [SWEEP] Performing emergency memory cleanup...")
                 try:
                     # Clear any remaining episode references
                     for var_name in ['episode_env', 'episode_base_env', 'episode_data']:
@@ -2295,7 +1632,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                             del locals()[var_name]
 
                     # Force aggressive cleanup
-                    import gc
+                    # gc already imported at module level
                     for _ in range(5):
                         gc.collect()
 
@@ -2314,10 +1651,10 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     except Exception:
                         pass
 
-                    print(f"   ✅ Emergency cleanup completed")
+                    logger.info(f"   [OK] Emergency cleanup completed")
 
                 except Exception as cleanup_error:
-                    print(f"   ⚠️ Emergency cleanup failed: {cleanup_error}")
+                    logger.warning(f"   [WARN] Emergency cleanup failed: {cleanup_error}")
 
             # Save emergency checkpoint
             emergency_dir = os.path.join(monitoring_dirs['checkpoints'], f"emergency_episode_{episode_num}")
@@ -2326,26 +1663,28 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 agent.save_policies(emergency_dir)
 
                 # Save DL overlay weights for emergency checkpoint
-                # Check both episode_env (wrapper) and episode_base_env for dl_adapter
+                # Check both episode_env (wrapper) and episode_base_env for dl_adapter_overlay
                 dl_env = None
-                if 'episode_env' in locals() and hasattr(episode_env, 'dl_adapter') and episode_env.dl_adapter is not None:
+                if 'episode_env' in locals() and hasattr(episode_env, 'dl_adapter_overlay') and episode_env.dl_adapter_overlay is not None:
                     dl_env = episode_env
-                elif 'episode_base_env' in locals() and hasattr(episode_base_env, 'dl_adapter') and episode_base_env.dl_adapter is not None:
+                elif 'episode_base_env' in locals() and hasattr(episode_base_env, 'dl_adapter_overlay') and episode_base_env.dl_adapter_overlay is not None:
                     dl_env = episode_base_env
 
                 if dl_env is not None:
                     try:
-                        dl_weights_path = os.path.join(emergency_dir, "hedge_optimizer_online.h5")
-                        if hasattr(dl_env.dl_adapter.model, "save_weights"):
-                            dl_env.dl_adapter.model.save_weights(dl_weights_path)
-                            print(f"   💾 Emergency DL overlay weights saved: {dl_weights_path}")
-                        elif hasattr(dl_env.dl_adapter.model, "model") and hasattr(dl_env.dl_adapter.model.model, "save_weights"):
-                            dl_env.dl_adapter.model.model.save_weights(dl_weights_path)
-                            print(f"   💾 Emergency DL overlay weights saved: {dl_weights_path}")
+                        # ROBUST: Save with dimension-specific filename
+                        feature_dim = dl_env.dl_adapter_overlay.feature_dim
+                        dl_weights_path = os.path.join(emergency_dir, f"dl_overlay_online_{feature_dim}d.h5")
+                        if hasattr(dl_env.dl_adapter_overlay.model, "save_weights"):
+                            dl_env.dl_adapter_overlay.model.save_weights(dl_weights_path)
+                            logger.info(f"   [SAVE] Emergency DL overlay weights ({feature_dim}D) saved: {dl_weights_path}")
+                        elif hasattr(dl_env.dl_adapter_overlay.model, "model") and hasattr(dl_env.dl_adapter_overlay.model.model, "save_weights"):
+                            dl_env.dl_adapter_overlay.model.model.save_weights(dl_weights_path)
+                            logger.info(f"   [SAVE] Emergency DL overlay weights ({feature_dim}D) saved: {dl_weights_path}")
                     except Exception as dl_save_error:
-                        print(f"   ⚠️ Emergency DL overlay save failed: {dl_save_error}")
+                        logger.warning(f"   [WARN] Emergency DL overlay save failed: {dl_save_error}")
                 else:
-                    print(f"   ⚠️ No DL adapter found for emergency checkpoint")
+                    logger.warning(f"   [WARN] No DL adapter found for emergency checkpoint")
 
                 # Save agent training state for emergency checkpoint
                 try:
@@ -2362,30 +1701,30 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     }
                     with open(agent_state_path, 'w') as f:
                         json.dump(agent_state, f, indent=2)
-                    print(f"   💾 Emergency agent state saved: {agent_state_path}")
+                    logger.info(f"   [SAVE] Emergency agent state saved: {agent_state_path}")
                 except Exception as state_error:
-                    print(f"   ⚠️ Emergency agent state save failed: {state_error}")
+                    logger.warning(f"   [WARN] Emergency agent state save failed: {state_error}")
 
-                print(f"   💾 Emergency checkpoint saved: {emergency_dir}")
+                logger.info(f"   [SAVE] Emergency checkpoint saved: {emergency_dir}")
             except Exception as save_error:
-                print(f"   ⚠️ Emergency checkpoint save failed: {save_error}")
+                logger.warning(f"   [WARN] Emergency checkpoint save failed: {save_error}")
 
             # Ask user if they want to continue with next episode
-            print(f"\n⚠️ Episode {episode_num} failed. Options:")
-            print(f"   1. Continue with Episode {episode_num + 1}")
-            print(f"   2. Stop training")
+            logger.warning(f"\n[WARN] Episode {episode_num} failed. Options:")
+            logger.info(f"   1. Continue with Episode {episode_num + 1}")
+            logger.info(f"   2. Stop training")
 
             if is_oom_error:
-                print(f"   💡 OOM Suggestion: Consider reducing batch size, episode timesteps, or enabling more aggressive memory cleanup")
+                logger.info(f"   [SUGGESTION] OOM: Consider reducing batch size, episode timesteps, or enabling more aggressive memory cleanup")
 
             # For now, continue to next episode (can be made interactive later)
-            print(f"   → Continuing with next episode...")
+            logger.info(f"   -> Continuing with next episode...")
             continue
 
-    print(f"\n🎉 EPISODE TRAINING COMPLETED!")
-    print(f"   Successful episodes: {successful_episodes}/{args.end_episode - args.start_episode + 1}")
-    print(f"   Total steps trained: {total_trained_all_episodes:,}")
-    print(f"   Time period covered: {get_episode_info(args.start_episode)['start_date']} → {get_episode_info(args.end_episode)['end_date']}")
+    logger.info(f"\n[SUCCESS] EPISODE TRAINING COMPLETED!")
+    logger.info(f"   Successful episodes: {successful_episodes}/{args.end_episode - args.start_episode + 1}")
+    logger.info(f"   Total steps trained: {total_trained_all_episodes:,}")
+    logger.info(f"   Time period covered: {get_episode_info(args.start_episode)['start_date']} -> {get_episode_info(args.end_episode)['end_date']}")
 
     return total_trained_all_episodes
 
@@ -2393,14 +1732,98 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 # Main
 # =====================================================================
 
+def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
+    """
+    Initialize DL overlay adapter for an environment.
+
+    This is the SINGLE SOURCE OF TRUTH for DL overlay initialization.
+    Ensures consistent feature_dim detection and adapter setup across all code paths.
+
+    Args:
+        env: RenewableMultiAgentEnv instance
+        config: Configuration object
+        args: Command-line arguments
+
+    Returns:
+        True if overlay was successfully initialized, False otherwise
+    """
+    if not args.dl_overlay:
+        return False
+
+    try:
+        logger.info("[DL] Initializing DL Overlay System (34D Forecast-Aware Mode: 28D base + 6D deltas)")
+        logger.debug(f"[DEBUG] env.forecast_generator = {env.forecast_generator}")
+
+        # STRICT: 34D mode only - forecasts are mandatory
+        if env.forecast_generator is None:
+            raise ValueError("DL Overlay requires forecast_generator. Forecasts are mandatory for 34D mode.")
+
+        # CRITICAL: Enable overlay in config (only when flag is set AND not explicitly disabled)
+        config.overlay_enabled = True
+
+        feature_dim = 34  # HARD CONSTRAINT: 34D (28D base + 6D deltas)
+        bridge_dim = getattr(config, 'overlay_bridge_dim', 4)
+
+        # FAMC: Get meta head parameters
+        meta_head_dim = getattr(config, 'meta_baseline_head_dim', 32)
+        enable_meta_head = getattr(config, 'meta_baseline_enable', False)
+
+        # Initialize DLAdapter for overlay inference (34D: 28D base + 6D deltas)
+        overlay_adapter = DLAdapter(
+            feature_dim=feature_dim,
+            bridge_dim=bridge_dim,
+            verbose=False,
+            meta_head_dim=meta_head_dim,
+            enable_meta_head=enable_meta_head
+        )
+
+        # STANDARDIZED: Store as dl_adapter_overlay (unified naming)
+        env.dl_adapter_overlay = overlay_adapter
+        # CRITICAL: Mirror feature_dim from adapter to environment (EXACTLY ONCE)
+        env.feature_dim = feature_dim
+
+        logger.info(f"   [OK] DL Overlay adapter initialized (feature_dim={feature_dim}, bridge_dim={bridge_dim})")
+        logger.info(f"   [OK] Mode: 34D Forecast-Aware (28D base + 6D deltas)")
+        logger.info(f"   [OK] Horizons: immediate (100%), short (95%), medium (90%), long (risk-only)")
+
+        # Display 34D feature configuration
+        logger.info("   [OK] Features: 34 (6 market + 3 positions + 16 multi-horizon forecasts + 3 portfolio + 6 deltas)")
+        logger.info("   [OK] Multi-horizon forecasts: [wind, solar, hydro, price] × [immediate, short, medium, long]")
+        logger.info("   [OK] Delta features: [Δprice_short, Δprice_med, Δprice_long, direction_consistency, mwdir, |mwdir|]")
+        logger.info("   [ROBUST] Strict shape contracts enforced at runtime")
+        logger.info("   [ROBUST] Per-horizon metrics tracked for tuning")
+
+        # Initialize OverlayTrainer for model training
+        try:
+            from dl_overlay import OverlayTrainer
+            overlay_trainer = OverlayTrainer(
+                model=overlay_adapter.model,
+                learning_rate=1e-3,
+                verbose=False
+            )
+            env.overlay_trainer = overlay_trainer
+            logger.info(f"   [OK] Overlay trainer initialized (learning_rate=1e-3)")
+        except Exception as e:
+            logger.warning(f"Failed to initialize overlay trainer: {e}")
+            env.overlay_trainer = None
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed to initialize DL overlay adapter: {e}")
+        env.dl_adapter_overlay = None
+        env.overlay_trainer = None
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Multi-Agent RL with Hyperparameter Optimization")
     parser.add_argument("--data_path", type=str, default="sample.csv", help="Path to energy time series data")
     parser.add_argument("--timesteps", type=int, default=50000, help="TUNED: Increased for full synergy emergence (was 20000)")
     parser.add_argument("--device", type=str, default="cpu", help="Device for RL training (cuda/cpu)")
     parser.add_argument("--investment_freq", type=int, default=144, help="Investor action frequency in steps")
-    parser.add_argument("--model_dir", type=str, default="saved_models", help="Dir with trained forecast models")
-    parser.add_argument("--scaler_dir", type=str, default="saved_scalers", help="Dir with trained scalers")
+    parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models", help="Dir with trained forecast models (NEW: Updated to Forecast_ANN structure)")
+    parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers", help="Dir with trained scalers (NEW: Updated to Forecast_ANN structure)")
 
     # Optimization
     parser.add_argument("--optimize", action="store_true", help="Run hyperparameter optimization before training")
@@ -2410,54 +1833,66 @@ def main():
 
     # Training
     parser.add_argument("--save_dir", type=str, default="training_agent_results", help="Where to save outputs")
-    parser.add_argument("--checkpoint_freq", type=int, default=52000, help="Checkpoint frequency optimized for 520K timestep runs (10 checkpoints total)")
+    parser.add_argument("--checkpoint_freq", type=int, default=-1, help="Checkpoint frequency (-1 = end of each episode, otherwise save every N steps)")
     parser.add_argument("--resume_from", type=str, default=None, help="Resume training from checkpoint directory")
     parser.add_argument("--validate_env", action="store_true", default=True, help="Validate env setup before training")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--experience_replay", action="store_true", help="Enable experience replay buffer")
-    parser.add_argument("--replay_buffer_size", type=int, default=10000, help="Size of experience replay buffer")
+    # NOTE: Experience replay is not implemented - PPO uses on-policy learning
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
 
     # Rewards
     parser.add_argument("--adapt_rewards", action="store_true", default=True, help="Enable adaptive reward weights")
     parser.add_argument("--reward_analysis_freq", type=int, default=2000, help="Analyze rewards every N steps")
-    parser.add_argument("--portfolio_reward_weight", type=float, default=0.8, help="Weight for portfolio performance in reward")
-    parser.add_argument("--risk_penalty_weight", type=float, default=0.2, help="Weight for risk penalty in reward")
+    # NOTE: Reward weights are configured in config.py (profit_reward_weight, risk_penalty_weight)
+    # Use optimized_params to override if needed
 
     # DL Overlay - Hedge optimization parameters
     parser.add_argument("--dl_overlay", action="store_true", help="Enable DL hedge optimization overlay")
-    parser.add_argument("--dl_buffer_size", type=int, default=256, help="DL buffer size")
-    parser.add_argument("--dl_label_every", type=int, default=12, help="DL labeling frequency")
-    parser.add_argument("--dl_train_every", type=int, default=60, help="DL training frequency")
-    parser.add_argument("--dl_batch_size", type=int, default=128, help="TUNED: Optimal DL batch size")
-    parser.add_argument("--dl_learning_rate", type=float, default=1e-3, help="TUNED: Optimal DL learning rate")
-    parser.add_argument("--risk_aversion", type=float, default=5.0, help="TUNED: Balanced risk aversion parameter")
+    parser.add_argument("--expert_blend_weight", type=float, default=0.0, help="Expert suggestion blend weight (0.0=pure PPO, 1.0=pure expert, 0.3=30%% expert)")
+    parser.add_argument("--expert_blend_mode", type=str, default="none", choices=["none", "fixed", "adaptive", "residual"],
+                       help="Expert blending mode: none (passive hints), fixed (constant blend), adaptive (confidence-based), residual (PPO learns corrections)")
+    # OPTIMIZED: Train 10x more frequently (every 500 steps) for faster adaptation
+    parser.add_argument("--dl_train_every", type=int, default=500, help="OPTIMIZED: DL training frequency")
+    # NOTE: DL overlay training parameters (buffer_size, batch_size, learning_rate) are hardcoded in dl_overlay.py
+    # OverlayExperienceBuffer: max_size=10,000
+    # OverlayTrainer: learning_rate=3e-3, batch_size from buffer sampling
 
-    # Forecasting Control (only enabled with --enable_forecasts)
-    # Get default from config
-    try:
-        from config import EnhancedConfig
-        default_config = EnhancedConfig()
-        default_threshold = default_config.forecast_confidence_threshold
-    except Exception:
-        default_threshold = 0.05  # Fallback
+    # FGB: Forecast-Guided Baseline (replaces action blending)
+    parser.add_argument("--forecast_baseline_enable", action="store_true", default=False, help="Enable forecast-guided value baseline")
+    parser.add_argument("--forecast_baseline_lambda", type=float, default=0.5, help="FGB: Baseline adjustment weight λ ∈ [0,1] (used in 'fixed' mode)")
+    parser.add_argument("--forecast_trust_window", type=int, default=2016, help="FGB: Rolling window for trust calibration (~2 weeks)")
+    parser.add_argument("--forecast_trust_min", type=float, default=0.6, help="FGB: Minimum trust threshold for risk uplift")
+    parser.add_argument("--forecast_trust_metric", type=str, default="combo", choices=["combo", "hitrate", "absdir"], help="FGB: Trust computation method")
+    parser.add_argument("--risk_uplift_enable", action="store_true", default=False, help="FGB: Enable trust-weighted risk sizing")
+    parser.add_argument("--risk_uplift_kappa", type=float, default=0.15, help="FGB: Max 15% sizing uplift (κ_uplift)")
+    parser.add_argument("--risk_uplift_cap", type=float, default=1.15, help="FGB: Maximum risk multiplier cap")
+    parser.add_argument("--risk_uplift_drawdown_gate", type=float, default=0.07, help="FGB: Disable uplift if drawdown > 7%")
+    parser.add_argument("--risk_uplift_vol_gate", type=float, default=0.02, help="FGB: Disable uplift if volatility > 2%")
 
-    parser.add_argument("--forecast_confidence_threshold", type=float, default=default_threshold, help="Minimum forecast confidence for trading")
-    parser.add_argument("--conservative_trading", action="store_true", help="Enable conservative trading mode")
+    # FAMC: Forecast-Aware Meta-Critic (Learned Control-Variate Baseline)
+    parser.add_argument("--fgb_mode", type=str, default="fixed", choices=["fixed", "online", "meta"], help="FAMC: Baseline mode (fixed=constant λ, online=adaptive λ*, meta=learned critic)")
+    parser.add_argument("--fgb_lambda_max", type=float, default=0.8, help="FAMC: Maximum λ* for online/meta modes")
+    parser.add_argument("--fgb_clip_bps", type=float, default=0.10, help="FAMC: Per-step correction cap in return units (0.10 = 10bp, FIXED from 0.01)")
+    parser.add_argument("--fgb_warmup_steps", type=int, default=2000, help="FAMC: No correction before this many steps")
+    parser.add_argument("--fgb_moment_beta", type=float, default=0.01, help="FAMC: EMA rate for Cov/Var moments")
+    parser.add_argument("--meta_baseline_enable", action="store_true", default=False, help="FAMC: Enable meta-critic head g_φ(x_t)")
+    parser.add_argument("--meta_baseline_loss", type=str, default="mse", choices=["mse", "corr"], help="FAMC: Loss function for meta head")
+    parser.add_argument("--meta_baseline_head_dim", type=int, default=32, help="FAMC: Hidden dimension for meta-critic head")
+    parser.add_argument("--meta_train_every", type=int, default=512, help="FAMC: Train meta head every N steps")
 
-    # Ultra Fast Mode Control (logging only)
-    parser.add_argument("--ultra_fast_mode", action="store_true",
-                       help="Ultra fast mode: no CSV logging, console output only")
+    # === 3-TIER SYSTEM: Forecast Utilisation ===
+    # Tier 1 (Baseline MARL): No forecasts, 6D investor observations
+    # Tier 2 (Direct Deltas): Forecasts loaded, 9D investor observations (6 base + 3 forecast: z_short, z_medium, trust)
+    # Tier 3 (FAMC): Tier 2 + DL overlay + FGB meta mode for variance reduction, 13D investor observations (9 + 4 bridge)
+    parser.add_argument("--enable_forecast_utilisation", action="store_true", default=False,
+                       help="MASTER FLAG: Enable forecast model loading + direct delta observations (Tier 2/3)")
 
-    # Logging Control
-    parser.add_argument("--log_interval", type=int, default=20,
-                       help="Log results every N timesteps (default: 20). Works consistently across all modes.")
+    # GNN Encoder (independent add-on - works with or without forecasts)
+    parser.add_argument("--enable_gnn_encoder", action="store_true", default=False,
+                       help="Enable GNN observation encoder for Tier 2B (works on 6D base or 9D forecast-enhanced observations)")
 
-    # Forecasting integration
-    parser.add_argument(
-        "--enable_forecasts",
-        action="store_true",
-        help="Enable forecasting integration with precomputed forecasts for O(1) lookups during training."
-    )
+    # Forecasting Control (requires --enable_forecast_utilisation)
+    parser.add_argument("--confidence_floor", type=float, default=0.6, help="Minimum confidence floor (0.0-1.0, default 0.6). MAPE-based confidence cannot go below this value.")
     parser.add_argument(
         "--precompute_batch_size",
         type=int,
@@ -2465,7 +1900,7 @@ def main():
         help="Batch size to use for offline forecast precompute (TF inference)."
     )
 
-    # MW Scale Configuration - Fix for capacity-factor→MW conversion
+    # MW Scale Configuration - Fix for capacity-factor->MW conversion
     parser.add_argument("--wind_mw_scale", type=float, default=None,
                        help="Override wind MW scale for capacity factor conversion (default: from config)")
     parser.add_argument("--solar_mw_scale", type=float, default=None,
@@ -2492,117 +1927,324 @@ def main():
 
     args = parser.parse_args()
 
-    # No incompatible flag combinations - ultra fast mode only affects logging
+    # === SETUP TERMINAL OUTPUT LOGGING ===
+    # Create logs directory in save_dir
+    log_dir = os.path.join(args.save_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create log file with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(log_dir, f"training_output_{timestamp}.txt")
+    
+    # Setup TeeOutput to capture both print() and logging
+    # Create separate instances for stdout and stderr (both write to same file)
+    tee_output_stdout = TeeOutput(log_file_path)
+    tee_output_stdout._set_stream_type(is_stdout=True)
+    tee_output_stderr = TeeOutput(log_file_path)
+    tee_output_stderr._set_stream_type(is_stderr=True)
+    sys.stdout = tee_output_stdout
+    sys.stderr = tee_output_stderr
+    # Store both for cleanup (use stdout as primary reference)
+    tee_output = tee_output_stdout
+    tee_output._stderr_instance = tee_output_stderr  # Store reference to stderr instance
+    
+    # Reconfigure logging with file handler (centralized in logger.py)
+    configure_logging(level=logging.INFO, log_file=log_file_path, force_reconfigure=True)
+    
+    logger.info(f"\n[LOG] Terminal output being saved to: {log_file_path}")
+    logger.info(f"[LOG] All logging will be captured in this file\n")
+
+    # === AUTO-DEPENDENCY RESOLUTION (3-TIER SYSTEM) ===
+    def resolve_dependencies(args):
+        """
+        Automatically resolve configuration dependencies for 3-tier system:
+        Tier 1 (Baseline MARL): No forecasts
+        Tier 2 (Direct Deltas): enable_forecast_utilisation=True
+        Tier 3 (FAMC): enable_forecast_utilisation=True + fgb_mode=meta
+        """
+        changes_made = []
+
+        # === TIER 3: FGB requires forecast utilisation ===
+        if args.fgb_mode in ['online', 'meta'] or args.meta_baseline_enable or args.forecast_baseline_enable:
+            if not args.enable_forecast_utilisation:
+                args.enable_forecast_utilisation = True
+                changes_made.append(f"Enabled --enable_forecast_utilisation (required for FGB mode '{args.fgb_mode}')")
+
+        # === FGB requires DL overlay (for expected_dnav computation) ===
+        # CRITICAL: ALL FGB modes need DL overlay because expected_dnav() requires overlay_output
+        # expected_dnav uses pred_reward and mwdir from DL overlay inference
+        if args.forecast_baseline_enable or args.fgb_mode in ['fixed', 'online', 'meta']:
+            if not args.dl_overlay:
+                args.dl_overlay = True
+                changes_made.append("Enabled --dl_overlay (required for FGB: expected_dnav needs overlay_output)")
+
+        # === FAMC meta mode requires meta_baseline_enable ===
+        if args.fgb_mode == 'meta':
+            if not args.meta_baseline_enable:
+                args.meta_baseline_enable = True
+                changes_made.append("Enabled --meta_baseline_enable (required for fgb_mode='meta')")
+
+            # CRITICAL FIX: Meta mode requires forecast_baseline_enable for FAMC correction to run
+            if not args.forecast_baseline_enable:
+                args.forecast_baseline_enable = True
+                changes_made.append("Enabled --forecast_baseline_enable (required for FAMC correction)")
+
+        # === Forecast utilisation does NOT require DL overlay ===
+        # Tier 2 uses direct deltas from ForecastGenerator (NO DL overlay needed)
+        # DL overlay is ONLY needed for Tier 3 (FGB/FAMC) when explicitly requested
+        # Do NOT auto-enable DL overlay for Tier 2 - it uses ForecastGenerator directly
+
+        # === Disable expert blending when using direct deltas ===
+        if args.enable_forecast_utilisation and args.expert_blend_mode != 'none':
+            logger.warning(f"\n[WARN] Direct delta observations enabled but expert_blend_mode='{args.expert_blend_mode}'")
+            logger.warning(f"[WARN] Direct deltas give PPO full control - expert blending is redundant")
+            logger.warning(f"[RECOMMEND] Use --expert_blend_mode none (PPO learns from deltas directly)")
+
+        # Log auto-configuration summary
+        if changes_made:
+            logger.info("\n" + "="*70)
+            logger.info("AUTO-CONFIGURATION: Dependencies Resolved")
+            logger.info("="*70)
+            for change in changes_made:
+                logger.info(f"  ✓ {change}")
+            logger.info("="*70 + "\n")
+
+        # Log tier information
+        if args.enable_forecast_utilisation:
+            if args.fgb_mode == 'meta':
+                logger.info("[TIER 3] FAMC Mode: Baseline MARL + Direct Deltas + Meta-Critic")
+            elif args.fgb_mode in ['online', 'fixed'] and args.forecast_baseline_enable:
+                logger.info(f"[TIER 3] FGB Mode: Baseline MARL + Direct Deltas + FGB ({args.fgb_mode})")
+            else:
+                logger.info("[TIER 2] Direct Delta Mode: Baseline MARL + Forecast Deltas")
+        else:
+            logger.info("[TIER 1] Baseline MARL: No forecasts, 6D observations")
+
+        return args
+
+    # Apply dependency resolution
+    args = resolve_dependencies(args)
 
     # Safer device selection
     if args.device.lower() == "cuda" and not torch.cuda.is_available():
-        print("CUDA requested but not available. Falling back to CPU.")
+        logger.warning("CUDA requested but not available. Falling back to CPU.")
         args.device = "cpu"
 
     # Initialize TensorFlow based on device setting
     from generator import initialize_tensorflow
-    initialize_tensorflow(args.device)
+    tf = initialize_tensorflow(args.device)
 
-    # Seed everything for repeatability (uses config.seed after we create it; use a temp seed now too)
-    seed_hint = 42
-    random.seed(seed_hint)
-    np.random.seed(seed_hint)
-    torch.manual_seed(seed_hint)
+    # Seed everything for repeatability (uses args.seed from command line)
+    seed_value = args.seed
+    
+    # CRITICAL: Set deterministic operations BEFORE seeding
+    # This must be done before any PyTorch operations
+    import torch
+    torch.use_deterministic_algorithms(True, warn_only=True)  # Enable deterministic algorithms
+    torch.backends.cudnn.deterministic = True  # Make CuDNN deterministic
+    torch.backends.cudnn.benchmark = False  # Disable benchmark for reproducibility
+    
+    # Seed all random number generators
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed_hint)
+        torch.cuda.manual_seed_all(seed_value)
+        torch.cuda.manual_seed(seed_value)
 
-    print("Enhanced Multi-Horizon Energy Investment RL System")
-    print("=" * 60)
-    print("Features: Hyperparameter Optimization + Multi-Objective Rewards")
+    # CRITICAL: Seed TensorFlow for deterministic DL overlay training
+    if tf is not None:
+        tf.random.set_seed(seed_value)
+        os.environ['TF_DETERMINISTIC_OPS'] = '1'  # Force deterministic ops
+        os.environ['TF_CUDNN_DETERMINISTIC'] = '1'  # Make CuDNN deterministic
+        os.environ['PYTHONHASHSEED'] = str(seed_value)  # Python hash seed
+    
+    # CRITICAL: Seed environment's RNG at initialization
+    # This ensures environment randomness is also deterministic
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+
+    logger.info(f"[SEED] All RNGs seeded with {seed_value} for deterministic training")
+    logger.info(f"[SEED] PyTorch deterministic algorithms: ENABLED")
+    logger.info(f"[SEED] CuDNN deterministic: ENABLED")
+
+    logger.info("Enhanced Multi-Horizon Energy Investment RL System")
+    logger.info("=" * 60)
+    logger.info("Features: Hyperparameter Optimization + Multi-Objective Rewards")
 
     # Create save dir + metrics subdir
     os.makedirs(args.save_dir, exist_ok=True)
     metrics_dir = os.path.join(args.save_dir, "metrics")
     os.makedirs(metrics_dir, exist_ok=True)
 
-    # 1) Load data - Skip for episode training (data loaded per episode)
-    if args.episode_training:
-        print(f"\n[EPISODE] Episode Training Mode: Data will be loaded per episode from {args.episode_data_dir}")
-        print(f"   Skipping initial data load - using episode datasets instead")
-        # Create dummy data for environment initialization
-        data = pd.DataFrame({
-            'timestamp': pd.date_range('2015-01-01', periods=100, freq='10min'),
-            'wind': np.random.rand(100),
-            'solar': np.random.rand(100),
-            'hydro': np.random.rand(100),
-            'load': np.random.rand(100),
-            'price': np.random.rand(100)
-        })
-        print(f"   Created dummy data for environment setup: {data.shape}")
-    else:
-        print(f"\nLoading data from: {args.data_path}")
-        try:
-            data = load_energy_data(args.data_path, config=config, mw_scale_overrides=mw_scale_overrides)
-            print(f"Data loaded: {data.shape}")
-            print(f"Columns: {list(data.columns)}")
-            if "timestamp" in data.columns and data["timestamp"].notna().any():
-                ts = data["timestamp"].dropna()
-                print(f"Date range: {ts.iloc[0]} -> {ts.iloc[-1]}")
-            if len(data) < 1000:
-                print(f"Limited data ({len(data)} rows). More data -> better training stability.")
-        except Exception as e:
-            print(f"Error loading data: {e}")
-            return
-
-    # 2) Forecaster - ONLY enabled with --enable_forecasts flag
-    if not args.enable_forecasts:
-        print("\n[BASELINE] Forecasting disabled (use --enable_forecasts to enable)")
-        forecaster = None
-    else:
-        print("\nInitializing multi-horizon forecaster...")
-        try:
-            forecaster = MultiHorizonForecastGenerator(
-                model_dir=args.model_dir,
-                scaler_dir=args.scaler_dir,
-                look_back=6,
-                verbose=True
-            )
-            print("Forecaster initialized successfully!")
-
-            # Skip precomputation for episode training (will be done per episode)
-            if args.episode_training:
-                print("[EPISODE] Episode training mode: Forecast precomputation will be done per episode")
-                print("   Skipping global forecast precomputation")
-            else:
-                # Precompute forecasts offline (required when forecaster is enabled)
-                try:
-                    print(f"Precomputing forecasts offline (batch_size={args.precompute_batch_size})…")
-                    print("Checking for cached forecasts first...")
-                    forecaster.precompute_offline(
-                        df=data,
-                        timestamp_col="timestamp",
-                        batch_size=max(1, int(args.precompute_batch_size)),
-                        cache_dir=args.forecast_cache_dir
-                    )
-                    print("[OK] Forecasts precomputed successfully!")
-                except Exception as pe:
-                    print(f"❌ Precompute failed: {pe}")
-                    print("Forecasting requires precomputed forecasts. Disabling forecaster.")
-                    forecaster = None
-
-        except Exception as e:
-            print(f"Failed to initialize forecaster: {e}")
-            forecaster = None
-
-    # 3) Initialize best_params (must happen before config creation)
+    # CRITICAL FIX: Create config FIRST before loading data
+    # Initialize best_params (must happen before config creation)
     best_params = None
     if args.use_previous_optimization:
-        print("\nChecking for previous optimization results...")
+        logger.info("\nChecking for previous optimization results...")
         opt_dir = os.path.join(args.save_dir, "optimization_results")
         best_params, _ = load_previous_optimization(opt_dir)
         if best_params:
-            print("Using previous optimization results")
+            logger.info("Using previous optimization results")
         else:
-            print("No previous optimization found")
+            logger.info("No previous optimization found")
 
-    # 4) Config setup (MOVED UP - must happen before environment creation)
-    print("\nCreating optimized training configuration...")
+    # Create config
+    logger.info("\nCreating optimized training configuration...")
     config = EnhancedConfig(optimized_params=best_params)
+
+    # Override config.seed with command-line argument
+    config.seed = args.seed
+    logger.info(f"[CONFIG] Using seed: {config.seed}")
+
+    # === 3-TIER SYSTEM: Apply forecast utilisation to config ===
+    logger.info("\nApplying forecast utilisation configuration...")
+    config.enable_forecast_utilisation = args.enable_forecast_utilisation
+    logger.info(f"[FORECAST_UTIL] Enabled: {config.enable_forecast_utilisation}")
+    if config.enable_forecast_utilisation:
+        logger.info(f"[FORECAST_UTIL] Investor observations: 9D (6 base + 3 forecast)")
+        logger.info(f"[FORECAST_UTIL]   Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl")
+        logger.info(f"[FORECAST_UTIL]   Forecast (3D): z_short, z_medium, trust")
+        logger.info(f"[FORECAST_UTIL]   REMOVED: z_long, forecast_quality, 4 interaction terms (redundant for faster learning)")
+
+        # TIER 2: Direct deltas from ForecastGenerator + ForecastEngine (NO DL overlay needed)
+        # Direct deltas are computed by:
+        #   1. ForecastGenerator (ANN/LSTM models) → generates forecasts
+        #   2. _compute_forecast_deltas() → computes z-scores from forecasts
+        #   3. ForecastEngine → processes z-scores into observation features (z_short, z_medium, trust)
+        # DL overlay is ONLY for Tier 3 (when --dl_overlay flag is set)
+        # Tier 2 does NOT need DL overlay - it learns directly from forecast deltas
+        config.overlay_bridge_enable = False
+        config.overlay_pred_reward_lambda = 0.0
+        config.overlay_pred_reward_enable = False
+        config.overlay_apply_risk_budget = False
+        # NOTE: overlay_enabled is False by default (only True if --dl_overlay flag is set)
+        logger.info(f"[FORECAST_UTIL] Tier 2 uses direct deltas from ForecastGenerator (NO DL overlay needed)")
+        logger.info(f"[FORECAST_UTIL]   ForecastGenerator → _compute_forecast_deltas() → ForecastEngine → observations")
+        logger.info(f"[FORECAST_UTIL]   PPO learns directly from forecast z-scores (z_short, z_medium, trust)")
+    else:
+        logger.info(f"[FORECAST_UTIL] Investor observations: 6D (baseline MARL)")
+
+    # === GNN Encoder (Tier 2B): Apply GNN configuration ===
+    logger.info("\nApplying GNN encoder configuration...")
+    config.enable_gnn_encoder = args.enable_gnn_encoder
+    if config.enable_gnn_encoder:
+        # REFACTORED: GNN encoder is independent of forecast integration
+        # It can work on base observations (6D) OR forecast-enhanced observations (9D)
+        # This makes GNN encoder a true add-on that can be used with or without forecasts
+        obs_type = "9D (with forecasts)" if config.enable_forecast_utilisation else "6D (base)"
+        logger.info(f"[GNN] Enabled: Graph Attention Network encoder (Tier 2B)")
+        logger.info(f"[GNN]   Observation type: {obs_type}")
+        logger.info(f"[GNN]   Features dim: {config.gnn_features_dim}")
+        logger.info(f"[GNN]   Hidden dim: {config.gnn_hidden_dim}")
+        logger.info(f"[GNN]   Layers: {config.gnn_num_layers}")
+        logger.info(f"[GNN]   Graph type: {config.gnn_graph_type}")
+    else:
+        if config.enable_forecast_utilisation:
+            logger.info(f"[GNN] Disabled (Tier 2A - direct forecast features)")
+        else:
+            logger.info(f"[GNN] Disabled (Tier 1 - baseline MARL)")
+
+    # FGB: Apply forecast-guided baseline CLI args to config
+    logger.info("\nApplying forecast-guided baseline configuration...")
+    config.forecast_baseline_enable = args.forecast_baseline_enable
+    config.forecast_baseline_lambda = args.forecast_baseline_lambda
+    config.forecast_trust_window = args.forecast_trust_window
+    config.forecast_trust_min = args.forecast_trust_min
+    config.forecast_trust_metric = args.forecast_trust_metric
+    config.risk_uplift_enable = args.risk_uplift_enable
+    config.risk_uplift_kappa = args.risk_uplift_kappa
+    config.risk_uplift_cap = args.risk_uplift_cap
+    config.risk_uplift_drawdown_gate = args.risk_uplift_drawdown_gate
+    config.risk_uplift_vol_gate = args.risk_uplift_vol_gate
+
+    # FAMC: Apply FAMC/meta-critic CLI args to config (CRITICAL FIX)
+    logger.info("\nApplying FAMC configuration...")
+    config.fgb_mode = args.fgb_mode
+    config.fgb_lambda_max = args.fgb_lambda_max
+    config.fgb_clip_bps = args.fgb_clip_bps
+    config.fgb_warmup_steps = args.fgb_warmup_steps
+    config.fgb_moment_beta = args.fgb_moment_beta
+    config.meta_baseline_enable = args.meta_baseline_enable
+    config.meta_baseline_loss = args.meta_baseline_loss
+    config.meta_baseline_head_dim = args.meta_baseline_head_dim
+    config.meta_train_every = args.meta_train_every
+    logger.info(f"[FAMC] Mode: {config.fgb_mode}")
+    logger.info(f"[FAMC] Meta-critic: {'enabled' if config.meta_baseline_enable else 'disabled'}")
+    if config.meta_baseline_enable:
+        logger.info(f"[FAMC] Meta head dim: {config.meta_baseline_head_dim}")
+        logger.info(f"[FAMC] Meta train every: {config.meta_train_every} steps")
+        logger.info(f"[FAMC] Lambda max: {config.fgb_lambda_max}")
+
+    # Expert Blending: Apply expert blending CLI args to config (CRITICAL FIX)
+    logger.info("\nApplying expert blending configuration...")
+    config.expert_blend_mode = args.expert_blend_mode
+    config.expert_blend_weight = args.expert_blend_weight
+    logger.info(f"[EXPERT_BLEND] Mode: {config.expert_blend_mode}")
+    if config.expert_blend_mode != 'none':
+        logger.info(f"[EXPERT_BLEND] Weight: {config.expert_blend_weight}")
+
+    # FGB: Emit deprecation warnings if old blending flags are used
+    if hasattr(args, 'overlay_alpha') and args.overlay_alpha is not None and args.overlay_alpha != 0.0:
+        logger.warning("[WARN] DEPRECATED: --overlay_alpha is no longer supported.")
+        logger.warning("       Action blending has been replaced by forecast-guided baseline.")
+        logger.warning("       Set --forecast_baseline_enable to use the new approach.")
+
+    logger.info(f"\n[FGB] Forecast baseline: {'enabled' if config.forecast_baseline_enable else 'disabled'}")
+    logger.info(f"[FGB] Risk uplift: {'enabled' if config.risk_uplift_enable else 'disabled'}")
+
+    # DEBUG: Verify all FAMC and expert blending config values are applied correctly
+    logger.info("\n" + "="*70)
+    logger.info("FAMC & EXPERT BLENDING CONFIGURATION VERIFICATION")
+    logger.info("="*70)
+    logger.info(f"forecast_baseline_enable:  {config.forecast_baseline_enable}")
+    logger.info(f"fgb_mode:                  {config.fgb_mode}")
+    logger.info(f"fgb_lambda_max:            {config.fgb_lambda_max}")
+    logger.info(f"fgb_clip_bps:              {config.fgb_clip_bps}")
+    logger.info(f"meta_baseline_enable:      {config.meta_baseline_enable}")
+    logger.info(f"meta_baseline_head_dim:    {config.meta_baseline_head_dim}")
+    logger.info(f"meta_train_every:          {config.meta_train_every}")
+    logger.info(f"expert_blend_mode:         {getattr(config, 'expert_blend_mode', 'NOT SET')}")
+    logger.info(f"expert_blend_weight:       {getattr(config, 'expert_blend_weight', 'NOT SET')}")
+    logger.info(f"risk_uplift_enable:        {config.risk_uplift_enable}")
+    logger.info(f"risk_uplift_kappa:         {config.risk_uplift_kappa}")
+    logger.info("="*70)
+
+    # VALIDATE CONFIGURATION (NEW)
+    logger.info("\nValidating configuration...")
+    try:
+        config.validate_configuration()
+        logger.info("[OK] Configuration validation passed")
+    except ValueError as e:
+        logger.error(f"[ERROR] Configuration validation failed:")
+        logger.error(f"  {e}")
+        return
+
+    # FIX: Validate forecast configuration - forecasts needed for EITHER dl_overlay OR forecast_baseline_enable OR enable_forecast_utilisation
+    logger.info("\nValidating forecast configuration...")
+    forecast_required = args.dl_overlay or args.forecast_baseline_enable or args.enable_forecast_utilisation
+
+    if forecast_required:
+        logger.info(f"Forecast models required (enable_forecast_utilisation={args.enable_forecast_utilisation})")
+        # FAIL-FAST: Check that model directories exist
+        if not args.model_dir or not os.path.exists(args.model_dir):
+            error_msg = (
+                f"[ERROR] Forecast models required but model_dir not found: {args.model_dir}\n"
+                f"  Reason: --enable_forecast_utilisation is enabled (Tier 2/3)\n"
+                f"  Action: Train forecast models and save to '{args.model_dir}/' or use Tier 1 (baseline MARL)"
+            )
+            logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+        if not args.scaler_dir or not os.path.exists(args.scaler_dir):
+            error_msg = (
+                f"[ERROR] Forecast scalers required but scaler_dir not found: {args.scaler_dir}\n"
+                f"  Reason: --enable_forecast_utilisation is enabled (Tier 2/3)\n"
+                f"  Action: Train forecast models and save scalers to '{args.scaler_dir}/' or use Tier 1 (baseline MARL)"
+            )
+            logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+        logger.info(f"[OK] Forecast directories validated: model_dir={args.model_dir}, scaler_dir={args.scaler_dir}")
+    else:
+        logger.info("[TIER 1] Baseline MARL mode - no forecasts required")
 
     # Apply MW scale overrides from CLI arguments
     mw_scale_overrides = {
@@ -2614,131 +2256,317 @@ def main():
 
     # Update config with CLI overrides if provided
     if any(v is not None for v in mw_scale_overrides.values()):
-        print("\nApplying MW scale overrides from CLI:")
+        logger.info("\nApplying MW scale overrides from CLI:")
         for key, value in mw_scale_overrides.items():
             if value is not None:
                 config.mw_conversion_scales[key] = float(value)
-                print(f"  {key}: {value} MW")
+                logger.info(f"  {key}: {value} MW")
+
+    # 1) Load data - Skip for episode training (data loaded per episode)
+    if args.episode_training:
+        logger.info(f"\n[EPISODE] Episode Training Mode: Data will be loaded per episode from {args.episode_data_dir}")
+        logger.info(f"   Skipping initial data load - using episode datasets instead")
+        # Create dummy data for environment initialization
+        data = pd.DataFrame({
+            'timestamp': pd.date_range('2015-01-01', periods=100, freq='10min'),
+            'wind': np.random.rand(100),
+            'solar': np.random.rand(100),
+            'hydro': np.random.rand(100),
+            'load': np.random.rand(100),
+            'price': np.random.rand(100)
+        })
+        logger.info(f"   Created dummy data for environment setup: {data.shape}")
+    else:
+        logger.info(f"\nLoading data from: {args.data_path}")
+        try:
+            data = load_energy_data(args.data_path, config=config, mw_scale_overrides=mw_scale_overrides)
+            logger.info(f"Data loaded: {data.shape}")
+            logger.info(f"Columns: {list(data.columns)}")
+            if "timestamp" in data.columns and data["timestamp"].notna().any():
+                ts = data["timestamp"].dropna()
+                logger.info(f"Date range: {ts.iloc[0]} -> {ts.iloc[-1]}")
+            if len(data) < 1000:
+                logger.warning(f"Limited data ({len(data)} rows). More data -> better training stability.")
+        except Exception as e:
+            logger.error(f"Error loading data: {e}")
+            return
+
+    # 2) Forecaster - Required when forecast utilisation is enabled (Tier 2/3)
+    # Tier 1 (Baseline MARL): No forecasts needed
+    # Tier 2/3 (Direct Deltas / FAMC): Forecasts required for delta computation
+    forecaster = None
+    forecast_required = args.enable_forecast_utilisation  # Master flag controls forecast loading
+
+    if forecast_required:
+        feature_description = []
+        if args.fgb_mode == 'meta':
+            feature_description.append("FAMC meta-critic")
+        elif args.fgb_mode in ['online', 'fixed'] and args.forecast_baseline_enable:
+            feature_description.append(f"FGB ({args.fgb_mode} mode)")
+        else:
+            feature_description.append("direct delta observations")
+
+        if args.dl_overlay:
+            feature_description.append("DL overlay (34D: 28D base + 6D deltas)")
+
+        logger.info(f"\nInitializing multi-horizon forecaster (required for: {', '.join(feature_description)})...")
+        try:
+            # Auto-detect metadata directory if using Forecast_ANN structure
+            metadata_dir = None
+            if "Forecast_ANN" in args.model_dir or os.path.exists(os.path.join(os.path.dirname(args.model_dir), "metadata")):
+                potential_metadata = os.path.join(os.path.dirname(args.model_dir), "metadata")
+                if os.path.exists(potential_metadata):
+                    metadata_dir = potential_metadata
+            
+            forecaster = MultiHorizonForecastGenerator(
+                model_dir=args.model_dir,
+                scaler_dir=args.scaler_dir,
+                metadata_dir=metadata_dir,  # NEW: Auto-detected metadata directory
+                look_back=24,  # IMPROVED: Default to 24 (will be overridden by metadata if available)
+                verbose=True,
+                fallback_mode=False,  # CRITICAL: Disable fallback - we need real models
+                timing_log_path=os.path.join('analysis', 'forecast_timing.csv')
+            )
+            logger.info("Forecaster initialized successfully!")
+
+            # DIAGNOSTIC: Check if models are actually loaded
+            stats = forecaster.get_loading_stats()
+            logger.info(f"   [STATS] Forecast models: {stats['models_loaded']}/{stats['models_attempted']} loaded ({stats['success_rate']:.1f}% success)")
+
+            # FAIL-FAST: No silent fallback allowed when forecasts are required
+            if stats['fallback_mode'] or stats['models_loaded'] == 0:
+                error_msg = (
+                    f"\n[CRITICAL ERROR] Forecast models failed to load!\n"
+                    f"   Models loaded: {stats['models_loaded']}/{stats['models_attempted']}\n"
+                    f"   Fallback mode: {stats['fallback_mode']}\n"
+                    f"   Required for: {', '.join(feature_description)}\n"
+                    f"   Model directory: {args.model_dir}\n"
+                    f"   Scaler directory: {args.scaler_dir}\n"
+                    f"\n"
+                    f"   ACTION REQUIRED:\n"
+                    f"   1. Train forecast models using the forecast training script\n"
+                    f"   2. Ensure models are saved to '{args.model_dir}/'\n"
+                    f"   3. Ensure scalers are saved to '{args.scaler_dir}/'\n"
+                    f"   OR\n"
+                    f"   4. Disable forecast features (remove --dl_overlay and --forecast_baseline_enable flags)\n"
+                    f"\n"
+                    f"   Loading errors: {stats['loading_errors'][:3] if stats['loading_errors'] else 'None'}\n"
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            else:
+                logger.info(f"   [OK] Forecaster using trained models - real predictions enabled")
+
+            # Skip precomputation for episode training (will be done per episode)
+            if args.episode_training:
+                logger.info("[EPISODE] Episode training mode: Forecast precomputation will be done per episode")
+                logger.info("   Skipping global forecast precomputation")
+            else:
+                # Precompute forecasts offline (required for forecast features)
+                try:
+                    logger.info(f"Precomputing forecasts offline (batch_size={args.precompute_batch_size})…")
+                    logger.info("Checking for cached forecasts first...")
+                    forecaster.precompute_offline(
+                        df=data,
+                        timestamp_col="timestamp",
+                        batch_size=max(1, int(args.precompute_batch_size)),
+                        cache_dir=args.forecast_cache_dir
+                    )
+                    logger.info("[OK] Forecasts precomputed successfully!")
+                except Exception as pe:
+                    error_msg = (
+                        f"[ERROR] Forecast precomputation failed: {pe}\n"
+                        f"  Forecasts are required for: {', '.join(feature_description)}\n"
+                        f"  Cannot continue without precomputed forecasts."
+                    )
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+        except Exception as e:
+            # FAIL-FAST: Don't silently continue if forecasts are required
+            error_msg = (
+                f"[CRITICAL ERROR] Failed to initialize forecaster: {e}\n"
+                f"  Forecasts are required for: {', '.join(feature_description)}\n"
+                f"  Cannot continue without forecast models."
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+    else:
+        logger.info("\n[TIER 1] Baseline MARL mode: Skipping forecaster initialization")
+        logger.info("[TIER 1] Investor observations: 6D (wind, solar, hydro, price, load, budget)")
+        logger.info("[TIER 1] To enable forecast deltas, use: --enable_forecast_utilisation")
 
     # Re-seed using config.seed to ensure consistency with agent init
+    # (config.seed was already set from args.seed above)
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
 
+    # CRITICAL: Re-seed TensorFlow with config.seed
+    if tf is not None:
+        tf.random.set_seed(config.seed)
+        os.environ['PYTHONHASHSEED'] = str(config.seed)
+
+    logger.info(f"[SEED] Re-seeded all RNGs with {config.seed} before environment creation")
+
     # 4) Environment setup
-    print("\nSetting up enhanced environment with multi-objective rewards...")
+    logger.info("\nSetting up enhanced environment with multi-objective rewards...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(metrics_dir, f"enhanced_metrics_{timestamp}.csv")
 
     # CRITICAL FIX: Create base environment first, then DL adapter with proper reference
     try:
         # Step 1: Create base environment without DL adapter
+        # NEW: Pass logs as log_dir so debug logs are saved in logs folder
+        # Create logs subdirectory inside save_dir
+        logs_dir = os.path.join(args.save_dir, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
         base_env = RenewableMultiAgentEnv(
             data,
             investment_freq=args.investment_freq,
             forecast_generator=forecaster,
             dl_adapter=None,  # No adapter yet
-            config=config  # Pass config to environment
+            config=config,  # Pass config to environment
+            log_dir=logs_dir  # NEW: Save debug logs in logs folder
         )
 
         # NOTE: Forecast confidence threshold will be set after reward calculator initialization
 
-        # Step 2: Create HedgeAdapter with proper environment reference
-        dl_adapter = None
-        if args.dl_overlay:
-            # SIMPLE HEDGE OPTIMIZER - Now integrated directly into dl_overlay.py!
-            print("[DL] Using SIMPLE hedge optimizer (integrated into dl_overlay.py)")
-            dl_adapter = HedgeAdapter(
-                base_env,  # CRITICAL FIX: Pass actual environment, not None
-                buffer_size=getattr(args, 'dl_buffer_size', 256),  # Keep original buffer size
-                label_every=getattr(args, 'dl_label_every', 20),
-                train_every=getattr(args, 'dl_train_every', 100),
-                batch_size=getattr(args, 'dl_batch_size', 64),  # Keep original batch size
-                log_dir=args.save_dir  # Use save directory for DL overlay logs
-            )
-            print("   [OK] Memory: 287MB -> 0.1MB (1934x reduction)")
-            print("   [OK] Parameters: 2.7M -> 3.2K (839x reduction)")
-            print("   [OK] Features: 43 -> 17 (8 historical + 9 forecast)")
-            print("   [OK] Lightweight and efficient implementation with forecast integration")
+        # Step 2: Initialize DLAdapter for overlay inference (28D Forecast-Aware mode)
+        # This provides shared intelligence, adaptive risk budgeting, and predictive reward shaping
+        # Use the single source of truth for initialization
+        initialize_dl_overlay(base_env, config, args)
 
-            if args.enable_forecasts:
-                print("DL hedge optimization enabled with forecasting integration")
-                print("   [STABILITY] Forecast confidence clamped to [0.7, 1.0] for DL stability")
-                print("   [MULTI-HORIZON] Investment frequency determines horizon (short ≤50, medium >50)")
-                print("   [STABILITY] Smoothed fallback generation reduces forecast noise impact")
-            else:
-                print("DL hedge optimization enabled (basic mode without forecasting)")
-
-            # Step 3: Set the adapter reference in the environment
-            base_env.dl_adapter = dl_adapter
-            print("   [OK] DL adapter properly linked to environment")
+        # FGB: Initialize CalibrationTracker for forecast trust computation
+        # TIER 2: Uses trust for observations only (no FGB baseline adjustment)
+        # TIER 3: Uses trust for observations AND FGB baseline adjustment
+        # Initialize when EITHER enable_forecast_utilisation OR forecast_baseline_enable is True
+        if (config.enable_forecast_utilisation or config.forecast_baseline_enable) and forecaster is not None:
+            try:
+                from dl_overlay import CalibrationTracker
+                base_env.calibration_tracker = CalibrationTracker(
+                    window_size=config.forecast_trust_window,
+                    trust_metric=config.forecast_trust_metric,
+                    verbose=args.debug,
+                    init_budget=config.init_budget,  # FGB: Pass fund NAV for exposure scaling
+                    direction_weight=config.forecast_trust_direction_weight  # Weight for directional accuracy (default: 0.7)
+                )
+                if config.forecast_baseline_enable:
+                    logger.info(f"[TIER 3] CalibrationTracker initialized for FGB (window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, dir_weight={config.forecast_trust_direction_weight})")
+                else:
+                    logger.info(f"[TIER 2] CalibrationTracker initialized for trust computation (window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, dir_weight={config.forecast_trust_direction_weight})")
+            except Exception as e:
+                # FAIL-FAST: CalibrationTracker is required for forecast utilisation
+                error_msg = f"[ERROR] CalibrationTracker initialization failed but is required for forecast utilisation: {e}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+        else:
+            base_env.calibration_tracker = None
+            if config.enable_forecast_utilisation or config.forecast_baseline_enable:
+                logger.warning("[WARN] Forecast utilisation enabled but forecaster not available - CalibrationTracker not initialized")
 
         # Environment wrapper selection based on mode
-        if args.ultra_fast_mode:
-            # Ultra fast mode: no CSV logging, console output only
-            if forecaster is not None:
-                # Ultra fast mode with forecasting - use forecasting wrapper but disable CSV logging
-                env = MultiHorizonWrapperEnv(
-                    base_env,
-                    forecaster,
-                    log_path=None,  # No CSV logging
-                    total_timesteps=args.timesteps,
-                    disable_csv_logging=True  # Disable CSV logging
-                )
-                print("[ULTRA FAST] Using ULTRA FAST mode with forecasting (no CSV logging)")
-            else:
-                # Ultra fast mode baseline - use simple progress wrapper
-                from wrapper import UltraFastProgressWrapper
-                env = UltraFastProgressWrapper(base_env, args.timesteps)
-                print("[ULTRA FAST] Using ULTRA FAST mode baseline (no CSV logging)")
-        elif forecaster is None:
-            # Baseline mode WITH CSV logging - use wrapper without forecaster
-            from wrapper import BaselineCSVWrapper
-            # Use baseline-specific log path
-            baseline_log_path = os.path.join(args.save_dir, "baseline_results.csv")
-            env = BaselineCSVWrapper(
-                base_env,
-                log_path=baseline_log_path,
-                total_timesteps=args.timesteps,
-                log_interval=args.log_interval
-            )
-            print(f"[OK] Using baseline environment with CSV logging (every {args.log_interval} timesteps)")
-        else:
-            # AI mode with forecasting and CSV logging
+        if forecaster is not None:
+            # Use forecasting wrapper
             env = MultiHorizonWrapperEnv(
                 base_env,
                 forecaster,
-                log_path=log_path,
-                total_timesteps=args.timesteps,
-                log_interval=args.log_interval
+                total_timesteps=args.timesteps
             )
-            print(f"[OK] Using full AI environment with forecasting (every {args.log_interval} timesteps)")
+            logger.info("[OK] Using multi-horizon wrapper with forecasting")
+            # UPGRADE: Connect wrapper reference for profit-seeking expert guidance
+            # base_env.set_wrapper_reference(env)
+        else:
+            # Use base environment without forecasting (28D mode requires forecasts)
+            env = base_env
+            logger.info("[OK] Using environment without forecasting")
 
-        # DL adapter maintains fixed 13-feature architecture for add-on independence
-        if dl_adapter:
+        # DL overlay adapter (34D: 28D base + 6D deltas)
+        if args.dl_overlay and hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay is not None:
             try:
-                # DL adapter uses fixed 13 features regardless of observation space
-                # This ensures add-on independence (forecasting doesn't affect DL overlay)
-                fixed_feature_dim = 13  # 4 state + 3 positions + 3 forecasts + 3 portfolio
-                print(f"   DL adapter maintains fixed {fixed_feature_dim} features (add-on independent)")
+                # DL overlay is 34D forecast-aware mode only (28D base + 6D deltas)
+                feature_dim = base_env.dl_adapter_overlay.feature_dim
+                if feature_dim != 34:
+                    raise ValueError(f"DL overlay must be 34D (28D base + 6D deltas), got {feature_dim}D")
+                logger.info(f"   DL overlay: 34D Forecast-Aware (28D base + 6D deltas with directional signals)")
             except Exception as e:
-                print(f"   Warning: DL adapter dimension info: {e}")
+                logger.error(f"   Error: DL overlay dimension validation failed: {e}")
+                raise
 
-        # FIXED: Apply command line forecast confidence threshold after reward calculator is initialized
-        if hasattr(base_env, 'reward_calculator') and base_env.reward_calculator is not None:
-            if hasattr(base_env.reward_calculator, 'forecast_confidence_threshold'):
-                base_env.reward_calculator.forecast_confidence_threshold = args.forecast_confidence_threshold
-                print(f"   Forecast confidence threshold set to: {args.forecast_confidence_threshold}")
+        # FIXED: Apply command line forecast confidence threshold to config (single source of truth)
+        # Only set and display forecast confidence if forecasting is actually enabled
+        if forecaster is not None:
+            # Apply confidence floor from command line
+            if hasattr(config, 'confidence_floor'):
+                config.confidence_floor = args.confidence_floor
+                logger.info(f"   Confidence floor set to: {args.confidence_floor}")
 
-        print("Enhanced environment created successfully!")
-        print("   Multi-objective rewards: enabled")
-        print("   Enhanced risk management: enabled")
-        print("   Forecast-augmented observations via wrapper: enabled")
-        print(f"   Metrics CSV: {log_path}")
+        logger.info("Enhanced environment created successfully!")
+        logger.info("   Multi-objective rewards: enabled")
+        if forecaster is not None:
+            logger.info(f"   Enhanced risk management: enabled. Confidence floor: {args.confidence_floor}")
+            logger.info("   Forecast-augmented observations via wrapper: enabled")
+        else:
+            logger.info("   Enhanced risk management: enabled (no forecasts)")
+            logger.info("   Forecast-augmented observations: disabled")
+        logger.info("   Checkpoint summaries: enabled (saved after each checkpoint)")
+
+        # FORECAST OPTIMIZATION: Add diagnostic logging after environment creation
+        if args.enable_forecast_utilisation and forecaster is not None:
+            logger.info("\n" + "="*70)
+            logger.info("FORECAST INTEGRATION DIAGNOSTICS")
+            logger.info("="*70)
+            logger.info(f"Max position size:              {config.max_position_size * 100:.1f}% of capital")
+            logger.info(f"Capital allocation:             {config.capital_allocation_fraction * 100:.1f}% of fund")
+            logger.info(f"Effective max position:         ${config.init_budget * config.capital_allocation_fraction * config.max_position_size * config.dkk_to_usd_rate / 1e6:.1f}M USD")
+            logger.info(f"Confidence floor:               {config.confidence_floor * 100:.0f}%")
+            logger.info(f"Forecast reward weight:         {base_env.reward_calculator.reward_weights.get('forecast', 0.0) * 100:.0f}% of total reward" if hasattr(base_env, 'reward_calculator') and base_env.reward_calculator else "Not initialized yet")
+            logger.info("="*70)
+
+        # VALIDATION SUMMARY: Display what forecast features are active
+        logger.info("\n" + "="*70)
+        logger.info("FORECAST FEATURE VALIDATION SUMMARY")
+        logger.info("="*70)
+        logger.info(f"Forecaster loaded:              {'YES' if forecaster is not None else 'NO'}")
+        logger.info(f"DL Overlay enabled:             {'YES (34D: 28D base + 6D deltas)' if args.dl_overlay else 'NO'}")
+        logger.info(f"Forecast utilisation:           {'YES (Tier 2/3)' if args.enable_forecast_utilisation else 'NO (Tier 1)'}")
+        logger.info(f"FGB mode:                       {args.fgb_mode if args.fgb_mode != 'none' else 'DISABLED'}")
+        if args.fgb_mode == 'meta':
+            logger.info(f"  └─ FAMC meta-critic:          {'YES' if args.meta_baseline_enable else 'NO'}")
+            logger.info(f"  └─ Meta head dim:             {config.meta_baseline_head_dim}")
+            logger.info(f"  └─ Meta train every:          {config.meta_train_every} steps")
+        elif args.fgb_mode in ['online', 'fixed']:
+            logger.info(f"  └─ Traditional FGB:           {'YES' if args.forecast_baseline_enable else 'NO'}")
+            logger.info(f"  └─ CalibrationTracker:        {'YES' if hasattr(base_env, 'calibration_tracker') and base_env.calibration_tracker is not None else 'NO'}")
+        logger.info(f"Risk uplift:                    {'YES' if config.risk_uplift_enable else 'NO'}")
+
+        # CRITICAL VALIDATION: Ensure consistency
+        validation_errors = []
+        if args.dl_overlay and forecaster is None:
+            validation_errors.append("DL overlay enabled but forecaster not loaded!")
+        if args.forecast_baseline_enable and forecaster is None:
+            validation_errors.append("Forecast-guided baseline enabled but forecaster not loaded!")
+        if (args.enable_forecast_utilisation or args.forecast_baseline_enable) and (not hasattr(base_env, 'calibration_tracker') or base_env.calibration_tracker is None):
+            validation_errors.append("Forecast utilisation enabled but CalibrationTracker not initialized!")
+        # FIXED: Only validate DLAdapter if overlay_enabled is True (not just dl_overlay flag)
+        # Tier 2 sets dl_overlay=True (for auto-config) but overlay_enabled=False (to prevent inference)
+        if args.dl_overlay and config.overlay_enabled and (not hasattr(base_env, 'dl_adapter_overlay') or base_env.dl_adapter_overlay is None):
+            validation_errors.append("DL overlay enabled but DLAdapter not initialized!")
+
+        if validation_errors:
+            logger.error("\n" + "!"*70)
+            logger.error("CRITICAL VALIDATION ERRORS:")
+            for error in validation_errors:
+                logger.error(f"  ❌ {error}")
+            logger.error("!"*70)
+            raise RuntimeError("Forecast feature validation failed. See errors above.")
+        else:
+            logger.info("\n✓ All forecast features validated successfully")
+        logger.info("="*70 + "\n")
     except Exception as e:
-        print(f"Failed to setup environment: {e}")
+        logger.error(f"Failed to setup environment: {e}")
         import traceback
         traceback.print_exc()
         return
@@ -2747,21 +2575,21 @@ def main():
     if args.validate_env:
         try:
             _obs, _ = env.reset()
-            print("Env reset OK for validation.")
+            logger.info("Env reset OK for validation.")
         except Exception as e:
-            print(f"Env validation reset failed (continuing): {e}")
+            logger.warning(f"Env validation reset failed (continuing): {e}")
 
     # Patched: DL integration now happens inside the environment itself.
     if args.dl_overlay:
-        print("DL allocation overlay active (online self-labeling enabled)")
+        logger.info("DL allocation overlay active (online self-labeling enabled)")
 
     # 4) (Optional) HPO (best_params already initialized above)
     if args.optimize and not best_params:
-        print("\nRunning hyperparameter optimization...")
+        logger.info("\nRunning hyperparameter optimization...")
         opt_data = data.head(min(5000, len(data)))
         opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster, dl_adapter=None, config=config)
         opt_env = opt_base_env if forecaster is None \
-                  else MultiHorizonWrapperEnv(opt_base_env, forecaster, log_path=None)
+                  else MultiHorizonWrapperEnv(opt_base_env, forecaster)
 
         best_params, best_perf = run_hyperparameter_optimization(
             opt_env,
@@ -2781,8 +2609,64 @@ def main():
         del opt_env, opt_base_env
 
     # 5) Agents (config already created above)
-    print("\nInitializing enhanced multi-agent RL system...")
+    logger.info("\nInitializing enhanced multi-agent RL system...")
     try:
+        # CRITICAL FIX: Reset environment BEFORE initializing agent
+        # This ensures the wrapper has updated observation spaces to match actual observations
+        # (especially important for 28D mode where forecast dimensions are added at runtime)
+        logger.info("   [PREP] Resetting environment to finalize observation spaces...")
+        try:
+            obs = env.reset()
+            
+            # FORECAST OPTIMIZATION: Verify forecasts are working after first reset
+            if args.enable_forecast_utilisation and forecaster is not None:
+                logger.info("\n" + "="*70)
+                logger.info("FORECAST VERIFICATION (After First Reset)")
+                logger.info("="*70)
+                
+                # Check if forecast attributes exist
+                has_z_short = hasattr(base_env, 'z_short_price')
+                has_z_medium = hasattr(base_env, 'z_medium_price')
+                has_trust = hasattr(base_env, '_forecast_trust')
+                
+                logger.info(f"Forecast attributes present:    {has_z_short and has_z_medium and has_trust}")
+                
+                if has_z_short and has_z_medium:
+                    z_short = float(getattr(base_env, 'z_short_price', 0.0))
+                    z_medium = float(getattr(base_env, 'z_medium_price', 0.0))
+                    trust = float(getattr(base_env, '_forecast_trust', 0.0))
+                    
+                    logger.info(f"  z_short_price:                {z_short:.4f}")
+                    logger.info(f"  z_medium_price:               {z_medium:.4f}")
+                    logger.info(f"  forecast_trust:               {trust:.4f}")
+                    
+                    # Check if values are non-zero (good sign)
+                    if abs(z_short) > 1e-6 or abs(z_medium) > 1e-6:
+                        logger.info("  Status:                       ✅ FORECASTS ARE WORKING!")
+                    else:
+                        logger.warning("  Status:                       ⚠️  WARNING: Forecast z-scores are ZERO!")
+                        logger.warning("  Action:                       Check if forecast models loaded correctly")
+                else:
+                    logger.error("  Status:                       ❌ ERROR: Forecast attributes missing!")
+                    logger.error("  Action:                       Check forecast generator initialization")
+                
+                # Check investor observations
+                if 'investor_0' in obs:
+                    inv_obs = obs['investor_0']
+                    logger.info(f"\nInvestor observation shape:     {inv_obs.shape}")
+                    logger.info(f"Expected shape:                 (9,) for Tier 2")
+                    if len(inv_obs) >= 9:
+                        logger.info(f"  Forecast features [6:9]:      [{inv_obs[6]:.4f}, {inv_obs[7]:.4f}, {inv_obs[8]:.4f}]")
+                        if abs(inv_obs[6]) > 1e-6 or abs(inv_obs[7]) > 1e-6:
+                            logger.info("  Status:                       ✅ Forecasts in observations!")
+                        else:
+                            logger.warning("  Status:                       ⚠️  Forecast features are ZERO in observations!")
+                
+                logger.info("="*70 + "\n")
+                
+        except Exception as e:
+            logger.warning(f"   [WARN] Environment reset during prep failed: {e}")
+
         agent = MultiESGAgent(
             config,
             env=env,
@@ -2790,15 +2674,15 @@ def main():
             training=True,
             debug=args.debug
         )
-        print("Enhanced multi-agent system initialized")
-        print(f"   Device: {args.device}")
-        print(f"   Agents: {env.possible_agents}")
-        print(f"   Learning rate: {config.lr:.2e}")
-        print(f"   Update frequency: {config.update_every}")
-        print("   Multi-objective rewards: enabled")
-        print("   Adaptive hyperparameters: enabled")
+        logger.info("Enhanced multi-agent system initialized")
+        logger.info(f"   Device: {args.device}")
+        logger.info(f"   Agents: {env.possible_agents}")
+        logger.info(f"   Learning rate: {config.lr:.2e}")
+        logger.info(f"   Update frequency: {config.update_every}")
+        logger.info("   Multi-objective rewards: enabled")
+        logger.info("   Adaptive hyperparameters: enabled")
     except Exception as e:
-        print(f"Failed to initialize agents: {e}")
+        logger.error(f"Failed to initialize agents: {e}")
         try:
             if hasattr(env, "close"):
                 env.close()
@@ -2814,11 +2698,11 @@ def main():
     # 9) Training - Episode or Continuous
     try:
         if args.episode_training:
-            print("\n🎯 Starting Episode-Based Training (6-month periods)...")
-            print(f"   Episode data directory: {args.episode_data_dir}")
-            print(f"   Episodes: {args.start_episode} → {args.end_episode}")
-            print(f"   Cooling period: {args.cooling_period} minutes")
-            print("   Thermal management: enabled")
+            logger.info("\n[TRAINING] Starting Episode-Based Training (6-month periods)...")
+            logger.info(f"   Episode data directory: {args.episode_data_dir}")
+            logger.info(f"   Episodes: {args.start_episode} -> {args.end_episode}")
+            logger.info(f"   Cooling period: {args.cooling_period} minutes")
+            logger.info("   Thermal management: enabled")
 
             total_trained = run_episode_training(
                 agent=agent,
@@ -2831,11 +2715,11 @@ def main():
                 forecaster=forecaster
             )
         else:
-            print("\nStarting Enhanced Multi-Objective Training...")
-            print(f"   Training timesteps: {args.timesteps:,}")
-            print(f"   Checkpoint frequency: {args.checkpoint_freq:,}")
-            print(f"   Adaptive rewards: {'enabled' if args.adapt_rewards else 'disabled'}")
-            print("   Performance monitoring: enabled")
+            logger.info("\nStarting Enhanced Multi-Objective Training...")
+            logger.info(f"   Training timesteps: {args.timesteps:,}")
+            logger.info(f"   Checkpoint frequency: {args.checkpoint_freq:,}")
+            logger.info(f"   Adaptive rewards: {'enabled' if args.adapt_rewards else 'disabled'}")
+            logger.info("   Performance monitoring: enabled")
 
             callbacks = None
             if args.adapt_rewards:
@@ -2843,23 +2727,31 @@ def main():
                 # replicate so multi-agent wrapper/agent sees a list of callbacks (one per policy)
                 callbacks = [reward_cb] * len(env.possible_agents)
 
+            # FIX: If checkpoint_freq is -1 (default), use old default of 52000 for regular training
+            checkpoint_freq = args.checkpoint_freq
+            if checkpoint_freq == -1:
+                checkpoint_freq = 52000
+                logger.info(f"[CHECKPOINT] Using default checkpoint frequency: {checkpoint_freq:,} steps")
+
             total_trained = enhanced_training_loop(
                 agent=agent,
                 env=env,
                 timesteps=args.timesteps,
-                checkpoint_freq=args.checkpoint_freq,
+                checkpoint_freq=checkpoint_freq,
                 monitoring_dirs=monitoring_dirs,
                 callbacks=callbacks,
-                resume_from=args.resume_from
+                resume_from=args.resume_from,
+                dl_train_every=args.dl_train_every  # Pass overlay training frequency
             )
 
-        print("Enhanced training completed!")
+        logger.info("Enhanced training completed!")
 
 
 
     except Exception as e:
-        print(f"Training failed: {e}")
-        raise
+        logger.error(f"Training failed: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Close envs if they expose close()
         try:
@@ -2867,15 +2759,32 @@ def main():
                 env.close()
         except Exception:
             pass
+        # Always close log file, even on error
+        try:
+            logger.info(f"\n[LOG] Closing log file: {log_file_path}")
+            # Close both tee outputs
+            if hasattr(tee_output, 'close'):
+                tee_output.close()
+            if hasattr(tee_output, '_stderr_instance') and hasattr(tee_output._stderr_instance, 'close'):
+                tee_output._stderr_instance.close()
+            # Restore original stdout/stderr
+            if hasattr(tee_output, 'stdout'):
+                sys.stdout = tee_output.stdout
+            if hasattr(tee_output, '_stderr_instance') and hasattr(tee_output._stderr_instance, 'stderr'):
+                sys.stderr = tee_output._stderr_instance.stderr
+            elif hasattr(tee_output, 'stderr'):
+                sys.stderr = tee_output.stderr
+        except Exception:
+            pass
 
     # 9) Save final models
-    print("\nSaving final trained models...")
+    logger.info("\nSaving final trained models...")
     final_dir = os.path.join(args.save_dir, "final_models")
     os.makedirs(final_dir, exist_ok=True)
     saved_count = agent.save_policies(final_dir)
 
     if saved_count > 0:
-        print(f"Saved {saved_count} trained agents to: {final_dir}")
+        logger.info(f"Saved {saved_count} trained agents to: {final_dir}")
         cfg_file = os.path.join(final_dir, "training_config.json")
         with open(cfg_file, 'w') as f:
             json.dump({
@@ -2886,7 +2795,7 @@ def main():
                 'device': args.device,
                 'optimized_params': best_params,
                 'enhanced_features': {
-                    'forecasting_enabled': args.enable_forecasts,
+                    'forecasting_enabled': True,  # Always enabled for 28D DL overlay mode
                     'dl_overlay_enabled': args.dl_overlay,
                     'has_dl_weights': args.dl_overlay and getattr(base_env, "dl_adapter", None) is not None
                 },
@@ -2900,31 +2809,35 @@ def main():
                     'update_every': config.update_every
                 }
             }, f, indent=2)
-        print(f"Training configuration saved to: {cfg_file}")
+        logger.info(f"Training configuration saved to: {cfg_file}")
 
-    # 10) Save the online-trained hedge optimizer (if possible)
-    if args.dl_overlay and getattr(base_env, "dl_adapter", None):
+    # 10) Save the online-trained DL overlay model (if possible)
+    if args.dl_overlay and getattr(base_env, "dl_adapter_overlay", None):
         try:
-            # Save to training directory
-            out_weights = os.path.join(args.save_dir, "hedge_optimizer_online.h5")
-            if hasattr(base_env.dl_adapter.model, "save_weights"):
-                base_env.dl_adapter.model.save_weights(out_weights)
-                print(f"Saved online-trained hedge optimizer to: {out_weights}")
-            elif hasattr(base_env.dl_adapter.model, "model") and hasattr(base_env.dl_adapter.model.model, "save_weights"):
-                base_env.dl_adapter.model.model.save_weights(out_weights)
-                print(f"Saved online-trained hedge optimizer to: {out_weights}")
+            # ROBUST: Save with dimension-specific filename to avoid conflicts
+            overlay_adapter = base_env.dl_adapter_overlay
+            feature_dim = overlay_adapter.feature_dim
 
-            # CRITICAL: Also save to final_models directory for evaluation
-            final_weights = os.path.join(final_dir, "hedge_optimizer_online.h5")
-            if hasattr(base_env.dl_adapter.model, "save_weights"):
-                base_env.dl_adapter.model.save_weights(final_weights)
-                print(f"💾 DL overlay weights saved to final models: {final_weights}")
-            elif hasattr(base_env.dl_adapter.model, "model") and hasattr(base_env.dl_adapter.model.model, "save_weights"):
-                base_env.dl_adapter.model.model.save_weights(final_weights)
-                print(f"💾 DL overlay weights saved to final models: {final_weights}")
+            # Save to training directory (dimension-specific)
+            out_weights = os.path.join(args.save_dir, f"dl_overlay_online_{feature_dim}d.h5")
+            if hasattr(overlay_adapter.model, "save_weights"):
+                overlay_adapter.model.save_weights(out_weights)
+                logger.info(f"Saved online-trained DL overlay ({feature_dim}D) to: {out_weights}")
+            elif hasattr(overlay_adapter.model, "model") and hasattr(overlay_adapter.model.model, "save_weights"):
+                overlay_adapter.model.model.save_weights(out_weights)
+                logger.info(f"Saved online-trained DL overlay ({feature_dim}D) to: {out_weights}")
+
+            # CRITICAL: Also save to final_models directory for evaluation (dimension-specific)
+            final_weights = os.path.join(final_dir, f"dl_overlay_online_{feature_dim}d.h5")
+            if hasattr(overlay_adapter.model, "save_weights"):
+                overlay_adapter.model.save_weights(final_weights)
+                logger.info(f"[SAVE] DL overlay weights ({feature_dim}D) saved to final models: {final_weights}")
+            elif hasattr(overlay_adapter.model, "model") and hasattr(overlay_adapter.model.model, "save_weights"):
+                overlay_adapter.model.model.save_weights(final_weights)
+                logger.info(f"[SAVE] DL overlay weights ({feature_dim}D) saved to final models: {final_weights}")
 
         except Exception as e:
-            print(f"Could not save hedge optimizer weights: {e}")
+            logger.warning(f"Could not save hedge optimizer weights: {e}")
 
     # 11) Force a final log flush (avoid losing buffered rows)
     try:
@@ -2939,66 +2852,66 @@ def main():
 
 def smoke_test():
     """Unit smoke test to ensure no duplicate names and no syntax errors."""
-    print("Running smoke test...")
+    logger.info("Running smoke test...")
 
     # Test imports to catch syntax errors and duplicate names
     try:
         import environment
-        print("✓ environment.py imported successfully")
+        logger.info("✓ environment.py imported successfully")
     except Exception as e:
-        print(f"✗ environment.py import failed: {e}")
+        logger.error(f"✗ environment.py import failed: {e}")
         return False
 
     try:
         import wrapper
-        print("✓ wrapper.py imported successfully")
+        logger.info("✓ wrapper.py imported successfully")
     except Exception as e:
-        print(f"✗ wrapper.py import failed: {e}")
+        logger.error(f"✗ wrapper.py import failed: {e}")
         return False
 
     try:
         import config
-        print("✓ config.py imported successfully")
+        logger.info("✓ config.py imported successfully")
     except Exception as e:
-        print(f"✗ config.py import failed: {e}")
+        logger.error(f"✗ config.py import failed: {e}")
         return False
 
     try:
         import risk
-        print("✓ risk.py imported successfully")
+        logger.info("✓ risk.py imported successfully")
     except Exception as e:
-        print(f"✗ risk.py import failed: {e}")
+        logger.error(f"✗ risk.py import failed: {e}")
         return False
 
     try:
         import generator
-        print("✓ generator.py imported successfully")
+        logger.info("✓ generator.py imported successfully")
     except Exception as e:
-        print(f"✗ generator.py import failed: {e}")
+        logger.error(f"✗ generator.py import failed: {e}")
         return False
 
     try:
         import dl_overlay
-        print("✓ dl_overlay.py imported successfully")
+        logger.info("✓ dl_overlay.py imported successfully")
     except Exception as e:
-        print(f"✗ dl_overlay.py import failed: {e}")
+        logger.error(f"✗ dl_overlay.py import failed: {e}")
         return False
 
     try:
         import evaluation
-        print("✓ evaluation.py imported successfully")
+        logger.info("✓ evaluation.py imported successfully")
     except Exception as e:
-        print(f"✗ evaluation.py import failed: {e}")
+        logger.error(f"✗ evaluation.py import failed: {e}")
         return False
 
     try:
         import metacontroller
-        print("✓ metacontroller.py imported successfully")
+        logger.info("✓ metacontroller.py imported successfully")
     except Exception as e:
-        print(f"✗ metacontroller.py import failed: {e}")
+        logger.error(f"✗ metacontroller.py import failed: {e}")
         return False
 
-    print("✓ All modules imported successfully - no duplicate names or syntax errors detected")
+    logger.info("✓ All modules imported successfully - no duplicate names or syntax errors detected")
     return True
 
 

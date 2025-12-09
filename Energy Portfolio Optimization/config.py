@@ -1,10 +1,110 @@
 from typing import Optional, Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# UNIFIED CONSTANTS (SINGLE SOURCE OF TRUTH)
+# ============================================================================
+# These constants ensure consistent configuration across all modes and code paths
+
+# Overlay feature dimension (CANONICAL)
+OVERLAY_FEATURE_DIM = 34    # 28D base features + 6D deltas (price, direction, mwdir)
+
+# Price normalization constants
+PRICE_MEAN = 250.0          # Historical mean price (DKK/MWh)
+PRICE_STD = 50.0            # Historical std dev (DKK/MWh)
+PRICE_CLIP_SIGMA = 3.0      # Clip at ±3 sigma for outlier handling
+
+# Risk controller constants
+RISK_LOOKBACK_WINDOW_DEFAULT = 144  # Default lookback window for risk calculations
+RISK_LOOKBACK_WINDOW_MAX = 200      # Maximum lookback window (memory cap)
+
+# Adaptive scaling constants
+ADAPTIVE_SCALE_SATURATION_THRESHOLD = 0.95  # Threshold for adaptive scaling saturation prevention
+ADAPTIVE_SCALE_MIN_OFFSET = 0.01            # Small offset from min/max boundaries
+ADAPTIVE_SCALE_COMPRESSION_FACTOR = 5.0     # Compression factor for values near boundaries
+
+# Regulatory risk constants
+REGULATORY_RISK_BASE_STRESS_WEIGHT = 0.4    # Weight for market stress in regulatory risk
+REGULATORY_RISK_FALLBACK = 0.20             # Fallback regulatory risk when no history
+REGULATORY_RISK_SEASON_BASE = 0.05          # Base seasonal component
+REGULATORY_RISK_SEASON_AMPLITUDE = 0.05     # Amplitude of seasonal variation
+REGULATORY_RISK_FALLBACK_ERROR = 0.35       # Fallback value on calculation error
+
+# Risk fallback values (on calculation errors)
+RISK_FALLBACK_MARKET = 0.30
+RISK_FALLBACK_OPERATIONAL = 0.20
+RISK_FALLBACK_PORTFOLIO = 0.25
+RISK_FALLBACK_LIQUIDITY = 0.15
+RISK_FALLBACK_REGULATORY = 0.35
+RISK_FALLBACK_OVERALL = 0.25
+
+# Risk action defaults
+RISK_ACTION_MULTIPLIER_DEFAULT = 1.0
+RISK_ACTION_MAX_INVESTMENT_DEFAULT = 0.30
+RISK_ACTION_CASH_RESERVE_DEFAULT = 0.10
+RISK_ACTION_HEDGE_DEFAULT = 0.50
+RISK_ACTION_REBALANCE_DEFAULT = 0.30
+RISK_ACTION_TOLERANCE_DEFAULT = 0.70
+
+# DL Overlay constants
+DL_OVERLAY_WINDOW_SIZE_DEFAULT = 2016       # ~2 weeks @ 10-min steps
+DL_OVERLAY_INIT_BUDGET_DEFAULT = 1e8        # 100M DKK default budget
+DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT = 0.8   # 80% direction, 20% magnitude
+
+# DL Overlay loss weights (28D mode) - normalized to sum to 1.0
+DL_OVERLAY_LOSS_WEIGHTS = {
+    'bridge_vec': 0.083,       # ~8.3%: Bridge vector guidance
+    'risk_budget': 0.167,      # ~16.7%: Risk budget allocation
+    'pred_reward': 0.167,      # ~16.7%: Predicted reward
+    'strat_immediate': 0.208,  # ~20.8%: HIGHEST - Full forecast, most actionable
+    'strat_short': 0.167,      # ~16.7%: HIGH - 95% confidence tactical adjustments
+    'strat_medium': 0.125,     # ~12.5%: MEDIUM - 90% confidence strategic shifts
+    'strat_long': 0.083,       # ~8.3%: LOW - Risk-only long-term positioning
+}  # Total: 1.000
+
+# Wrapper cache defaults (fallback when no config)
+WRAPPER_FORECAST_CACHE_SIZE_DEFAULT = 1000
+WRAPPER_AGENT_CACHE_SIZE_DEFAULT = 2000
+WRAPPER_MEMORY_LIMIT_MB_DEFAULT = 1024.0
+
+# Environment constants
+ENV_MARKET_STRESS_DEFAULT = 0.5
+ENV_OVERALL_RISK_DEFAULT = 0.5
+ENV_MARKET_RISK_DEFAULT = 0.5
+ENV_POSITION_EXPOSURE_THRESHOLD = 0.001     # Threshold for exploration bonus
+ENV_EXPLORATION_BONUS_MULTIPLIER = 0.5      # Multiplier for exploration bonus
+
+def normalize_price(price_raw: float) -> float:
+    """
+    UNIFIED PRICE NORMALIZATION (SINGLE SOURCE OF TRUTH)
+
+    Converts raw price to [-1, 1] range using z-score normalization with clipping.
+    This function is used everywhere in the codebase to ensure consistency.
+
+    Uses z-score normalization with clipping:
+    - Converts raw price to standard deviations from mean
+    - Clips extreme values to prevent outliers
+    - Divides by PRICE_CLIP_SIGMA to get [-1,1] range
+
+    Args:
+        price_raw: Raw price in DKK/MWh
+
+    Returns:
+        Normalized price in [-1.0, 1.0] range
+    """
+    import numpy as np
+    z_score = (price_raw - PRICE_MEAN) / PRICE_STD
+    z_clipped = np.clip(z_score, -PRICE_CLIP_SIGMA, PRICE_CLIP_SIGMA)
+    return float(z_clipped / PRICE_CLIP_SIGMA)
+
 
 class EnhancedConfig:
     """Enhanced configuration class with optimization support and centralized hardcoded values"""
 
     # Configuration version for validation
-    CONFIG_VERSION = "2.1.0"
+    CONFIG_VERSION = "2.2.0"  # Updated for unified normalization
 
     def __init__(self, optimized_params: Optional[Dict[str, Any]] = None):
         # =============================================================================
@@ -48,13 +148,15 @@ class EnhancedConfig:
         self.battery_capex_per_mwh = 400000.0  # $400k/MWh (market rate)
 
         # Operating costs and fees - FIXED: Convert USD to DKK
-        self.operating_cost_rate = 0.03  # 3% of revenue
+        self.operating_cost_rate = 0.025  # 3% of revenue
         self.maintenance_cost_mwh = 3.5 / self.dkk_to_usd_rate  # $3.5/MWh → ~24.1 DKK/MWh
         self.insurance_rate = 0.004  # 0.4% of asset value annually
-        self.management_fee_rate = 0.015  # 1.5% of fund value annually (realistic for infrastructure)
+        self.management_fee_rate = 0.01  # 1.5% of fund value annually (realistic for infrastructure)
         self.property_tax_rate = 0.005  # 0.5% of asset value annually
         self.debt_service_rate = 0.015  # 1.5% of asset value annually (realistic debt service)
-        self.distribution_rate = 0.30  # 30% of positive cash distributed
+        self.distribution_rate = 0.10  # 10% of excess cash distributed
+        self.target_cash_ratio = 0.15  # FIXED: Increased to 15% to give agents more working capital
+        self.min_distribution_threshold_ratio = 0.01  # FIXED: Increased to 1% to reduce distribution frequency
         self.administration_fee_rate = 0.0001  # 0.01% of fund value annually (basic admin)
 
         # Grid and transmission fees - FIXED: Convert USD to DKK
@@ -72,6 +174,11 @@ class EnhancedConfig:
         # Trading costs - FIXED: Convert USD to DKK
         self.transaction_fixed_cost = 25.0 / self.dkk_to_usd_rate  # $25/trade → ~172 DKK/trade
         self.transaction_cost_bps = 0.5  # 0.5 basis points (institutional rates)
+
+        # Battery dispatch economic thresholds
+        self.battery_hurdle_min_dkk = 5.0  # Minimum hurdle rate in DKK/MWh
+        self.battery_price_sensitivity = 0.02  # Price-based hurdle factor
+        self.battery_rt_loss_weight = 0.3  # Weight of round-trip loss in hurdle calculation
 
         # Battery operational parameters - FIXED: Convert USD to DKK
         self.battery_opex_rate = 0.0002  # Battery operational cost rate per MWh capacity
@@ -102,8 +209,11 @@ class EnhancedConfig:
         self.mtm_update_threshold = 1e-9  # Threshold for applying MTM updates to positions
 
         # NAV bounds for renewable energy fund - INFRASTRUCTURE REALISTIC
-        self.nav_min_ratio = 0.90  # INFRASTRUCTURE: Minimum 90% of initial (conservative downside protection)
-        self.nav_max_ratio = 1.05  # INFRASTRUCTURE: Maximum 105% of initial (5% return cap - very realistic for infrastructure)
+        # NOTE: These are currently UNUSED by design (THESIS MODE)
+        # The environment intentionally uses unconstrained NAV to allow realistic fund dynamics
+        # Only prevents negative NAV; no artificial min/max bounds applied
+        self.nav_min_ratio = 0.90  # INFRASTRUCTURE: Minimum 90% of initial (conservative downside protection) [UNUSED]
+        self.nav_max_ratio = 1.10  # INFRASTRUCTURE: Maximum 110% of initial (5% return cap - very realistic for infrastructure) [UNUSED]
 
 
 
@@ -111,19 +221,20 @@ class EnhancedConfig:
         # ENVIRONMENT AND SIMULATION PARAMETERS
         # =============================================================================
 
-        # Meta controller ranges (BASELINE4 PROVEN CONFIG - KEY FIX!)
+        # Meta controller ranges (28D Forecast-Aware Mode)
         self.meta_freq_min = 6  # Every hour if 10-min data
-        self.meta_freq_max = 144  # 24 hours max (was 288 - more responsive)
-        self.meta_cap_min = 0.05  # 5% minimum (Baseline4 - was 0.10)
+        self.meta_freq_max = 144  # 24 hours max (more responsive)
+        self.meta_cap_min = 0.05  # 5% minimum capital allocation
         self.meta_cap_max = 0.75  # 75% maximum capital allocation
         self.sat_eps = 1e-3
 
-        # Investment and operational parameters - CAPITAL PRESERVATION
-        self.investment_freq = 24   # CAPITAL PRESERVATION: Every 4 hours for careful positioning
-        self.min_investment_freq = 12   # CAPITAL PRESERVATION: 2 hour minimum
-        self.max_investment_freq = 288  # CAPITAL PRESERVATION: 48 hours maximum (very patient)
-        self.capital_allocation_fraction = 0.15  # CAPITAL PRESERVATION: Only 15% capital allocation
+        # Investment and operational parameters - FORECAST OPTIMIZATION
+        self.investment_freq = 6   # CAPITAL PRESERVATION: Every 4 hours for careful positioning
+        self.min_investment_freq = 4   # CAPITAL PRESERVATION: 2 hour minimum
+        self.max_investment_freq = 12  # CAPITAL PRESERVATION: 48 hours maximum (very patient)
+        self.capital_allocation_fraction = 0.35  # FORECAST OPTIMIZATION: Increased to 35% (from 25%) for stronger forecast impact
         self.risk_multiplier = 0.5  # CAPITAL PRESERVATION: Minimal risk multiplier
+        self.no_trade_threshold = 0.02  # 2% of target position - trades below this are ignored
 
         # Battery operational parameters
         self.batt_soc_min = 0.1  # 10% minimum state of charge
@@ -155,7 +266,7 @@ class EnhancedConfig:
         # OPERATIONAL EXCELLENCE: Capital preservation risk management
         self.max_drawdown_threshold = 0.10  # CAPITAL PRESERVATION: 10% maximum drawdown
         self.volatility_lookback = 60  # CAPITAL PRESERVATION: 60 days for very stable calculations
-        self.max_position_size = 0.01  # INFRASTRUCTURE: 1% maximum single position size (minimal trading)
+        self.max_position_size = 0.05  # FORECAST OPTIMIZATION: 5% maximum single position size (increased from 1% for forecast impact)
         self.volatility_scaling = 0.8   # CAPITAL PRESERVATION: High scaling for minimal risk
         self.target_sharpe_ratio = 2.0  # CAPITAL PRESERVATION: High target for excellent risk-adjusted returns
         self.risk_free_rate = 0.02      # 2% risk-free rate (Danish government bonds)
@@ -193,12 +304,27 @@ class EnhancedConfig:
             'liquidity_stress_high': 0.75,   # OPTIMIZED: Reduced from 0.80 for better liquidity management
         }
 
+        # Risk calculation component weights - PHASE 5.10 FIX: Parameterized risk model
+        self.market_risk_volatility_weight = 0.6
+        self.market_risk_momentum_weight = 0.4
+        self.market_risk_momentum_factor = 0.5
+        self.operational_risk_volatility_weight = 0.7
+        self.operational_risk_intermittency_weight = 0.3
+        self.portfolio_risk_concentration_weight = 0.6
+        self.portfolio_risk_capital_weight = 0.4
+        self.liquidity_risk_buffer_weight = 0.6
+        self.liquidity_risk_cashflow_weight = 0.4
+
         # REMOVED: Duplicate risk_budget_allocation (consolidated above)
 
         # NEW: Infrastructure fund performance targets
         self.annual_return_target = 0.06   # INFRASTRUCTURE: 6% annual return target (conservative infrastructure)
         self.max_annual_volatility = 0.08  # INFRASTRUCTURE: 8% maximum annual volatility (very stable)
         self.min_sharpe_ratio = 1.5        # INFRASTRUCTURE: High risk-adjusted returns for conservative funds
+
+        # Physical asset depreciation parameters
+        self.annual_depreciation_rate = 0.02  # 2% annual straight-line depreciation
+        self.max_depreciation_ratio = 0.75  # Maximum 75% depreciation over asset life
 
         # =============================================================================
         # FORECASTING AND PRICING PARAMETERS
@@ -209,11 +335,13 @@ class EnhancedConfig:
         self.price_clip_min = -1000.0  # Minimum price for clipping
         self.price_clip_max = 1e9  # Maximum price for clipping
 
-        # STANDARDIZATION: Price normalization constants (now using Normal version's proven approach)
-        # NOTE: These are kept for compatibility but actual normalization now uses hardcoded values
-        # matching Normal version: z_score / 10.0, clipped to [-10, 10] for proven performance
-        self.price_normalization_divisor = 10.0  # Updated to match Normal version's proven scaling
-        self.price_z_score_clip = 3.0  # Clip z-scores to ±3σ before normalization
+        # PRICE NORMALIZATION: Unified rule across all code paths
+        # Actual implementation: price_n = clip(z_score, -3, 3) / 3 → [-1, 1]
+        # This ensures consistent feature scaling across environment, wrapper, and DL overlay
+        # NOTE: price_normalization_divisor and price_z_score_clip below are LEGACY and UNUSED
+        # The actual pipeline uses: z_score clipped to ±3σ, then divided by 3 to get [-1,1]
+        self.price_normalization_divisor = 10.0  # LEGACY: Kept for compatibility only [UNUSED]
+        self.price_z_score_clip = 3.0  # ACTUAL: Clip z-scores to ±3σ before dividing by 3
 
         # FALLBACK STATS: For consistent two-step normalization when rolling stats unavailable
         self.price_fallback_mean = 250.0  # Typical DKK/MWh price for fallback z-score calculation
@@ -228,6 +356,21 @@ class EnhancedConfig:
             "long": 144,         # 24 hours - 144 steps ahead
             "strategic": 1008    # 7 days - 1008 steps ahead
         }
+
+        # Forecast integration constants (Tier D add-ons)
+        self.forecast_price_capacity = 6982.0
+        self.forecast_direction_conflict_exposure = 0.12
+        self.forecast_low_exposure_threshold = 0.05
+        self.forecast_follow_target_exposure = 0.12
+        self.forecast_follow_bonus_scale = 0.015
+        # FIX: Increased penalty scales to strongly discourage misalignment
+        # This helps agent learn to align position direction with forecast direction
+        self.forecast_direction_penalty_scale = 1.0  # Increased from 0.35 to strongly penalize direction conflicts
+        self.forecast_entry_penalty_scale = 0.12  # Keep moderate for entry gaps
+        self.forecast_neutral_penalty_scale = 1.2  # Keep for neutral positions
+        self.forecast_usage_bonus_scale = 0.02
+        self.forecast_usage_bonus_mtm_scale = 15000.0
+        self.forecast_usage_exposure_threshold = 0.02
 
         # CANONICAL FORECAST TARGETS: Single source of truth for all forecast models
         self.forecast_targets = ["wind", "solar", "hydro", "price", "load"]
@@ -275,9 +418,8 @@ class EnhancedConfig:
         # REWARD AND FORECAST PARAMETERS
         # =============================================================================
 
-        # Forecast confidence thresholds
-        self.forecast_confidence_threshold = 0.30  # AGGRESSIVE: 30% threshold for maximum trading
-        self.forecast_confidence_threshold_zero = 0.0  # Zero forecast confidence (no forecast reward)
+        # Forecast confidence thresholds - REMOVED legacy unused parameters
+        # Actual confidence control via confidence_floor (0.6) in MAPE-based calculation below
 
         # Reward calculation parameters - CAPITAL PRESERVATION FOCUS
         self.base_reward_scale = 1.0  # CAPITAL PRESERVATION: Minimal reward scale for stability
@@ -296,12 +438,241 @@ class EnhancedConfig:
         self.risk_controller_reward_weight = 1.0  # Risk controller reward scaling
         self.meta_controller_reward_weight = 1.0   # Meta controller reward scaling
 
+        # NEW: Expert guidance parameters for profit-seeking logic
+        self.expert_price_rise_threshold = 1.05  # Suggest 'long' if price forecast is >5% higher
+        self.expert_price_fall_threshold = 0.95  # Suggest 'short' if price forecast is <5% lower
+        self.expert_suggestion_strength = 1.2   # Strength of the suggestion (e.g., +1.2 or -1.2) - INCREASED FROM 0.8 FOR FULL PUNCH
+
+        # =============================================================================
+        # DL OVERLAY PARAMETERS (28D FORECAST-AWARE MODE ONLY)
+        # =============================================================================
+
+        # === Overlay controls ===
+        self.overlay_enabled = False  # Master switch for DL overlay (only enabled with --dl_overlay flag)
+        self.overlay_mode = "auto"  # "auto" | "defense" | "off"
+        self.overlay_intensity = 1.0  # [0.5, 1.5] scales amplitude
+
+        # === Information Bridge (28D) ===
+        # CONDITIONAL: Disabled when using direct deltas (Tier 2/3) to prevent interference
+        # Bridge vectors force PPO to use DL overlay's representation instead of learning its own
+        self.overlay_bridge_dim = 4  # Dims appended per agent from shared embedding
+        self.overlay_bridge_enable_battery = True  # Append bridge to battery_operator_0
+        self.overlay_bridge_enable = True  # Master flag: disable when using direct deltas (auto-set)
+
+        # === Predictive reward shaping (28D auxiliary) ===
+        # CONDITIONAL: Disabled when using direct deltas (Tier 2/3) to prevent reward contamination
+        # Pred_reward forces PPO to chase DL overlay's predictions instead of learning from actual outcomes
+        self.overlay_pred_reward_lambda = 0.4  # Weight for predictive shaping in reward calc - INCREASED FROM 0.1 TO 0.4 FOR STRONGER AGENT LEARNING
+        self.overlay_pred_reward_window = 20  # Steps to smooth overlay predicted reward
+        self.overlay_pred_reward_enable = True  # Master flag: disable when using direct deltas (auto-set)
+
+        # === Multi-horizon strategy blending (28D) ===
+        # Blend weights for 4 horizons: immediate, short, medium, long
+        # Tuned for: immediate=99%, short=95%, medium=90%, long=80% (risk-only)
+        # Weights reflect relative accuracy: immediate is most accurate, long is least
+        self.overlay_blend_weights = {
+            'immediate': 0.58,  # Immediate: Full forecast, most actionable (99% accuracy)
+            'short': 0.26,      # Short (1h): 95% confidence tactical adjustments
+            'medium': 0.12,     # Medium (4h): 90% confidence strategic shifts
+            'long': 0.04,       # Long (24h): Risk-only, minimal directional signal (80% accuracy)
+        }
+
+        # === Confidence scaling ===
+        # FORECAST OPTIMIZATION: Lowered confidence floor from 0.6 to 0.5 for more trading opportunities
+        self.force_full_confidence = False  # DISABLED: Use actual forecast confidence from MAPE tracking
+        self.confidence_floor = 0.5  # Minimum confidence (50%) - lowered from 60% to allow more forecast-driven trades
+        self.overlay_forecast_conf_thresh = 0.5  # Threshold for overlay strategy activation (50%)
+
+        # === Risk budget ===
+        self.risk_budget_minmax = (0.5, 1.5)  # Risk budget scaling range
+        self.volatility_brake_threshold = 1.8  # Multiply size by 0.8 if vol > 1.8x median
+
+        # === Per-horizon confidence thresholds (for future gating experiments) ===
+        self.horizon_confidence_thresholds = {
+            'immediate': 0.70,  # Immediate: High confidence required
+            'short': 0.65,      # Short: Medium-high confidence
+            'medium': 0.60,     # Medium: Medium confidence
+            'long': 0.50,       # Long: Low confidence (risk-only anyway)
+        }
+
+        # === DEPRECATED: Action blending (replaced by forecast-guided baseline) ===
+        # FGB: These parameters are deprecated and will be removed in a future version.
+        # Action blending has been replaced by forecast-guided value baseline.
+        # The DL overlay now informs the PPO baseline and risk sizing, not action execution.
+        # CRITICAL: These are ALWAYS disabled. Do NOT change these values.
+        self.enable_action_blending = False  # DEPRECATED: ALWAYS False (use forecast baseline instead)
+        self.overlay_alpha = 0.0             # DEPRECATED: ALWAYS 0.0 (no action blending)
+        self.force_positive_alpha = False    # DEPRECATED: ALWAYS False (no longer used)
+        self.log_overlay_blend = False       # DEPRECATED: ALWAYS False (no longer used)
+        self.deprecation_warnings = True     # Emit one-time warnings for deprecated parameters
+
+        # === FGB: Forecast-Guided Baseline (replaces action blending) ===
+        # The DL overlay remains a forecaster, not a controller.
+        # PPO remains the action decision-maker; we reduce advantage variance via baseline adjustment.
+        # FIXED: Default to False (must be explicitly enabled via command-line flag)
+        self.forecast_baseline_enable = False  # Enable forecast-guided value baseline (default: OFF)
+        self.forecast_baseline_lambda = 0.5    # λ ∈ [0,1]: weight for baseline adjustment (used in "fixed" mode)
+
+        # === FGB: Forecast Trust Calibration ===
+        # Rolling window for online calibration of forecast trust (τₜ)
+        # CRITICAL FIX: Reduced from 2016 to 500 for faster adaptation (Issue #4)
+        self.forecast_trust_window = 500      # ~3.5 days @ 10-min steps (was 2016 = ~2 weeks)
+        self.forecast_trust_min = 0.45        # Minimum trust threshold for risk uplift (aligns with medium band)
+        self.forecast_trust_metric = "hitrate"  # {"combo", "hitrate", "absdir"}: trust computation method
+        self.forecast_trust_direction_weight = 0.8  # Weight for directional accuracy in combo metric (only used if metric="combo")
+        # CRITICAL FIX: Increased trust scale min from 0.5 to 0.8 to reduce penalty for low trust (Issue #4)
+        self.forecast_trust_scale_min = 0.8    # Minimum trust scale (was 0.5) - less penalty for low trust
+        self.forecast_trust_scale_max = 1.5    # Maximum trust scale
+        # RATIONALE: Forecast models have ~72% directional accuracy (trust ≈ 0.45 with hitrate metric).
+        # Using pure hitrate metric (ignores magnitude error) and lowering threshold to 0.4 allows risk uplift to activate.
+        # This is appropriate because forecasts get DIRECTION right 72% of time, which is valuable for trading.
+
+        # === Forecast Reward Warmup ===
+        # Gradually turn on forecast-based rewards so early training behaves like Tier 1
+        # and forecasts can only start to influence behavior once statistics (EMA, MAPE, trust)
+        # have had time to stabilize.
+        #
+        # Typical episode has ~26,000 timesteps, so 5,000 steps is a gentle warmup.
+        self.forecast_reward_warmup_steps = 5000
+
+        # === FGB: Risk Uplift (trust-weighted position sizing) ===
+        # Modulate risk budget conservatively when forecasts are credible (no action blending)
+        # FIXED: Default to False (must be explicitly enabled via command-line flag)
+        self.risk_uplift_enable = False       # Enable trust-weighted risk sizing (default: OFF)
+        self.risk_uplift_kappa = 0.15         # κ_uplift: 15% sizing uplift (FIXED: match command-line default)
+        self.risk_uplift_cap = 1.15           # Maximum risk multiplier (1.0 + kappa)
+
+        # === FAMC: Forecast-Aware Meta-Critic (Learned Control-Variate Baseline) ===
+        # Advanced variance reduction using learned state-only critic with online λ* optimization
+        self.fgb_mode = "fixed"               # {"fixed", "online", "meta"}: baseline mode
+        self.fgb_lambda_max = 0.8             # Maximum λ* for online/meta modes (clip ceiling)
+        self.fgb_clip_bps = 0.10              # FIXED: Per-step correction cap (10 bp = 0.10, was 0.01)
+        self.fgb_warmup_steps = 2000          # No correction before this many steps (warm-up period)
+        self.fgb_moment_beta = 0.01           # EMA rate for Cov/Var moments (0.01 = ~100-step window)
+
+        # === FAMC: Meta-Critic Head Training ===
+        # FIXED: Default to False (must be explicitly enabled via command-line flag)
+        self.meta_baseline_enable = False     # Enable meta-critic head g_φ(x_t) (default: OFF)
+        self.meta_baseline_loss = "mse"       # {"mse", "corr"}: loss function for meta head
+        self.meta_baseline_head_dim = 32      # Hidden dimension for meta-critic head
+        self.meta_train_every = 512           # Train meta head every N steps
+        self.risk_uplift_drawdown_gate = 0.07 # Disable uplift if drawdown > 7%
+        self.risk_uplift_vol_gate = 0.0       # Disable vol gate for A/B testing (was 0.02)
+
+        # === Forecast Reward Parameters (Tier 2/3) ===
+        # FIX: Moderate increase from 5.0 to 10.0 (2x instead of 4x) for balanced learning
+        # Analysis showed agent alignment is random (49%) - need stronger incentive but not too aggressive
+        # The profitability gate in forecast_engine.py prevents over-rewarding bad trades
+        # Moderate multiplier encourages learning without destabilizing reward signal
+        self.forecast_alignment_multiplier = 10.0  # Moderate increase from 5.0 (2x) - balanced approach
+        self.forecast_alignment_multiplier_battery = 15.0  # Keep enabled for battery (arbitrage benefits from forecasts)
+
+        # FIX: Make generation forecast weight configurable (Issue #8)
+        self.generation_forecast_weight = 0.3  # Weight for generation forecasts in combined score (default: 0.3 = 30%)
+        # FIX: EMA std initialization parameters (Issue #1)
+        self.ema_std_init_samples = 20  # Number of samples to use for adaptive EMA std initialization
+        self.ema_std_init_alpha = 0.2   # Higher alpha for first 100 steps (faster convergence)
+        
+        # CRITICAL FIX: Reduce warmup to make forecast integration more aggressive
+        # Original: 5000 steps = ~20% of episode, too conservative
+        # New: 1000 steps = ~4% of episode, forecasts kick in quickly
+        self.forecast_reward_warmup_steps = 1000  # Reduced from 5000 to make forecasts impactful sooner
+        self.ema_std_min = 10.0         # Minimum EMA std value (DKK) - prevents division by tiny values
+        # CRITICAL FIX: Increased from 500.0 to 2000.0 to prevent saturation (Issue #1)
+        self.ema_std_max = 2000.0       # Maximum EMA std value (DKK) - prevents extreme values (was 500.0)
+        # CRITICAL FIX: Increased EMA alpha from 0.05 to 0.1 for faster adaptation (Issue #9)
+        self.ema_alpha = 0.1            # EMA smoothing factor (was 0.05) - faster adaptation to forecast error distribution
+        # FIX: Forecast failure handling (Issue #5)
+        self.forecast_failure_decay = 0.95  # Decay factor for previous z-scores on forecast failure
+        # FIX: Generation EMA std clamping range (Issue #5)
+        self.gen_ema_std_min = 0.01  # Minimum EMA std for generation (normalized, not DKK)
+        self.gen_ema_std_max = 1.0   # Maximum EMA std for generation (normalized, not DKK)
+        self.forecast_pnl_reward_scale = 500.0  # Scale realized MTM contribution in reward shaping
+
+        # === Expert Blending Mode (CRITICAL FIX: Added missing config attributes) ===
+        self.expert_blend_mode = "none"       # {"none", "fixed", "adaptive", "residual"}: expert blending mode
+        self.expert_blend_weight = 0.0        # Blend weight for fixed mode (0.0-1.0)
+
+        # === Forecast Utilisation (2-TIER SYSTEM) ===
+        # Tier 1 (Baseline MARL): enable_forecast_utilisation=False
+        # Tier 2 (Risk Management + Novel Signal Filtering): enable_forecast_utilisation=True
+        #   - Automatically enables forecast_risk_management_mode
+        #   - Uses MAPE thresholds for hedging vs trading decisions
+        #   - Adaptive position sizing based on confidence & volatility
+        self.enable_forecast_utilisation = False  # Master flag: enables forecast loading + risk management
+
+        # === Forecast Risk Management Mode (AUTO-ENABLED WITH FORECASTS) ===
+        # When enable_forecast_utilisation=True, this is automatically enabled
+        # Uses forecasts for risk management instead of directional trading
+        self.forecast_risk_management_mode = False  # Auto-enabled when enable_forecast_utilisation=True
+
+        # Risk management parameters
+        self.forecast_confidence_high_threshold = 0.48  # Above this: normal positions (~top 20% trust)
+        self.forecast_confidence_medium_threshold = 0.45  # Above this: 70% positions (~top 40% trust)
+        self.forecast_confidence_low_scale = 0.5  # Below medium: 50% positions
+
+        self.forecast_volatility_high_threshold = 1.5  # Above this: 50% positions
+        self.forecast_volatility_medium_threshold = 1.0  # Above this: 75% positions
+
+        self.forecast_direction_change_exit_fraction = 0.5  # Exit 50% on direction flip
+        self.forecast_direction_change_min_strength = 0.5  # Min z-score to trigger
+
+        self.forecast_extreme_threshold = 2.0  # z-score threshold for extremes
+        self.forecast_extreme_profit_taking_fraction = 0.3  # Take 30% profits
+
+        self.forecast_risk_management_weight = 0.20  # 20% of total reward for risk management
+
+        # === NOVEL: Multi-Horizon Signal Filtering ===
+        # Only trade when forecast delta > MAPE threshold (statistically significant)
+        # This filters out noise and focuses on high-confidence opportunities
+        self.enable_signal_filtering = True  # Enable MAPE-based signal filtering
+        self.signal_filter_mape_multiplier = 0.8  # Trade when |delta| > multiplier * MAPE
+        self.signal_filter_horizon_weights = {  # Weights for multi-horizon aggregation
+            'short': 0.5,   # Short-term (6 steps) gets 50% weight
+            'medium': 0.3,  # Medium-term (24 steps) gets 30% weight
+            'long': 0.2     # Long-term (144 steps) gets 20% weight
+        }
+        self.signal_filter_min_horizons = 1  # Minimum number of horizons with significant signals
+        self.signal_filter_neutral_position_scale = 0.1  # Scale positions to 10% when no signal
+        # Gradually relax the gate so filters remain usable late in an episode
+        self.signal_gate_initial_multiplier = 3.0  # Initial multiple of MAPE required to trade
+        self.signal_gate_min_multiplier = 0.8      # Floor multiple once decay completes
+        self.signal_gate_decay_start = 720         # Timesteps before decay begins
+        self.signal_gate_decay_duration = 2880     # Steps to move from initial -> min multiplier
+        self.enable_signal_gate_decay = True
+
+        # === NOVEL: Investor-Specific Hedging vs Trading Thresholds ===
+        # Different MAPE multipliers for different strategies
+        # HEDGING: Protect existing positions when small forecast deviations detected
+        # TRADING: Take new positions only when large forecast deviations detected
+        self.investor_hedge_mape_multiplier = 0.4   # Hedge when |delta| > 0.4x MAPE (more responsive)
+        self.investor_trade_mape_multiplier = 1.1   # Trade when |delta| > 1.1x MAPE (moderate threshold)
+        self.investor_aggressive_trade_mape_multiplier = 1.6  # Aggressive trade when |delta| > 1.6x MAPE
+
+        # Position sizing for different signal strengths
+        self.investor_hedge_position_scale = 0.5    # 50% positions for hedging (gives exposures above reward gate)
+        self.investor_trade_position_scale = 0.7    # 70% positions for normal trading
+        self.investor_aggressive_position_scale = 1.0  # 100% positions for strong signals
+
+        # Multi-horizon consensus requirements
+        self.investor_require_consensus = False     # Allow majority vote without hard consensus veto
+        self.investor_consensus_min_horizons = 1    # At least 1 horizon must agree (already lenient)
+        self.investor_consensus_direction_threshold = 0.35  # 35% weighted alignment now enough to trade
+
+        # Reward tuning for forecast utilisation bonuses (investor agent only)
+        self.forecast_usage_bonus_scale = 0.02  # Max extra reward added when MTM > 0 and forecast used
+        self.forecast_usage_bonus_mtm_scale = 15000.0  # Normalization for MTM (DKK) when computing bonus
+
+        # === Overlay Risk Budget Application ===
+        # Control whether overlay's risk multiplier is always applied
+        self.overlay_apply_risk_budget = True # Always apply overlay risk budget (unless explicitly disabled)
+
         # =============================================================================
         # REINFORCEMENT LEARNING PARAMETERS
         # =============================================================================
 
         # Training defaults - OPTIMIZED for better convergence
-        self.update_every = 24  # OPTIMIZED: Reduced from 32 for more responsive learning
+        self.update_every = 128  # OPTIMIZED: Reduced from 32 for more responsive learning
         self.lr = 8e-4  # OPTIMIZED: Reduced from 1e-3 for more stable convergence
         self.ent_coef = 0.015  # OPTIMIZED: Increased from 0.01 for better exploration
         self.verbose = 1
@@ -319,6 +690,17 @@ class EnhancedConfig:
         # Network architecture
         self.net_arch = [256, 128, 64]  # Deeper network for better pattern recognition
         self.activation_fn = "relu"  # Changed from tanh for better gradient flow
+
+        # GNN Encoder (Tier 2 only)
+        self.enable_gnn_encoder = False  # Enable GNN observation encoder for relationship learning
+        self.gnn_features_dim = 18  # Output dimension of GNN encoder (divisible by num_heads=3)
+        self.gnn_hidden_dim = 30  # Hidden dimension of GAT layers (divisible by num_heads=3: 30/3=10)
+        self.gnn_num_layers = 2  # Number of GAT layers
+        self.gnn_num_heads = 3  # IMPROVED: Multi-head attention (3 heads for different relationship types)
+        self.gnn_dropout = 0.1  # Dropout rate for GAT
+        self.gnn_graph_type = 'full'  # 'full' (fully-connected) or 'learned' (learnable adjacency)
+        self.gnn_use_attention_pooling = True  # IMPROVED: Use attention pooling instead of mean pooling
+        self.gnn_net_arch = [128, 64]  # Smaller MLP after GNN (GNN does feature extraction)
 
         # Agent policies
         self.agent_policies = [
@@ -412,6 +794,101 @@ class EnhancedConfig:
             self.owned_battery_capacity_mwh * capex_values['battery_mwh']
         )
 
+    def validate_configuration(self) -> bool:
+        """
+        CONFIGURATION VALIDATION (NEW)
+
+        Validates that all configuration parameters are consistent and within valid ranges.
+        Raises ValueError if validation fails.
+
+        Returns:
+            True if all validations pass
+
+        Raises:
+            ValueError: If any validation fails
+        """
+        errors = []
+
+        # 1. Allocation fractions should sum to 1.0
+        total_allocation = self.physical_allocation + self.financial_allocation
+        if abs(total_allocation - 1.0) > 0.01:
+            errors.append(f"Allocation fractions sum to {total_allocation}, expected 1.0")
+
+        # 2. Ownership fractions should be in [0, 1]
+        for name, value in [
+            ("wind_ownership_fraction", self.wind_ownership_fraction),
+            ("solar_ownership_fraction", self.solar_ownership_fraction),
+            ("hydro_ownership_fraction", self.hydro_ownership_fraction),
+        ]:
+            if not (0.0 <= value <= 1.0):
+                errors.append(f"{name}={value} not in [0, 1]")
+
+        # 3. Meta controller ranges should be valid
+        if self.meta_freq_min >= self.meta_freq_max:
+            errors.append(f"meta_freq_min ({self.meta_freq_min}) >= meta_freq_max ({self.meta_freq_max})")
+        if self.meta_cap_min >= self.meta_cap_max:
+            errors.append(f"meta_cap_min ({self.meta_cap_min}) >= meta_cap_max ({self.meta_cap_max})")
+
+        # 4. Investment frequency ranges should be valid
+        if self.min_investment_freq >= self.max_investment_freq:
+            errors.append(f"min_investment_freq ({self.min_investment_freq}) >= max_investment_freq ({self.max_investment_freq})")
+        if self.investment_freq < self.min_investment_freq or self.investment_freq > self.max_investment_freq:
+            errors.append(f"investment_freq ({self.investment_freq}) not in [{self.min_investment_freq}, {self.max_investment_freq}]")
+
+        # 5. Battery SOC bounds should be valid
+        if self.batt_soc_min >= self.batt_soc_max:
+            errors.append(f"batt_soc_min ({self.batt_soc_min}) >= batt_soc_max ({self.batt_soc_max})")
+        if not (0.0 <= self.batt_soc_min <= 1.0) or not (0.0 <= self.batt_soc_max <= 1.0):
+            errors.append(f"Battery SOC bounds not in [0, 1]")
+
+        # 6. Battery efficiency should be in (0, 1]
+        if not (0.0 < self.batt_efficiency <= 1.0):
+            errors.append(f"batt_efficiency ({self.batt_efficiency}) not in (0, 1]")
+
+        # 7. Price bounds should be valid
+        if self.minimum_price_floor >= self.maximum_price_cap:
+            errors.append(f"minimum_price_floor ({self.minimum_price_floor}) >= maximum_price_cap ({self.maximum_price_cap})")
+        if self.minimum_price_filter >= self.minimum_price_floor:
+            errors.append(f"minimum_price_filter ({self.minimum_price_filter}) >= minimum_price_floor ({self.minimum_price_floor})")
+
+        # 8. Leverage should be >= 1.0
+        if self.max_leverage < 1.0:
+            errors.append(f"max_leverage ({self.max_leverage}) < 1.0")
+
+        # 9. Rate parameters should be in [0, 1]
+        rate_params = [
+            ("operating_cost_rate", self.operating_cost_rate),
+            ("insurance_rate", self.insurance_rate),
+            ("management_fee_rate", self.management_fee_rate),
+            ("property_tax_rate", self.property_tax_rate),
+            ("debt_service_rate", self.debt_service_rate),
+            ("distribution_rate", self.distribution_rate),
+            ("target_cash_ratio", self.target_cash_ratio),
+            ("battery_opex_rate", self.battery_opex_rate),
+            ("performance_fee_rate", self.performance_fee_rate),
+            ("trading_cost_rate", self.trading_cost_rate),
+        ]
+        for name, value in rate_params:
+            if not (0.0 <= value <= 1.0):
+                errors.append(f"{name}={value} not in [0, 1]")
+
+        # 10. Forecast horizons should be positive integers
+        for horizon_name, horizon_steps in self.forecast_horizons.items():
+            if not isinstance(horizon_steps, int) or horizon_steps <= 0:
+                errors.append(f"forecast_horizons[{horizon_name}]={horizon_steps} not a positive integer")
+
+        # 11. Overlay parameters should be valid
+        if self.overlay_bridge_dim <= 0:
+            errors.append(f"overlay_bridge_dim ({self.overlay_bridge_dim}) <= 0")
+
+        if errors:
+            error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        logger.info("[OK] Configuration validation passed")
+        return True
+
     def _apply_optimized_params(self, params: Dict[str, Any]):
         print("Applying optimized hyperparameters...")
 
@@ -459,3 +936,151 @@ class EnhancedConfig:
         print(f"   Agent modes: {[p['mode'] for p in self.agent_policies]}")
         print(f"   Update every: {self.update_every}")
         print(f"   Batch size: {self.batch_size}")
+
+
+# =====================================================================
+# 2-TIER SYSTEM: SIMPLIFIED
+# =====================================================================
+# Tier 1: EnhancedConfig() with enable_forecast_utilisation=False
+# Tier 2: EnhancedConfig() with enable_forecast_utilisation=True (auto-enables risk management)
+#
+# The ImprovedTier2Config class below is DEPRECATED and kept only for backward compatibility.
+# Just use: config = EnhancedConfig(); config.enable_forecast_utilisation = True
+
+class ImprovedTier2Config(EnhancedConfig):
+    """
+    Improved Tier 2 configuration that uses forecasts for risk management.
+
+    Key changes from original Tier 2:
+    1. Disable forecast alignment rewards (was causing -$643K losses)
+    2. Enable forecast risk management mode
+    3. Use forecasts to adjust position sizes based on confidence
+    4. Use forecasts to detect volatility and reduce exposure
+    5. NOVEL: Multi-horizon signal filtering (only trade when delta > MAPE)
+    6. Reward risk-adjusted performance, not forecast alignment
+
+    Expected outcome: Tier 2 should outperform Tier 1 by $60K-$110K per episode
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # ============================================================
+        # PHASE 1: DISABLE BROKEN FORECAST REWARDS
+        # ============================================================
+
+        # CRITICAL FIX: Disable forecast alignment rewards for INVESTORS
+        # Original: 20.0 (caused agent to get +20.91 reward for losing $13,625)
+        # New: 0.0 (no rewards for forecast alignment)
+        self.forecast_alignment_multiplier = 0.0
+
+        # Battery keeps using forecasts (arbitrage works differently)
+        self.forecast_alignment_multiplier_battery = 15.0
+
+        # Enable risk management mode
+        self.forecast_risk_management_mode = True
+
+        # Keep forecasts enabled for observations
+        self.enable_forecast_utilisation = True
+
+        # ============================================================
+        # PHASE 2: RISK MANAGEMENT PARAMETERS
+        # ============================================================
+
+        # Position sizing based on forecast confidence
+        self.forecast_confidence_high_threshold = 0.48  # Above this: normal positions (~top 20% trust)
+        self.forecast_confidence_medium_threshold = 0.45  # Above this: 70% positions (~top 40% trust)
+        self.forecast_confidence_low_scale = 0.5  # Below medium: 50% positions
+
+        # Volatility-based position scaling
+        self.forecast_volatility_high_threshold = 1.5  # Above this: 50% positions
+        self.forecast_volatility_medium_threshold = 1.0  # Above this: 75% positions
+
+        # Exit signals on forecast direction changes
+        self.forecast_direction_change_exit_fraction = 0.5  # Exit 50% on direction flip
+        self.forecast_direction_change_min_strength = 0.5  # Min z-score to trigger
+
+        # Profit-taking on extreme forecasts
+        self.forecast_extreme_threshold = 2.0  # z-score threshold for extremes
+        self.forecast_extreme_profit_taking_fraction = 0.3  # Take 30% profits
+
+        # Risk management reward weight
+        self.forecast_risk_management_weight = 0.20  # 20% of total reward
+
+        # ============================================================
+        # NOVEL: MULTI-HORIZON SIGNAL FILTERING
+        # ============================================================
+
+        # Only trade when forecast delta > MAPE threshold (statistically significant)
+        self.enable_signal_filtering = True
+        self.signal_filter_mape_multiplier = 1.0  # Trade when |delta| > 1.0 * MAPE
+        self.signal_filter_horizon_weights = {
+            'short': 0.5,   # Short-term (6 steps) gets 50% weight
+            'medium': 0.3,  # Medium-term (24 steps) gets 30% weight
+            'long': 0.2     # Long-term (144 steps) gets 20% weight
+        }
+        self.signal_filter_min_horizons = 1  # Minimum number of horizons with significant signals
+        self.signal_filter_neutral_position_scale = 0.1  # Scale positions to 10% when no signal
+
+        # ============================================================
+        # REWARD WEIGHTS (ADJUSTED FOR RISK MANAGEMENT)
+        # ============================================================
+
+        # Rebalance weights to emphasize risk management
+        # Total should sum to 1.0
+        self.profit_reward_weight = 0.35  # Operational revenue (same as Tier 1)
+        self.risk_reward_weight = 0.30    # Risk management (increased from 0.25)
+        self.hedging_reward_weight = 0.15  # Hedging effectiveness
+        self.nav_stability_weight = 0.20   # NAV stability (reduced from 0.25)
+
+        # NO forecast directional reward
+        self.forecast_directional_weight = 0.0  # Disabled
+
+        # ============================================================
+        # POSITION SIZING (MORE CONSERVATIVE)
+        # ============================================================
+
+        # Reduce max position size to be more conservative
+        # Tier 1 takes up to 66% positions, Tier 2 will be more adaptive
+        self.max_position_size = 0.008  # 0.8% (reduced from 1.0%)
+
+        # This will be scaled by forecast confidence and volatility
+        # Effective range: 0.4% - 0.8% depending on conditions
+
+        # ============================================================
+        # FORECAST TRUST CALIBRATION (FASTER ADAPTATION)
+        # ============================================================
+
+        # Faster trust adaptation for quicker response to forecast quality
+        self.forecast_trust_window = 300  # 300 steps (~2 days)
+        self.forecast_trust_min = 0.45  # Minimum trust threshold (aligns with medium band)
+
+        # ============================================================
+        # LOGGING AND DEBUGGING
+        # ============================================================
+
+        # Enable detailed logging for risk management decisions
+        self.log_forecast_risk_management = True
+        self.log_position_scaling_decisions = True
+
+        print("\n" + "="*70)
+        print("IMPROVED TIER 2 CONFIGURATION LOADED")
+        print("="*70)
+        print("Forecast Mode: RISK MANAGEMENT (not directional trading)")
+        print(f"Alignment Multiplier: {self.forecast_alignment_multiplier} (disabled)")
+        print(f"Risk Management Weight: {self.forecast_risk_management_weight}")
+        print(f"Max Position Size: {self.max_position_size*100:.1f}%")
+        print(f"Confidence Thresholds: High={self.forecast_confidence_high_threshold}, Med={self.forecast_confidence_medium_threshold}")
+        print(f"Volatility Thresholds: High={self.forecast_volatility_high_threshold}, Med={self.forecast_volatility_medium_threshold}")
+        print(f"Signal Filtering: Enabled (trade when |delta| > {self.signal_filter_mape_multiplier}x MAPE)")
+        print("="*70 + "\n")
+
+
+def get_improved_tier2_config():
+    """
+    Get the improved Tier 2 configuration.
+
+    Returns:
+        ImprovedTier2Config instance
+    """
+    return ImprovedTier2Config()
