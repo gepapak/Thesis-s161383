@@ -372,6 +372,19 @@ class EnhancedConfig:
         self.forecast_usage_bonus_mtm_scale = 15000.0
         self.forecast_usage_exposure_threshold = 0.02
 
+        # PHASE 1 FIX: Forecast confidence gating thresholds (balanced)
+        # Adjusted based on actual forecast quality: trust 0.48-0.51, confidence 0.99, z_combined 0.0-0.5
+        # Relaxed from overly strict values to enable forecast usage while maintaining quality
+        self.forecast_trust_threshold = 0.45  # Relaxed from 0.6 - allow moderate trust (0.48-0.51)
+        self.forecast_confidence_threshold = 0.7  # Keep (already passing with 0.99)
+        self.forecast_signal_threshold = 0.2  # Relaxed from 0.3 - allow weaker signals (z_combined often 0.0-0.5)
+
+        # PHASE 1 FIX: Forecast error penalty parameters (addresses reward mismatch)
+        self.forecast_error_penalty_scale = 0.5  # Scale for forecast error penalty in alignment reward
+        self.forecast_error_penalty_lambda = 0.3  # Lambda for forecast error penalty in signal score
+        self.loss_penalty_multiplier = 2.0  # More aggressive penalty for losses (was 1.0)
+        self.profitability_bonus_multiplier = 1.5  # Bonus multiplier for profitable positions
+
         # CANONICAL FORECAST TARGETS: Single source of truth for all forecast models
         self.forecast_targets = ["wind", "solar", "hydro", "price", "load"]
 
@@ -671,21 +684,23 @@ class EnhancedConfig:
         # REINFORCEMENT LEARNING PARAMETERS
         # =============================================================================
 
-        # Training defaults - OPTIMIZED for better convergence
+        # Training defaults - STRENGTHENED FOR BETTER LEARNING
         self.update_every = 128  # OPTIMIZED: Reduced from 32 for more responsive learning
-        self.lr = 8e-4  # OPTIMIZED: Reduced from 1e-3 for more stable convergence
-        self.ent_coef = 0.015  # OPTIMIZED: Increased from 0.01 for better exploration
+        self.lr = 1.5e-3  # STRENGTHENED: Increased from 8e-4 to 1.5e-3 for faster learning (87% increase)
+        self.ent_coef = 0.005  # STRENGTHENED LEARNING: Reduced from 0.015 to focus on exploitation
         self.verbose = 1
         self.seed = 42
         self.multithreading = True
 
-        # PPO-specific parameters
-        self.batch_size = 128  # USER SPECIFIED: Larger batch for more stable early learning
-        self.gamma = 0.99
-        self.gae_lambda = 0.95
-        self.clip_range = 0.2
+        # PPO-specific parameters - STRENGTHENED FOR BETTER LEARNING
+        self.batch_size = 256  # STRENGTHENED: Increased from 128 for more stable gradients
+        self.gamma = 0.995  # STRENGTHENED: Increased from 0.99 for longer horizon credit assignment
+        self.gae_lambda = 0.98  # STRENGTHENED: Increased from 0.95 for more stable value estimates
+        self.clip_range = 0.15  # STRENGTHENED: Reduced from 0.2 for more conservative updates
         self.vf_coef = 0.5
         self.max_grad_norm = 0.5
+        self.n_epochs = 10  # STRENGTHENED: Increased from default 5 for more gradient updates
+        self.n_steps = 1024  # STRENGTHENED: Increased from 512 for more experience per update
 
         # Network architecture
         self.net_arch = [256, 128, 64]  # Deeper network for better pattern recognition

@@ -1882,8 +1882,8 @@ def main():
 
     # === 3-TIER SYSTEM: Forecast Utilisation ===
     # Tier 1 (Baseline MARL): No forecasts, 6D investor observations
-    # Tier 2 (Direct Deltas): Forecasts loaded, 9D investor observations (6 base + 3 forecast: z_short, z_medium, trust)
-    # Tier 3 (FAMC): Tier 2 + DL overlay + FGB meta mode for variance reduction, 13D investor observations (9 + 4 bridge)
+    # Tier 2 (Direct Deltas): Forecasts loaded, 10D investor observations (6 base + 4 forecast: z_short, z_medium, trust, normalized_error)
+    # Tier 3 (FAMC): Tier 2 + DL overlay + FGB meta mode for variance reduction, 14D investor observations (10 + 4 bridge)
     parser.add_argument("--enable_forecast_utilisation", action="store_true", default=False,
                        help="MASTER FLAG: Enable forecast model loading + direct delta observations (Tier 2/3)")
 
@@ -1973,7 +1973,9 @@ def main():
         # === FGB requires DL overlay (for expected_dnav computation) ===
         # CRITICAL: ALL FGB modes need DL overlay because expected_dnav() requires overlay_output
         # expected_dnav uses pred_reward and mwdir from DL overlay inference
-        if args.forecast_baseline_enable or args.fgb_mode in ['fixed', 'online', 'meta']:
+        # FIXED: Only enable DL overlay if FGB is actually enabled (forecast_baseline_enable=True)
+        # Tier 1 doesn't use FGB, so DL overlay should not be enabled
+        if args.forecast_baseline_enable:
             if not args.dl_overlay:
                 args.dl_overlay = True
                 changes_made.append("Enabled --dl_overlay (required for FGB: expected_dnav needs overlay_output)")
@@ -2101,10 +2103,10 @@ def main():
     config.enable_forecast_utilisation = args.enable_forecast_utilisation
     logger.info(f"[FORECAST_UTIL] Enabled: {config.enable_forecast_utilisation}")
     if config.enable_forecast_utilisation:
-        logger.info(f"[FORECAST_UTIL] Investor observations: 9D (6 base + 3 forecast)")
+        logger.info(f"[FORECAST_UTIL] Investor observations: 10D (6 base + 4 forecast)")
         logger.info(f"[FORECAST_UTIL]   Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl")
-        logger.info(f"[FORECAST_UTIL]   Forecast (3D): z_short, z_medium, trust")
-        logger.info(f"[FORECAST_UTIL]   REMOVED: z_long, forecast_quality, 4 interaction terms (redundant for faster learning)")
+        logger.info(f"[FORECAST_UTIL]   Forecast (4D): z_short, z_medium, trust, normalized_error")
+        logger.info(f"[FORECAST_UTIL]   NEW: normalized_error allows agent to adapt to changing forecast quality")
 
         # TIER 2: Direct deltas from ForecastGenerator + ForecastEngine (NO DL overlay needed)
         # Direct deltas are computed by:

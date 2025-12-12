@@ -33,7 +33,7 @@ class ForecastComputationResult:
 @dataclass
 class ForecastObservationFeatures:
     """Forecast features to add to observations."""
-    investor_features: Optional[np.ndarray] = None  # 3D: z_short, z_medium, trust
+    investor_features: Optional[np.ndarray] = None  # 4D: z_short, z_medium, trust, normalized_error (PHASE 2 FIX)
     battery_features: Optional[np.ndarray] = None   # 4D: total_gen, z_short, z_medium, z_long
     risk_features: Optional[np.ndarray] = None     # 3D: z_short, vol_forecast, trust
     meta_features: Optional[np.ndarray] = None      # 2D: trust, expected_return
@@ -389,6 +389,39 @@ class ForecastEngine:
         else:
             quality_mult = 0.3
 
+        # PHASE 1 FIX: Compute realized_vs_forecast early (needed for error penalties in alignment reward)
+        price_return_short = price_returns.get('short') if price_returns else None
+        price_return_medium = price_returns.get('medium') if price_returns else None
+        price_return_long = price_returns.get('long') if price_returns else None
+        price_return_forecast = price_returns.get('forecast') if price_returns else 0.0
+        one_step_return = price_returns.get('one_step') if price_returns else 0.0
+
+        if price_return_short is None:
+            price_return_short = one_step_return
+        if price_return_medium is None:
+            price_return_medium = price_return_short
+        if price_return_long is None:
+            price_return_long = price_return_medium
+
+        realized_vs_forecast = float(one_step_return - (price_return_forecast or 0.0))
+
+        # PHASE 1 FIX: Strengthen forecast confidence gating
+        # Only use forecasts when they're highly reliable (addresses reward mismatch)
+        forecast_confidence = float(np.clip(1.0 / (1.0 + avg_mape), 0.0, 1.0))
+        trust_threshold = getattr(config, 'forecast_trust_threshold', 0.6)  # Increased from 0.5
+        confidence_threshold = getattr(config, 'forecast_confidence_threshold', 0.7)  # Increased from 0.5
+        signal_threshold = getattr(config, 'forecast_signal_threshold', 0.3)  # Increased from 0.2
+        
+        # Check explicit confidence gates (in addition to risk manager gates)
+        explicit_gate_passed = (
+            forecast_trust > trust_threshold and
+            forecast_confidence > confidence_threshold and
+            abs(z_combined) > signal_threshold
+        )
+        
+        # Combine with risk manager gates (both must pass)
+        forecast_gate_passed = forecast_gate_passed and explicit_gate_passed
+
         if forecast_gate_passed:
             alignment_value = position_normalized * forecast_direction_normalized * position_exposure
             alignment_score = float(np.clip(alignment_value, -1.0, 1.0))
@@ -398,13 +431,29 @@ class ForecastEngine:
             # This provides stronger signal without destabilizing reward distribution
             forecast_alignment_reward = np.clip(alignment_mult * alignment_score * quality_mult, -10.0, 10.0)
             
-            # FIX: Add profitability gate - don't reward alignment if position is losing money
-            # This prevents rewarding agents for following forecasts that lead to losses
-            if mtm_pnl < -1000.0:  # Position is losing more than $1K
-                # Reduce reward proportionally to loss magnitude
-                # If losing $10K, reduce reward by 50%; if losing $20K, reduce by 100% (no reward)
-                loss_penalty = min(1.0, abs(mtm_pnl) / 20000.0)  # Scale: $20K loss = 100% penalty
+            # PHASE 1 FIX: Strengthen profitability gate - more aggressive penalties for losses
+            # This directly addresses the reward structure mismatch issue
+            if mtm_pnl < 0:
+                # Progressive penalty: -$1K = 10% reduction, -$5K = 50%, -$10K = 100% (no reward)
+                loss_penalty_mult = getattr(config, 'loss_penalty_multiplier', 2.0)  # More aggressive
+                loss_penalty = min(1.0, abs(mtm_pnl) / (10000.0 / loss_penalty_mult))  # Scale: $10K loss = 100% penalty
                 forecast_alignment_reward *= max(0.0, 1.0 - loss_penalty)
+            else:
+                # PHASE 1 FIX: Bonus for profitable positions - reward when forecasts lead to profits
+                profit_bonus_mult = getattr(config, 'profitability_bonus_multiplier', 1.5)
+                profit_bonus = min(1.0, mtm_pnl / 10000.0)  # Scale: $10K profit = 100% bonus
+                forecast_alignment_reward *= (1.0 + profit_bonus * profit_bonus_mult * 0.5)  # Up to 50% bonus
+            
+            # PHASE 1 FIX: Add forecast error penalty - penalize when forecasts are wrong
+            # This addresses the credit assignment problem
+            forecast_error_penalty_scale = getattr(config, 'forecast_error_penalty_scale', 0.5)
+            if abs(realized_vs_forecast) > 0.01:  # Forecast error > 1%
+                # Penalize proportionally to forecast error magnitude
+                error_penalty = -forecast_error_penalty_scale * abs(realized_vs_forecast) * position_exposure * 10.0
+                forecast_alignment_reward += error_penalty
+            
+            # Weight alignment reward by forecast accuracy (only reward when forecasts are reliable)
+            forecast_alignment_reward *= (forecast_trust * forecast_confidence)
 
             signal_strength = float(investor_strategy.get('signal_strength', 0.5)) if investor_strategy else 0.0
             trade_signal_active = bool(investor_strategy and investor_strategy.get('trade_signal', False))
@@ -459,6 +508,13 @@ class ForecastEngine:
         if env:
             env._prev_total_position = total_position
 
+        # PHASE 1 FIX: Initialize forecast error penalty (used in signal score)
+        # Note: realized_vs_forecast is already computed above
+        forecast_error_penalty = 0.0
+        if abs(realized_vs_forecast) > 0.01 and position_exposure > 0:  # Forecast error > 1% and position exists
+            error_penalty_lambda = getattr(config, 'forecast_error_penalty_lambda', 0.3)
+            forecast_error_penalty = -error_penalty_lambda * abs(realized_vs_forecast) * position_exposure * 20.0
+
         risk_reward = risk_adj.get('risk_reward', 0.0) if risk_adj else 0.0
         extreme_delta_penalty = 0.0
         if forecast_deltas is not None and position_exposure > 0:
@@ -470,27 +526,14 @@ class ForecastEngine:
             if delta_short_raw > 2.0 or delta_medium_raw > 2.0 or delta_long_raw > 2.0:
                 extreme_delta_penalty = -50.0 * position_exposure  # Less aggressive penalty
 
+        # PHASE 1 FIX: Include forecast error penalty in signal score
         forecast_signal_score = (
             0.60 * forecast_alignment_reward +
             0.30 * pnl_reward +
             0.10 * risk_reward +
-            extreme_delta_penalty
+            extreme_delta_penalty +
+            forecast_error_penalty  # NEW: Penalize forecast errors
         )
-
-        price_return_short = price_returns.get('short') if price_returns else None
-        price_return_medium = price_returns.get('medium') if price_returns else None
-        price_return_long = price_returns.get('long') if price_returns else None
-        price_return_forecast = price_returns.get('forecast') if price_returns else 0.0
-        one_step_return = price_returns.get('one_step') if price_returns else 0.0
-
-        if price_return_short is None:
-            price_return_short = one_step_return
-        if price_return_medium is None:
-            price_return_medium = price_return_short
-        if price_return_long is None:
-            price_return_long = price_return_medium
-
-        realized_vs_forecast = float(one_step_return - (price_return_forecast or 0.0))
 
         usage_exposure_threshold = getattr(config, 'forecast_usage_exposure_threshold', 0.02)
         forecast_used_flag = bool(
@@ -528,15 +571,18 @@ class ForecastEngine:
         warmup_factor_debug = float(getattr(env, '_forecast_warmup_factor', 1.0) if env else 1.0)
 
         price_return_1step = one_step_return or 0.0
+        # CRITICAL FIX: Use normalized position_signed instead of raw total_position
+        # total_position is the raw value in DKK, but position_signed is normalized (should be ~-1 to 1)
+        # This ensures consistent logging between Tier 1 and Tier 2
         debug_payload = {
-            'position_signed': total_position,
+            'position_signed': position_signed,  # FIXED: Use normalized value, not raw total_position
             'position_exposure': position_exposure_norm,
             'price_return_1step': price_return_1step,
             'price_return_forecast': price_return_forecast or 0.0,
             'forecast_signal_score': forecast_signal_score,
-            'wind_pos_norm': current_positions.get('wind', 0.0) / max(max_pos, 1.0),
-            'solar_pos_norm': current_positions.get('solar', 0.0) / max(max_pos, 1.0),
-            'hydro_pos_norm': current_positions.get('hydro', 0.0) / max(max_pos, 1.0),
+            'wind_pos_norm': wind_pos_norm,  # FIXED: Use already-calculated normalized values
+            'solar_pos_norm': solar_pos_norm,  # FIXED: Use already-calculated normalized values
+            'hydro_pos_norm': hydro_pos_norm,  # FIXED: Use already-calculated normalized values
             'z_short': z_short,
             'z_medium': z_medium,
             'z_long': z_long,
@@ -709,11 +755,29 @@ class ForecastEngine:
             return ForecastObservationFeatures()
         
         try:
-            # Investor features: 3D (z_short, z_medium, trust)
+            # PHASE 2 FIX: Add forecast error to observations (4D instead of 3D)
+            # This allows agent to adapt to changing forecast quality
+            env = getattr(self, 'env', None)
+            normalized_error = 0.0
+            if env is not None:
+                try:
+                    # Get recent MAPE for short horizon (most relevant for trading)
+                    mape_history = getattr(env, '_horizon_mape', {}).get('short', [])
+                    if len(mape_history) > 0:
+                        recent_mape = float(np.mean(list(mape_history)[-10:]))
+                        mape_thresholds = getattr(env, '_mape_thresholds', {})
+                        mape_threshold_short = mape_thresholds.get('short', 0.02)
+                        # Normalize error: 0.0 = perfect, 1.0 = at threshold, >1.0 = worse than threshold
+                        normalized_error = float(np.clip(recent_mape / max(mape_threshold_short, 1e-6), 0.0, 2.0))
+                except Exception:
+                    pass
+            
+            # Investor features: 4D (z_short, z_medium, trust, normalized_error)
             investor_features = np.array([
                 self.z_short_price,
                 self.z_medium_price,
-                self.forecast_trust
+                self.forecast_trust,
+                normalized_error  # NEW: Recent forecast error
             ], dtype=np.float32)
             
             # Battery features: 4D (total_gen, z_short, z_medium, z_long)

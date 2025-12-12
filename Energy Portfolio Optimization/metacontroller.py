@@ -314,8 +314,11 @@ class MultiESGAgent:
                         policy._last_obs = None
                     if hasattr(policy, '_last_episode_starts'):
                         policy._last_episode_starts = None
-                    if hasattr(policy, 'num_timesteps'):
-                        policy.num_timesteps = 0
+                    # CRITICAL FIX: DO NOT reset num_timesteps - let SB3 manage it via reset_num_timesteps parameter
+                    # Resetting num_timesteps can break learning rate schedules and callbacks that depend on it
+                    # The reset_num_timesteps parameter in agent.learn() already handles this correctly
+                    # if hasattr(policy, 'num_timesteps'):
+                    #     policy.num_timesteps = 0  # REMOVED: Let SB3 manage this via reset_num_timesteps
 
                     self.logger.info(f"[OK] Reset policy {i} ({policy.mode}) for new episode")
                 except Exception as e:
@@ -485,16 +488,16 @@ class MultiESGAgent:
             if policy_mode == "PPO":
                 algo_kwargs.update(
                     {
-                        "ent_coef": getattr(config, "ent_coef", 0.01),
-                        "n_steps": int(min(self.n_steps, 512)),
-                        "batch_size": 128,  # FIXED: Standardized batch size for all agents
-                        "gae_lambda": float(getattr(config, "gae_lambda", 0.95)),
-                        "clip_range": float(getattr(config, "clip_range", 0.2)),
+                        "ent_coef": getattr(config, "ent_coef", 0.005),
+                        "n_steps": int(min(self.n_steps, getattr(config, "n_steps", 1024))),  # STRENGTHENED: Increased from 512
+                        "batch_size": getattr(config, "batch_size", 256),  # STRENGTHENED: Use config batch_size (256)
+                        "gae_lambda": float(getattr(config, "gae_lambda", 0.98)),
+                        "clip_range": float(getattr(config, "clip_range", 0.15)),
                         "normalize_advantage": True,
                         "vf_coef": float(getattr(config, "vf_coef", 0.5)),
                         "max_grad_norm": float(getattr(config, "max_grad_norm", 0.5)),
-                        "gamma": float(getattr(config, "gamma", 0.99)),
-                        "n_epochs": int(min(getattr(config, "n_epochs", 10), 5)),
+                        "gamma": float(getattr(config, "gamma", 0.995)),
+                        "n_epochs": int(min(getattr(config, "n_epochs", 10), getattr(config, "n_epochs", 10))),  # STRENGTHENED: Increased from 5 to 10
                     }
                 )
             elif policy_mode in ("SAC", "TD3"):

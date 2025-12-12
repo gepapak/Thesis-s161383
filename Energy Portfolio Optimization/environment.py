@@ -93,8 +93,8 @@ class StabilizedObservationManager:
 
         if enable_forecast_util:
             # TIER 2: Forecasts enabled
-            # CRITICAL FIX #3: Investor: 9D = 6 base + 3 forecast (reduced from 15D for faster learning)
-            specs["investor_0"] = {"base": 9}
+            # PHASE 2 FIX: Investor: 10D = 6 base + 4 forecast (added normalized_error for forecast quality awareness)
+            specs["investor_0"] = {"base": 10}
 
             # Battery: 8D = 4 base + 1 total generation (sum of wind+solar+hydro) + 3 price (all horizons)
             # OPTIMIZED: Sum generation forecasts into single total generation signal (reduces dimensions, battery cares about total supply)
@@ -130,12 +130,10 @@ class StabilizedObservationManager:
 
         # CONDITIONAL: investor_0 space depends on forecast utilisation
         if enable_forecast_util:
-            # CRITICAL FIX #3: Reduced to 9D observations (6 base + 3 forecast) for faster learning
+            # PHASE 2 FIX: Updated to 10D observations (6 base + 4 forecast) for forecast error awareness
             # Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl
-            # Forecast (3D): z_short, z_medium, trust
-            # REMOVED: z_long (less accurate), forecast_quality (redundant with trust), 4 interaction terms (redundant)
-            # Rationale: Less dimensions = faster learning, less noise, agent focuses on essential features
-            # The agent can learn relationships between z_short, z_medium, and trust without explicit interaction terms
+            # Forecast (4D): z_short, z_medium, trust, normalized_error
+            # NEW: normalized_error allows agent to adapt to changing forecast quality
             inv_low  = np.array([
                 -1.0,  # price_current (normalized, can be negative)
                 0.0,   # budget_normalized (always positive, FIXED: now [0, 1] instead of [0, 10])
@@ -145,7 +143,8 @@ class StabilizedObservationManager:
                 -1.0,  # mtm_pnl_norm (can be negative)
                 -1.0,  # z_short (short-term price forecast)
                 -1.0,  # z_medium (medium-term price forecast)
-                0.0    # forecast_trust (always positive, historical accuracy)
+                0.0,   # forecast_trust (always positive, historical accuracy)
+                0.0    # normalized_error (always positive, recent forecast error normalized by threshold)
             ], dtype=np.float32)
             inv_high = np.array([
                 1.0,   # price_current
@@ -156,9 +155,10 @@ class StabilizedObservationManager:
                 1.0,   # mtm_pnl_norm
                 1.0,   # z_short
                 1.0,   # z_medium
-                1.0    # forecast_trust
+                1.0,   # forecast_trust
+                2.0    # normalized_error (0.0 = perfect, 1.0 = at threshold, 2.0 = 2x threshold)
             ], dtype=np.float32)
-            inv_shape = (9,)
+            inv_shape = (10,)
         else:
             # Tier 1: 6D baseline observations (same structure as Tier 2, just no forecasts)
             # Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl
@@ -750,14 +750,26 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # Legacy compatibility
         self.battery_capacity = 0.0
 
+        # CRITICAL FIX: Ensure self.t is 0 before asset deployment and NAV calculation
+        # This prevents depreciation from being applied during initialization
+        # Save current t if it exists, then set to 0
+        original_t_init = getattr(self, 't', None)
+        self.t = 0
+
         # FIXED: Deploy initial assets (ONE-TIME ONLY)
         if not self.assets_deployed:
             self._deploy_initial_assets_once(initial_asset_plan)
 
         # CRITICAL FIX: Initialize reward calculator AFTER asset deployment with correct baseline NAV
         if getattr(self, 'reward_calculator', None) is None:
+            # CRITICAL: Ensure t=0 for initial NAV calculation (no depreciation)
+            self.t = 0
             # Use post-CAPEX NAV as baseline instead of pre-CAPEX init_budget
-            post_capex_nav = self._calculate_fund_nav()
+            # CRITICAL FIX: Pass current_timestep=0 explicitly to ensure no depreciation
+            post_capex_nav = self._calculate_fund_nav(current_timestep=0)
+            # Restore original t if it was set (should be None at init, but be safe)
+            if original_t_init is not None:
+                self.t = original_t_init
             self.reward_calculator = ProfitFocusedRewardCalculator(initial_budget=post_capex_nav, config=self.config)
             # Store config reference for reward calculator
             if hasattr(self.reward_calculator, 'config'):
@@ -1231,24 +1243,32 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Deploy physical assets (using physical allocation, not trading budget)
             total_physical_capex_used = 0.0
 
+            # CRITICAL FIX: Reset physical_assets to zero first to ensure clean state
+            self.physical_assets = {
+                'wind_capacity_mw': 0.0,
+                'solar_capacity_mw': 0.0,
+                'hydro_capacity_mw': 0.0,
+                'battery_capacity_mwh': 0.0,
+            }
+
             for asset_type, specs in plan.items():
                 if asset_type == 'wind':
-                    capacity = specs['capacity_mw'] * scale_factor
+                    capacity = float(specs['capacity_mw'] * scale_factor)  # CRITICAL: Explicit float conversion
                     self.physical_assets['wind_capacity_mw'] = capacity
                     capex_used = capacity * self.asset_capex['wind_mw']
 
                 elif asset_type == 'solar':
-                    capacity = specs['capacity_mw'] * scale_factor
+                    capacity = float(specs['capacity_mw'] * scale_factor)  # CRITICAL: Explicit float conversion
                     self.physical_assets['solar_capacity_mw'] = capacity
                     capex_used = capacity * self.asset_capex['solar_mw']
 
                 elif asset_type == 'hydro':
-                    capacity = specs['capacity_mw'] * scale_factor
+                    capacity = float(specs['capacity_mw'] * scale_factor)  # CRITICAL: Explicit float conversion
                     self.physical_assets['hydro_capacity_mw'] = capacity
                     capex_used = capacity * self.asset_capex['hydro_mw']
 
                 elif asset_type == 'battery':
-                    capacity = specs['capacity_mwh'] * scale_factor
+                    capacity = float(specs['capacity_mwh'] * scale_factor)  # CRITICAL: Explicit float conversion
                     self.physical_assets['battery_capacity_mwh'] = capacity
                     self.battery_capacity = capacity  # Legacy sync
                     capex_used = capacity * self.asset_capex['battery_mwh']
@@ -1267,14 +1287,32 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Trading budget remains unchanged (it's separate from physical allocation)
             # self.budget stays as trading_allocation_budget (~662M DKK)
 
-            # Update equity
-            self._calculate_fund_nav()
+            # CRITICAL FIX: Pass current_timestep=0 explicitly to ensure no depreciation
+            # No need to modify self.t - just pass the correct timestep as parameter
+            nav_after_deploy = self._calculate_fund_nav(current_timestep=0)
 
-            logger.info(f"Asset deployment complete:")
-            logger.info(f"  Wind: {self.physical_assets['wind_capacity_mw']:.1f} MW")
-            logger.info(f"  Solar: {self.physical_assets['solar_capacity_mw']:.1f} MW")
-            logger.info(f"  Hydro: {self.physical_assets['hydro_capacity_mw']:.1f} MW")
-            logger.info(f"  Battery: {self.physical_assets['battery_capacity_mwh']:.1f} MWh")
+            # CRITICAL DEBUG: Log deployment details for consistency verification
+            tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+            logger.info(f"[{tier_name}_ASSET_DEPLOY] Asset deployment complete:")
+            logger.info(f"  Physical allocation budget: {self.physical_allocation_budget:,.0f} DKK")
+            logger.info(f"  Total CAPEX required: {total_capex:,.0f} DKK")
+            logger.info(f"  Scale factor: {scale_factor:.6f}")
+            logger.info(f"  Physical CAPEX deployed: {self.physical_capex_deployed:,.0f} DKK")
+            logger.info(f"  Wind: {self.physical_assets['wind_capacity_mw']:.6f} MW (CAPEX: {self.physical_assets['wind_capacity_mw'] * self.asset_capex['wind_mw']:,.0f} DKK)")
+            logger.info(f"  Solar: {self.physical_assets['solar_capacity_mw']:.6f} MW (CAPEX: {self.physical_assets['solar_capacity_mw'] * self.asset_capex['solar_mw']:,.0f} DKK)")
+            logger.info(f"  Hydro: {self.physical_assets['hydro_capacity_mw']:.6f} MW (CAPEX: {self.physical_assets['hydro_capacity_mw'] * self.asset_capex['hydro_mw']:,.0f} DKK)")
+            logger.info(f"  Battery: {self.physical_assets['battery_capacity_mwh']:.6f} MWh (CAPEX: {self.physical_assets['battery_capacity_mwh'] * self.asset_capex['battery_mwh']:,.0f} DKK)")
+            
+            # CRITICAL: Calculate and log actual physical book value from NAV calculation
+            # This will show if depreciation is being applied
+            self.t = 0  # Ensure t=0 for NAV calculation
+            calculated_nav = self._calculate_fund_nav()
+            calculated_physical = calculated_nav - self.budget - getattr(self, 'accumulated_operational_revenue', 0.0) - sum(self.financial_positions.values())
+            logger.info(f"  Calculated NAV: {calculated_nav:,.0f} DKK")
+            logger.info(f"  Calculated Physical Assets (from NAV): {calculated_physical:,.0f} DKK")
+            logger.info(f"  Expected Physical Assets (no dep): {self.physical_capex_deployed:,.0f} DKK")
+            logger.info(f"  Difference: {calculated_physical - self.physical_capex_deployed:,.0f} DKK ({(calculated_physical / self.physical_capex_deployed - 1.0) * 100:.4f}%)")
+            
             logger.info(f"  Total CAPEX: {total_capex * scale_factor:,.0f} DKK (${total_capex * scale_factor * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
             logger.info(f"  Remaining cash: {self.budget:,.0f} DKK (${self.budget * self.config.dkk_to_usd_rate / 1e6:.0f}M USD)")
 
@@ -1377,15 +1415,30 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # FIXED: PROPER NAV CALCULATION
     # =====================================================================
 
-    def _calculate_fund_nav(self) -> float:
+    def _calculate_fund_nav(self, current_timestep: Optional[int] = None) -> float:
         """
         REFACTORED: Calculate true fund NAV using FinancialEngine.
         NAV = Trading Cash + Physical Asset Book Value + Accumulated Operational Revenue + Financial Instrument MTM
+        
+        Args:
+            current_timestep: Optional timestep to use for depreciation. If None, uses self.t
         """
         try:
-            # FIXED: Safety check for self.t attribute
-            current_timestep = getattr(self, 't', 0)
+            # CRITICAL FIX: Use provided timestep parameter, or fall back to self.t
+            # This ensures consistent NAV calculation when called from _update_finance with i parameter
+            if current_timestep is None:
+                current_timestep = getattr(self, 't', 0)
             accumulated_operational_revenue = getattr(self, 'accumulated_operational_revenue', 0.0)
+            
+            # CRITICAL DEBUG: Log when NAV is calculated at timestep 0
+            if current_timestep == 0:
+                tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+                logger.info(f"[{tier_name}_NAV_CALC] Calculating NAV at t=0:")
+                logger.info(f"  current_timestep param = {current_timestep}")
+                logger.info(f"  self.t = {getattr(self, 't', 0)}")
+                logger.info(f"  budget = {self.budget:,.0f} DKK")
+                logger.info(f"  physical_assets = {self.physical_assets}")
+                logger.info(f"  physical_capex_deployed = {getattr(self, 'physical_capex_deployed', 0.0):,.0f} DKK")
             
             # Use FinancialEngine for calculation
             from financial_engine import FinancialEngine
@@ -1398,6 +1451,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 current_timestep=current_timestep,
                 config=self.config
             )
+            
+            # CRITICAL DEBUG: Log calculated NAV at timestep 0
+            if current_timestep == 0:
+                tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+                logger.info(f"[{tier_name}_NAV_CALC] NAV calculated: {nav:,.0f} DKK (${nav * 0.145 / 1_000_000:.2f}M)")
             
             self.equity = nav
             return nav
@@ -1711,6 +1769,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
         current_timestep = getattr(self, 't', 0)
         is_true_episode_end = (current_timestep >= self.max_steps)
 
+        # CRITICAL FIX: For Episode 0 first reset, ensure t=0 before any NAV calculations
+        # This prevents depreciation from being applied during initial reset
+        if not hasattr(self, '_episode_counter') or self._episode_counter == -1:
+            # First reset (Episode 0) - ensure t=0
+            self.t = 0
+
         # Only reset time if true episode end
         if is_true_episode_end:
             self.t = 0
@@ -1728,7 +1792,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.step_in_episode = 0
         self.agents = self.possible_agents[:]
 
-        # CRITICAL FIX: Only reset financial state on true episode end
+        # CRITICAL FIX: EVERY episode should fully reset (except agent learning)
+        # This ensures each episode starts from identical initial state
+        # Only agent's learned policy (neural network weights) persists
         if is_true_episode_end:
             # Full reset at end of data
             self._reset_financial_state_full()
@@ -1751,7 +1817,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
             
             logger.info(f"[EMA_STD_RESET] Reset EMA std state for new episode")
         else:
-            # Preserve gains for PPO buffer resets
+            # RESTORED: For PPO buffer resets, preserve financial gains
+            # This allows gains to accumulate across episodes, showing learning progress
+            # Only reset operational state, not financial positions/budget
+            logger.info(f"[RESET] PPO buffer reset: Preserving financial state (gains accumulate)")
+            
+            # Use partial reset that preserves financial gains
             self._reset_financial_state()
 
         for a in self.possible_agents:
@@ -1841,12 +1912,18 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
 
-        # Recalculate NAV with current state (don't reset to initial)
-        self._calculate_fund_nav()
+        # CRITICAL FIX: Recalculate NAV with current state (preserving financial gains)
+        # Use current timestep for depreciation calculation
+        current_t = getattr(self, 't', 0)
+        self._calculate_fund_nav(current_timestep=current_t)
 
     def _reset_financial_state_full(self):
         """FULL RESET: Only used at true episode end (end of data)"""
         logger.info(f"💰 FULL FINANCIAL RESET: Resetting all gains to initial state")
+
+        # CRITICAL FIX: Reset assets_deployed flag to allow proper recalculation
+        # This ensures physical_capex_deployed is recalculated consistently
+        self.assets_deployed = False
 
         # Reset financial instruments to zero
         self.financial_positions = {
@@ -1885,34 +1962,95 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.accumulated_operational_revenue = 0.0
         
         # CRITICAL FIX: Ensure self.t is 0 before calculating NAV to prevent depreciation differences
-        original_t = getattr(self, 't', 0)
+        # For reset, we always want t=0 (no depreciation)
         self.t = 0
         
-        # CRITICAL FIX: Calculate initial NAV manually to ensure consistency
-        # NAV = Trading Cash + Physical Asset Book Value (no depreciation at t=0) + Op Revenue (0) + Fin MTM (0)
+        # CRITICAL FIX: Recalculate physical_capex_deployed from config to ensure consistency
+        # This ensures Tier 1 and Tier 2 have identical physical assets
+        plan = self.config.get_initial_asset_plan()
+        total_capex = 0.0
+        for asset_type, specs in plan.items():
+            if asset_type == 'wind': 
+                capex = specs['capacity_mw'] * self.asset_capex['wind_mw']
+            elif asset_type == 'solar': 
+                capex = specs['capacity_mw'] * self.asset_capex['solar_mw']
+            elif asset_type == 'hydro': 
+                capex = specs['capacity_mw'] * self.asset_capex['hydro_mw']
+            elif asset_type == 'battery': 
+                capex = specs['capacity_mwh'] * self.asset_capex['battery_mwh']
+            else: 
+                continue
+            total_capex += capex
         
-        # Use trading_allocation_budget directly to ensure consistency
-        trading_cash = float(self.trading_allocation_budget)
-        
-        # CRITICAL FIX: Use stored physical_capex_deployed to ensure consistency
-        if hasattr(self, 'physical_capex_deployed'):
-            physical_book_value = float(self.physical_capex_deployed)
+        # Check if scaling is needed (same logic as _deploy_initial_assets_once)
+        if total_capex > self.physical_allocation_budget:
+            scale_factor = (self.physical_allocation_budget * 0.95) / total_capex
         else:
-            logger.warning("[RESET] 'physical_capex_deployed' not found. Recalculating book value, which may cause inconsistency.")
-            # Fallback recalculation logic
-            plan = self.config.get_initial_asset_plan()
-            physical_book_value = 0.0
-            for asset_type, specs in plan.items():
-                if asset_type == 'wind': capex = specs['capacity_mw'] * self.asset_capex['wind_mw']
-                elif asset_type == 'solar': capex = specs['capacity_mw'] * self.asset_capex['solar_mw']
-                elif asset_type == 'hydro': capex = specs['capacity_mw'] * self.asset_capex['hydro_mw']
-                elif asset_type == 'battery': capex = specs['capacity_mwh'] * self.asset_capex['battery_mwh']
-                else: continue
-                physical_book_value += capex
+            scale_factor = 1.0
+        
+        # Recalculate physical_capex_deployed with scaling
+        # CRITICAL FIX: Use explicit float() conversions to ensure identical values between tiers
+        physical_book_value = 0.0
+        for asset_type, specs in plan.items():
+            if asset_type == 'wind': 
+                capacity = float(specs['capacity_mw'] * scale_factor)
+                capex = float(capacity * self.asset_capex['wind_mw'])
+            elif asset_type == 'solar': 
+                capacity = float(specs['capacity_mw'] * scale_factor)
+                capex = float(capacity * self.asset_capex['solar_mw'])
+            elif asset_type == 'hydro': 
+                capacity = float(specs['capacity_mw'] * scale_factor)
+                capex = float(capacity * self.asset_capex['hydro_mw'])
+            elif asset_type == 'battery': 
+                capacity = float(specs['capacity_mwh'] * scale_factor)
+                capex = float(capacity * self.asset_capex['battery_mwh'])
+            else: 
+                continue
+            physical_book_value = float(physical_book_value + capex)
+        
+        # CRITICAL FIX: Store recalculated physical_capex_deployed to ensure consistency
+        self.physical_capex_deployed = physical_book_value
+        
+        # CRITICAL FIX: Reset physical assets to match recalculated values
+        self.physical_assets = {
+            'wind_capacity_mw': 0.0,
+            'solar_capacity_mw': 0.0,
+            'hydro_capacity_mw': 0.0,
+            'battery_capacity_mwh': 0.0,
+        }
+        # CRITICAL FIX: Use explicit float() conversions to ensure identical values between tiers
+        for asset_type, specs in plan.items():
+            if asset_type == 'wind':
+                self.physical_assets['wind_capacity_mw'] = float(specs['capacity_mw'] * scale_factor)
+            elif asset_type == 'solar':
+                self.physical_assets['solar_capacity_mw'] = float(specs['capacity_mw'] * scale_factor)
+            elif asset_type == 'hydro':
+                self.physical_assets['hydro_capacity_mw'] = float(specs['capacity_mw'] * scale_factor)
+            elif asset_type == 'battery':
+                self.physical_assets['battery_capacity_mwh'] = float(specs['capacity_mwh'] * scale_factor)
+        
+        # Mark as deployed again (after recalculation)
+        self.assets_deployed = True
+        
+        # CRITICAL DEBUG: Log reset details for consistency verification
+        tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+        logger.info(f"[{tier_name}_RESET] Physical assets recalculated:")
+        logger.info(f"  Physical allocation budget: {self.physical_allocation_budget:,.0f} DKK")
+        logger.info(f"  Total CAPEX required: {total_capex:,.0f} DKK")
+        logger.info(f"  Scale factor: {scale_factor:.10f}")  # More precision
+        logger.info(f"  Physical CAPEX deployed: {self.physical_capex_deployed:,.0f} DKK")
+        logger.info(f"  Physical book value: {physical_book_value:,.0f} DKK")
+        logger.info(f"  Wind: {self.physical_assets['wind_capacity_mw']:.10f} MW")  # More precision
+        logger.info(f"  Solar: {self.physical_assets['solar_capacity_mw']:.10f} MW")
+        logger.info(f"  Hydro: {self.physical_assets['hydro_capacity_mw']:.10f} MW")
+        logger.info(f"  Battery: {self.physical_assets['battery_capacity_mwh']:.10f} MWh")
 
         # At reset, operational revenue and financial MTM are zero.
         operational_revenue_value = 0.0
         financial_mtm_value = 0.0
+
+        # Use trading_allocation_budget directly to ensure consistency
+        trading_cash = float(self.trading_allocation_budget)
 
         # Calculate NAV directly from consistent components
         initial_nav = trading_cash + physical_book_value + operational_revenue_value + financial_mtm_value
@@ -1920,8 +2058,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # CRITICAL FIX: Force NAV to be consistent by setting equity explicitly
         self.equity = float(initial_nav)
         
-        # Restore original timestep
-        self.t = original_t
+        # CRITICAL FIX: Keep t=0 after reset (don't restore original_t)
+        # This ensures NAV calculations after reset use t=0 (no depreciation)
+        # t will be incremented in step() function
+        self.t = 0
+        
+        # CRITICAL FIX: Store the initial NAV from reset to use for logging at timestep 0
+        # This ensures identical NAV values at timestep 0, before any trades are executed
+        self._initial_nav_from_reset = float(initial_nav)
         
         # Log for debugging
         if hasattr(self, 'config'):
@@ -1961,10 +2105,15 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self._apply_meta_control(acts['meta_controller_0'])
 
             # investor + battery ops (battery returns realized cash delta)
-            trade_amount = self._execute_investor_trades(acts['investor_0'])
+            # CRITICAL FIX: Pass i (timestep) to _execute_investor_trades for consistency
+            trade_amount = self._execute_investor_trades(acts['investor_0'], timestep=i)
             battery_cash_delta = self._execute_battery_ops(acts['battery_operator_0'], i)
 
             # FIXED: finance update (MTM, costs, realized rev incl. battery cash)
+            # CRITICAL FIX: Ensure i is the correct timestep (should be self.t, but verify)
+            # At timestep 0, i should be 0 to ensure no depreciation
+            if i != self.t:
+                logger.warning(f"[NAV_FIX] Timestep mismatch: i={i}, self.t={self.t}")
             financial = self._update_finance(i, trade_amount, battery_cash_delta)
 
             # regime updates & rewards
@@ -1972,9 +2121,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self._update_risk_snapshots(i)
 
             # Track forecast accuracy if forecaster is available
+            # CRITICAL FIX: Use i (captured timestep) instead of self.t for consistency
             if self.forecast_generator and hasattr(self.forecast_generator, 'predict_all_horizons'):
                 try:
-                    current_forecasts = self.forecast_generator.predict_all_horizons(timestep=self.t)
+                    current_forecasts = self.forecast_generator.predict_all_horizons(timestep=i)
                     if isinstance(current_forecasts, dict):
                         self._track_forecast_accuracy(current_forecasts)
                 except Exception:
@@ -2053,18 +2203,20 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
             # ===== REGIME DETECTION UPDATE =====
             # Update regime detector with current price
-            if hasattr(self, 'regime_detector') and hasattr(self, '_price') and self.t < len(self._price):
-                current_price = float(self._price[self.t])
+            # CRITICAL FIX: Use i (captured timestep) instead of self.t for consistency
+            if hasattr(self, 'regime_detector') and hasattr(self, '_price') and i < len(self._price):
+                current_price = float(self._price[i])
                 self.regime_detector.update(current_price)
 
                 # Detect regime every 6 steps (hourly)
-                if self.t % 6 == 0:
+                # CRITICAL FIX: Use i (captured timestep) instead of self.t for consistency
+                if i % 6 == 0:
                     regime_info = self.regime_detector.detect_regime()
                     self._current_regime = regime_info
 
                     # Log regime changes daily
-                    if self.t % 144 == 0:
-                        logger.info(f"[REGIME] Step {self.t}: {regime_info['regime']} "
+                    if i % 144 == 0:
+                        logger.info(f"[REGIME] Step {i}: {regime_info['regime']} "
                                    f"(confidence={regime_info['confidence']:.2f}, "
                                    f"mult={regime_info['position_multiplier']:.2f}, "
                                    f"hurst={regime_info['metrics'].get('hurst_exponent', 0.5):.3f})")
@@ -2418,7 +2570,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # FIXED: Financial Instrument Trading (Separate from Physical Assets)
     # ------------------------------------------------------------------
 
-    def _execute_investor_trades(self, inv_action: np.ndarray) -> float:
+    def _execute_investor_trades(self, inv_action: np.ndarray, timestep: Optional[int] = None) -> float:
         """
         CORRECTED & FINAL: Executes trades based DIRECTLY on the RL agent's action.
 
@@ -2430,6 +2582,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         Returns total traded notional for transaction costs
         """
+        # CRITICAL FIX: Use timestep parameter if provided, otherwise use self.t
+        t = timestep if timestep is not None else getattr(self, 't', 0)
+        
         # === FGB: ACTION BLENDING REMOVED ===
         # DEPRECATED: Action blending has been replaced by forecast-guided baseline.
         # The DL overlay now informs the PPO baseline and risk sizing, not action execution.
@@ -2448,7 +2603,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Fall through to use original policy action
 
         # Trading is only allowed at the specified frequency
-        if self.t > 0 and self.t % self.investment_freq != 0:
+        # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
+        # CRITICAL FIX: Prevent trading at timestep 0 to ensure identical initial NAV
+        # At timestep 0, we want to log the reset NAV before any trades are executed
+        if t == 0:
+            return 0.0  # No trading at timestep 0 - ensures identical initial NAV
+        if t > 0 and t % self.investment_freq != 0:
             return 0.0
 
         # Do not trade if disabled by high drawdown
@@ -2476,18 +2636,20 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
             # VOLATILITY BRAKE: Reduce positions if realized volatility is elevated
             # If vol > 1.8x median, multiply by 0.8 to reduce risk
+            # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
             volatility_brake_mult = 1.0
-            if self.t > 50:
+            if t > 50:
                 try:
                     # Compute recent realized volatility
-                    recent_price_vol = float(np.std(self._price[max(0, self.t-50):self.t]))
-                    median_price_vol = float(np.median(np.std(self._price[max(0, i-50):i]) for i in range(max(50, self.t-500), self.t, 50)))
+                    recent_price_vol = float(np.std(self._price[max(0, t-50):t]))
+                    median_price_vol = float(np.median(np.std(self._price[max(0, i-50):i]) for i in range(max(50, t-500), t, 50)))
 
                     vol_threshold = getattr(self.config, 'volatility_brake_threshold', 1.8)
                     if median_price_vol > 1e-6 and recent_price_vol > vol_threshold * median_price_vol:
                         volatility_brake_mult = 0.8
-                        if self.t % 500 == 0:
-                            logger.info(f"[VOLATILITY_BRAKE] Step {self.t}: recent_vol={recent_price_vol:.4f} > {vol_threshold:.1f}x median={median_price_vol:.4f}, reducing by 20%")
+                        # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
+                        if t % 500 == 0:
+                            logger.info(f"[VOLATILITY_BRAKE] Step {t}: recent_vol={recent_price_vol:.4f} > {vol_threshold:.1f}x median={median_price_vol:.4f}, reducing by 20%")
                 except Exception:
                     pass  # Silently ignore volatility brake errors
 
@@ -2503,15 +2665,20 @@ class RenewableMultiAgentEnv(ParallelEnv):
             #
             # This maximizes overlay's contribution to NAV improvement.
 
+            # CRITICAL FIX: Apply risk controller's multiplier
+            # Risk controller sets self.risk_multiplier via _apply_risk_control()
+            # This must be included in position sizing to ensure risk controller's actions affect trades
+            risk_controller_mult = getattr(self, 'risk_multiplier', 1.0)
+            
             # Check if overlay risk budget should be applied
             always_apply_overlay = getattr(self.config, 'overlay_apply_risk_budget', True)
 
             if always_apply_overlay:
-                # Apply overlay risk budget + volatility brake
-                combined_multiplier = position_size_multiplier * smoothed_overlay_mult * volatility_brake_mult
+                # Apply all multipliers: position_size, risk_controller, overlay, volatility_brake
+                combined_multiplier = position_size_multiplier * risk_controller_mult * smoothed_overlay_mult * volatility_brake_mult
             else:
-                # Skip overlay risk budget (RL-only sizing)
-                combined_multiplier = position_size_multiplier * volatility_brake_mult
+                # Skip overlay risk budget (RL-only sizing), but still apply risk controller
+                combined_multiplier = position_size_multiplier * risk_controller_mult * volatility_brake_mult
 
             strategy_multiplier = 1.0
             strategy_meta = getattr(self, '_current_investor_strategy', None)
@@ -2539,10 +2706,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
             tradeable_capital = available_capital * combined_multiplier
 
             # DEBUG: Log risk multiplier application (always applied now)
-            if self.t % 500 == 0 and self.t > 0:
-                logger.debug(f"[OVERLAY RISK] Step {self.t}: "
-                            f"risk_budget={smoothed_overlay_mult:.4f}, rl_mult={position_size_multiplier:.4f}, "
-                            f"vol_brake={volatility_brake_mult:.4f}, combined={combined_multiplier:.4f}")
+            # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
+            if t % 500 == 0 and t > 0:
+                logger.debug(f"[OVERLAY RISK] Step {t}: "
+                            f"risk_controller={risk_controller_mult:.4f}, rl_mult={position_size_multiplier:.4f}, "
+                            f"risk_budget={smoothed_overlay_mult:.4f}, vol_brake={volatility_brake_mult:.4f}, "
+                            f"combined={combined_multiplier:.4f}")
 
             # === STEP 2: Map the agent's normalized actions to target DKK positions ===
             # ENHANCED: Apply Kelly position sizing + regime detection
@@ -2627,9 +2796,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             target_hydro = action_hydro * max_pos_size_hydro
 
             # Log combined multipliers periodically
-            if self.t % 500 == 0 and self.t > 0:
+            # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
+            if t % 500 == 0 and t > 0:
                 kelly_regime_geom = np.sqrt(kelly_multipliers['wind'] * regime_mult)
-                logger.info(f"[SIZING] Step {self.t}: "
+                logger.info(f"[SIZING] Step {t}: "
                            f"conf={forecast_confidences['wind']:.2f}, "
                            f"kelly={kelly_multipliers['wind']:.2f}, "
                            f"regime={regime_mult:.2f}, "
@@ -2669,9 +2839,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self.budget = max(0.0, self.budget)
 
                 # P&L-BASED TRAINING: Track action taken for later P&L attribution
-                current_price = float(self._price[self.t]) if self.t < len(self._price) else 250.0
+                # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
+                current_price = float(self._price[t]) if t < len(self._price) else 250.0
                 self._action_history.append({
-                    'timestep': self.t,
+                    'timestep': t,
                     'action': inv_action.copy(),  # The action that was taken
                     'positions': {
                         'wind': target_wind,
@@ -4357,7 +4528,32 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self._check_emergency_reallocation(operational_revenue)
 
             # 8) Calculate fund NAV
-            fund_nav = self._calculate_fund_nav()
+            # CRITICAL FIX: Pass i (the timestep parameter) directly to _calculate_fund_nav
+            # This ensures consistent NAV calculation even if self.t changes
+            # No need to modify self.t - just pass the correct timestep as parameter
+            # CRITICAL DEBUG: Log when calculating NAV at timestep 0 and 1
+            if i <= 1:
+                tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+                accumulated_operational_revenue = getattr(self, 'accumulated_operational_revenue', 0.0)
+                financial_mtm = sum(self.financial_positions.values())
+                logger.info(f"[{tier_name}_UPDATE_FINANCE] Calculating NAV in _update_finance at i={i}:")
+                logger.info(f"  i parameter = {i}")
+                logger.info(f"  self.t = {getattr(self, 't', 0)}")
+                logger.info(f"  budget = {self.budget:,.0f} DKK")
+                logger.info(f"  physical_assets = {self.physical_assets}")
+                logger.info(f"  accumulated_operational_revenue = {accumulated_operational_revenue:,.0f} DKK")
+                logger.info(f"  financial_positions MTM = {financial_mtm:,.0f} DKK")
+            fund_nav = self._calculate_fund_nav(current_timestep=i)
+            if i <= 1:
+                tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+                # Calculate components to see what's different
+                accumulated_operational_revenue = getattr(self, 'accumulated_operational_revenue', 0.0)
+                financial_mtm = sum(self.financial_positions.values())
+                # Calculate physical assets from NAV
+                physical_from_nav = fund_nav - self.budget - accumulated_operational_revenue - financial_mtm
+                logger.info(f"[{tier_name}_UPDATE_FINANCE] NAV calculated at i={i}: {fund_nav:,.0f} DKK (${fund_nav * 0.145 / 1_000_000:.2f}M)")
+                logger.info(f"  NAV breakdown: budget={self.budget:,.0f}, physical={physical_from_nav:,.0f}, operational={accumulated_operational_revenue:,.0f}, mtm={financial_mtm:,.0f}")
+                logger.info(f"  current_timestep passed to _calculate_fund_nav = {i}")
 
             # 9) Track performance
             self.performance_history['revenue_history'].append(net_cash_flow)
@@ -4392,20 +4588,31 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     # Check if position is being closed or flipped
                     # Close: sign change or reduction > 50%
                     notional_change = current_notional - old_notional
-                    is_closing = (old_notional * current_notional < 0 or  # Sign flip
-                                 abs(notional_change) > abs(old_notional) * 0.5)  # Large reduction
+                    is_sign_flip = old_notional * current_notional < 0
+                    is_large_reduction = abs(notional_change) > abs(old_notional) * 0.5
+                    is_closing = is_sign_flip or is_large_reduction
 
                     if is_closing and abs(old_notional) > 100:
                         # Calculate realized P&L from entry to close
-                        realized_pnl = (current_price - pos['entry_price']) * old_notional
+                        if is_sign_flip:
+                            # Sign flip: close full position, realize P&L on full old_notional
+                            realized_pnl = (current_price - pos['entry_price']) * old_notional
+                        else:
+                            # Large reduction: realize P&L only on the portion being closed
+                            closed_notional = old_notional - current_notional
+                            realized_pnl = (current_price - pos['entry_price']) * closed_notional
+
+                        # CRITICAL FIX: Add realized P&L to cash to preserve trading gains in NAV
+                        self.budget += realized_pnl
 
                         # Update Kelly with realized P&L
                         self.kelly_sizer.update(asset, realized_pnl)
-                        logger.info(f"[KELLY] {asset} position closed: "
+                        logger.info(f"[REALIZED] {asset} position closed: "
                                    f"notional={old_notional:.0f}, "
                                    f"entry_price={pos['entry_price']:.2f}, "
                                    f"exit_price={current_price:.2f}, "
-                                   f"realized_pnl={realized_pnl:.2f}")
+                                   f"realized_pnl={realized_pnl:.2f} DKK, "
+                                   f"added_to_cash=True")
 
                         # Open new position at current price
                         pos['entry_price'] = current_price
@@ -5521,8 +5728,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
     def _assign_rewards(self, financial: Dict[str, float]):
         """FIXED: Reward assignment with proper separation of value sources"""
         try:
-            # Calculate fund NAV - ensure float
-            fund_nav = float(self._calculate_fund_nav())
+            # CRITICAL FIX: Use fund_nav from financial dict (already calculated with correct timestep in _update_finance)
+            # This ensures consistent NAV values between Tier 1 and Tier 2
+            # _update_finance calculates NAV with self.t = i, so it's already correct
+            fund_nav = float(financial.get('fund_nav', 0.0))
+            if fund_nav == 0.0:
+                # Fallback: recalculate if not present (should not happen, but be safe)
+                # CRITICAL: Use current self.t (which should be the timestep from step())
+                fund_nav = float(self._calculate_fund_nav())
 
             # Get cash flow (actual money earned this step) - ensure float
             cash_flow = float(financial.get('revenue', 0.0))
@@ -5803,7 +6016,18 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 
                 # Calculate current portfolio metrics (logged at every timestep)
                 dkk_to_usd = 0.145  # Conversion rate
-                current_fund_nav_dkk = fund_nav  # Already calculated in _update_finance
+                # CRITICAL FIX: At timestep 0, use the NAV from reset (before any trades)
+                # This ensures identical starting NAV values between Tier 1 and Tier 2
+                # After timestep 0, use the NAV from _update_finance (which includes trades)
+                # NOTE: self.t is still 0 here because it's incremented AFTER _assign_rewards is called
+                if int(self.t) == 0 and hasattr(self, '_initial_nav_from_reset'):
+                    current_fund_nav_dkk = self._initial_nav_from_reset
+                    tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
+                    logger.info(f"[{tier_name}_NAV_LOG_FIX] Using initial NAV from reset at t=0: {current_fund_nav_dkk:,.0f} DKK (${current_fund_nav_dkk * 0.145 / 1_000_000:.2f}M)")
+                else:
+                    # CRITICAL FIX: Use fund_nav from _update_finance (already calculated with correct timestep i)
+                    # _update_finance sets self.t = i before calculating NAV, ensuring correct depreciation
+                    current_fund_nav_dkk = fund_nav
                 current_fund_nav_usd = current_fund_nav_dkk * dkk_to_usd / 1_000_000  # Convert to millions USD
                 current_cash_dkk = getattr(self, 'budget', 0.0)
                 current_trading_gains = getattr(self, 'cumulative_mtm_pnl', 0.0)
