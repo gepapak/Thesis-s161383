@@ -530,6 +530,10 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
         """
         FAIL-FAST: Get base observation dimension from environment with strict validation.
         No static fallbacks allowed - any failure indicates configuration/environment issues.
+        
+        CRITICAL FIX: When forecasts are enabled, the base environment ALREADY includes
+        forecast features in the "base" observation space. So we should use the FULL
+        observation space dimension from the base environment, not try to add more.
         """
         try:
             # Method 1: Use environment's explicit dimension method
@@ -540,6 +544,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 return dim
 
             # Method 2: Use observation space shape
+            # CRITICAL FIX: When forecasts are enabled, base_env.observation_space already includes forecasts
+            # So we should use the FULL dimension, not try to add more forecast dimensions
             if hasattr(self.base_env, 'observation_space'):
                 if callable(self.base_env.observation_space):
                     space = self.base_env.observation_space(agent)
@@ -555,7 +561,18 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 dim = int(space.shape[0])
                 if dim <= 0:
                     raise ValueError(f"Invalid base dimension {dim} from observation_space({agent}).shape")
-                return dim
+                
+                # CRITICAL FIX: When forecasts are enabled, the base environment observation space
+                # already includes all forecast features. So we return the FULL dimension.
+                # The wrapper should NOT add additional forecast dimensions in this case.
+                enable_forecast_util = getattr(self.base_env.config, 'enable_forecast_utilisation', False) if hasattr(self.base_env, 'config') else False
+                if enable_forecast_util:
+                    # Base environment already includes forecasts - return full dimension
+                    logger.debug(f"[BASE_DIM] {agent}: Using full observation space dimension {dim}D (forecasts already included in base)")
+                    return dim
+                else:
+                    # Tier 1: Base environment doesn't include forecasts - return base dimension
+                    return dim
 
             # No valid method found
             raise ValueError(f"Cannot determine base observation dimension for agent '{agent}': "
@@ -586,6 +603,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 base_dims = int(dims.get(agent, 0))
                 # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
                 result = base_dims + (1 if agent != "risk_controller_0" else 0)
+                # FIX #7: Add 2 dims for consensus_direction and consensus_confidence
+                result += (2 if agent != "risk_controller_0" else 0)
                 if agent == "meta_controller_0":
                     print(f"[FORECAST_DIM] {agent}: get_agent_forecast_dims={base_dims}, confidence=1, total={result}")
                 return result
@@ -595,6 +614,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 base_dims = int(len(targets) * len(horizons))
                 # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
                 result = base_dims + (1 if agent != "risk_controller_0" else 0)
+                # FIX #7: Add 2 dims for consensus signals
+                result += (2 if agent != "risk_controller_0" else 0)
                 if agent == "meta_controller_0":
                     print(f"[FORECAST_DIM] {agent}: targets={len(targets)}, horizons={len(horizons)}, base_dims={base_dims}, confidence=1, total={result}")
                 return result
@@ -606,7 +627,9 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                     base_dims = len(targets) * len(horizons)
                     # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
                     confidence_dim = 1 if agent != "risk_controller_0" else 0
-                    return base_dims + confidence_dim
+                    # FIX #7: Add consensus signals (2 dims) except risk_controller
+                    consensus_dim = 2 if agent != "risk_controller_0" else 0
+                    return base_dims + confidence_dim + consensus_dim
             except Exception:
                 pass
             # FAIL-FAST: No static fallbacks - fail fast to maintain single source of truth
@@ -619,7 +642,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                     horizons = self.forecaster.agent_horizons.get(agent, [])
                     base_dims = len(targets) * len(horizons)
                     confidence_dim = 1 if agent != "risk_controller_0" else 0
-                    return base_dims + confidence_dim
+                    consensus_dim = 2 if agent != "risk_controller_0" else 0
+                    return base_dims + confidence_dim + consensus_dim
             except Exception:
                 pass
             # FAIL-FAST: No static fallbacks - fail fast to maintain single source of truth
@@ -706,7 +730,55 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 v = f_proc.get(key, 0.0)
                 out[bd + j] = float(v if np.isfinite(v) else 0.0)
 
+        # FIX #7: Append consensus signals (direction, confidence) after forecast features
+        try:
+            if agent != "risk_controller_0":
+                # Consensus derived from forecast engine's quality-weighted signal and trust
+                consensus_direction = 0.0
+                consensus_confidence = 0.0
+                # Attempt to read from environment's forecast engine debug/state
+                fe = getattr(self.base_env, 'forecast_engine', None)
+                if fe is not None:
+                    # Use last quality-weighted signal and trust if available
+                    qsig = None
+                    try:
+                        if hasattr(self.base_env, '_quality_signal_debug'):
+                            dbg = getattr(self.base_env, '_quality_signal_debug')
+                            qsig = float(dbg.get('quality_signal', 0.0))
+                    except Exception:
+                        pass
+                    if qsig is None:
+                        # Fallback: use combined_forecast_score from env debug if present
+                        try:
+                            if hasattr(self.base_env, '_debug_forecast_reward'):
+                                qsig = float(self.base_env._debug_forecast_reward.get('combined_forecast_score', 0.0))
+                        except Exception:
+                            qsig = 0.0
+                    consensus_direction = float(np.sign(qsig))
+                    consensus_confidence = float(np.clip(getattr(fe, 'forecast_trust', 0.5), 0.0, 1.0))
+                else:
+                    # Fallback: derive from forecasts dictionary if possible
+                    avg_signal = 0.0
+                    cnt = 0
+                    for k, v in (forecasts or {}).items():
+                        if isinstance(v, (int, float)) and np.isfinite(v):
+                            avg_signal += float(v)
+                            cnt += 1
+                    avg_signal = avg_signal / cnt if cnt > 0 else 0.0
+                    consensus_direction = float(np.sign(avg_signal))
+                    consensus_confidence = 0.5
+
+                # Append to observation vector safely
+                # Place after existing total_dim; expand buffer if needed
+                if out.size < (bd + fd + 2):
+                    out = np.pad(out, (0, bd + fd + 2 - out.size)).astype(np.float32)
+                out[bd + fd: bd + fd + 2] = np.array([consensus_direction, consensus_confidence], dtype=np.float32)
+        except Exception:
+            # Keep observations valid even if consensus computation fails
+            pass
+
         low, high = spec['bounds']
+        # Clip only within declared bounds length; extra consensus dims already included in td
         np.clip(out, low[:td], high[:td], out=out)
         return out
 
@@ -973,27 +1045,34 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._obs_spaces = {}
         specs = self.obs_builder.validator.agent_observation_specs
 
-        # FIX: Get overlay configuration ONCE during initialization
-        # TIER-SPECIFIC OBSERVATION DIMENSIONS:
-        # Tier 1 (Basic MARL): No forecasts, no bridge → 6D investor observations
-        # Tier 2 (Forecast Integration): Forecasts enabled, NO bridge → 9D investor observations (6 base + 3 forecast)
-        # Tier 3 (Forecast + FGB Meta): Forecasts enabled + bridge vectors → 13D investor observations (9 + 4 bridge)
-        overlay_enabled = getattr(self.env.config, 'overlay_enabled', False)
-        bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable', True)  # Master flag for bridge vectors
-        # CRITICAL: Only add bridge dimensions when BOTH overlay is enabled AND bridge is enabled
-        # This prevents zero-padding noise when bridge vectors aren't actually used
-        # Tier 2 should NOT have bridge dimensions - they interfere with direct forecast learning
-        # Only Tier 3 (with DL overlay) should have bridge dimensions
-        bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4) if (overlay_enabled and bridge_enabled) else 0
-        battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False) and overlay_enabled and bridge_enabled
+        # ROBUST TIER DETECTION: Use centralized tier utilities
+        from tier_utils import get_tier_from_config, should_include_bridge_dimensions, get_tier_description
         
-        # ROBUSTNESS CHECK: If forecast utilisation is enabled but overlay is not, bridge should be disabled
-        # This ensures Tier 2 doesn't get bridge dimensions
-        enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
-        if enable_forecast_util and not overlay_enabled:
-            # Tier 2: Forecast integration without overlay - no bridge dimensions
+        tier = get_tier_from_config(self.env.config)
+        logger.info(f"[OBS_SPACE_TIER] Detected: {tier} - {get_tier_description(tier)}")
+        
+        # Determine bridge dimensions using centralized logic
+        if should_include_bridge_dimensions(self.env.config):
+            bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4)
+            bridge_enabled = True
+            logger.info(f"[OBS_SPACE_BRIDGE] Bridge dimensions enabled: {bridge_dim}D")
+        else:
             bridge_dim = 0
             bridge_enabled = False
+            logger.debug(f"[OBS_SPACE_BRIDGE] Bridge dimensions disabled (Tier 2 or Tier 1)")
+        
+        enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
+        
+        # Battery bridge dimensions (optional, usually disabled)
+        battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False) and bridge_enabled
+        
+        # Store bridge_enabled for use in _augment_with_expert_suggestions
+        self._bridge_enabled = bridge_enabled
+        
+        # Log configuration
+        logger.info(f"[OBS_SPACE_CONFIG] tier={tier}, enable_forecast_util={enable_forecast_util}, "
+                   f"bridge_enabled={bridge_enabled}, bridge_dim={bridge_dim}, "
+                   f"battery_bridge_enabled={battery_bridge_enabled}")
 
         for agent, spec in specs.items():
             low, high = spec['bounds']
@@ -1053,7 +1132,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                            f"bridge={bridge_dim} ({bridge_status}), TOTAL={final_dim}")
 
             else:
-                # Other agents (risk_controller_0, meta_controller_0): base + forecasts only
+                # Battery operator without bridge, or other agents (risk_controller_0, meta_controller_0)
                 # NO runtime modifications - use total_dim as-is
                 final_dim = total_dim
 
@@ -1062,8 +1141,13 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     shape=(final_dim,), dtype=np.float32
                 )
 
-                logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
-                           f"TOTAL={final_dim}")
+                # Log battery operator specifically to verify correct dimension for Tier 2
+                if agent == "battery_operator_0":
+                    logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
+                               f"bridge=0 (disabled for Tier 2), TOTAL={final_dim}")
+                else:
+                    logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
+                               f"TOTAL={final_dim}")
 
 
 
@@ -1080,6 +1164,19 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     def observation_space(self, agent): return self._obs_spaces[agent]
 
     def action_space(self, agent): return self.env.action_space(agent)
+    
+    def rebuild_observation_spaces(self):
+        """
+        CRITICAL: Rebuild observation spaces after DL adapter is initialized.
+        
+        This ensures that observation spaces include bridge vectors for Tier 3
+        when the DL adapter is initialized AFTER the wrapper is created.
+        
+        Must be called after initialize_dl_overlay() is called.
+        """
+        logger.info("[OBS_SPACE_REBUILD] Rebuilding observation spaces to include bridge vectors if DL adapter is present")
+        self._build_wrapper_observation_spaces()
+        logger.info("[OBS_SPACE_REBUILD] Observation spaces rebuilt successfully")
 
     @property
     def observation_spaces(self): return {a: self.observation_space(a) for a in self.possible_agents}
@@ -1125,16 +1222,15 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             # Tier 2: No bridge (forecast integration without overlay) → 9D observations
             # Tier 3: Bridge enabled (forecast integration + DL overlay) → 13D observations
             # NO ZERO-PADDING: Bridge dimensions only added when actually enabled and available
-            overlay_enabled = getattr(self.env.config, 'overlay_enabled', False)
-            bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable', True)
-            enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
+            # Use centralized tier utilities for consistency
+            from tier_utils import should_include_bridge_dimensions
             
-            # ROBUSTNESS: Tier 2 should not have bridge dimensions
-            if enable_forecast_util and not overlay_enabled:
+            if should_include_bridge_dimensions(self.env.config):
+                bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4)
+                bridge_enabled = True
+            else:
                 bridge_dim = 0
                 bridge_enabled = False
-            else:
-                bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4) if (overlay_enabled and bridge_enabled) else 0
 
             # TIER-SPECIFIC: Only append bridge vectors when they're actually enabled and available
             # NO ZERO-PADDING: If bridge isn't enabled, observation space shouldn't include those dimensions
@@ -1146,7 +1242,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     # Dimension mismatch - this should not happen if observation space is built correctly
                     if expected_dim > current_dim:
                         # Observation space expects more dimensions - this should only happen if bridge is enabled
-                        if overlay_enabled and bridge_enabled and hasattr(self.env, '_overlay_bridge_cache'):
+                        if self._bridge_enabled and hasattr(self.env, '_overlay_bridge_cache'):
                             bridge_vec = self.env._overlay_bridge_cache.get("investor_0", None)
                             if bridge_vec is not None and isinstance(bridge_vec, np.ndarray):
                                 bridge_vec = np.clip(bridge_vec.astype(np.float32), -1.0, 1.0)
@@ -1162,10 +1258,35 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                             raise ValueError(f"[BRIDGE_VEC] Observation space mismatch: expected {expected_dim}D but bridge not enabled. "
                                            f"Current dim: {current_dim}D. This indicates observation space was incorrectly built. "
                                            f"overlay_enabled={overlay_enabled}, bridge_enabled={bridge_enabled}")
-                    else:
-                        # Observation has more dimensions than expected - truncate (shouldn't happen)
-                        logger.warning(f"[BRIDGE_VEC] Observation has more dimensions than expected: {current_dim}D > {expected_dim}D. Truncating.")
-                        observations['investor_0'] = observations['investor_0'][:expected_dim]
+                    elif expected_dim < current_dim:
+                        # Observation has more dimensions than expected - this happens when:
+                        # 1. Observation space was built WITHOUT bridge dimensions (Tier 2 mode)
+                        # 2. But bridge vectors are being appended (Tier 3 mode)
+                        # CRITICAL FIX: If bridge is enabled, the observation space was built incorrectly!
+                        # FAIL-FAST: Don't truncate - raise error to force proper initialization
+                        if self._bridge_enabled:
+                            # This is a configuration bug: observation space should have included bridge dimensions
+                            error_msg = (
+                                f"[BRIDGE_VEC] CRITICAL BUG: Observation space mismatch detected!\n"
+                                f"  Expected: {expected_dim}D (observation space)\n"
+                                f"  Actual: {current_dim}D (observation with bridge vectors)\n"
+                                f"  bridge_enabled={self._bridge_enabled}, bridge_dim={bridge_dim}\n"
+                                f"This indicates observation space was built BEFORE overlay was initialized.\n"
+                                f"SOLUTION: Call rebuild_observation_spaces() after initialize_dl_overlay(), or\n"
+                                f"ensure wrapper checks for dl_adapter_overlay when building spaces.\n"
+                                f"Cannot proceed with incorrect observation dimensions."
+                            )
+                            logger.error(error_msg)
+                            raise ValueError(error_msg)
+                        else:
+                            # Bridge not enabled but observation has more dimensions - configuration error
+                            error_msg = (
+                                f"[BRIDGE_VEC] Observation dimension mismatch: expected {expected_dim}D, got {current_dim}D.\n"
+                                f"Bridge is disabled but observation has extra dimensions. This indicates a configuration error.\n"
+                                f"Cannot proceed with incorrect observation dimensions."
+                            )
+                            logger.error(error_msg)
+                            raise ValueError(error_msg)
 
                 # Append bridge vector to battery_operator_0 if enabled
                 # CONDITIONAL: Only when overlay is enabled AND battery bridge is enabled
@@ -1173,26 +1294,57 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                     expected_dim = self._obs_spaces['battery_operator_0'].shape[0]
                     current_dim = observations['battery_operator_0'].shape[0]
                     
-                    if expected_dim > current_dim and overlay_enabled and bridge_enabled:
+                    # CRITICAL: Validate dimension match BEFORE attempting augmentation
+                    if expected_dim != current_dim:
                         battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False)
-                        if battery_bridge_enabled and hasattr(self.env, '_overlay_bridge_cache_batt'):
-                            bridge_vec_batt = getattr(self.env, '_overlay_bridge_cache_batt', None)
-                            if bridge_vec_batt is not None and isinstance(bridge_vec_batt, np.ndarray):
-                                bridge_vec_batt = np.clip(bridge_vec_batt.astype(np.float32), -1.0, 1.0)
-                                observations['battery_operator_0'] = np.concatenate([observations['battery_operator_0'], bridge_vec_batt]).astype(np.float32)
+                        enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
+                        
+                        if expected_dim > current_dim:
+                            # Observation space expects more dimensions (bridge enabled)
+                            # Use bridge_enabled flag for consistency
+                            if self._bridge_enabled and battery_bridge_enabled:
+                                if hasattr(self.env, '_overlay_bridge_cache_batt'):
+                                    bridge_vec_batt = getattr(self.env, '_overlay_bridge_cache_batt', None)
+                                    if bridge_vec_batt is not None and isinstance(bridge_vec_batt, np.ndarray):
+                                        bridge_vec_batt = np.clip(bridge_vec_batt.astype(np.float32), -1.0, 1.0)
+                                        observations['battery_operator_0'] = np.concatenate([observations['battery_operator_0'], bridge_vec_batt]).astype(np.float32)
+                                    else:
+                                        logger.error(f"[BRIDGE_VEC] Battery bridge enabled but cache missing. "
+                                                   f"Expected {expected_dim}D, got {current_dim}D. "
+                                                   f"This indicates a configuration mismatch - observation space was built with bridge dimensions but bridge vectors are not available.")
+                                else:
+                                    logger.error(f"[BRIDGE_VEC] Battery bridge enabled but cache attribute missing. "
+                                               f"Expected {expected_dim}D, got {current_dim}D.")
                             else:
-                                logger.warning(f"[BRIDGE_VEC] Battery bridge enabled but cache missing. "
-                                             f"Expected {expected_dim}D, got {current_dim}D.")
-                        elif expected_dim > current_dim:
-                            logger.error(f"[BRIDGE_VEC] Battery observation space mismatch: expected {expected_dim}D but bridge not enabled. "
-                                       f"Current dim: {current_dim}D.")
+                                # CRITICAL ERROR: Observation space expects bridge dimensions but bridge is disabled
+                                # This happens when agent was initialized with wrong observation space (before fix)
+                                logger.error(f"[OBS_DIM_MISMATCH] Battery operator observation space mismatch: "
+                                           f"expected {expected_dim}D (with bridge) but environment provides {current_dim}D (no bridge). "
+                                           f"overlay_enabled={overlay_enabled}, bridge_enabled={bridge_enabled}, "
+                                           f"battery_bridge_enabled={battery_bridge_enabled}, enable_forecast_util={enable_forecast_util}. "
+                                           f"This indicates the agent was initialized with incorrect observation space. "
+                                           f"Please restart training with the fixed code.")
+                                # FAIL-FAST: Raise error to prevent silent failures
+                                raise ValueError(f"[OBS_DIM_MISMATCH] Battery operator observation dimension mismatch: "
+                                               f"expected {expected_dim}D but got {current_dim}D. "
+                                               f"The agent was initialized with an incorrect observation space. "
+                                               f"Please restart training with the fixed code.")
+                        else:
+                            # Observation has more dimensions than expected - configuration error
+                            error_msg = (
+                                f"[BRIDGE_VEC] Battery observation dimension mismatch: expected {expected_dim}D, got {current_dim}D.\n"
+                                f"This indicates a configuration error - observation space doesn't match actual observations.\n"
+                                f"Cannot proceed with incorrect observation dimensions."
+                            )
+                            logger.error(error_msg)
+                            raise ValueError(error_msg)
 
             if 'investor_0' not in observations:
                 return observations
 
             # REMOVED: Expert suggestion augmentation (legacy code removed)
-            # Tier 2 optionally uses GNN encoder to learn feature relationships
-            # (when --enable_forecast_utilisation and --enable_gnn_encoder flags enabled).
+            # GNN encoder optionally learns feature relationships (works for both Tier 1 and Tier 2)
+            # (when --enable_gnn_encoder flag enabled, optionally combined with --enable_forecast_utilisation for Tier 2).
             # Pre-trained ANN/LSTM forecasts provide additional observations.
             # NOT rule-based expert suggestions. Expert suggestions interfered with PPO learning and are deprecated
 
@@ -1299,6 +1451,21 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # This is a safety check to catch any dimension mismatches
         for agent in validated:
             if agent in self._obs_spaces:
+                # CRITICAL FIX: Ensure observation is 1D (no batch dimension)
+                obs = validated[agent]
+                if obs.ndim > 1:
+                    # Remove batch dimension if present - use squeeze(0) to be explicit
+                    if obs.shape[0] == 1:
+                        obs = obs.squeeze(0)  # Remove first dimension if it's size 1
+                    else:
+                        obs = obs.flatten()  # Flatten if no single batch dimension
+                    validated[agent] = obs.astype(np.float32)
+                elif obs.ndim == 0:
+                    # Scalar - convert to 1D array
+                    validated[agent] = np.array([obs], dtype=np.float32)
+                else:
+                    validated[agent] = obs.astype(np.float32)
+                
                 expected_dim = self._obs_spaces[agent].shape[0]
                 actual_dim = validated[agent].shape[0]
 
@@ -1358,6 +1525,21 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # This is a safety check to catch any dimension mismatches
         for agent in validated:
             if agent in self._obs_spaces:
+                # CRITICAL FIX: Ensure observation is 1D (no batch dimension)
+                obs = validated[agent]
+                if obs.ndim > 1:
+                    # Remove batch dimension if present - use squeeze(0) to be explicit
+                    if obs.shape[0] == 1:
+                        obs = obs.squeeze(0)  # Remove first dimension if it's size 1
+                    else:
+                        obs = obs.flatten()  # Flatten if no single batch dimension
+                    validated[agent] = obs.astype(np.float32)
+                elif obs.ndim == 0:
+                    # Scalar - convert to 1D array
+                    validated[agent] = np.array([obs], dtype=np.float32)
+                else:
+                    validated[agent] = obs.astype(np.float32)
+                
                 expected_dim = self._obs_spaces[agent].shape[0]
                 actual_dim = validated[agent].shape[0]
 

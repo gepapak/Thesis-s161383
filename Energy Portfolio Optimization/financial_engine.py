@@ -283,8 +283,12 @@ class FinancialEngine:
             return float(max(fund_equity, 0.0))  # Only prevent negative NAV
             
         except Exception as e:
-            logger.error(f"NAV calculation error: {e}")
-            return max(budget, config.init_budget * 0.01)
+            # Fail-fast: NAV computation must never silently fall back, otherwise tier results can be invalid.
+            raise RuntimeError(
+                f"Fund NAV calculation failed: {e}. "
+                f"Inputs: budget={budget}, accumulated_operational_revenue={accumulated_operational_revenue}, "
+                f"current_timestep={current_timestep}"
+            ) from e
     
     @staticmethod
     def calculate_timestep_costs(
@@ -715,3 +719,48 @@ class FinancialEngine:
             logger.error(f"MTM P&L calculation failed: {e}")
             return 0.0, financial_positions.copy()
 
+    # ------------------------------------------------------------------
+    # CORRECTNESS: Exposure vs MTM separation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def calculate_mtm_pnl_from_exposure(
+        financial_exposures: Dict[str, float],
+        price_return: float,
+        config: EnhancedConfig
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Calculate Mark-to-Market P&L given *exposures* (not position values).
+
+        IMPORTANT:
+        - `financial_exposures` represents notional exposure in DKK for each sleeve.
+        - This function does NOT update the exposure (exposure changes only on trades).
+        - Per-asset MTM P&L is returned so the caller can accumulate true MTM value separately.
+        """
+        try:
+            wind_exp = float(financial_exposures.get('wind_instrument_value', 0.0))
+            solar_exp = float(financial_exposures.get('solar_instrument_value', 0.0))
+            hydro_exp = float(financial_exposures.get('hydro_instrument_value', 0.0))
+
+            # Cap price returns to realistic energy market volatility
+            cap_min = getattr(config, 'mtm_price_return_cap_min', -0.015)
+            cap_max = getattr(config, 'mtm_price_return_cap_max', 0.015)
+            capped_price_return = float(np.clip(price_return, cap_min, cap_max))
+
+            wind_mtm = wind_exp * capped_price_return
+            solar_mtm = solar_exp * capped_price_return
+            hydro_mtm = hydro_exp * capped_price_return
+
+            mtm_pnl = float(wind_mtm + solar_mtm + hydro_mtm)
+            per_asset = {
+                'wind_instrument_value': float(wind_mtm),
+                'solar_instrument_value': float(solar_mtm),
+                'hydro_instrument_value': float(hydro_mtm),
+            }
+            return mtm_pnl, per_asset
+        except Exception as e:
+            logger.error(f"MTM P&L (exposure-based) calculation failed: {e}")
+            return 0.0, {
+                'wind_instrument_value': 0.0,
+                'solar_instrument_value': 0.0,
+                'hydro_instrument_value': 0.0,
+            }

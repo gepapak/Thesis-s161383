@@ -220,6 +220,9 @@ class RewardLogger:
         self.log_dir = log_dir
         self.tier_name = tier_name
         os.makedirs(log_dir, exist_ok=True)
+
+        # Track unknown-field warnings so we only log each unknown field once
+        self._warned_unknown_fields = set()
         
         # CSV file for step-by-step logging (will be set per episode)
         self.csv_file = None
@@ -230,9 +233,22 @@ class RewardLogger:
         self.category_writers = {}
         self.category_handles = {}
         self.category_fields = {
-            'portfolio': ['episode', 'timestep', 'portfolio_value_usd_millions', 'cash_dkk',
-                          'trading_gains_usd_thousands', 'operating_gains_usd_thousands', 'mtm_pnl',
-                          'price_current', 'price_return_1step', 'price_return_forecast'],
+            'portfolio': [
+                'episode', 'timestep',
+                # Core portfolio metrics
+                'portfolio_value_usd_millions', 'cash_dkk',
+                'trading_gains_usd_thousands', 'operating_gains_usd_thousands', 'mtm_pnl',
+                # Fund NAV component breakdown (DKK)
+                'fund_nav_dkk', 'trading_cash_dkk', 'physical_book_value_dkk',
+                'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
+                'depreciation_ratio', 'years_elapsed',
+                # NAV attribution drivers
+                'nav_start', 'nav_end', 'pnl_total', 'pnl_battery', 'pnl_generation', 'pnl_hedge', 'cash_delta_ops',
+                # Battery dispatch metrics (FIX #5)
+                'battery_decision', 'battery_intensity', 'battery_spread', 'battery_adjusted_hurdle', 'battery_volatility_adj',
+                # Price & returns
+                'price_current', 'price_return_1step', 'price_return_forecast'
+            ],
             'positions': ['episode', 'timestep', 'position_signed', 'position_exposure',
                           'wind_pos_norm', 'solar_pos_norm', 'hydro_pos_norm',
                           'investor_action', 'battery_action'],
@@ -307,6 +323,15 @@ class RewardLogger:
                  cash_dkk: float = 0.0,
                  trading_gains_usd_thousands: float = 0.0,
                  operating_gains_usd_thousands: float = 0.0,
+                 # Fund NAV component breakdown (DKK)
+                 fund_nav_dkk: float = 0.0,
+                 trading_cash_dkk: float = 0.0,
+                 physical_book_value_dkk: float = 0.0,
+                 accumulated_operational_revenue_dkk: float = 0.0,
+                 financial_mtm_dkk: float = 0.0,
+                 financial_exposure_dkk: float = 0.0,
+                 depreciation_ratio: float = 0.0,
+                 years_elapsed: float = 0.0,
                  # Forecast signals
                  z_short: float = 0.0,
                  z_medium: float = 0.0,
@@ -453,7 +478,30 @@ class RewardLogger:
                  forecast_error_short_pct: float = 0.0,
                  forecast_error_medium_pct: float = 0.0,
                  forecast_error_long_pct: float = 0.0,
-                 agent_followed_forecast: bool = False):
+                 agent_followed_forecast: bool = False,
+                 # NEW: NAV attribution drivers (per-step financial breakdown)
+                 nav_start: float = 0.0,
+                 nav_end: float = 0.0,
+                 pnl_total: float = 0.0,
+                 pnl_battery: float = 0.0,
+                 pnl_generation: float = 0.0,
+                 pnl_hedge: float = 0.0,
+                 cash_delta_ops: float = 0.0,
+                 # NEW: Battery dispatch metrics (FIX #5 - volatility-aware battery)
+                 battery_decision: str = 'idle',
+                 battery_intensity: float = 0.0,
+                 battery_spread: float = 0.0,
+                 battery_adjusted_hurdle: float = 0.0,
+                 battery_volatility_adj: float = 0.0,
+                 # NEW: Battery state metrics (BATTERY REWARD FIX)
+                 battery_energy: float = 0.0,
+                 battery_capacity: float = 0.0,
+                 battery_soc: float = 0.0,
+                 battery_cash_delta: float = 0.0,
+                 battery_throughput: float = 0.0,
+                 battery_degradation_cost: float = 0.0,
+                 battery_eta_charge: float = 0.0,
+                 battery_eta_discharge: float = 0.0):
         """Log detailed step information"""
         # DEBUG to verify log_step is being called
         if timestep % 100 == 0:
@@ -496,6 +544,15 @@ class RewardLogger:
             'operating_gains_usd_thousands': operating_gains_usd_thousands,
             # Primary portfolio metrics (mtm_pnl is per-step, not cumulative)
             'mtm_pnl': mtm_pnl,
+            # Fund NAV component breakdown (DKK)
+            'fund_nav_dkk': fund_nav_dkk,
+            'trading_cash_dkk': trading_cash_dkk,
+            'physical_book_value_dkk': physical_book_value_dkk,
+            'accumulated_operational_revenue_dkk': accumulated_operational_revenue_dkk,
+            'financial_mtm_dkk': financial_mtm_dkk,
+            'financial_exposure_dkk': financial_exposure_dkk,
+            'depreciation_ratio': depreciation_ratio,
+            'years_elapsed': years_elapsed,
             # Position info
             'position_signed': position_signed,
             'position_exposure': position_exposure,
@@ -695,6 +752,41 @@ class RewardLogger:
         row['investor_action'] = serialize_action(investor_action)
         row['battery_action'] = serialize_action(battery_action)
         
+        # NEW: NAV attribution drivers (per-step financial breakdown)
+        row['nav_start'] = nav_start
+        row['nav_end'] = nav_end
+        row['pnl_total'] = pnl_total
+        row['pnl_battery'] = pnl_battery
+        row['pnl_generation'] = pnl_generation
+        row['pnl_hedge'] = pnl_hedge
+        row['cash_delta_ops'] = cash_delta_ops
+        
+        # NEW: Battery dispatch metrics (FIX #5)
+        row['battery_decision'] = battery_decision
+        row['battery_intensity'] = battery_intensity
+        row['battery_spread'] = battery_spread
+        row['battery_adjusted_hurdle'] = battery_adjusted_hurdle
+        row['battery_volatility_adj'] = battery_volatility_adj
+        # NEW: Battery state metrics (BATTERY REWARD FIX)
+        row['battery_energy'] = battery_energy
+        row['battery_capacity'] = battery_capacity
+        row['battery_soc'] = battery_soc
+        row['battery_cash_delta'] = battery_cash_delta
+        row['battery_throughput'] = battery_throughput
+        row['battery_degradation_cost'] = battery_degradation_cost
+        row['battery_eta_charge'] = battery_eta_charge
+        row['battery_eta_discharge'] = battery_eta_discharge
+        
+        # NEW: Forecast vs actual comparison
+        row['current_price_dkk'] = current_price_dkk
+        row['forecast_price_short_dkk'] = forecast_price_short_dkk
+        row['forecast_price_medium_dkk'] = forecast_price_medium_dkk
+        row['forecast_price_long_dkk'] = forecast_price_long_dkk
+        row['forecast_error_short_pct'] = forecast_error_short_pct
+        row['forecast_error_medium_pct'] = forecast_error_medium_pct
+        row['forecast_error_long_pct'] = forecast_error_long_pct
+        row['agent_followed_forecast'] = int(agent_followed_forecast)
+        
         row_to_write = row
         try:
             writer_fieldnames = getattr(self.csv_writer, 'fieldnames', None)
@@ -702,7 +794,10 @@ class RewardLogger:
                 allowed_fields = set(writer_fieldnames)
                 extra_fields = [key for key in row.keys() if key not in allowed_fields]
                 if extra_fields:
-                    logging.warning(f"[LOGGER] Dropping unknown columns: {extra_fields}")
+                    new_fields = [f for f in extra_fields if f not in self._warned_unknown_fields]
+                    if new_fields:
+                        logging.warning(f"[LOGGER] Dropping unknown columns: {new_fields}")
+                        self._warned_unknown_fields.update(new_fields)
                 row_to_write = {field: row.get(field, '') for field in writer_fieldnames}
         except Exception as filter_err:
             logging.debug(f"[LOGGER] Could not align row with fieldnames: {filter_err}")
@@ -788,6 +883,10 @@ class RewardLogger:
             'trading_gains_usd_thousands', 'operating_gains_usd_thousands',
             # Primary portfolio metrics (mtm_pnl is per-step, not cumulative)
             'mtm_pnl',  # Mark-to-market PnL (per-step, not cumulative)
+            # Fund NAV component breakdown (DKK)
+            'fund_nav_dkk', 'trading_cash_dkk', 'physical_book_value_dkk',
+            'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
+            'depreciation_ratio', 'years_elapsed',
             # Position info (common to both tiers)
             'position_signed', 'position_exposure',
             # Price data (for forward-looking accuracy analysis)
@@ -861,7 +960,15 @@ class RewardLogger:
             # NEW: Forecast vs actual comparison (deep debugging)
             'current_price_dkk', 'forecast_price_short_dkk', 'forecast_price_medium_dkk', 'forecast_price_long_dkk',
             'forecast_error_short_pct', 'forecast_error_medium_pct', 'forecast_error_long_pct',
-            'agent_followed_forecast'
+            'agent_followed_forecast',
+            # NEW: NAV attribution drivers (per-step financial breakdown)
+            'nav_start', 'nav_end', 'pnl_total', 'pnl_battery', 'pnl_generation', 'pnl_hedge', 'cash_delta_ops',
+            # NEW: Battery dispatch metrics (FIX #5)
+            'battery_decision', 'battery_intensity', 'battery_spread', 'battery_adjusted_hurdle', 'battery_volatility_adj',
+            # NEW: Battery state metrics for diagnostics (BATTERY REWARD FIX)
+            'battery_energy', 'battery_capacity', 'battery_soc',
+            'battery_cash_delta', 'battery_throughput', 'battery_degradation_cost',
+            'battery_eta_charge', 'battery_eta_discharge'
         ]
 
         # Preserve insertion order while removing duplicates

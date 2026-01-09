@@ -107,6 +107,7 @@ class EnhancedConfig:
     CONFIG_VERSION = "2.2.0"  # Updated for unified normalization
 
     def __init__(self, optimized_params: Optional[Dict[str, Any]] = None):
+        # (Removed) Fair-comparison flag: fairness is now the default behavior.
         # =============================================================================
         # FUND STRUCTURE AND ECONOMICS
         # =============================================================================
@@ -205,6 +206,14 @@ class EnhancedConfig:
         self.mtm_price_return_cap_min = -0.001  # REALISTIC: -0.1% maximum loss per 10-min step (≈-14% daily)
         self.mtm_price_return_cap_max = 0.001   # REALISTIC: +0.1% maximum gain per 10-min step (≈+14% daily)
 
+        # FAIR SPARSE REWARD FIXES: Multi-step returns and MTM inclusion
+        # These apply to ALL tiers equally, making rewards less sparse without unfair advantages
+        # REDUCED: Smaller window (2 instead of 3) to preserve reward signal strength
+        # REDUCED: Lower MTM weight (0.2 instead of 0.3) to reduce noise
+        self.pnl_reward_multi_step_window = 2  # Use rolling average of 2 timesteps (reduced from 3 to preserve signal)
+        self.pnl_reward_include_mtm = True  # Include unrealized PnL delta in rewards (fair for all tiers)
+        self.pnl_reward_mtm_weight = 0.2  # Weight for MTM component (20% MTM, 80% realized return) - reduced from 0.3 to reduce noise
+
         # MTM threshold for position updates
         self.mtm_update_threshold = 1e-9  # Threshold for applying MTM updates to positions
 
@@ -232,7 +241,7 @@ class EnhancedConfig:
         self.investment_freq = 6   # CAPITAL PRESERVATION: Every 4 hours for careful positioning
         self.min_investment_freq = 4   # CAPITAL PRESERVATION: 2 hour minimum
         self.max_investment_freq = 12  # CAPITAL PRESERVATION: 48 hours maximum (very patient)
-        self.capital_allocation_fraction = 0.35  # FORECAST OPTIMIZATION: Increased to 35% (from 25%) for stronger forecast impact
+        self.capital_allocation_fraction = 0.40  # INCREASED: 40% (from 35%) to allow larger positions for Tier 2/3 forecast learning
         self.risk_multiplier = 0.5  # CAPITAL PRESERVATION: Minimal risk multiplier
         self.no_trade_threshold = 0.02  # 2% of target position - trades below this are ignored
 
@@ -266,7 +275,7 @@ class EnhancedConfig:
         # OPERATIONAL EXCELLENCE: Capital preservation risk management
         self.max_drawdown_threshold = 0.10  # CAPITAL PRESERVATION: 10% maximum drawdown
         self.volatility_lookback = 60  # CAPITAL PRESERVATION: 60 days for very stable calculations
-        self.max_position_size = 0.05  # FORECAST OPTIMIZATION: 5% maximum single position size (increased from 1% for forecast impact)
+        self.max_position_size = 0.08  # INCREASED: 8% maximum single position size (from 5%) to encourage larger positions for Tier 2/3
         self.volatility_scaling = 0.8   # CAPITAL PRESERVATION: High scaling for minimal risk
         self.target_sharpe_ratio = 2.0  # CAPITAL PRESERVATION: High target for excellent risk-adjusted returns
         self.risk_free_rate = 0.02      # 2% risk-free rate (Danish government bonds)
@@ -550,8 +559,8 @@ class EnhancedConfig:
 
         # === FGB: Risk Uplift (trust-weighted position sizing) ===
         # Modulate risk budget conservatively when forecasts are credible (no action blending)
-        # FIXED: Default to False (must be explicitly enabled via command-line flag)
-        self.risk_uplift_enable = False       # Enable trust-weighted risk sizing (default: OFF)
+        # Controlled by --enable_forecast_risk_management flag (unified with forecast_risk_management_mode)
+        self.risk_uplift_enable = False       # Enable trust-weighted risk sizing (controlled by --enable_forecast_risk_management)
         self.risk_uplift_kappa = 0.15         # κ_uplift: 15% sizing uplift (FIXED: match command-line default)
         self.risk_uplift_cap = 1.15           # Maximum risk multiplier (1.0 + kappa)
 
@@ -608,16 +617,17 @@ class EnhancedConfig:
 
         # === Forecast Utilisation (2-TIER SYSTEM) ===
         # Tier 1 (Baseline MARL): enable_forecast_utilisation=False
-        # Tier 2 (Risk Management + Novel Signal Filtering): enable_forecast_utilisation=True
-        #   - Automatically enables forecast_risk_management_mode
-        #   - Uses MAPE thresholds for hedging vs trading decisions
-        #   - Adaptive position sizing based on confidence & volatility
-        self.enable_forecast_utilisation = False  # Master flag: enables forecast loading + risk management
+        # Tier 2 (Forecast-Enhanced Observations): enable_forecast_utilisation=True
+        #   - Forecast features added to observations (14D = 6 base + 8 forecast)
+        #   - Optional add-ons: forecast_risk_management_mode, risk_uplift_enable
+        self.enable_forecast_utilisation = False  # Master flag: enables forecast loading + observation features
+        # NOTE: When enabled, uses full forecast features (Tier 22): z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal (14D total = 6 base + 8 forecast)
 
-        # === Forecast Risk Management Mode (AUTO-ENABLED WITH FORECASTS) ===
-        # When enable_forecast_utilisation=True, this is automatically enabled
+        # === Forecast Risk Management Mode (OPTIONAL ADD-ON - SEPARATE FLAG) ===
+        # Controlled by --enable_forecast_risk_management flag (separate from enable_forecast_utilisation)
+        # When enabled, also enables risk_uplift_enable (both controlled by same unified flag)
         # Uses forecasts for risk management instead of directional trading
-        self.forecast_risk_management_mode = False  # Auto-enabled when enable_forecast_utilisation=True
+        self.forecast_risk_management_mode = False  # Optional add-on: controlled by --enable_forecast_risk_management flag
 
         # Risk management parameters
         self.forecast_confidence_high_threshold = 0.48  # Above this: normal positions (~top 20% trust)
@@ -646,7 +656,7 @@ class EnhancedConfig:
             'long': 0.2     # Long-term (144 steps) gets 20% weight
         }
         self.signal_filter_min_horizons = 1  # Minimum number of horizons with significant signals
-        self.signal_filter_neutral_position_scale = 0.1  # Scale positions to 10% when no signal
+        self.signal_filter_neutral_position_scale = 0.6  # Scale positions to 60% when no signal (increased from 0.1)
         # Gradually relax the gate so filters remain usable late in an episode
         self.signal_gate_initial_multiplier = 3.0  # Initial multiple of MAPE required to trade
         self.signal_gate_min_multiplier = 0.8      # Floor multiple once decay completes
@@ -663,9 +673,9 @@ class EnhancedConfig:
         self.investor_aggressive_trade_mape_multiplier = 1.6  # Aggressive trade when |delta| > 1.6x MAPE
 
         # Position sizing for different signal strengths
-        self.investor_hedge_position_scale = 0.5    # 50% positions for hedging (gives exposures above reward gate)
-        self.investor_trade_position_scale = 0.7    # 70% positions for normal trading
-        self.investor_aggressive_position_scale = 1.0  # 100% positions for strong signals
+        self.investor_hedge_position_scale = 0.7    # 70% positions for hedging (increased from 0.5)
+        self.investor_trade_position_scale = 0.9    # 90% positions for normal trading (increased from 0.7)
+        self.investor_aggressive_position_scale = 1.2  # 120% positions for strong signals (increased from 1.0)
 
         # Multi-horizon consensus requirements
         self.investor_require_consensus = False     # Allow majority vote without hard consensus veto
@@ -687,7 +697,7 @@ class EnhancedConfig:
         # Training defaults - STRENGTHENED FOR BETTER LEARNING
         self.update_every = 128  # OPTIMIZED: Reduced from 32 for more responsive learning
         self.lr = 1.5e-3  # STRENGTHENED: Increased from 8e-4 to 1.5e-3 for faster learning (87% increase)
-        self.ent_coef = 0.005  # STRENGTHENED LEARNING: Reduced from 0.015 to focus on exploitation
+        self.ent_coef = 0.010  # FAIR COMPARISON: Same for both tiers (increased to encourage position-taking)
         self.verbose = 1
         self.seed = 42
         self.multithreading = True
@@ -706,8 +716,10 @@ class EnhancedConfig:
         self.net_arch = [256, 128, 64]  # Deeper network for better pattern recognition
         self.activation_fn = "relu"  # Changed from tanh for better gradient flow
 
-        # GNN Encoder (Tier 2 only)
-        self.enable_gnn_encoder = False  # Enable GNN observation encoder for relationship learning
+        # GNN Encoder (works for both Tier 1 and Tier 2)
+        self.enable_gnn_encoder = False  # Enable GNN observation encoder for relationship learning (works on 6D base or 14D forecast-enhanced observations)
+        
+        # Tier 1 defaults (6D base observations)
         self.gnn_features_dim = 18  # Output dimension of GNN encoder (divisible by num_heads=3)
         self.gnn_hidden_dim = 30  # Hidden dimension of GAT layers (divisible by num_heads=3: 30/3=10)
         self.gnn_num_layers = 2  # Number of GAT layers
@@ -716,6 +728,26 @@ class EnhancedConfig:
         self.gnn_graph_type = 'full'  # 'full' (fully-connected) or 'learned' (learnable adjacency)
         self.gnn_use_attention_pooling = True  # IMPROVED: Use attention pooling instead of mean pooling
         self.gnn_net_arch = [128, 64]  # Smaller MLP after GNN (GNN does feature extraction)
+        
+        # Tier 2 settings (14D: 6 base + 8 forecast features)
+        # PUBLICATION-FAIR: Match Tier 1 output capacity while keeping hierarchical structure
+        # The hierarchical architecture is the KEY DIFFERENCE needed to utilize forecast features
+        # Matched capacities (output_dim, MLP) isolate the architecture effect
+        self.gnn_features_dim_tier2 = 18  # MATCHED: Same final output as Tier 1 (each sub-encoder → 9D, fused → 18D)
+        self.gnn_hidden_dim_tier2 = 30  # MATCHED: Same as Tier 1 (each sub-encoder uses 15)
+        self.gnn_num_layers_tier2 = 2  # MATCHED: Same depth (sub-encoders use full 2 layers each, fusion adds structure)
+        self.gnn_num_heads_tier2 = 3  # MATCHED: Same as Tier 1
+        self.gnn_dropout_tier2 = 0.1  # MATCHED: Same as Tier 1
+        self.gnn_graph_type_tier2 = 'hierarchical'  # KEY DIFFERENCE: Hierarchical structure (only architectural difference)
+        self.gnn_use_attention_pooling_tier2 = True  # MATCHED: Same as Tier 1
+        self.gnn_net_arch_tier2 = [128, 64]  # MATCHED: Same MLP as Tier 1
+        
+        # NOTE FOR PUBLICATION:
+        # - Output dimensions matched: Both produce 18D final representation
+        # - MLP matched: Both use [128, 64]
+        # - Depth matched: Both use 2 layers (hierarchical splits into 2 parallel paths)
+        # - Only difference: Hierarchical structure (separate base/forecast encoders + cross-attention)
+        # This isolates whether the hierarchical architecture (necessary for forecast features) provides benefit
 
         # Agent policies
         self.agent_policies = [
@@ -1002,10 +1034,10 @@ class ImprovedTier2Config(EnhancedConfig):
         # PHASE 2: RISK MANAGEMENT PARAMETERS
         # ============================================================
 
-        # Position sizing based on forecast confidence
-        self.forecast_confidence_high_threshold = 0.48  # Above this: normal positions (~top 20% trust)
-        self.forecast_confidence_medium_threshold = 0.45  # Above this: 70% positions (~top 40% trust)
-        self.forecast_confidence_low_scale = 0.5  # Below medium: 50% positions
+        # Position sizing based on forecast confidence (MADE MORE AGGRESSIVE)
+        self.forecast_confidence_high_threshold = 0.40  # Above this: normal positions (lowered from 0.48)
+        self.forecast_confidence_medium_threshold = 0.35  # Above this: 70% positions (lowered from 0.45)
+        self.forecast_confidence_low_scale = 0.7  # Below medium: 70% positions (increased from 0.5)
 
         # Volatility-based position scaling
         self.forecast_volatility_high_threshold = 1.5  # Above this: 50% positions
@@ -1020,7 +1052,9 @@ class ImprovedTier2Config(EnhancedConfig):
         self.forecast_extreme_profit_taking_fraction = 0.3  # Take 30% profits
 
         # Risk management reward weight
-        self.forecast_risk_management_weight = 0.20  # 20% of total reward
+        self.forecast_risk_management_weight = 0.20
+        
+        # NOTE: ent_coef is inherited from EnhancedConfig (0.010) - same for both tiers for fair comparison  # 20% of total reward
 
         # ============================================================
         # NOVEL: MULTI-HORIZON SIGNAL FILTERING
@@ -1035,7 +1069,7 @@ class ImprovedTier2Config(EnhancedConfig):
             'long': 0.2     # Long-term (144 steps) gets 20% weight
         }
         self.signal_filter_min_horizons = 1  # Minimum number of horizons with significant signals
-        self.signal_filter_neutral_position_scale = 0.1  # Scale positions to 10% when no signal
+        self.signal_filter_neutral_position_scale = 0.6  # Scale positions to 60% when no signal (increased from 0.1)
 
         # ============================================================
         # REWARD WEIGHTS (ADJUSTED FOR RISK MANAGEMENT)

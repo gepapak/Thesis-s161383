@@ -308,11 +308,34 @@ class EnhancedRiskController:
 
     def calculate_forecast_uncertainty_risk(self, env_state: Dict) -> float:
         """
-        ENHANCEMENT: Calculate risk from forecast uncertainty (spread of quantiles).
+        FIX #6: Calculate risk from forecast uncertainty (MAPE-based).
+        
+        Maps forecast MAPE (Mean Absolute Percentage Error) to risk:
+        - MAPE < 5%: Low uncertainty risk (0.0)
+        - MAPE 5-10%: Moderate risk (0.2-0.4)
+        - MAPE 10-20%: High risk (0.4-0.7)
+        - MAPE > 20%: Very high risk (0.7-1.0)
+        
         Returns a value in [0, 1].
         """
         try:
-            # Extract forecast quantiles if available
+            # Get forecast MAPE if available from env
+            forecast_mape = float(env_state.get('forecast_mape', 0.15))
+            
+            # Map MAPE to risk [0, 1]
+            # MAPE is typically 0.05 to 0.35; map nonlinearly to emphasize high error
+            forecast_mape = float(np.clip(forecast_mape, 0.0, 0.4))
+            
+            if forecast_mape < 0.05:
+                risk = 0.0
+            elif forecast_mape < 0.10:
+                risk = (forecast_mape - 0.05) / 0.05 * 0.3  # [0.0, 0.3]
+            elif forecast_mape < 0.20:
+                risk = 0.3 + (forecast_mape - 0.10) / 0.10 * 0.4  # [0.3, 0.7]
+            else:
+                risk = 0.7 + (forecast_mape - 0.20) / 0.20 * 0.3  # [0.7, 1.0]
+            
+            # Extract forecast quantiles if available (alternative method)
             price_forecasts = env_state.get('price_forecasts', [])
             if isinstance(price_forecasts, (list, tuple)) and len(price_forecasts) >= 3:
                 # Assume forecasts are [q10, q50, q90] or similar
@@ -321,15 +344,20 @@ class EnhancedRiskController:
                     q10, q50, q90 = forecasts[0], forecasts[1], forecasts[2]
                     if q50 > 0:
                         uncertainty = (q90 - q10) / q50  # Relative spread
-                        return float(np.clip(uncertainty * 0.5, 0.0, 1.0))  # Scale to [0,1]
+                        # Combine MAPE and quantile uncertainty
+                        quantile_risk = float(np.clip(uncertainty * 0.5, 0.0, 1.0))
+                        risk = 0.6 * risk + 0.4 * quantile_risk  # Blend approaches
 
             # Fallback: use price volatility as proxy for forecast uncertainty
             if len(self.price_history) >= 5:
                 prices = np.array(list(self.price_history)[-5:], dtype=np.float64)
                 volatility = np.std(prices) / max(np.mean(prices), 1.0)
-                return float(np.clip(volatility * 2.0, 0.0, 1.0))
+                volatility_risk = float(np.clip(volatility * 2.0, 0.0, 1.0))
+                # If MAPE not available, use volatility as fallback
+                if forecast_mape == 0.15:  # Default value
+                    risk = 0.5 * risk + 0.5 * volatility_risk
 
-            return 0.15  # Default moderate uncertainty
+            return float(np.clip(risk, 0.0, 1.0))
         except Exception as e:
             self.logger.warning(f"Forecast uncertainty risk calculation failed: {e}")
             return 0.15
@@ -839,17 +867,17 @@ class ForecastRiskManager:
                 # Normalize to [0, 1] range (cap at 3.0 for extreme signals)
                 signal_strength = min(weighted_strength / 3.0, 1.0)
 
-        # 1. CONFIDENCE-BASED POSITION SCALING
+        # 1. CONFIDENCE-BASED POSITION SCALING (MADE MORE AGGRESSIVE)
         if forecast_trust > self.confidence_high:
-            confidence_scale = 1.0  # High confidence → normal positions
+            confidence_scale = 1.2  # High confidence → 120% positions (boosted from 1.0)
         elif forecast_trust > self.confidence_medium:
-            confidence_scale = 0.7  # Medium confidence → 70% positions
+            confidence_scale = 0.9  # Medium confidence → 90% positions (increased from 0.7)
         else:
-            confidence_scale = self.confidence_low_scale  # Low confidence → 50% positions
+            confidence_scale = self.confidence_low_scale  # Low confidence → uses config value
 
-        # NOVEL: If no significant signal, reduce position to zero (stay neutral)
+        # NOVEL: If no significant signal, reduce position but not to zero (MADE MORE AGGRESSIVE)
         if not trade_signal:
-            confidence_scale *= 0.1  # 10% of normal (near-zero positions)
+            confidence_scale *= 0.6  # 60% of normal (increased from 0.1 to allow more positions)
 
         # 2. VOLATILITY-BASED POSITION SCALING
         forecast_volatility = float(np.std([z_short, z_medium, z_long]))
@@ -1000,6 +1028,9 @@ class ForecastRiskManager:
         # This allows Tier 2 to exploit good forecasts while protecting against bad ones!
 
         # Calculate average MAPE across horizons
+        # BUG FIX: Check if mape_thresholds is None before accessing
+        if mape_thresholds is None:
+            mape_thresholds = {'short': 0.02, 'medium': 0.025, 'long': 0.03}  # Default thresholds
         mape_values = [mape_thresholds.get(h, 0.0) for h in ['short', 'medium', 'long'] if mape_thresholds.get(h, 0.0) > 1e-6]
         avg_mape = np.mean(mape_values) if len(mape_values) > 0 else 0.05
 
@@ -1052,6 +1083,10 @@ class ForecastRiskManager:
         # Analyze each horizon
         horizon_analysis = {}
         weights = {'short': 0.5, 'medium': 0.3, 'long': 0.2}
+
+        # BUG FIX: Check if forecast_deltas is None before accessing
+        if forecast_deltas is None:
+            forecast_deltas = {'short': 0.0, 'medium': 0.0, 'long': 0.0}  # Default: no deltas
 
         for horizon in ['short', 'medium', 'long']:
             delta = forecast_deltas.get(horizon, 0.0)
@@ -1131,10 +1166,11 @@ class ForecastRiskManager:
         active_horizons = [h for h, a in horizon_analysis.items() if a['signal_type'] != 'neutral']
 
         if len(active_horizons) == 0:
-            # No signals, stay neutral
+            # No signals, stay neutral but allow some positions (MADE MORE AGGRESSIVE)
+            neutral_scale = getattr(self.config, 'signal_filter_neutral_position_scale', 0.6)
             return {
                 'strategy': 'neutral',
-                'position_scale': 0.1,
+                'position_scale': neutral_scale,  # Use config value (0.6) instead of hardcoded 0.1
                 'direction': 0,
                 'signal_strength': 0.0,
                 'consensus': False,
@@ -1170,19 +1206,19 @@ class ForecastRiskManager:
             else:
                 avg_direction = -neg_weight / max(total_weight, 1e-6)
 
-        # NOVEL FEATURE: FORECAST QUALITY BOOSTING
+        # NOVEL FEATURE: FORECAST QUALITY BOOSTING (MADE MORE AGGRESSIVE)
         # When forecasts are excellent (MAPE < 3%), BOOST position sizes
         # When forecasts are poor (MAPE > 8%), REDUCE position sizes
         # This allows agent to capitalize on good forecasts while protecting against bad ones
 
         if avg_mape < 0.03:  # Excellent forecasts
-            quality_boost = 1.3  # Increase position sizes by 30%
+            quality_boost = 1.5  # Increase position sizes by 50% (increased from 30%)
         elif avg_mape < 0.05:  # Good forecasts
-            quality_boost = 1.1  # Increase position sizes by 10%
+            quality_boost = 1.2  # Increase position sizes by 20% (increased from 10%)
         elif avg_mape < 0.08:  # Decent forecasts
             quality_boost = 1.0  # No change
         else:  # Poor forecasts
-            quality_boost = 0.7  # Reduce position sizes by 30%
+            quality_boost = 0.8  # Reduce position sizes by 20% (less reduction from 30%)
 
         forced_strategy = None
         forced_position_scale = None
@@ -1221,7 +1257,8 @@ class ForecastRiskManager:
                 position_scale = hedge_scale * forecast_trust * quality_boost
             else:
                 strategy = 'neutral'
-                position_scale = 0.1
+                neutral_scale = getattr(self.config, 'signal_filter_neutral_position_scale', 0.6)
+                position_scale = neutral_scale  # Use config value instead of hardcoded 0.1
         else:
             # Determine overall strategy from strongest signal
             signal_types = [horizon_analysis[h]['signal_type'] for h in active_horizons]
@@ -1240,7 +1277,8 @@ class ForecastRiskManager:
                 position_scale = hedge_scale * forecast_trust * quality_boost
             else:
                 strategy = 'neutral'
-                position_scale = 0.1
+                neutral_scale = getattr(self.config, 'signal_filter_neutral_position_scale', 0.6)
+                position_scale = neutral_scale  # Use config value instead of hardcoded 0.1
 
         # Compute overall signal strength
         weighted_strength = sum(

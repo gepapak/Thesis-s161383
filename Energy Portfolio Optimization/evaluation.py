@@ -1071,6 +1071,222 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
         return {}
 
 
+def _load_eval_forecast_paths_episode19(forecast_base_dir: str = "forecast_models") -> Dict[str, str]:
+    """
+    Evaluation on unseen data uses the latest trained forecast models (Episode 19).
+    No training should happen in evaluation.
+    """
+    try:
+        from episode_forecast_integration import get_evaluation_forecast_paths
+        return get_evaluation_forecast_paths(forecast_base_dir=forecast_base_dir)
+    except Exception:
+        # Fallback to the conventional folder layout
+        ep_dir = os.path.join(forecast_base_dir, "episode_19")
+        return {
+            "model_dir": os.path.join(ep_dir, "models"),
+            "scaler_dir": os.path.join(ep_dir, "scalers"),
+            "metadata_dir": os.path.join(ep_dir, "metadata"),
+        }
+
+
+def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
+    """
+    Evaluate Tier 1 / Tier 2 / Tier 3 on unseen data using:
+    - MARL weights from each tier's `final_models/`
+    - Forecast models from Episode 19 for Tier 2/3
+    - No forecast training
+    """
+    from config import EnhancedConfig
+
+    results: Dict[str, Any] = {
+        "evaluation_mode": "tiers",
+        "eval_data": args.eval_data,
+        "tiers": {},
+    }
+
+    # Default: evaluate the full unseen dataset unless user explicitly sets --eval_steps
+    steps = args.eval_steps if args.eval_steps is not None else (len(eval_data) - 1)
+    steps = int(max(1, steps))
+
+    # Forecast models (Episode 19) for Tier 2 and Tier 3
+    forecast_paths = _load_eval_forecast_paths_episode19(getattr(args, "forecast_base_dir", "forecast_models"))
+    model_dir = forecast_paths.get("model_dir")
+    scaler_dir = forecast_paths.get("scaler_dir")
+    metadata_dir = forecast_paths.get("metadata_dir")
+    # Shared cache across Tier 2 and Tier 3 (same models + same unseen dataset)
+    shared_eval_cache_dir = os.path.join(args.output_dir, "forecast_cache_eval_episode19_2025H1")
+
+    def _tier_eval(name: str, tier_dir: str, enable_forecast: bool, dl_overlay: bool) -> Dict[str, Any]:
+        tier_out = os.path.join(args.output_dir, name)
+        os.makedirs(tier_out, exist_ok=True)
+        env_log_dir = os.path.join(tier_out, "env_logs")
+        os.makedirs(env_log_dir, exist_ok=True)
+
+        # Load SB3 policies
+        final_models_dir = os.path.join(tier_dir, "final_models")
+        models = load_checkpoint_models(final_models_dir)
+
+        # Build config that matches the tier's observation setup
+        cfg = EnhancedConfig()
+        cfg.enable_forecast_utilisation = bool(enable_forecast)
+        cfg.fgb_mode = "meta" if (name == "tier3") else "fixed"
+        # Keep risk-management gate OFF for fair comparison (evaluation matches training tier2/3 in your run)
+        cfg.forecast_risk_management_mode = False
+
+        # Tier 3 overlay flags (environment uses these for tier naming/logging; adapter presence enables bridge)
+        if name == "tier3":
+            cfg.overlay_enabled = True
+            cfg.forecast_baseline_enable = True
+            # IMPORTANT: Tier 3 (fgb_mode=meta) must enable the meta head so the overlay weight graph matches
+            cfg.meta_baseline_enable = True
+            cfg.meta_baseline_head_dim = int(getattr(cfg, "meta_baseline_head_dim", 32))
+        else:
+            cfg.overlay_enabled = False
+            cfg.forecast_baseline_enable = False
+            cfg.meta_baseline_enable = False
+
+        dl_path = None
+        if dl_overlay:
+            # Tier 3 weight file name in this repo
+            cand = os.path.join(final_models_dir, "dl_overlay_online_34d.h5")
+            dl_path = cand if os.path.exists(cand) else None
+
+        # Environment per tier
+        if enable_forecast:
+            if not (model_dir and scaler_dir) or not os.path.exists(model_dir) or not os.path.exists(scaler_dir):
+                raise FileNotFoundError(
+                    f"Episode 19 forecast paths not found. model_dir={model_dir} scaler_dir={scaler_dir}"
+                )
+            env, _ = create_evaluation_environment(
+                eval_data,
+                enable_forecasting=True,
+                model_dir=model_dir,
+                scaler_dir=scaler_dir,
+                metadata_dir=metadata_dir,
+                dl_overlay_weights_path=dl_path,
+                output_dir=tier_out,
+                investment_freq=args.investment_freq,
+                config=cfg,
+                env_log_dir=env_log_dir,
+                forecast_cache_dir=shared_eval_cache_dir,
+                precompute_forecasts=True,
+                precompute_batch_size=8192,
+            )
+        else:
+            env, _ = create_evaluation_environment(
+                eval_data,
+                enable_forecasting=False,
+                output_dir=tier_out,
+                investment_freq=args.investment_freq,
+                config=cfg,
+                env_log_dir=env_log_dir,
+            )
+
+        tier_metrics = run_checkpoint_evaluation(models, env, eval_data, steps)
+        if tier_metrics is None:
+            return {"status": "failed", "error": "evaluation_failed"}
+
+        tier_metrics["status"] = "completed"
+        tier_metrics["tier_dir"] = tier_dir
+        tier_metrics["final_models_dir"] = final_models_dir
+        if enable_forecast:
+            tier_metrics["forecast_episode"] = 19
+            tier_metrics["forecast_model_dir"] = model_dir
+            tier_metrics["forecast_scaler_dir"] = scaler_dir
+        if dl_path:
+            tier_metrics["dl_overlay_weights"] = dl_path
+        return tier_metrics
+
+    print_section_header("Tier Suite Evaluation (Unseen 2025 H1)")
+    print_progress(f"📏 Evaluating for {steps} steps")
+
+    # Tier 1: no forecasts, no overlay
+    results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir, enable_forecast=False, dl_overlay=False)
+
+    # Tier 2: forecasts enabled (Episode 19), no overlay
+    results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir, enable_forecast=True, dl_overlay=False)
+
+    # Tier 3: forecasts enabled (Episode 19) + overlay weights
+    results["tiers"]["tier3"] = _tier_eval("tier3", args.tier3_dir, enable_forecast=True, dl_overlay=True)
+
+    return results
+
+
+def _pct(x: Any) -> float:
+    """Convert a return-like value to percent (supports fraction or percent already)."""
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    # Heuristic: if magnitude looks like already-percent (e.g. 4.2), keep it.
+    if abs(v) > 1.5:
+        return v
+    return v * 100.0
+
+
+def write_tier_comparison_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[str, str]:
+    """
+    Write a single, consolidated Tier1/2/3 comparison report (CSV + Markdown).
+    Returns: (csv_path, md_path)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    rows = []
+    for tier_name in ["tier1", "tier2", "tier3"]:
+        r = tier_results.get(tier_name, {}) or {}
+        rows.append({
+            "tier": tier_name,
+            "status": r.get("status", "unknown"),
+            "final_portfolio_value_usd": float(r.get("final_portfolio_value", 0.0)),
+            "initial_portfolio_value_usd": float(r.get("initial_portfolio_value", 0.0)),
+            "total_return_pct": _pct(r.get("total_return", 0.0)),
+            "sharpe_ratio": float(r.get("sharpe_ratio", 0.0)),
+            "max_drawdown_pct": _pct(r.get("max_drawdown", 0.0)),
+            "volatility": float(r.get("volatility", 0.0)),
+            "total_rewards": float(r.get("total_rewards", 0.0)),
+            "average_risk": float(r.get("average_risk", 0.0)),
+            "forecast_episode": r.get("forecast_episode", ""),
+            "forecast_model_dir": r.get("forecast_model_dir", ""),
+            "dl_overlay_weights": r.get("dl_overlay_weights", ""),
+            "tier_dir": r.get("tier_dir", ""),
+            "final_models_dir": r.get("final_models_dir", ""),
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(output_dir, f"tier_comparison_{ts}.csv")
+    df.to_csv(csv_path, index=False)
+
+    # Simple markdown report
+    md_path = os.path.join(output_dir, f"tier_comparison_{ts}.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("## Tier 1 vs Tier 2 vs Tier 3 — Unseen Evaluation Report\n\n")
+        f.write(f"- **Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **Output CSV**: `{os.path.basename(csv_path)}`\n\n")
+
+        f.write("### Summary Table\n\n")
+        f.write("| Tier | Status | Final (USD) | Return % | Sharpe | Max DD % | Vol |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|\n")
+        for _, row in df.iterrows():
+            f.write(
+                f"| {row['tier']} | {row['status']} | {row['final_portfolio_value_usd']:.2f} | "
+                f"{row['total_return_pct']:.3f} | {row['sharpe_ratio']:.4f} | "
+                f"{row['max_drawdown_pct']:.3f} | {row['volatility']:.6f} |\n"
+            )
+
+        f.write("\n### Evaluation Inputs / Artifacts\n\n")
+        for _, row in df.iterrows():
+            f.write(f"- **{row['tier']}**:\n")
+            f.write(f"  - final_models: `{row['final_models_dir']}`\n")
+            if str(row.get("forecast_episode", "")).strip() != "":
+                f.write(f"  - forecast_episode: `{row['forecast_episode']}`\n")
+                f.write(f"  - forecast_model_dir: `{row['forecast_model_dir']}`\n")
+            if str(row.get("dl_overlay_weights", "")).strip() != "":
+                f.write(f"  - dl_overlay_weights: `{row['dl_overlay_weights']}`\n")
+
+    return csv_path, md_path
+
+
 def load_agent_system(trained_agents_dir: str, eval_env, enhanced: bool = False) -> Optional[Any]:
     """Load MultiESGAgent system from directory."""
     model_type = "enhanced" if enhanced else "standard"
@@ -1135,64 +1351,65 @@ def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[A
     return load_agent_system(enhanced_models_dir, eval_env, enhanced=True)
 
 
-def create_evaluation_dl_adapter(base_env, dl_weights_path: str):
-    """Create a minimal DL adapter for evaluation without circular imports."""
+def create_evaluation_dl_adapter(base_env, dl_weights_path: str, config=None):
+    """
+    Create the Tier 3 DL overlay adapter for evaluation.
+
+    IMPORTANT: This must match training:
+    - Uses `dl_overlay.DLAdapter` (34D features)
+    - Loads `dl_overlay_online_34d.h5` weights
+    """
     try:
-        import tensorflow as tf
-        from dl_overlay import AdvancedHedgeOptimizer
-        from collections import deque
+        import numpy as np
+        from dl_overlay import DLAdapter
+        from utils import load_overlay_weights
 
-        # Create a minimal adapter class for evaluation
-        class EvaluationDLAdapter:
-            def __init__(self, base_env, dl_weights_path):
-                self.e = base_env
-                self.feature_dim = 13  # Fixed dimension for DL overlay consistency
-                self.model = AdvancedHedgeOptimizer(feature_dim=self.feature_dim)
+        feature_dim = 34  # training contract for Tier 3 overlay
+        bridge_dim = int(getattr(config, "overlay_bridge_dim", 4)) if config is not None else 4
+        meta_head_dim = int(getattr(config, "meta_baseline_head_dim", 32)) if config is not None else 32
+        enable_meta_head = bool(getattr(config, "meta_baseline_enable", False)) if config is not None else False
 
-                # Build the model by calling it with dummy input to create variables
-                print_progress("🔧 Building DL model structure...")
-                dummy_input = tf.random.normal((1, self.feature_dim))
-                _ = self.model(dummy_input, training=False)  # This creates the variables
-                print_progress("✅ DL model structure built")
+        adapter = DLAdapter(
+            feature_dim=feature_dim,
+            bridge_dim=bridge_dim,
+            verbose=False,
+            meta_head_dim=meta_head_dim,
+            enable_meta_head=enable_meta_head,
+        )
 
-                # Now load the trained weights
-                print_progress("📥 Loading DL overlay weights...")
-                try:
-                    if hasattr(self.model, "load_weights"):
-                        self.model.load_weights(dl_weights_path)
-                        print_progress("✅ DL overlay weights loaded successfully")
-                    elif hasattr(self.model, "model") and hasattr(self.model.model, "load_weights"):
-                        self.model.model.load_weights(dl_weights_path)
-                        print_progress("✅ DL overlay weights loaded successfully")
-                    else:
-                        print_progress("⚠️ No load_weights method found, using default weights")
-                except Exception as load_error:
-                    print_progress(f"⚠️ Failed to load weights: {load_error}")
-                    print_progress("   Continuing with default weights...")
+        # Build weights by forcing one forward pass (TF needs variables created before load)
+        _ = adapter.shared_inference(np.zeros((1, feature_dim), dtype=np.float32), training=False)
 
-                # Minimal attributes for evaluation (no training needed)
-                self.buffer = deque(maxlen=256)
-                self.training_step_count = 0
+        ok = load_overlay_weights(adapter, dl_weights_path, feature_dim)
+        if ok:
+            print_progress("✅ DL overlay weights loaded successfully (Tier 3)")
+        else:
+            print_progress("⚠️ Failed to load DL overlay weights (continuing with untrained overlay)")
 
-            def maybe_learn(self, t: int):
-                """Dummy method for evaluation - no learning during evaluation."""
-                pass
-
-        return EvaluationDLAdapter(base_env, dl_weights_path)
+        return adapter
 
     except Exception as e:
-        print_progress(f"⚠️ Failed to create evaluation DL adapter: {e}")
+        print_progress(f"⚠️ Failed to create Tier 3 DL adapter: {e}")
         return None
 
 
-def create_evaluation_environment(data: pd.DataFrame,
-                                 enable_forecasting: bool = True,
-                                 model_dir: str = "saved_models",
-                                 scaler_dir: str = "saved_scalers",
-                                 log_path: Optional[str] = None,
-                                 dl_overlay_weights_path: Optional[str] = None,
-                                 output_dir: str = "evaluation_results") -> Tuple[Any, Optional[Any]]:
-    """Create evaluation environment with optional forecasting."""
+def create_evaluation_environment(
+    data: pd.DataFrame,
+    enable_forecasting: bool = True,
+    model_dir: str = "saved_models",
+    scaler_dir: str = "saved_scalers",
+    metadata_dir: Optional[str] = None,
+    log_path: Optional[str] = None,
+    dl_overlay_weights_path: Optional[str] = None,
+    output_dir: str = "evaluation_results",
+    investment_freq: int = 48,
+    config=None,
+    env_log_dir: Optional[str] = None,
+    forecast_cache_dir: Optional[str] = None,
+    precompute_forecasts: bool = False,
+    precompute_batch_size: int = 8192,
+) -> Tuple[Any, Optional[Any]]:
+    """Create evaluation environment with optional forecasting (Tier-aligned)."""
     print_progress("🏗️ Setting up evaluation environment...")
 
     # Setup forecaster
@@ -1200,12 +1417,12 @@ def create_evaluation_environment(data: pd.DataFrame,
     if enable_forecasting:
         print_progress("🔮 Loading forecaster models and scalers...")
         try:
-            # Auto-detect metadata directory if using Forecast_ANN structure
-            metadata_dir = None
-            if "Forecast_ANN" in model_dir or os.path.exists(os.path.join(os.path.dirname(model_dir), "metadata")):
-                potential_metadata = os.path.join(os.path.dirname(model_dir), "metadata")
-                if os.path.exists(potential_metadata):
-                    metadata_dir = potential_metadata
+            # Auto-detect metadata directory if caller did not provide it
+            if metadata_dir is None:
+                if "Forecast_ANN" in model_dir or os.path.exists(os.path.join(os.path.dirname(model_dir), "metadata")):
+                    potential_metadata = os.path.join(os.path.dirname(model_dir), "metadata")
+                    if os.path.exists(potential_metadata):
+                        metadata_dir = potential_metadata
             
             forecaster = MultiHorizonForecastGenerator(
                 model_dir=model_dir,
@@ -1215,6 +1432,23 @@ def create_evaluation_environment(data: pd.DataFrame,
                 verbose=False
             )
             print_progress("✅ Forecaster loaded successfully")
+
+            # Optional: build/load an offline cache for the entire evaluation dataset.
+            # This mirrors training-time precompute and makes Tier 2/3 evaluation faster + deterministic.
+            if precompute_forecasts:
+                try:
+                    cache_dir = forecast_cache_dir or os.path.join(output_dir, "forecast_cache_eval")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    print_progress(f"🧊 Precomputing/loading forecast cache for evaluation (batch_size={int(precompute_batch_size)})...")
+                    forecaster.precompute_offline(
+                        df=data,
+                        timestamp_col="timestamp",
+                        batch_size=max(1, int(precompute_batch_size)),
+                        cache_dir=cache_dir,
+                    )
+                    print_progress(f"✅ Evaluation forecast cache ready: {cache_dir}")
+                except Exception as e:
+                    print_progress(f"⚠️ Forecast cache precompute failed (continuing with on-the-fly forecasts): {e}")
         except Exception as e:
             print_progress(f"❌ Failed to load forecaster: {e}")
             print_progress("🚫 Continuing without forecasting...")
@@ -1224,20 +1458,25 @@ def create_evaluation_environment(data: pd.DataFrame,
     # Create base environment
     try:
         print_progress("🌍 Creating base environment...")
+
         # Create base environment without forecaster for training-compatible mode
         if enable_forecasting:
             base_env = RenewableMultiAgentEnv(
                 data,
-                investment_freq=144,
-                forecast_generator=forecaster
+                investment_freq=int(investment_freq),
+                forecast_generator=forecaster,
+                config=config,
+                log_dir=env_log_dir,
             )
             print_progress("✅ Enhanced base environment created")
         else:
             # Create basic environment without forecaster for training compatibility
             base_env = RenewableMultiAgentEnv(
                 data,
-                investment_freq=144,
-                forecast_generator=None
+                investment_freq=int(investment_freq),
+                forecast_generator=None,
+                config=config,
+                log_dir=env_log_dir,
             )
             print_progress("✅ Basic base environment created")
 
@@ -1246,8 +1485,8 @@ def create_evaluation_environment(data: pd.DataFrame,
             try:
                 print_progress(f"🚀 Loading DL overlay weights: {os.path.basename(dl_overlay_weights_path)}")
 
-                # Create a minimal DL adapter for evaluation (avoid circular imports)
-                dl_adapter = create_evaluation_dl_adapter(base_env, dl_overlay_weights_path)
+                # Create the real Tier 3 DL adapter and attach it
+                dl_adapter = create_evaluation_dl_adapter(base_env, dl_overlay_weights_path, config=config)
 
                 if dl_adapter:
                     # Attach DL adapter to base environment (use canonical dl_adapter_overlay naming)
@@ -1263,13 +1502,9 @@ def create_evaluation_environment(data: pd.DataFrame,
         # Wrap with forecasting if enabled
         if forecaster is not None and enable_forecasting:
             print_progress("🔄 Wrapping environment with forecasting...")
-            if log_path is None:
-                logs_dir = os.path.join(output_dir, "evaluation_logs")
-                os.makedirs(logs_dir, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_path = os.path.join(logs_dir, f"unified_evaluation_{timestamp}.csv")
-
-            eval_env = MultiHorizonWrapperEnv(base_env, forecaster, log_path=log_path)
+            # NOTE: MultiHorizonWrapperEnv does not accept log_path (no CSV logging).
+            # We rely on the base env's log_dir instead.
+            eval_env = MultiHorizonWrapperEnv(base_env, forecaster)
             print_progress("✅ Environment created with forecasting wrapper")
         else:
             eval_env = base_env
@@ -1280,6 +1515,8 @@ def create_evaluation_environment(data: pd.DataFrame,
     except Exception as e:
         print_progress(f"❌ Error creating environment: {e}")
         return None, None
+
+
 
 
 def _coerce_action_for_space(action: np.ndarray, action_space):
@@ -1972,8 +2209,20 @@ def main():
     parser = argparse.ArgumentParser(description="Unified Evaluation Script")
 
     # Mode selection
-    parser.add_argument("--mode", choices=["checkpoint", "agents", "baselines", "compare", "comprehensive"], required=True,
-                       help="Evaluation mode: 'checkpoint' for latest checkpoint, 'agents' for custom agent directory, 'baselines' for traditional methods, 'compare' for comprehensive comparison, 'comprehensive' for all configurations")
+    parser.add_argument(
+        "--mode",
+        choices=["checkpoint", "agents", "baselines", "compare", "comprehensive", "tiers"],
+        required=True,
+        help=(
+            "Evaluation mode: "
+            "'checkpoint' for latest checkpoint, "
+            "'agents' for custom agent directory, "
+            "'baselines' for traditional methods, "
+            "'compare' for comprehensive comparison, "
+            "'comprehensive' for all configurations, "
+            "'tiers' to evaluate Tier1/2/3 (unseen data) using final_models + Episode19 forecasts"
+        ),
+    )
 
     # Data and model paths
     parser.add_argument("--eval_data", type=str, default="evaluation_dataset/unseendata.csv",
@@ -1990,6 +2239,7 @@ def main():
                        help="Forecast scaler directory (NEW: Updated to Forecast_ANN structure)")
     parser.add_argument("--no_forecast", action="store_true",
                        help="Disable forecasting for baseline comparison")
+
 
     # Enhanced model support
     parser.add_argument("--enhanced_models", type=str, default=None,
@@ -2008,6 +2258,18 @@ def main():
                        help="Number of timesteps to evaluate (default: auto)")
     parser.add_argument("--output_dir", type=str, default="evaluation_results",
                        help="Output directory for results")
+    parser.add_argument("--investment_freq", type=int, default=48,
+                       help="Investor action frequency for evaluation (should match training; default 48)")
+
+    # Tier-suite evaluation (Tier 1/2/3 on unseen data)
+    parser.add_argument("--tier1_dir", type=str, default="tier1gnn_seed789",
+                       help="Tier 1 run directory containing final_models/")
+    parser.add_argument("--tier2_dir", type=str, default="tier2gnn_seed789",
+                       help="Tier 2 run directory containing final_models/")
+    parser.add_argument("--tier3_dir", type=str, default="tier3gnn_seed789",
+                       help="Tier 3 run directory containing final_models/ (and dl_overlay_online_34d.h5)")
+    parser.add_argument("--forecast_base_dir", type=str, default="forecast_models",
+                       help="Base directory for episode-specific forecast models (evaluation uses episode_19)")
 
     # Analysis options
     parser.add_argument("--analyze", action="store_true",
@@ -2086,8 +2348,30 @@ def main():
         print_progress(f"❌ Error loading evaluation data: {e}")
         sys.exit(1)
 
-    # Create evaluation environment
-    # For agents, checkpoint, and compare modes, disable forecasting to match training environment
+    # Tier suite mode builds a separate environment per tier (and uses Episode 19 forecasts for tier2/3)
+    if args.mode == "tiers":
+        try:
+            results = run_tier_suite_evaluation(eval_data, args)
+            # Always write a single consolidated report (CSV + Markdown)
+            csv_path, md_path = write_tier_comparison_report(results.get("tiers", {}), args.output_dir)
+            results["tier_comparison_csv"] = csv_path
+            results["tier_comparison_md"] = md_path
+
+            analysis = None
+            if args.analyze:
+                # Keep legacy analyzer optional; the tier report is the canonical summary.
+                analysis = analyze_comprehensive_results({"configurations": results.get("tiers", {})})
+
+            save_results(results, args.output_dir, mode="tiers", analysis=analysis)
+            print_progress(f"📄 Tier comparison report written: {md_path}")
+            print_progress(f"📄 Tier comparison CSV written: {csv_path}")
+            return
+        except Exception as e:
+            print_progress(f"❌ Tier suite evaluation failed: {e}")
+            raise
+
+    # Create evaluation environment for other modes
+    # NOTE: Legacy behavior disables forecasting for some modes; tier-suite handles forecasting explicitly.
     enable_forecasting = (not args.no_forecast) and (args.mode not in ["agents", "checkpoint", "compare"])
 
     eval_env, forecaster = create_evaluation_environment(
@@ -2095,7 +2379,9 @@ def main():
         enable_forecasting=enable_forecasting,
         model_dir=args.model_dir,
         scaler_dir=args.scaler_dir,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        investment_freq=args.investment_freq,
+        config=None,
     )
 
     if eval_env is None:

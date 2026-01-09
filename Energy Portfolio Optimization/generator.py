@@ -376,6 +376,10 @@ class MultiHorizonForecastGenerator:
         self._model_available: Dict[str, bool] = {}
         self.history: Dict[str, deque] = {}               # per-target values
         self._X_buffers: Dict[str, np.ndarray] = {}       # per-target (1, look_back) preallocated inputs
+        
+        # CRITICAL FIX: Store training cap values from metadata (for bounds consistency)
+        # Will be populated during model loading from metadata files
+        self._training_caps: Dict[str, float] = {}  # target -> cap value from training
 
         # caches (LRU-based for better memory management)
         self._global_cache = LRUCache(max_size=8000)  # Increased size for better hit rate
@@ -611,6 +615,17 @@ class MultiHorizonForecastGenerator:
                                 if self.verbose:
                                     print(f"[INFO] Updating look_back from {self.look_back} to {metadata_look_back} (from metadata for {key})")
                                 self.look_back = int(metadata_look_back)
+                            
+                            # CRITICAL FIX: Store training cap value from metadata (for bounds consistency)
+                            # Cap is the max value from training data, used for MAPE calculation
+                            training_cap = md.get("cap")
+                            if training_cap is not None and target in self.targets:
+                                # Use the maximum cap across all horizons for each target
+                                if target not in self._training_caps:
+                                    self._training_caps[target] = float(training_cap)
+                                else:
+                                    # Use max cap if multiple horizons have different caps
+                                    self._training_caps[target] = max(self._training_caps[target], float(training_cap))
                             
                         except Exception as e:
                             if self.verbose:
@@ -1467,52 +1482,32 @@ class MultiHorizonForecastGenerator:
 
     def _debias_price_forecast(self, raw_forecast: float, t: int) -> float:
         """
-        Apply adaptive debiasing to price forecasts to correct for train-test distribution mismatch.
-
-        The models were trained on 2015-2024 data (training set mean=292.86 DKK),
-        but test episodes may have different price distributions (e.g., Episode 0 mean=183.74 DKK).
-
-        This method estimates the local price level and adjusts forecasts accordingly.
+        Apply minimal bounds checking to price forecasts.
+        
+        SIMPLIFIED: Models are always trained per-episode on the same data they're used on.
+        No distribution mismatch → no debiasing needed.
+        
+        Only applies reasonable bounds to prevent extreme outliers.
         """
-        # Get recent price history (last 144 steps = 24 hours)
-        lookback = min(144, t)
-        if lookback < 24:
-            # Not enough history - return raw forecast
-            return raw_forecast
-
-        # Get recent actual prices from stored data
+        # Get recent actual prices for bounds calculation
         recent_prices = []
         if self._data_df is not None and 'price' in self._data_df.columns:
+            lookback = min(144, max(10, t))
             start_idx = max(0, t - lookback)
             end_idx = t
-            if end_idx <= len(self._data_df):
+            if end_idx <= len(self._data_df) and start_idx < end_idx:
                 recent_prices = self._data_df['price'].iloc[start_idx:end_idx].values.tolist()
-
-        if len(recent_prices) < 24:
-            # Not enough history - return raw forecast
-            return raw_forecast
-
-        # Calculate local price level (median of recent prices)
-        local_price_level = float(np.median(recent_prices))
-
-        # Training set mean (from scaler)
-        training_mean = 292.86  # DKK (from scaler_y.mean_)
-
-        # Calculate bias: how much the model over/under-predicts relative to local level
-        # If local_price_level = 180 DKK and training_mean = 293 DKK,
-        # then bias = 293 - 180 = +113 DKK (model predicts too high)
-        bias = training_mean - local_price_level
-
-        # Apply debiasing
-        debiased_forecast = raw_forecast - bias
-
-        # Sanity check: don't let debiasing create extreme values
-        # Clamp to reasonable range around local price level
-        min_forecast = local_price_level * 0.5  # -50%
-        max_forecast = local_price_level * 2.0  # +100%
-        debiased_forecast = np.clip(debiased_forecast, min_forecast, max_forecast)
-
-        return float(debiased_forecast)
+                recent_prices = [p for p in recent_prices if np.isfinite(p)]
+        
+        if len(recent_prices) >= 5:
+            local_mean = float(np.mean(recent_prices))
+            # Apply conservative bounds: ±100% around local mean (just to prevent extreme outliers)
+            min_forecast = local_mean * 0.5
+            max_forecast = local_mean * 2.0
+            return float(np.clip(raw_forecast, min_forecast, max_forecast))
+        else:
+            # No history - return raw forecast with basic safety bounds
+            return float(np.clip(raw_forecast, 50.0, 1000.0))
 
     def _predict_target_horizon(self, target: str, hname: str, t: int) -> float:
         """
@@ -1527,9 +1522,8 @@ class MultiHorizonForecastGenerator:
         if arr is not None and 0 <= t < len(arr):
             val = arr[t]
             if np.isfinite(val):
-                # CRITICAL FIX: Apply adaptive debiasing for price forecasts
-                if target == 'price':
-                    val = self._debias_price_forecast(val, t)
+                # NOTE: Precomputed forecasts already have debiasing applied during precomputation
+                # No need to apply debiasing again here
                 return float(val)
 
         # 2) Check runtime cache
@@ -1582,6 +1576,10 @@ class MultiHorizonForecastGenerator:
                     y = self._inverse_scale_y(model_key, y_pred)
                     # Simple bounds check
                     y = self._constrain_target(target, y)
+                    
+                    # Apply debiasing for price forecasts (runtime predictions)
+                    if target == 'price':
+                        y = self._debias_price_forecast(y, t)
 
             except Exception as e:
                 if self.verbose:
@@ -1666,8 +1664,10 @@ class MultiHorizonForecastGenerator:
 
     def _constrain_target(self, target: str, val: float) -> float:
         """
-        Apply realistic bounds for raw MW values.
-        Much simpler than previous normalization approach.
+        Apply realistic bounds for raw MW values using training cap values from metadata.
+        
+        CRITICAL FIX: Uses training cap values (max from training data) for bounds consistency.
+        Falls back to hardcoded bounds if training caps not available.
         """
         try:
             if not np.isfinite(val):
@@ -1675,17 +1675,27 @@ class MultiHorizonForecastGenerator:
 
             result = float(val)
 
-            # Apply realistic bounds based on actual data range
-            bounds = {
-                "wind": (0.0, 1600.0),    # 0 to max observed (1500) + buffer
-                "solar": (0.0, 1100.0),   # 0 to max observed (1000) + buffer
-                "hydro": (0.0, 1100.0),   # 0 to max observed (1000) + buffer
-                "price": (-50.0, 500.0),  # Reasonable price range
-                "load": (500.0, 3500.0),  # Reasonable load range
-            }
+            # CRITICAL FIX: Use training cap values from metadata for bounds (consistent with training)
+            # Add small buffer (5%) above cap to allow for slight variations
+            if target in self._training_caps:
+                training_cap = self._training_caps[target]
+                # Use cap * 1.05 as upper bound (5% buffer) or cap * 1.1 for wind (10% buffer for larger variance)
+                buffer_mult = 1.1 if target == 'wind' else 1.05
+                max_val = training_cap * buffer_mult
+                bounds = (0.0, max_val)
+            else:
+                # Fallback to hardcoded bounds if training caps not loaded
+                bounds_map = {
+                    "wind": (0.0, 1600.0),    # 0 to max observed (1500) + buffer
+                    "solar": (0.0, 1100.0),   # 0 to max observed (1000) + buffer
+                    "hydro": (0.0, 1100.0),   # 0 to max observed (1000) + buffer
+                    "price": (-50.0, 500.0),  # Reasonable price range
+                    "load": (500.0, 3500.0),  # Reasonable load range
+                }
+                bounds = bounds_map.get(target, (0.0, 1e6))
 
-            if target in bounds:
-                min_val, max_val = bounds[target]
+            if bounds:
+                min_val, max_val = bounds
                 result = max(min_val, min(max_val, result))
 
             return result
@@ -1828,6 +1838,12 @@ class MultiHorizonForecastGenerator:
 
                 for i in range(T):
                     preds[i] = self._constrain_target(target, preds[i])
+                
+                # CRITICAL FIX: Apply debiasing for price forecasts during precomputation
+                # This ensures precomputed forecasts have proper bias correction applied
+                if target == 'price' and self._data_df is not None and 'price' in self._data_df.columns:
+                    for i in range(T):
+                        preds[i] = self._debias_price_forecast(preds[i], i)
 
                 self._precomputed[key] = preds
 

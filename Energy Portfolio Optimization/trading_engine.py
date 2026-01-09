@@ -58,10 +58,16 @@ class TradingEngine:
         meta_cap_min: float,
         meta_cap_max: float,
         meta_freq_min: int,
-        meta_freq_max: int
+        meta_freq_max: int,
+        forecast_confidence: float = 0.5,
+        disable_confidence_scaling: bool = False
     ) -> Tuple[float, int]:
         """
-        REFACTORED: Apply meta control for capital allocation and trading frequency.
+        FIX #4: Apply meta control with forecast confidence scaling.
+        
+        Apply meta control for capital allocation and trading frequency,
+        scaled by forecast confidence to increase/decrease position sizing
+        based on forecast quality.
         
         Args:
             meta_action: Meta controller action array [-1, 1]
@@ -69,6 +75,7 @@ class TradingEngine:
             meta_cap_max: Maximum capital allocation fraction
             meta_freq_min: Minimum trading frequency
             meta_freq_max: Maximum trading frequency
+            forecast_confidence: [0.2, 1.0] from forecast_trust
             
         Returns:
             Tuple of (capital_allocation_fraction, investment_freq)
@@ -83,7 +90,22 @@ class TradingEngine:
             
             # Apply symmetric mapping to both components
             cap = map_from_minus1_1(a0, meta_cap_min, meta_cap_max)
-            capital_allocation_fraction = float(np.clip(cap, meta_cap_min, meta_cap_max))
+            
+            # FIX #4: Scale capital allocation by forecast confidence (unless disabled for fair A/B)
+            if disable_confidence_scaling:
+                confidence_multiplier = 1.0
+            else:
+                # Map confidence [0.2, 1.0] to multiplier [0.7, 1.5]
+                forecast_confidence = float(np.clip(forecast_confidence, 0.2, 1.0))
+                confidence_multiplier = 0.7 + (forecast_confidence - 0.2) / 0.8 * 0.8  # [0.7, 1.5]
+            
+            # Apply confidence scaling to capital allocation
+            # SAFETY: Never allow allocating more than 100% of capital.
+            clip_lo = max(0.0, float(meta_cap_min) * 0.7)  # Allow up to 30% reduction
+            clip_hi = min(1.0, float(meta_cap_max) * 1.5)  # Allow up to 50% increase but cap at 1.0
+            if clip_hi < clip_lo:
+                clip_hi = clip_lo
+            capital_allocation_fraction = float(np.clip(cap * confidence_multiplier, clip_lo, clip_hi))
             
             freq = int(round(map_from_minus1_1(a1, meta_freq_min, meta_freq_max)))
             investment_freq = int(np.clip(freq, meta_freq_min, meta_freq_max))
@@ -107,10 +129,14 @@ class TradingEngine:
         batt_eta_charge: float,
         batt_eta_discharge: float,
         minimum_price_filter: float,
-        maximum_price_cap: float
+        maximum_price_cap: float,
+        price_volatility_forecast: float = 0.0
     ) -> Tuple[str, float]:
         """
-        REFACTORED: Decide battery dispatch policy ('charge'/'discharge'/'idle', intensity 0..1).
+        FIX #5: Decide battery dispatch policy with volatility weighting.
+        
+        Decide battery dispatch policy ('charge'/'discharge'/'idle', intensity 0..1),
+        with volatility weighting to increase arbitrage in high-volatility periods.
         
         Args:
             current_price: Current electricity price (DKK/MWh)
@@ -122,6 +148,7 @@ class TradingEngine:
             batt_eta_discharge: Battery discharge efficiency
             minimum_price_filter: Minimum price filter
             maximum_price_cap: Maximum price cap
+            price_volatility_forecast: Expected price volatility [0, 1]
             
         Returns:
             Tuple of (decision, intensity) where decision is 'charge', 'discharge', or 'idle'
@@ -139,11 +166,21 @@ class TradingEngine:
             rt_loss = (1.0/(max(batt_eta_charge*batt_eta_discharge, 1e-6)) - 1.0) * 10.0
             hurdle = needed + battery_rt_loss_weight * rt_loss
             
-            if spread > hurdle:
+            # FIX #5: Reduce hurdle by up to 30% when volatility is high
+            # High volatility = more profitable arbitrage opportunities
+            price_volatility_forecast = float(np.clip(price_volatility_forecast, 0.0, 1.0))
+            volatility_adjustment = 1.0 - (0.3 * price_volatility_forecast)  # [1.0, 0.7]
+            adjusted_hurdle = hurdle * volatility_adjustment
+            
+            if spread > adjusted_hurdle:
                 inten = float(np.clip(spread / (abs(p_now) + 0.1), 0.0, 1.0))
+                # Boost intensity slightly for high volatility
+                inten = float(np.clip(inten * (1.0 + 0.3 * price_volatility_forecast), 0.0, 1.0))
                 return ("charge", inten)
-            elif spread < -hurdle:
+            elif spread < -adjusted_hurdle:
                 inten = float(np.clip((-spread) / (abs(p_now) + 0.1), 0.0, 1.0))
+                # Boost intensity slightly for high volatility
+                inten = float(np.clip(inten * (1.0 + 0.3 * price_volatility_forecast), 0.0, 1.0))
                 return ("discharge", inten)
             else:
                 return ("idle", 0.0)
@@ -241,6 +278,7 @@ class TradingEngine:
             cash_delta = 0.0
             throughput_mwh = 0.0
             new_battery_energy = battery_energy
+            invalid_action_penalty = 0.0  # NEW: Track invalid action penalty
             
             if decision == "discharge" and soc > batt_soc_min + 1e-6:
                 energy_possible = min(battery_energy - soc_min_e, max_energy_this_step * inten)
@@ -261,16 +299,28 @@ class TradingEngine:
                 cash_delta -= grid_mwh * price
             else:
                 battery_discharge_power = 0.0
+                # NEW: Add penalty for invalid actions (discharge at min SOC or charge at max SOC)
+                if decision == "discharge" and soc <= batt_soc_min + 1e-6:
+                    # CRITICAL FIX: Penalty for trying to discharge empty battery
+                    # Use degradation cost as reference for penalty magnitude (ensures meaningful signal)
+                    invalid_action_penalty = -batt_degradation_cost * max_energy_this_step * 2.0  # 2x degradation cost
+                elif decision == "charge" and soc >= batt_soc_max - 1e-6:
+                    # Moderate penalty for trying to charge full battery
+                    invalid_action_penalty = -batt_degradation_cost * max_energy_this_step * 1.0  # 1x degradation cost
             
             deg_cost = batt_degradation_cost * throughput_mwh
             cash_delta -= deg_cost
+            
+            # NEW: Apply invalid action penalty to cash_delta
+            cash_delta += invalid_action_penalty
             
             # Bounds check
             new_battery_energy = float(np.clip(new_battery_energy, 0.0, battery_capacity_mwh))
             
             return float(cash_delta), {
                 'battery_energy': new_battery_energy,
-                'battery_discharge_power': battery_discharge_power
+                'battery_discharge_power': battery_discharge_power,
+                'invalid_action_penalty': invalid_action_penalty  # NEW: Return penalty for logging
             }
             
         except Exception as e:

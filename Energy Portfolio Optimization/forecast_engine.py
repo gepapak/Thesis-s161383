@@ -33,8 +33,8 @@ class ForecastComputationResult:
 @dataclass
 class ForecastObservationFeatures:
     """Forecast features to add to observations."""
-    investor_features: Optional[np.ndarray] = None  # 4D: z_short, z_medium, trust, normalized_error (PHASE 2 FIX)
-    battery_features: Optional[np.ndarray] = None   # 4D: total_gen, z_short, z_medium, z_long
+    investor_features: Optional[np.ndarray] = None  # 8D (Tier 22): z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal
+    battery_features: Optional[np.ndarray] = None   # 6D: z_short_wind, z_short_solar, z_short_hydro, z_short_price, z_medium_price, z_long_price
     risk_features: Optional[np.ndarray] = None     # 3D: z_short, vol_forecast, trust
     meta_features: Optional[np.ndarray] = None      # 2D: trust, expected_return
 
@@ -161,15 +161,28 @@ class ForecastEngine:
             corr_medium = self._horizon_correlations.get('medium', 0.0)
             corr_long = self._horizon_correlations.get('long', 0.0)
 
+        # FIX: Check if correlations are actually computed (non-zero)
+        # If correlations are 0.0, they're either not yet computed or truly zero
+        # In both cases, use default weights to ensure z_combined is computed
+        correlations_computed = (corr_short != 0.0 or corr_medium != 0.0 or corr_long != 0.0)
+        
         use_short = corr_short > 0.0
         use_medium = corr_medium > 0.0
         use_long = corr_long > 0.0
 
-        if not (use_short or use_medium or use_long):
-            weight_short = 0.7 if use_short else 0.0
-            weight_medium = 0.2 if use_medium else 0.0
-            weight_long = 0.1 if use_long else 0.0
+        if not correlations_computed:
+            # No correlations computed yet - use default weights (warmup period)
+            weight_short = 0.7
+            weight_medium = 0.2
+            weight_long = 0.1
+        elif not (use_short or use_medium or use_long):
+            # Correlations computed but all negative/zero - use default weights as fallback
+            # This ensures z_combined is still computed even with poor correlations
+            weight_short = 0.7
+            weight_medium = 0.2
+            weight_long = 0.1
         else:
+            # Use correlation-based weighting (only positive correlations)
             epsilon = 1e-6
             weight_short_raw = max(0.0, corr_short) if use_short else 0.0
             weight_medium_raw = max(0.0, corr_medium) if use_medium else 0.0
@@ -180,15 +193,27 @@ class ForecastEngine:
                 weight_medium = weight_medium_raw / total_weight
                 weight_long = weight_long_raw / total_weight
             else:
+                # Fallback to equal weights if correlations too small
                 num_horizons = sum([use_short, use_medium, use_long])
                 if num_horizons > 0:
                     weight_short = (1.0 / num_horizons) if use_short else 0.0
                     weight_medium = (1.0 / num_horizons) if use_medium else 0.0
                     weight_long = (1.0 / num_horizons) if use_long else 0.0
                 else:
-                    weight_short = weight_medium = weight_long = 0.0
+                    # Last resort: use default weights
+                    weight_short = 0.7
+                    weight_medium = 0.2
+                    weight_long = 0.1
 
         z_combined = float(weight_short * z_short + weight_medium * z_medium + weight_long * z_long)
+        
+        # CRITICAL FIX: Remove z_combined normalization by correlation strength
+        # This normalization was distorting forecast signals, making them harder to learn from
+        # Forecast features should be passed directly to observations without distortion
+        # The GNN encoder can learn to use forecasts based on their correlation with PnL rewards
+        # Simple weighted combination preserves forecast signal quality
+        z_combined = float(np.clip(z_combined, -2.0, 2.0))  # Clip to reasonable range only
+        
         if env is not None:
             env.z_combined = z_combined
 
@@ -408,19 +433,19 @@ class ForecastEngine:
         # PHASE 1 FIX: Strengthen forecast confidence gating
         # Only use forecasts when they're highly reliable (addresses reward mismatch)
         forecast_confidence = float(np.clip(1.0 / (1.0 + avg_mape), 0.0, 1.0))
-        trust_threshold = getattr(config, 'forecast_trust_threshold', 0.6)  # Increased from 0.5
-        confidence_threshold = getattr(config, 'forecast_confidence_threshold', 0.7)  # Increased from 0.5
-        signal_threshold = getattr(config, 'forecast_signal_threshold', 0.3)  # Increased from 0.2
         
-        # Check explicit confidence gates (in addition to risk manager gates)
-        explicit_gate_passed = (
-            forecast_trust > trust_threshold and
-            forecast_confidence > confidence_threshold and
-            abs(z_combined) > signal_threshold
-        )
+        # CRITICAL: Forecast rewards are blocked for fair comparison (observations only)
+        # Tier 2: Forecast observations only (no rewards) - agents learn from PnL correlation
+        # Tier 3: Forecast observations + FAMC (no forecast rewards) - FAMC handles variance reduction
+        # The difference is FAMC (variance reduction), not forecast rewards!
+        # Forecast features in observations alone should enable better decision-making through:
+        # 1. Predictive information (z-scores indicate future price movements)
+        # 2. Implicit learning (agents learn forecast→action mappings from PnL correlation)
+        # 3. GNN encoder learning (cross-attention fusion enables forecast→base interactions)
+        explicit_gate_passed = False  # Always block for BOTH tiers (fair comparison)
         
-        # Combine with risk manager gates (both must pass)
-        forecast_gate_passed = forecast_gate_passed and explicit_gate_passed
+        # OR logic: Gate passes if risk manager approves (but no forecast rewards)
+        forecast_gate_passed = forecast_gate_passed or explicit_gate_passed
 
         if forecast_gate_passed:
             alignment_value = position_normalized * forecast_direction_normalized * position_exposure
@@ -493,7 +518,7 @@ class ForecastEngine:
         else:
             forecast_alignment_reward = 0.0
 
-        if timestep > 0:
+        if timestep > 0 and timestep < len(env._price_raw):
             prev_price = float(np.clip(env._price_raw[timestep-1], 50.0, 1e9))
             current_price = float(np.clip(env._price_raw[timestep], 50.0, 1e9))
             price_return_raw = (current_price - prev_price) / max(abs(prev_price), 1e-6)
@@ -570,6 +595,26 @@ class ForecastEngine:
         )
         warmup_factor_debug = float(getattr(env, '_forecast_warmup_factor', 1.0) if env else 1.0)
 
+        # FIX #2/#3: Use quality-weighted signal and update dynamic trust
+        try:
+            mape_short_val = float(measured_mape_short) if np.isfinite(measured_mape_short) else float(mape_threshold_short)
+            mape_medium_val = float(measured_mape_medium) if np.isfinite(measured_mape_medium) else float(mape_threshold_medium)
+            mape_long_val = float(measured_mape_long) if np.isfinite(measured_mape_long) else float(mape_threshold_long)
+
+            quality_signal = self.compute_quality_weighted_signal(
+                float(z_short), float(z_medium), float(z_long),
+                mape_short_val, mape_medium_val, mape_long_val,
+                confidence_threshold=0.5
+            )
+            # Override prior forecast_signal_score with quality-weighted version
+            forecast_signal_score = quality_signal
+            # Update forecast trust dynamically based on MAPE
+            self.update_forecast_trust_from_mape(mape_short_val, mape_medium_val, mape_long_val)
+            forecast_trust = float(self.forecast_trust)
+        except Exception as _e:
+            # Keep existing values if quality weighting fails
+            pass
+
         price_return_1step = one_step_return or 0.0
         # CRITICAL FIX: Use normalized position_signed instead of raw total_position
         # total_position is the raw value in DKK, but position_signed is normalized (should be ~-1 to 1)
@@ -618,9 +663,9 @@ class ForecastEngine:
             'forecast_error_long_pct': forecast_error_long,
             'forecast_error': realized_vs_forecast,
             'realized_vs_forecast': realized_vs_forecast,
-            'mape_short': float(measured_mape_short) if not math.isnan(measured_mape_short) else float(mape_threshold_short),
-            'mape_medium': float(measured_mape_medium) if not math.isnan(measured_mape_medium) else float(mape_threshold_medium),
-            'mape_long': float(measured_mape_long) if not math.isnan(measured_mape_long) else float(mape_threshold_long),
+            'mape_short': float(mape_short_val) if 'mape_short_val' in locals() else float(measured_mape_short) if not math.isnan(measured_mape_short) else float(mape_threshold_short),
+            'mape_medium': float(mape_medium_val) if 'mape_medium_val' in locals() else float(measured_mape_medium) if not math.isnan(measured_mape_medium) else float(mape_threshold_medium),
+            'mape_long': float(mape_long_val) if 'mape_long_val' in locals() else float(measured_mape_long) if not math.isnan(measured_mape_long) else float(mape_threshold_long),
             'forecast_direction': forecast_direction,
             'position_direction': float(np.sign(position_normalized)),
             'agent_followed_forecast': bool(agent_followed_forecast),
@@ -647,6 +692,129 @@ class ForecastEngine:
             debug_payload=debug_payload,
         )
 
+    def compute_quality_weighted_signal(self, z_short: float, z_medium: float, z_long: float,
+                                       mape_short: float, mape_medium: float, mape_long: float,
+                                       confidence_threshold: float = 0.5) -> float:
+        """
+        FIX #2: Compute quality-weighted forecast signal with MAPE-based gating.
+        
+        Filters raw z-scores through forecast accuracy gates:
+        - Short horizon MAPE threshold: 8% (highest confidence)
+        - Medium horizon MAPE threshold: 12% (medium confidence)
+        - Long horizon MAPE threshold: 20% (lower confidence)
+        
+        Gates:
+        1. MAPE-based quality filtering (prevent trading on poor forecasts)
+        2. Confidence weighting (scale signal by accuracy relative to threshold)
+        3. Horizon weighting (prioritize accurate short horizon)
+        
+        Args:
+            z_short, z_medium, z_long: Raw z-scores from forecast
+            mape_short, mape_medium, mape_long: MAPE accuracy for each horizon
+            confidence_threshold: Min confidence required to use signal
+            
+        Returns:
+            Filtered signal in [-1, 1] range, or 0.0 if below confidence threshold
+        """
+        try:
+            # MAPE thresholds (FIX #2 critical parameters)
+            mape_thresh_short = 0.08   # 8% - high confidence
+            mape_thresh_medium = 0.12  # 12% - medium confidence
+            mape_thresh_long = 0.20    # 20% - lower confidence
+            
+            # Gate 1: Check if horizons meet MAPE thresholds
+            short_valid = mape_short < mape_thresh_short
+            medium_valid = mape_medium < mape_thresh_medium
+            long_valid = mape_long < mape_thresh_long
+            
+            # Gate 2: Compute confidence weights (1.0 - normalized MAPE)
+            # Maps MAPE to confidence: 0% MAPE → 1.0 confidence, at threshold → ~0.2 confidence
+            conf_short = max(0.0, (mape_thresh_short - mape_short) / mape_thresh_short) if short_valid else 0.0
+            conf_medium = max(0.0, (mape_thresh_medium - mape_medium) / mape_thresh_medium) if medium_valid else 0.0
+            conf_long = max(0.0, (mape_thresh_long - mape_long) / mape_thresh_long) if long_valid else 0.0
+            
+            # Gate 3: Horizon weights (short most reliable, long least)
+            weight_short = 0.70   # 70% short horizon
+            weight_medium = 0.20  # 20% medium horizon
+            weight_long = 0.10    # 10% long horizon (use sparingly)
+            
+            # Compute weighted signal with confidence multipliers
+            weighted_signal = (
+                weight_short * z_short * conf_short +
+                weight_medium * z_medium * conf_medium +
+                weight_long * z_long * conf_long
+            )
+            
+            # Compute overall confidence (weighted average of horizon confidences)
+            overall_confidence = (
+                weight_short * conf_short +
+                weight_medium * conf_medium +
+                weight_long * conf_long
+            )
+            
+            # Gate 4: Check if overall confidence meets threshold
+            if overall_confidence < confidence_threshold:
+                return 0.0  # Return neutral signal if confidence too low
+            
+            # Clip to [-1, 1] range
+            quality_weighted_signal = float(np.clip(weighted_signal, -1.0, 1.0))
+            
+            # Store for debugging
+            if self.env is not None:
+                if not hasattr(self.env, '_quality_signal_debug'):
+                    self.env._quality_signal_debug = {}
+                self.env._quality_signal_debug = {
+                    'raw_signal': (z_short + z_medium + z_long) / 3.0,
+                    'quality_signal': quality_weighted_signal,
+                    'overall_confidence': overall_confidence,
+                    'horizons_valid': (short_valid, medium_valid, long_valid),
+                    'confidences': (conf_short, conf_medium, conf_long),
+                }
+            
+            return quality_weighted_signal
+            
+        except Exception as e:
+            logger.warning(f"Quality-weighted signal computation failed: {e}")
+            return 0.0
+
+    def update_forecast_trust_from_mape(self, mape_short: float, mape_medium: float, 
+                                        mape_long: float) -> None:
+        """
+        FIX #3: Dynamically update forecast trust based on recent MAPE accuracy.
+        
+        Updates self.forecast_trust from static 0.5 to dynamic [0.2, 1.0] based on
+        rolling MAPE accuracy:
+        - If MAPE < 5%: trust = 1.0 (excellent)
+        - If MAPE < 10%: trust = 0.8 (good)
+        - If MAPE < 15%: trust = 0.6 (acceptable)
+        - If MAPE >= 15%: trust = 0.3-0.2 (poor)
+        
+        This allows position sizing to scale with forecast quality.
+        """
+        try:
+            # Compute weighted MAPE (prioritize short horizon)
+            weighted_mape = (0.70 * mape_short + 0.20 * mape_medium + 0.10 * mape_long)
+            
+            # Map MAPE to trust [0.2, 1.0]
+            if weighted_mape < 0.05:
+                trust = 1.0
+            elif weighted_mape < 0.10:
+                trust = 0.8
+            elif weighted_mape < 0.15:
+                trust = 0.6
+            elif weighted_mape < 0.20:
+                trust = 0.4
+            else:
+                trust = 0.2
+            
+            # Update trust with smoothing (70% new, 30% old for stability)
+            self.forecast_trust = 0.7 * trust + 0.3 * self.forecast_trust
+            
+            logger.debug(f"Updated forecast_trust to {self.forecast_trust:.3f} (MAPE: {weighted_mape:.3f})")
+            
+        except Exception as e:
+            logger.warning(f"Forecast trust update failed: {e}")
+
     def compute_forecast_z_scores(
         self,
         timestep: int,
@@ -656,9 +824,15 @@ class ForecastEngine:
         hydro_history: np.ndarray,
         price_mean: np.ndarray,
         price_std: np.ndarray,
-        wind_scale: float,
-        solar_scale: float,
-        hydro_scale: float
+        wind_mean: np.ndarray,
+        wind_std: np.ndarray,
+        solar_mean: np.ndarray,
+        solar_std: np.ndarray,
+        hydro_mean: np.ndarray,
+        hydro_std: np.ndarray,
+        wind_scale: float = None,  # DEPRECATED: kept for backward compatibility
+        solar_scale: float = None,  # DEPRECATED: kept for backward compatibility
+        hydro_scale: float = None   # DEPRECATED: kept for backward compatibility
     ) -> Dict[str, float]:
         """
         Compute forecast z-scores for all horizons and assets.
@@ -680,35 +854,104 @@ class ForecastEngine:
             horizon_medium = self.config.forecast_horizons.get('medium', 24)
             horizon_long = self.config.forecast_horizons.get('long', 144)
             
-            # Compute price z-scores
+            # CRITICAL FIX: Use return-based z-scores (consistent with environment.py)
+            # Forecast models predict price at t+h, so we compute forecast return: (forecast[t+h] - price[t]) / price[t]
+            # This is bias-immune and properly aligned with trading decisions
             current_price_raw = float(price_history[timestep]) if timestep < len(price_history) else 0.0
-            price_mean_val = float(price_mean[timestep]) if timestep < len(price_mean) else current_price_raw
-            price_std_val = max(float(price_std[timestep]), 1e-6) if timestep < len(price_std) else 1.0
             
-            # Price forecasts
+            # Price forecasts (predict price at t+h where h is horizon)
             price_short = self._get_forecast_safe(forecasts, "price", "short", default=current_price_raw)
             price_medium = self._get_forecast_safe(forecasts, "price", "medium", default=current_price_raw)
             price_long = self._get_forecast_safe(forecasts, "price", "long", default=current_price_raw)
             
-            z_short_price = (price_short - price_mean_val) / price_std_val
-            z_medium_price = (price_medium - price_mean_val) / price_std_val
-            z_long_price = (price_long - price_mean_val) / price_std_val
+            # Compute forecast returns: (forecast[t+h] - price[t]) / price[t]
+            # This gives the predicted return over the horizon period
+            forecast_return_short = (price_short - current_price_raw) / max(abs(current_price_raw), 1.0)
+            forecast_return_medium = (price_medium - current_price_raw) / max(abs(current_price_raw), 1.0)
+            forecast_return_long = (price_long - current_price_raw) / max(abs(current_price_raw), 1.0)
             
-            # Clip to reasonable range
-            z_short_price = float(np.clip(z_short_price, -3.0, 3.0))
-            z_medium_price = float(np.clip(z_medium_price, -3.0, 3.0))
-            z_long_price = float(np.clip(z_long_price, -3.0, 3.0))
+            # Apply tanh with scaling factor (typical returns are ±5%, so scale by 10x)
+            # This maps ±5% returns to ±0.46 z-scores, ±10% to ±0.76, ±20% to ±0.96
+            # This matches the approach in environment.py _compute_forecast_deltas()
+            z_short_price = float(np.tanh(forecast_return_short * 10.0))
+            z_medium_price = float(np.tanh(forecast_return_medium * 10.0))
+            z_long_price = float(np.tanh(forecast_return_long * 10.0))
             
-            # Generation forecasts (short horizon only for battery)
+            # Clip to reasonable range (tanh already bounds to [-1, 1], but clip for safety)
+            z_short_price = float(np.clip(z_short_price, -1.0, 1.0))
+            z_medium_price = float(np.clip(z_medium_price, -1.0, 1.0))
+            z_long_price = float(np.clip(z_long_price, -1.0, 1.0))
+            
+            # CRITICAL FIX: Generation forecasts use proper z-score formula with TRAINING statistics
+            # Use scaler statistics from training models (mean/std from training data), not rolling episode stats
+            # This ensures z-scores are normalized with the same distribution as training
             wind_short = self._get_forecast_safe(forecasts, "wind", "short", default=0.0)
             solar_short = self._get_forecast_safe(forecasts, "solar", "short", default=0.0)
             hydro_short = self._get_forecast_safe(forecasts, "hydro", "short", default=0.0)
             
-            z_short_wind = wind_short / max(wind_scale, 1e-6)
-            z_short_solar = solar_short / max(solar_scale, 1e-6)
-            z_short_hydro = hydro_short / max(hydro_scale, 1e-6)
+            # Get training statistics from scalers (preferred) or fallback to rolling stats
+            # This ensures consistency with training distribution
+            wind_model_key = f"wind_{self.config.forecast_horizons.get('short', 'short')}"
+            solar_model_key = f"solar_{self.config.forecast_horizons.get('short', 'short')}"
+            hydro_model_key = f"hydro_{self.config.forecast_horizons.get('short', 'short')}"
             
-            # Clip generation z-scores
+            # Try to get training mean/std from scalers first
+            if (self.forecast_generator and hasattr(self.forecast_generator, 'scalers') and 
+                wind_model_key in self.forecast_generator.scalers and 
+                'scaler_y' in self.forecast_generator.scalers[wind_model_key]):
+                scaler_y_wind = self.forecast_generator.scalers[wind_model_key]['scaler_y']
+                if hasattr(scaler_y_wind, 'mean_') and len(scaler_y_wind.mean_) > 0:
+                    wind_mean_val = float(scaler_y_wind.mean_[0])
+                else:
+                    wind_mean_val = float(wind_mean[timestep]) if timestep < len(wind_mean) else 0.0
+                if hasattr(scaler_y_wind, 'scale_') and len(scaler_y_wind.scale_) > 0:
+                    wind_std_val = max(float(scaler_y_wind.scale_[0]), 1e-6)
+                else:
+                    wind_std_val = max(float(wind_std[timestep]), 1e-6) if timestep < len(wind_std) else 1.0
+            else:
+                # Fallback to rolling stats if scalers not available
+                wind_mean_val = float(wind_mean[timestep]) if timestep < len(wind_mean) else 0.0
+                wind_std_val = max(float(wind_std[timestep]), 1e-6) if timestep < len(wind_std) else 1.0
+            
+            if (self.forecast_generator and hasattr(self.forecast_generator, 'scalers') and 
+                solar_model_key in self.forecast_generator.scalers and 
+                'scaler_y' in self.forecast_generator.scalers[solar_model_key]):
+                scaler_y_solar = self.forecast_generator.scalers[solar_model_key]['scaler_y']
+                if hasattr(scaler_y_solar, 'mean_') and len(scaler_y_solar.mean_) > 0:
+                    solar_mean_val = float(scaler_y_solar.mean_[0])
+                else:
+                    solar_mean_val = float(solar_mean[timestep]) if timestep < len(solar_mean) else 0.0
+                if hasattr(scaler_y_solar, 'scale_') and len(scaler_y_solar.scale_) > 0:
+                    solar_std_val = max(float(scaler_y_solar.scale_[0]), 1e-6)
+                else:
+                    solar_std_val = max(float(solar_std[timestep]), 1e-6) if timestep < len(solar_std) else 1.0
+            else:
+                solar_mean_val = float(solar_mean[timestep]) if timestep < len(solar_mean) else 0.0
+                solar_std_val = max(float(solar_std[timestep]), 1e-6) if timestep < len(solar_std) else 1.0
+            
+            if (self.forecast_generator and hasattr(self.forecast_generator, 'scalers') and 
+                hydro_model_key in self.forecast_generator.scalers and 
+                'scaler_y' in self.forecast_generator.scalers[hydro_model_key]):
+                scaler_y_hydro = self.forecast_generator.scalers[hydro_model_key]['scaler_y']
+                if hasattr(scaler_y_hydro, 'mean_') and len(scaler_y_hydro.mean_) > 0:
+                    hydro_mean_val = float(scaler_y_hydro.mean_[0])
+                else:
+                    hydro_mean_val = float(hydro_mean[timestep]) if timestep < len(hydro_mean) else 0.0
+                if hasattr(scaler_y_hydro, 'scale_') and len(scaler_y_hydro.scale_) > 0:
+                    hydro_std_val = max(float(scaler_y_hydro.scale_[0]), 1e-6)
+                else:
+                    hydro_std_val = max(float(hydro_std[timestep]), 1e-6) if timestep < len(hydro_std) else 1.0
+            else:
+                hydro_mean_val = float(hydro_mean[timestep]) if timestep < len(hydro_mean) else 0.0
+                hydro_std_val = max(float(hydro_std[timestep]), 1e-6) if timestep < len(hydro_std) else 1.0
+            
+            # Proper z-score computation: (value - training_mean) / training_std
+            # This ensures z-scores match the training distribution
+            z_short_wind = (wind_short - wind_mean_val) / wind_std_val
+            z_short_solar = (solar_short - solar_mean_val) / solar_std_val
+            z_short_hydro = (hydro_short - hydro_mean_val) / hydro_std_val
+            
+            # Clip generation z-scores to reasonable range
             z_short_wind = float(np.clip(z_short_wind, -3.0, 3.0))
             z_short_solar = float(np.clip(z_short_solar, -3.0, 3.0))
             z_short_hydro = float(np.clip(z_short_hydro, -3.0, 3.0))
@@ -750,6 +993,9 @@ class ForecastEngine:
         
         Returns ForecastObservationFeatures with arrays for each agent.
         Returns empty features if forecasts disabled.
+        
+        TEMPORAL ALIGNMENT FIX: Uses lagged z_medium (from t-24) to align with return at t+24.
+        This ensures the forecast that predicted current conditions is used.
         """
         if not self.enabled:
             return ForecastObservationFeatures()
@@ -767,23 +1013,59 @@ class ForecastEngine:
                         recent_mape = float(np.mean(list(mape_history)[-10:]))
                         mape_thresholds = getattr(env, '_mape_thresholds', {})
                         mape_threshold_short = mape_thresholds.get('short', 0.02)
-                        # Normalize error: 0.0 = perfect, 1.0 = at threshold, >1.0 = worse than threshold
-                        normalized_error = float(np.clip(recent_mape / max(mape_threshold_short, 1e-6), 0.0, 2.0))
+                        # CRITICAL FIX: Normalize error to [0, 1] to match observation space scale
+                        # 0.0 = perfect, 1.0 = at threshold or worse (clipped at threshold)
+                        # This ensures normalized_error is on same scale as other features (not 2x range)
+                        normalized_error = float(np.clip(recent_mape / max(mape_threshold_short, 1e-6), 0.0, 1.0))
                 except Exception:
                     pass
             
-            # Investor features: 4D (z_short, z_medium, trust, normalized_error)
+            # TEMPORAL ALIGNMENT: Get lagged z_medium from t-24 to align with return at t+24
+            # The forecast made 24 steps ago predicted what's happening now
+            z_medium_lagged = self.z_medium_price  # Default to current if no lag available
+            current_timestep = getattr(env, 't', None) if env is not None else None
+            horizon_medium = getattr(self.config, 'forecast_horizons', {}).get('medium', 24)
+            
+            if current_timestep is not None and current_timestep >= horizon_medium:
+                lag_timestep = current_timestep - horizon_medium
+                if hasattr(env, '_z_score_history') and lag_timestep in env._z_score_history:
+                    z_medium_lagged = float(env._z_score_history[lag_timestep].get('z_medium', z_medium_lagged))
+            
+            # ENGINEERED FEATURES: Direction, Momentum, Strength
+            # Direction: sign of z_medium_lagged (-1 for down, +1 for up, 0 for neutral)
+            direction = float(np.sign(z_medium_lagged))
+            
+            # Momentum: change in z_medium (current - previous)
+            z_medium_prev = getattr(self, '_z_medium_prev', z_medium_lagged)
+            momentum = float(np.clip(z_medium_lagged - z_medium_prev, -1.0, 1.0))
+            self._z_medium_prev = z_medium_lagged  # Store for next iteration
+            
+            # Strength: absolute value of z_medium_lagged (magnitude of signal)
+            strength = float(np.clip(abs(z_medium_lagged), 0.0, 1.0))
+            
+            # TRADE SIGNAL: Composite feature combining direction, strength, and trust
+            # Range: [-1, 1] where positive = buy signal, negative = sell signal, magnitude = confidence
+            trade_signal = float(np.clip(direction * strength * self.forecast_trust, -1.0, 1.0))
+            
+            # TIER 22: Full forecast features (8D: z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal)
+            # All features provide rich context for the agent to learn from
             investor_features = np.array([
-                self.z_short_price,
-                self.z_medium_price,
-                self.forecast_trust,
-                normalized_error  # NEW: Recent forecast error
+                self.z_short_price,        # Short-term price forecast z-score
+                z_medium_lagged,           # Medium-term price forecast (temporally aligned)
+                direction,                 # Sign of forecast signal (-1, 0, +1)
+                momentum,                  # Change in forecast signal
+                strength,                  # Absolute magnitude of forecast signal
+                self.forecast_trust,       # Forecast trust score
+                normalized_error,          # Recent forecast error (reliability indicator)
+                trade_signal               # Composite signal (direction * strength * trust)
             ], dtype=np.float32)
             
-            # Battery features: 4D (total_gen, z_short, z_medium, z_long)
-            z_short_total_gen = self.z_short_wind + self.z_short_solar + self.z_short_hydro
+            # Battery features: 6D (wind, solar, hydro, z_short, z_medium, z_long)
+            # CHANGE: Use separate generation signals instead of merged total
             battery_features = np.array([
-                float(np.clip(z_short_total_gen, -3.0, 3.0)),
+                float(np.clip(self.z_short_wind, -1.0, 1.0)),
+                float(np.clip(self.z_short_solar, -1.0, 1.0)),
+                float(np.clip(self.z_short_hydro, -1.0, 1.0)),
                 self.z_short_price,
                 self.z_medium_price,
                 self.z_long_price
