@@ -1088,6 +1088,40 @@ def _load_eval_forecast_paths_episode19(forecast_base_dir: str = "forecast_model
             "metadata_dir": os.path.join(ep_dir, "metadata"),
         }
 
+def _resolve_tier3_overlay_weights(final_models_dir: str, tier_dir: str) -> Optional[str]:
+    """
+    Resolve Tier 3 DL overlay weights robustly.
+
+    Some runs save `dl_overlay_online_34d.h5` under `checkpoints/episode_X/` but don't copy it to `final_models/`.
+    Evaluation should still work in that case.
+    """
+    import re
+
+    candidates = [
+        os.path.join(final_models_dir, "dl_overlay_online_34d.h5"),
+        os.path.join(final_models_dir, "dl_overlay_online.h5"),
+    ]
+
+    ckpt_root = os.path.join(tier_dir, "checkpoints")
+    if os.path.isdir(ckpt_root):
+        ep_dirs = []
+        try:
+            for name in os.listdir(ckpt_root):
+                m = re.match(r"episode_(\d+)$", name)
+                if m:
+                    ep_dirs.append((int(m.group(1)), os.path.join(ckpt_root, name)))
+        except Exception:
+            ep_dirs = []
+
+        for _, ep_path in sorted(ep_dirs, key=lambda x: x[0], reverse=True):
+            candidates.append(os.path.join(ep_path, "dl_overlay_online_34d.h5"))
+            candidates.append(os.path.join(ep_path, "dl_overlay_online.h5"))
+
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
 
 def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     """
@@ -1133,6 +1167,10 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         # Keep risk-management gate OFF for fair comparison (evaluation matches training tier2/3 in your run)
         cfg.forecast_risk_management_mode = False
 
+        # FAIR EVALUATION:
+        # Tier 3 overlay outputs are used only for FGB/FAMC baseline signals.
+        # No overlay reward shaping or overlay risk-budget sizing exists.
+
         # Tier 3 overlay flags (environment uses these for tier naming/logging; adapter presence enables bridge)
         if name == "tier3":
             cfg.overlay_enabled = True
@@ -1140,6 +1178,7 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
             # IMPORTANT: Tier 3 (fgb_mode=meta) must enable the meta head so the overlay weight graph matches
             cfg.meta_baseline_enable = True
             cfg.meta_baseline_head_dim = int(getattr(cfg, "meta_baseline_head_dim", 32))
+            # No risk-budget / bridge-vector ablations (removed for fair comparisons).
         else:
             cfg.overlay_enabled = False
             cfg.forecast_baseline_enable = False
@@ -1147,9 +1186,15 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
 
         dl_path = None
         if dl_overlay:
-            # Tier 3 weight file name in this repo
-            cand = os.path.join(final_models_dir, "dl_overlay_online_34d.h5")
-            dl_path = cand if os.path.exists(cand) else None
+            # Tier 3 overlay weights (prefer final_models/, fallback to latest checkpoints/episode_*/)
+            dl_path = _resolve_tier3_overlay_weights(final_models_dir=final_models_dir, tier_dir=tier_dir)
+            if dl_path is None:
+                raise FileNotFoundError(
+                    "Tier 3 evaluation requires DL overlay weights but none were found.\n"
+                    f"Looked in: {final_models_dir} and {os.path.join(tier_dir, 'checkpoints', 'episode_*')}\n"
+                    "Expected one of: dl_overlay_online_34d.h5 or dl_overlay_online.h5\n"
+                    "Fix: copy the latest checkpoint overlay weight into final_models/ and re-run evaluation."
+                )
 
         # Environment per tier
         if enable_forecast:
@@ -1201,13 +1246,16 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     print_progress(f"📏 Evaluating for {steps} steps")
 
     # Tier 1: no forecasts, no overlay
-    results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir, enable_forecast=False, dl_overlay=False)
+    if getattr(args, "tiers_only", "all") in ("all", "tier1"):
+        results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir, enable_forecast=False, dl_overlay=False)
 
     # Tier 2: forecasts enabled (Episode 19), no overlay
-    results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir, enable_forecast=True, dl_overlay=False)
+    if getattr(args, "tiers_only", "all") in ("all", "tier2"):
+        results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir, enable_forecast=True, dl_overlay=False)
 
     # Tier 3: forecasts enabled (Episode 19) + overlay weights
-    results["tiers"]["tier3"] = _tier_eval("tier3", args.tier3_dir, enable_forecast=True, dl_overlay=True)
+    if getattr(args, "tiers_only", "all") in ("all", "tier3"):
+        results["tiers"]["tier3"] = _tier_eval("tier3", args.tier3_dir, enable_forecast=True, dl_overlay=True)
 
     return results
 
@@ -1365,13 +1413,11 @@ def create_evaluation_dl_adapter(base_env, dl_weights_path: str, config=None):
         from utils import load_overlay_weights
 
         feature_dim = 34  # training contract for Tier 3 overlay
-        bridge_dim = int(getattr(config, "overlay_bridge_dim", 4)) if config is not None else 4
         meta_head_dim = int(getattr(config, "meta_baseline_head_dim", 32)) if config is not None else 32
         enable_meta_head = bool(getattr(config, "meta_baseline_enable", False)) if config is not None else False
 
         adapter = DLAdapter(
             feature_dim=feature_dim,
-            bridge_dim=bridge_dim,
             verbose=False,
             meta_head_dim=meta_head_dim,
             enable_meta_head=enable_meta_head,
@@ -2268,6 +2314,14 @@ def main():
                        help="Tier 2 run directory containing final_models/")
     parser.add_argument("--tier3_dir", type=str, default="tier3gnn_seed789",
                        help="Tier 3 run directory containing final_models/ (and dl_overlay_online_34d.h5)")
+    parser.add_argument(
+        "--tiers_only",
+        type=str,
+        default="all",
+        choices=["all", "tier1", "tier2", "tier3"],
+        help="Run only a subset of tiers in --mode tiers (useful when Tier1/2 were already evaluated).",
+    )
+    # Tier 3 risk-budget sizing ablation removed (risk-budget sizing no longer exists).
     parser.add_argument("--forecast_base_dir", type=str, default="forecast_models",
                        help="Base directory for episode-specific forecast models (evaluation uses episode_19)")
 

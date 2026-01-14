@@ -157,27 +157,20 @@ class GNNObservationEncoder(nn.Module):
         
         # Determine if this is hierarchical structure
         # Hierarchical GNN works for any observation space with a base/forecast split
-        # - Tier 2 Investor: 14D (6 base + 8 forecast)
-        # - Tier 3 Investor: 18D (6 base + 8 forecast + 4 bridge) - hierarchical processes first 14D
-        # - Battery: 8D (4 base + 4 forecast)
+        # - Investor: 14D (6 base + 8 forecast)
+        # - Battery: 10D (4 base + 6 forecast)
         self.is_hierarchical = (graph_type == 'hierarchical') and (base_feature_dim is not None)
         
-        # Track if we have bridge vectors appended (Tier 3)
-        self.has_bridge_vectors = False
+        # Tier 3 is observation-identical to Tier 2 (no bridge-vector augmentation).
+        # So forecast_feature_dim is simply the remainder after base features.
         self.forecast_feature_dim = None  # Initialize to None (will be set below)
         if self.is_hierarchical:
-            # Calculate forecast feature dimension
-            # For Tier 3 (18D): first 14D are base+forecast, last 4D are bridge vectors
-            # For Tier 2 (14D): all 14D are base+forecast
-            if obs_dim > self.base_feature_dim * 2:
-                # Likely has bridge vectors (Tier 3): obs_dim = 18, base_feature_dim = 6
-                # Forecast features are 8D (between base and bridge)
-                self.forecast_feature_dim = obs_dim - self.base_feature_dim - 4  # 18 - 6 - 4 = 8
-                self.has_bridge_vectors = True
-            else:
-                # No bridge vectors (Tier 2): obs_dim = 14, base_feature_dim = 6
-                self.forecast_feature_dim = obs_dim - self.base_feature_dim  # 14 - 6 = 8
-                self.has_bridge_vectors = False
+            self.forecast_feature_dim = obs_dim - self.base_feature_dim
+            if self.forecast_feature_dim <= 0:
+                raise RuntimeError(
+                    f"Invalid hierarchical split: obs_dim={obs_dim}, base_feature_dim={self.base_feature_dim}. "
+                    f"Expected forecast_feature_dim>0, got {self.forecast_feature_dim}."
+                )
             
             # IMPROVED: Separate GNN encoders with INCREASED capacity for forecast features
             # Forecast features are critical for Tier 2/3 performance, so give them MORE capacity
@@ -334,20 +327,8 @@ class GNNObservationEncoder(nn.Module):
             self.output_dim = output_dim  # Final output is the concatenation, which equals output_dim
             actual_output_dim = output_dim  # Set actual_output_dim for use in fusion layers
             
-            # TIER 3: Bridge vector processor (if bridge vectors present)
-            if self.has_bridge_vectors:
-                bridge_dim = 4  # overlay_bridge_dim = 4
-                # Small MLP to project bridge vectors to match output_dim for fusion
-                # Bridge vectors are coordination signals, should be fused into encoded features
-                self.bridge_processor = nn.Sequential(
-                    nn.Linear(bridge_dim, output_dim // 4),  # Project to smaller dim
-                    nn.LayerNorm(output_dim // 4),
-                    nn.GELU(),
-                    nn.Dropout(dropout * 0.5),
-                    nn.Linear(output_dim // 4, output_dim)  # Project to output_dim for fusion
-                )
-            else:
-                self.bridge_processor = None
+            # No bridge-vector processor (Tier 3 is observation-identical to Tier 2).
+            self.bridge_processor = None
             
             # IMPROVED: Cross-attention fusion layer with MULTI-HEAD for better capacity
             # Use 2 heads for cross-attention to capture different types of base-forecast interactions
@@ -530,19 +511,7 @@ class GNNObservationEncoder(nn.Module):
             # Split base and forecast features
             base_obs = obs[:, :self.base_feature_dim]  # (batch, base_feature_dim)
             
-            # Handle bridge vectors for Tier 3 (18D observations)
-            if self.has_bridge_vectors:
-                # Tier 3: obs_dim = 18, base_feature_dim = 6
-                # Structure: [6 base, 8 forecast, 4 bridge]
-                # Extract only forecast features (skip bridge vectors)
-                forecast_end_idx = self.base_feature_dim + self.forecast_feature_dim  # 6 + 8 = 14
-                forecast_obs = obs[:, self.base_feature_dim:forecast_end_idx]  # (batch, 8) - only forecast
-                bridge_obs = obs[:, forecast_end_idx:]  # (batch, 4) - bridge vectors for later fusion
-            else:
-                # Tier 2: obs_dim = 14, base_feature_dim = 6
-                # Structure: [6 base, 8 forecast]
-                forecast_obs = obs[:, self.base_feature_dim:]  # (batch, 8) - all remaining are forecast
-                bridge_obs = None  # No bridge vectors
+            forecast_obs = obs[:, self.base_feature_dim:]  # remaining dims are forecast features
             
             # Encode separately
             base_encoded = self.base_encoder(base_obs)  # (batch, base_enc_output_dim)
@@ -606,15 +575,6 @@ class GNNObservationEncoder(nn.Module):
                     f"GNN encoder output dimension mismatch: expected {self.output_dim}D, got {encoded.shape[1]}D. "
                     f"This indicates a bug in the forward pass."
                 )
-            
-            # TIER 3: Fuse bridge vectors if present (maintains output_dim)
-            # Bridge vectors are coordination signals from DL overlay
-            if self.has_bridge_vectors and bridge_obs is not None and self.bridge_processor is not None:
-                # Process bridge vectors through small MLP to output_dim
-                bridge_encoded = self.bridge_processor(bridge_obs)  # (batch, 4) → (batch, output_dim)
-                # Fuse bridge into encoded features via gated addition
-                # Bridge provides coordination context, add to encoded features
-                encoded = encoded + 0.3 * bridge_encoded  # Weighted fusion (bridge adds context)
             
             return encoded
         else:

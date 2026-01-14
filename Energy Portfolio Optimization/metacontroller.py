@@ -521,8 +521,7 @@ class MultiESGAgent:
         CRITICAL: Reinitialize observation spaces from environment.
         
         This must be called when the environment is updated (e.g., per episode)
-        to ensure observation spaces match the new environment's observation spaces,
-        especially when bridge vectors are enabled for Tier 3.
+        to ensure observation spaces match the new environment's observation spaces.
         
         CRITICAL: When observation spaces change, rollout buffers must be reset because
         they were initialized with the old observation space dimensions.
@@ -680,12 +679,7 @@ class MultiESGAgent:
                     use_attention_pooling = getattr(config, "gnn_use_attention_pooling_tier2", True)
                     net_arch = getattr(config, "gnn_net_arch_tier2", [128, 64])
                     # Determine base_feature_dim based on observation dimension
-                    if obs_dim == 18:
-                        # Tier 3: 18D = 14D (6 base + 8 forecast) + 4D bridge vectors
-                        # Use hierarchical GNN for first 14D (base+forecast split), bridge handled separately in fusion
-                        base_feature_dim = 6  # Investor: 6 base + 8 forecast = 14D, then 4D bridge appended
-                        # Note: Bridge vectors are appended after 14D, so hierarchical GNN processes base+forecast correctly
-                    elif obs_dim == 14:
+                    if obs_dim == 14:
                         base_feature_dim = 6  # Tier 2 Investor: 6 base + 8 forecast
                     elif obs_dim == 10:
                         base_feature_dim = 4  # Battery: 4 base + 6 forecast (separate generation signals)

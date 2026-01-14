@@ -7,13 +7,16 @@ observation dimensions, and tier-specific logic.
 
 TIER DEFINITIONS:
 - Tier 1 (MARL Baseline): No forecasts, no DL overlay
-  - Investor: 6D, Battery: 9D, Risk: 9D, Meta: 11D
+  - Investor: 6D, Battery: 4D, Risk: 9D, Meta: 11D
   
 - Tier 2 (MARL + Forecast Integration): Forecasts enabled, no DL overlay
-  - Investor: 14D (6 base + 8 forecast), Battery: 14D, Risk: 12D, Meta: 13D
+  - Investor: 14D (6 base + 8 forecast)
+  - Battery: 10D (4 base + 6 forecast: 3 gen z-scores + 3 price horizons)
+  - Risk: 12D (9 base + 3 forecast)
+  - Meta: 13D (11 base + 2 forecast)
   
-- Tier 3 (MARL + Forecast + FAMC): Forecasts + DL overlay + bridge vectors
-  - Investor: 18D (14 + 4 bridge), Battery: 14D, Risk: 12D, Meta: 13D
+- Tier 3 (MARL + Forecast + FAMC): Forecasts + DL overlay (FGB/FAMC only)
+  - Observation spaces are intentionally identical to Tier 2 for fair comparison.
 """
 
 from typing import Dict, Tuple, Optional
@@ -60,7 +63,7 @@ def get_expected_observation_dims(tier: str, agent_name: str) -> int:
     """
     base_dims = {
         'investor_0': 6,
-        'battery_operator_0': 9,
+        'battery_operator_0': 4,
         'risk_controller_0': 9,
         'meta_controller_0': 11,
     }
@@ -72,30 +75,28 @@ def get_expected_observation_dims(tier: str, agent_name: str) -> int:
         # Add forecast dimensions
         forecast_dims = {
             'investor_0': 8,      # 6 base + 8 forecast = 14D
-            'battery_operator_0': 5,  # 9 base + 5 forecast = 14D
+            'battery_operator_0': 6,  # 4 base + 6 forecast = 10D
             'risk_controller_0': 3,   # 9 base + 3 forecast = 12D
             'meta_controller_0': 2,   # 11 base + 2 forecast = 13D
         }
         return base_dims.get(agent_name, 6) + forecast_dims.get(agent_name, 0)
     
     elif tier == TIER_3:
-        # Add forecast + bridge dimensions
+        # Tier 3 (FGB/FAMC) is intentionally observation-identical to Tier 2 for fair comparison:
+        # no extra bridge-vector observation dimensions.
+        #
+        # RATIONALE:
+        # - We want to isolate the effect of FGB/FAMC variance reduction from representation changes.
+        # - Extra bridge dims can add noise / non-stationarity and break fair tier comparisons.
         forecast_dims = {
             'investor_0': 8,      # 6 base + 8 forecast = 14D
-            'battery_operator_0': 5,  # 9 base + 5 forecast = 14D
+            'battery_operator_0': 6,  # 4 base + 6 forecast = 10D
             'risk_controller_0': 3,   # 9 base + 3 forecast = 12D
             'meta_controller_0': 2,   # 11 base + 2 forecast = 13D
         }
-        bridge_dims = {
-            'investor_0': 4,      # 14 + 4 bridge = 18D
-            'battery_operator_0': 0,  # Usually disabled, but configurable
-            'risk_controller_0': 0,
-            'meta_controller_0': 0,
-        }
         base = base_dims.get(agent_name, 6)
         forecast = forecast_dims.get(agent_name, 0)
-        bridge = bridge_dims.get(agent_name, 0)
-        return base + forecast + bridge
+        return base + forecast
     
     else:
         raise ValueError(f"Unknown tier: {tier}")
@@ -152,16 +153,10 @@ def should_include_bridge_dimensions(config) -> bool:
     Returns:
         True if bridge dimensions should be included
     """
-    forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
-    overlay_enabled = getattr(config, 'overlay_enabled', False)
-    bridge_enabled = getattr(config, 'overlay_bridge_enable', True)
-    
-    # Tier 3 always includes bridge if forecast_baseline_enable is True
-    if forecast_baseline_enable:
-        return bridge_enabled
-    
-    # Otherwise, only if overlay is enabled and bridge is enabled
-    return overlay_enabled and bridge_enabled
+    # FAIR TIER 3: no bridge-vector dimensions are included in agent observations.
+    # Tier 3 is defined as Tier 2 observations + FGB/FAMC (baseline/advantage correction),
+    # not as an observation-augmentation method.
+    return False
 
 
 def get_tier_description(tier: str) -> str:
@@ -177,7 +172,7 @@ def get_tier_description(tier: str) -> str:
     descriptions = {
         TIER_1: "MARL Baseline - No forecasts, no DL overlay",
         TIER_2: "MARL + Forecast Integration - Forecasts enabled, no DL overlay",
-        TIER_3: "MARL + Forecast + FAMC - Forecasts + DL overlay + bridge vectors",
+        TIER_3: "MARL + Forecast + FAMC - Tier 2 observations + FGB/FAMC (DL-assisted baseline only)",
     }
     return descriptions.get(tier, f"Unknown tier: {tier}")
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DL Overlay System - Tier 3 ONLY (Multiple Capabilities)
+DL Overlay System - Tier 3 ONLY (FGB/FAMC support)
 
 IMPORTANT: This module is ONLY for Tier 3 (when --dl_overlay flag is set).
 Tier 2 (forecast integration) does NOT need this - it uses direct deltas from ForecastGenerator.
@@ -11,32 +11,40 @@ TIER 2 (Forecast Integration - NO DL overlay needed):
 - ForecastEngine → processes z-scores into observation features
 - PPO learns directly from forecast deltas (z_short, z_medium, trust)
 
-TIER 3 COMPONENTS (Multiple Capabilities - requires --dl_overlay flag):
-- OverlaySharedModel: Shared encoder with 7 output heads providing:
-  1. bridge_vec: Coordination signals (appended to agent observations)
-  2. risk_budget: Position sizing multiplier (scales position sizes)
-  3. pred_reward: Predictive reward shaping (adds to reward signal)
-  4. strat_immediate/short/medium/long: Multi-horizon trading strategy signals
-  5. meta_adv: Meta-critic head for FAMC (Forecast-Aware Meta-Critic)
+TIER 3 COMPONENTS (FGB/FAMC - requires --dl_overlay flag):
+- OverlaySharedModel: shared encoder with the minimal heads needed for FGB/FAMC:
+  1. pred_reward: predictive reward proxy used to estimate expected ΔNAV (NOT injected into env reward)
+  2. meta_adv: meta-critic head for FAMC (Forecast-Aware Meta-Critic) (optional)
 - DLAdapter: Thin API for environment integration with strict shape contracts
 - OverlayExperienceBuffer: Circular buffer for training (TIER 3 ONLY)
-- OverlayTrainer: Multi-head loss training with per-horizon metrics (TIER 3 ONLY)
+- OverlayTrainer: pred_reward-only training (TIER 3 ONLY)
 - CalibrationTracker: FGB forecast trust (τₜ) and expected ΔNAV (TIER 3 ONLY)
 
-DL OVERLAY OUTPUTS (All Tier 3):
-1. Bridge Vectors (4D): Multi-agent coordination signals
-2. Risk Budget (1D): Position sizing multiplier [0.5, 1.5]
-3. Predicted Reward (1D): Auxiliary reward signal [-1, 1]
-4. Strategy Heads (4×4D): Multi-horizon trading signals (immediate/short/medium/long)
-5. FGB Components: Forecast trust (τₜ) and expected ΔNAV for baseline adjustment
-6. Meta-Critic: FAMC advantage prediction (Tier 3 with --meta_baseline_enable)
+DL OVERLAY OUTPUTS (Tier 3):
+1. Predicted Reward (1D): auxiliary predictive signal [-1, 1] (used for expected ΔNAV; never injected)
+2. Meta-Critic (optional): FAMC advantage prediction (Tier 3 with --meta_baseline_enable)
 
 Features:
 - 34D mode: 28D base + 6D forecast deltas (short/medium/long for price/total_gen)
-- Bridge vectors + Risk budgeting + Multi-horizon strategy guidance
+- Minimal outputs: pred_reward (+ optional meta_adv head for FAMC)
 - Strict shape/name invariants enforced at runtime
 - Memory efficient (< 1 MB)
 """
+
+import os
+# ---------------------------------------------------------------------------
+# TensorFlow stability defaults (Windows-friendly)
+# ---------------------------------------------------------------------------
+# Your failure `exit=3221225477` corresponds to Windows 0xC0000005 (access violation),
+# which is a *native crash* (often TensorFlow / oneDNN / low-level threading).
+# These environment variables must be set BEFORE importing tensorflow.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# oneDNN can be a source of hard crashes on some Windows installs; disabling it is safer.
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+# Keep thread counts conservative to reduce native race conditions.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
 import numpy as np
 import tensorflow as tf
@@ -45,11 +53,17 @@ from typing import Dict, Any, Optional
 from collections import deque
 import logging
 from config import (
-    DL_OVERLAY_LOSS_WEIGHTS,
     DL_OVERLAY_WINDOW_SIZE_DEFAULT,
     DL_OVERLAY_INIT_BUDGET_DEFAULT,
     DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT,
 )  # UNIFIED: Import constants from config
+
+# Apply thread settings after import as well (best-effort; harmless if already set).
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(int(os.environ.get("TF_NUM_INTRAOP_THREADS", "1")))
+    tf.config.threading.set_inter_op_parallelism_threads(int(os.environ.get("TF_NUM_INTEROP_THREADS", "1")))
+except Exception:
+    pass
 
 # ============================================================================
 # DL OVERLAY: SHARED ENCODER + HEADS (28D FORECAST-AWARE MODE ONLY)
@@ -60,13 +74,8 @@ class OverlaySharedModel(tf.keras.Model):
     Shared encoder for 28D forecast-aware mode only.
 
     Outputs (strict shape contract):
-    - bridge_vec: (batch, bridge_dim) tanh ∈ [-1,1] → appended per agent
-    - risk_budget: (batch, 1) in [0.5, 1.5] → env scales position sizes
-    - pred_reward: (batch, 1) in [-1, +1] → auxiliary reward shaping
-    - strat_immediate: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] immediate signals
-    - strat_short: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] short-horizon (1h)
-    - strat_medium: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] medium-horizon (4h)
-    - strat_long: (batch, 4) tanh ∈ [-1,1] → [wind, solar, hydro, price] long-horizon (24h, risk-only)
+    - pred_reward: (batch, 1) in [-1, +1] → predictive signal for expected ΔNAV (never injected)
+    - meta_adv (optional): (batch, 1) → FAMC meta-critic control-variate
 
     DESIGN: 4 strategy heads for 4 forecast horizons
     - Immediate: Reactive trading (respond to NOW signals) - full forecast
@@ -75,10 +84,9 @@ class OverlaySharedModel(tf.keras.Model):
     - Long: Positioning (24h ahead) - risk-only (no directional signal)
     """
 
-    def __init__(self, feature_dim: int, bridge_dim: int = 4, meta_head_dim: int = 32, enable_meta_head: bool = False):
+    def __init__(self, feature_dim: int, meta_head_dim: int = 32, enable_meta_head: bool = False):
         super().__init__()
         self.feature_dim = feature_dim
-        self.bridge_dim = bridge_dim
         self.meta_head_dim = meta_head_dim
         self.enable_meta_head = enable_meta_head
 
@@ -91,17 +99,8 @@ class OverlaySharedModel(tf.keras.Model):
         self.do3 = Dropout(0.1, name='overlay_do3')
         self.d4 = Dense(32, activation='relu', name='overlay_d4')
 
-        # Output heads
-        self.bridge_head = Dense(bridge_dim, activation='tanh', name="bridge_vec")
-        self.risk_budget_head = Dense(1, activation='sigmoid', name="risk_budget")
+        # Output heads (minimal for FGB/FAMC)
         self.pred_reward_head = Dense(1, activation='tanh', name="pred_reward")
-
-        # 28D strategy heads (4D: wind, solar, hydro, price) - one for each horizon
-        # OPTIMAL: 4 heads for 4 horizons = full information utilization
-        self.strat_immediate = Dense(4, activation='tanh', name="strat_immediate")
-        self.strat_short = Dense(4, activation='tanh', name="strat_short")
-        self.strat_medium = Dense(4, activation='tanh', name="strat_medium")
-        self.strat_long = Dense(4, activation='tanh', name="strat_long")
 
         # TIER 3 ONLY: FAMC Meta-critic head g_φ(x_t) for learned control-variate baseline
         # This head predicts a state-only scalar correlated with PPO advantage
@@ -112,10 +111,10 @@ class OverlaySharedModel(tf.keras.Model):
                 Dense(meta_head_dim, activation='elu', name='meta_adv_hidden'),
                 Dense(1, activation='linear', name='meta_advantage_head')
             ], name='meta_critic')
-            logging.info(f"OverlaySharedModel initialized: {feature_dim} features -> bridge_dim={bridge_dim}, meta_head_dim={meta_head_dim} (TIER 3: FAMC enabled)")
+            logging.info(f"OverlaySharedModel initialized: {feature_dim} features -> meta_head_dim={meta_head_dim} (TIER 3: FAMC enabled)")
         else:
             self.meta_head = None
-            logging.info(f"OverlaySharedModel initialized: {feature_dim} features -> bridge_dim={bridge_dim} (TIER 2: No meta-critic)")
+            logging.info(f"OverlaySharedModel initialized: {feature_dim} features (no meta-critic)")
 
     def call(self, x, training=None):
         """Forward pass through shared encoder and heads"""
@@ -127,19 +126,9 @@ class OverlaySharedModel(tf.keras.Model):
         z = self.do3(z, training=training)
         z = self.d4(z)
 
-        # Generate outputs
-        bridge_vec = self.bridge_head(z)  # [-1,1]^bridge_dim
-        risk_budget = self.risk_budget_head(z) * 1.0 + 0.5  # [0.5,1.5]
         pred_reward = self.pred_reward_head(z)  # [-1,1]
-
         out = {
-            "bridge_vec": bridge_vec,
-            "risk_budget": risk_budget,
             "pred_reward": pred_reward,
-            "strat_immediate": self.strat_immediate(z),
-            "strat_short": self.strat_short(z),
-            "strat_medium": self.strat_medium(z),
-            "strat_long": self.strat_long(z),
         }
 
         # TIER 3 ONLY: FAMC meta-critic head output
@@ -158,8 +147,7 @@ class DLAdapter:
     STRICT 34D MODE: feature_dim must be 34 (28D base + 6D deltas). Fails fast if not.
     """
 
-    def __init__(self, feature_dim: int, bridge_dim: int = 4, verbose: bool = False,
-                 meta_head_dim: int = 32, enable_meta_head: bool = False):
+    def __init__(self, feature_dim: int, verbose: bool = False, meta_head_dim: int = 32, enable_meta_head: bool = False):
         # CRITICAL FIX: Remove hard 34D constraint - accept dynamic feature dimensions
         # This makes the system robust to feature additions (e.g., temperature, volatility)
         # The model will adapt to whatever feature_dim is provided by the environment
@@ -177,16 +165,15 @@ class DLAdapter:
             raise ValueError(error_msg)
 
         self.feature_dim = feature_dim
-        self.bridge_dim = bridge_dim
         self.verbose = verbose
         self.enable_meta_head = enable_meta_head
-        self.model = OverlaySharedModel(feature_dim, bridge_dim, meta_head_dim, enable_meta_head)
+        self.model = OverlaySharedModel(feature_dim, meta_head_dim, enable_meta_head)
         self._shape_check_done = False  # Track if we've validated shapes
 
         if enable_meta_head:
-            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic), bridge_dim={bridge_dim}, meta_head_dim={meta_head_dim} (FAMC enabled)")
+            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic), meta_head_dim={meta_head_dim} (FAMC enabled)")
         else:
-            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic), bridge_dim={bridge_dim}")
+            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic)")
 
     def shared_inference(self, feats_np: np.ndarray, training: bool = False) -> Dict[str, Any]:
         """
@@ -198,13 +185,8 @@ class DLAdapter:
 
         Returns:
             dict with strict keys and shapes:
-            - bridge_vec: (batch, bridge_dim)
-            - risk_budget: (batch, 1) in [0.5, 1.5]
             - pred_reward: (batch, 1) in [-1, 1]
-            - strat_immediate: (batch, 4)
-            - strat_short: (batch, 4)
-            - strat_medium: (batch, 4)
-            - strat_long: (batch, 4)
+            - meta_adv: (batch, 1) (only if enable_meta_head=True)
         """
         try:
             # Ensure 2D input
@@ -253,32 +235,27 @@ class DLAdapter:
 
     def _validate_output_shapes(self, result: Dict[str, np.ndarray], batch_size: int):
         """Validate output shapes match strict contract."""
-        required_keys = ["bridge_vec", "risk_budget", "pred_reward", "strat_immediate", "strat_short", "strat_medium", "strat_long"]
+        required_keys = ["pred_reward"]
+        if self.enable_meta_head:
+            required_keys.append("meta_adv")
 
         for key in required_keys:
             if key not in result:
                 raise KeyError(f"Missing required output key: {key}")
 
-        # Validate bridge_vec
-        assert result["bridge_vec"].ndim == 2, f"bridge_vec must be 2D, got {result['bridge_vec'].ndim}D"
-        assert result["bridge_vec"].shape[0] == batch_size, f"bridge_vec batch mismatch"
-        assert result["bridge_vec"].shape[1] == self.bridge_dim, f"bridge_vec dim mismatch"
-
-        # Validate risk_budget
-        assert result["risk_budget"].ndim in (1, 2), f"risk_budget must be 1D or 2D, got {result['risk_budget'].ndim}D"
-        if result["risk_budget"].ndim == 2:
-            assert result["risk_budget"].shape == (batch_size, 1), f"risk_budget shape mismatch"
-
         # Validate pred_reward
         assert result["pred_reward"].ndim in (1, 2), f"pred_reward must be 1D or 2D, got {result['pred_reward'].ndim}D"
+        if result["pred_reward"].ndim == 2:
+            assert result["pred_reward"].shape == (batch_size, 1), f"pred_reward shape mismatch"
 
-        # Validate strategy heads (all must be (batch, 4))
-        for head_name in ["strat_immediate", "strat_short", "strat_medium", "strat_long"]:
-            head = result[head_name]
-            assert head.ndim == 2, f"{head_name} must be 2D, got {head.ndim}D"
-            assert head.shape == (batch_size, 4), f"{head_name} must be (batch, 4), got {head.shape}"
+        # Validate meta_adv (optional)
+        if self.enable_meta_head:
+            assert "meta_adv" in result, "Missing required output key: meta_adv"
+            assert result["meta_adv"].ndim in (1, 2), f"meta_adv must be 1D or 2D, got {result['meta_adv'].ndim}D"
+            if result["meta_adv"].ndim == 2:
+                assert result["meta_adv"].shape == (batch_size, 1), f"meta_adv shape mismatch"
 
-        logging.info(f"[DLAdapter] Output shapes validated: batch_size={batch_size}, all heads OK")
+        logging.info(f"[DLAdapter] Output shapes validated: batch_size={batch_size}, keys={required_keys}")
 
 
 # ============================================================================
@@ -298,41 +275,29 @@ class OverlayExperienceBuffer:
         self.buffer.append(experience)
 
     def sample_batch(self, batch_size: int = 64) -> Dict[str, np.ndarray]:
-        """Sample random batch from buffer (28D only)"""
+        """Sample random batch from buffer (FGB/FAMC: pred_reward head only)."""
         if len(self.buffer) < batch_size:
             batch_size = len(self.buffer)
 
         indices = np.random.choice(len(self.buffer), size=batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
 
-        # Stack into arrays (28D: immediate, short, medium, long)
+        # Stack into arrays (FGB/FAMC: only pred_reward supervision)
         result = {
             'features': np.stack([b['features'] for b in batch]),
-            'bridge_vec_target': np.stack([b['bridge_vec_target'] for b in batch]),
-            'risk_budget_target': np.array([b['risk_budget_target'] for b in batch]),
             'pred_reward_target': np.array([b['pred_reward_target'] for b in batch]),
-            'strat_immediate_target': np.stack([b['strat_immediate_target'] for b in batch]),
-            'strat_short_target': np.stack([b['strat_short_target'] for b in batch]),
-            'strat_medium_target': np.stack([b['strat_medium_target'] for b in batch]),
-            'strat_long_target': np.stack([b['strat_long_target'] for b in batch]),
         }
         return result
 
     def get_validation_set(self) -> Dict[str, np.ndarray]:
-        """Get validation set (last 20% of buffer, 28D only)"""
+        """Get validation set (last 20% of buffer, FGB/FAMC pred_reward only)."""
         val_size = max(1, int(len(self.buffer) * self.validation_split))
         val_indices = list(range(len(self.buffer) - val_size, len(self.buffer)))
         batch = [self.buffer[i] for i in val_indices]
 
         result = {
             'features': np.stack([b['features'] for b in batch]),
-            'bridge_vec_target': np.stack([b['bridge_vec_target'] for b in batch]),
-            'risk_budget_target': np.array([b['risk_budget_target'] for b in batch]),
             'pred_reward_target': np.array([b['pred_reward_target'] for b in batch]),
-            'strat_immediate_target': np.stack([b['strat_immediate_target'] for b in batch]),
-            'strat_short_target': np.stack([b['strat_short_target'] for b in batch]),
-            'strat_medium_target': np.stack([b['strat_medium_target'] for b in batch]),
-            'strat_long_target': np.stack([b['strat_long_target'] for b in batch]),
         }
         return result
 
@@ -354,30 +319,16 @@ class OverlayTrainer:
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
         self.buffer = OverlayExperienceBuffer(max_size=10_000)
 
-        # Loss functions for each head (28D only)
+        # Loss functions for each head (FGB/FAMC: pred_reward only)
         self.loss_fns = {
-            'bridge_vec': tf.keras.losses.MeanSquaredError(),
-            'risk_budget': tf.keras.losses.MeanSquaredError(),
             'pred_reward': tf.keras.losses.MeanSquaredError(),
-            'strat_immediate': tf.keras.losses.MeanSquaredError(),
-            'strat_short': tf.keras.losses.MeanSquaredError(),
-            'strat_medium': tf.keras.losses.MeanSquaredError(),
-            'strat_long': tf.keras.losses.MeanSquaredError(),
         }
 
-        # Loss weights from config (OPTIMAL: Horizon-weighted for 28D)
-        # Immediate signals most actionable → highest weight
-        # Long-term signals less actionable → lower weight
-        # Tuned for: immediate=100%, short=95%, medium=90%, long=risk-only
-        self.loss_weights = DL_OVERLAY_LOSS_WEIGHTS.copy()
+        # Loss weights: only pred_reward is trained here (meta head is trained in metacontroller).
+        self.loss_weights = {'pred_reward': 1.0}
 
-        # Per-horizon metrics for monitoring
-        self.horizon_metrics = {
-            'strat_immediate': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
-            'strat_short': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
-            'strat_medium': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
-            'strat_long': {'mae': deque(maxlen=100), 'rmse': deque(maxlen=100)},
-        }
+        # (strategy-head metrics removed; only pred_reward is trained here)
+        self.horizon_metrics = {}
 
         # Metrics
         self.training_history = deque(maxlen=100)
@@ -393,7 +344,7 @@ class OverlayTrainer:
         self.buffer.add(experience)
 
     def train_step(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
-        """Single training step on batch (28D only)"""
+        """Single training step on batch (FGB/FAMC pred_reward only)."""
         try:
             features = tf.convert_to_tensor(batch['features'], dtype=tf.float32)
 
@@ -401,31 +352,22 @@ class OverlayTrainer:
                 # Forward pass
                 predictions = self.model(features, training=True)
 
-                # Compute loss for each head
+                # Compute loss (pred_reward only)
                 total_loss = 0.0
                 losses = {}
 
-                # Process all heads (28D: immediate, short, medium, long)
-                for head_name in ['bridge_vec', 'risk_budget', 'pred_reward', 'strat_immediate', 'strat_short', 'strat_medium', 'strat_long']:
+                for head_name in ['pred_reward']:
                     target_key = f'{head_name}_target'
                     target = tf.convert_to_tensor(batch[target_key], dtype=tf.float32)
                     pred = predictions[head_name]
 
-                    # Reshape risk_budget and pred_reward targets to match predictions
-                    if head_name in ['risk_budget', 'pred_reward']:
-                        target = tf.reshape(target, (-1, 1))
+                    # Reshape pred_reward targets to match predictions
+                    target = tf.reshape(target, (-1, 1))
 
                     head_loss = self.loss_fns[head_name](target, pred)
                     weighted_loss = head_loss * self.loss_weights[head_name]
                     total_loss += weighted_loss
                     losses[head_name] = float(head_loss.numpy())
-
-                    # Compute per-horizon metrics for strategy heads
-                    if head_name in self.horizon_metrics:
-                        mae = float(tf.reduce_mean(tf.abs(target - pred)).numpy())
-                        rmse = float(tf.sqrt(tf.reduce_mean(tf.square(target - pred))).numpy())
-                        self.horizon_metrics[head_name]['mae'].append(mae)
-                        self.horizon_metrics[head_name]['rmse'].append(rmse)
 
                 losses['total'] = float(total_loss.numpy())
 
@@ -542,7 +484,7 @@ class OverlayTrainer:
             return 0.0
 
     def validate(self) -> float:
-        """Compute validation loss (28D only)"""
+        """Compute validation loss (FGB/FAMC pred_reward only)."""
         try:
             if self.buffer.size() < 10:
                 return 0.0
@@ -552,14 +494,12 @@ class OverlayTrainer:
             predictions = self.model(features, training=False)
 
             total_loss = 0.0
-            # Validate all heads (28D: immediate, short, medium, long)
-            for head_name in ['bridge_vec', 'risk_budget', 'pred_reward', 'strat_immediate', 'strat_short', 'strat_medium', 'strat_long']:
+            for head_name in ['pred_reward']:
                 target_key = f'{head_name}_target'
                 target = tf.convert_to_tensor(val_batch[target_key], dtype=tf.float32)
                 pred = predictions[head_name]
 
-                if head_name in ['risk_budget', 'pred_reward']:
-                    target = tf.reshape(target, (-1, 1))
+                target = tf.reshape(target, (-1, 1))
 
                 head_loss = self.loss_fns[head_name](target, pred)
                 total_loss += head_loss * self.loss_weights[head_name]

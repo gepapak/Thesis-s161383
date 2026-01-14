@@ -518,31 +518,9 @@ class ProfitFocusedRewardCalculator:
             (adaptive_forecast_weight if hasattr(self, '_adaptive_forecast_weight') else rw.get('forecast', 0.0)) * forecast_score
         )
 
-        lambda_w = getattr(self.config, "overlay_pred_reward_lambda", 0.0) if self.config else 0.0
-        pred_reward_enabled = getattr(self.config, "overlay_pred_reward_enable", True) if self.config else True
-        feature_dim = getattr(self, 'feature_dim', OVERLAY_FEATURE_DIM)
-        if lambda_w > 1e-9 and pred_reward_enabled and feature_dim == OVERLAY_FEATURE_DIM:
-            try:
-                if hasattr(self, '_overlay_pred_r_hist') and len(self._overlay_pred_r_hist) > 0:
-                    pred_smoothed = float(np.mean(list(self._overlay_pred_r_hist)))
-                    pred_reward_contrib = float(lambda_w * pred_smoothed)
-                    reward = float(reward) + pred_reward_contrib
-
-                    try:
-                        mwdir = getattr(self, 'mwdir', 0.0)
-                        if self.t > 0:
-                            price_current_raw = self._price_raw[self.t] if self.t < len(self._price_raw) else 0.0
-                            price_prev_raw = self._price_raw[self.t-1] if self.t > 0 and self.t-1 < len(self._price_raw) else price_current_raw
-                            realized_return = (price_current_raw - price_prev_raw) / (abs(price_prev_raw) + 1e-6)
-                            mw_signal = float(np.clip(mwdir, -1.0, 1.0))
-                            alignment = np.sign(realized_return) * np.sign(mw_signal)
-                            lambda_mw = float(lambda_w * 0.5)
-                            mw_reward_contrib = float(lambda_mw * alignment)
-                            reward = float(reward) + mw_reward_contrib
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        # NOTE (fair comparison):
+        # Predicted-reward injection (auxiliary shaping) has been removed.
+        # All tiers train/evaluate on the same economic reward signal.
 
         if hasattr(self, 'config') and self.config:
             clip_min = getattr(self.config, 'reward_clip_min', -10.0)
@@ -1069,14 +1047,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_reward_weights = {}
 
         # =====================================================================
-        # DL OVERLAY STATE (34D FORECAST-AWARE MODE: 28D base + 6D deltas)
+        # DL OVERLAY STATE (Tier 3: FGB/FAMC only)
         # =====================================================================
-        self._overlay_bridge_cache = {"investor_0": np.zeros((self.config.overlay_bridge_dim,), np.float32)}
-        self._overlay_bridge_cache_batt = np.zeros((self.config.overlay_bridge_dim,), np.float32)
-        self._overlay_risk_multiplier = 1.0
-        self._overlay_pred_r_hist = deque(maxlen=getattr(self.config, "overlay_pred_reward_window", 20))
-        self.dl_adapter_overlay = None  # Will be set by main.py after instantiation (DLAdapter for overlay inference)
-        self.overlay_trainer = None  # Will be set by main.py after instantiation
+        # IMPORTANT (fairness): overlay outputs are NOT injected into env rewards or trade sizing.
+        # The overlay is used only for FGB/FAMC variance reduction (baseline / meta-critic signals).
+        self.dl_adapter_overlay = None  # Set by main.py (DLAdapter for overlay inference)
+        self.overlay_trainer = None  # Set by main.py (online overlay trainer; pred_reward head only)
 
         # =====================================================================
         # FGB: FORECAST-GUIDED BASELINE STATE
@@ -1181,8 +1157,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # =====================================================================
         self._overlay_feature_history = deque(maxlen=20)  # Recent features for target computation
         self._overlay_reward_history = deque(maxlen=20)   # Recent rewards for pred_reward target
-        self._overlay_action_history = deque(maxlen=20)   # Recent actions for bridge_vec target
-        self._overlay_pnl_history = deque(maxlen=20)      # Recent P&L for risk_budget target
+        self._overlay_pnl_history = deque(maxlen=20)      # Recent P&L for pred_reward target
 
         # =====================================================================
         # DELTA NORMALIZATION STATE (EMA std tracking for stabilization)
@@ -2260,43 +2235,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
                         # DEBUG: Log inference success
                         if i % 1000 == 0 and i > 0:
-                            # Show which outputs are actually USED (not just computed)
-                            bridge_enabled = getattr(self.config, 'overlay_bridge_enable', True)
-                            pred_reward_enabled = getattr(self.config, 'overlay_pred_reward_enable', True)
-                            used_outputs = []
-                            if bridge_enabled:
-                                used_outputs.append('bridge_vec')
-                            used_outputs.append('risk_budget')  # Always used
-                            if pred_reward_enabled:
-                                used_outputs.append('pred_reward')
-                            used_outputs.extend(['strat_immediate', 'strat_short', 'strat_medium', 'strat_long'])  # Always used for deltas
-
                             all_outputs = list(overlay_outs.keys()) if overlay_outs else []
-                            logger.info(f"[OVERLAY] Step {i}: Inference successful, computed={all_outputs}, USED={used_outputs}")
+                            logger.info(f"[OVERLAY] Step {i}: Inference successful, outputs={all_outputs}")
 
-                        # Cache results for wrapper and reward calculator
+                        # Cache results for FGB/FAMC (never injected into env reward)
                         if overlay_outs:
-                            # Bridge vectors (append to agent obs in wrapper)
-                            bridge_vec = overlay_outs.get("bridge_vec", np.zeros((self.config.overlay_bridge_dim,)))
-                            if isinstance(bridge_vec, np.ndarray) and bridge_vec.size > 0:
-                                self._overlay_bridge_cache["investor_0"] = bridge_vec[0] if len(bridge_vec.shape) > 1 else bridge_vec
-                            if getattr(self.config, 'overlay_bridge_enable_battery', False):
-                                self._overlay_bridge_cache_batt = bridge_vec[0] if len(bridge_vec.shape) > 1 else bridge_vec
-
-                            # Risk budget multiplier (scale position sizes)
-                            risk_budget = overlay_outs.get("risk_budget", np.array([[1.0]]))
-                            if isinstance(risk_budget, np.ndarray):
-                                self._overlay_risk_multiplier = float(risk_budget.flatten()[0])
-                                # DEBUG: Log risk multiplier values to verify they're changing
-                                if i % 100 == 0 and i > 0:
-                                    logger.debug(f"[OVERLAY] Step {i}: risk_mult={self._overlay_risk_multiplier:.4f}, ema={self._overlay_risk_ema:.4f}")
-
-                            # Predictive reward (for 28D reward shaping)
-                            pred_reward = overlay_outs.get("pred_reward", np.array([[0.0]]))
-                            if isinstance(pred_reward, np.ndarray):
-                                self._overlay_pred_r_hist.append(float(pred_reward.flatten()[0]))
-
-                            # FGB: Cache overlay output for forecast signals
+                            # FGB: Cache overlay output for forecast-guided baseline signals
                             self._last_overlay_output = overlay_outs
                             # FAMC: Cache overlay features (34D) for meta head training
                             self._last_overlay_features = base_features.copy()
@@ -2735,20 +2679,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             available_capital = self.budget * self.capital_allocation_fraction
             position_size_multiplier = getattr(self.reward_calculator, 'position_size_multiplier', 1.0)
 
-            # ENHANCEMENT: Apply overlay risk budget multiplier (smoothed with EMA)
-            # This scales position sizes based on market conditions learned by the overlay
-            overlay_risk_multiplier = getattr(self, '_overlay_risk_multiplier', 1.0)
-            # Smooth with EMA to avoid sudden jumps (alpha=0.2 for 5-step smoothing)
-            if not hasattr(self, '_overlay_risk_ema'):
-                self._overlay_risk_ema = overlay_risk_multiplier
-            else:
-                alpha = 0.2  # EMA smoothing factor
-                self._overlay_risk_ema = alpha * overlay_risk_multiplier + (1.0 - alpha) * self._overlay_risk_ema
-
-            # CRITICAL FIX: Clamp smoothed multiplier to [0.5, 1.5] to match model output range
-            # Previous [0.7, 1.2] was too tight and limited overlay's effectiveness
-            smoothed_overlay_mult = float(np.clip(self._overlay_risk_ema, 0.5, 1.5))
-
             # VOLATILITY BRAKE: Reduce positions if realized volatility is elevated
             # If vol > 1.8x median, multiply by 0.8 to reduce risk
             # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
@@ -2768,32 +2698,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 except Exception:
                     pass  # Silently ignore volatility brake errors
 
-            # FGB: Apply overlay risk budget when enabled
-            # Action blending is deprecated (overlay_alpha is always 0.0).
-            # The overlay's risk_budget multiplier is a key value lever.
-            # This ensures the overlay's learned risk regime is always respected.
-            #
-            # RATIONALE:
-            # - Blending is removed; overlay_alpha is always 0.0 (no action override)
-            # - Risk budget scaling is orthogonal to action execution
-            # - Overlay's learned risk multiplier should always be applied (unless explicitly disabled)
-            #
-            # This maximizes overlay's contribution to NAV improvement.
-
             # CRITICAL FIX: Apply risk controller's multiplier
             # Risk controller sets self.risk_multiplier via _apply_risk_control()
             # This must be included in position sizing to ensure risk controller's actions affect trades
             risk_controller_mult = getattr(self, 'risk_multiplier', 1.0)
-            
-            # Check if overlay risk budget should be applied
-            always_apply_overlay = getattr(self.config, 'overlay_apply_risk_budget', True)
 
-            if always_apply_overlay:
-                # Apply all multipliers: position_size, risk_controller, overlay, volatility_brake
-                combined_multiplier = position_size_multiplier * risk_controller_mult * smoothed_overlay_mult * volatility_brake_mult
-            else:
-                # Skip overlay risk budget (RL-only sizing), but still apply risk controller
-                combined_multiplier = position_size_multiplier * risk_controller_mult * volatility_brake_mult
+            # FAIR TIER 3: Remove overlay risk-budget sizing.
+            # Tier 3 remains Tier 2 observations + FGB/FAMC (baseline correction), without changing trade sizing logic.
+            combined_multiplier = position_size_multiplier * risk_controller_mult * volatility_brake_mult
 
             strategy_multiplier = 1.0
             strategy_meta = getattr(self, '_current_investor_strategy', None)
@@ -2823,10 +2735,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # DEBUG: Log risk multiplier application (always applied now)
             # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
             if t % 500 == 0 and t > 0:
-                logger.debug(f"[OVERLAY RISK] Step {t}: "
-                            f"risk_controller={risk_controller_mult:.4f}, rl_mult={position_size_multiplier:.4f}, "
-                            f"risk_budget={smoothed_overlay_mult:.4f}, vol_brake={volatility_brake_mult:.4f}, "
-                            f"combined={combined_multiplier:.4f}")
+                logger.debug(
+                    f"[SIZING_MULT] Step {t}: "
+                    f"risk_controller={risk_controller_mult:.4f}, rl_mult={position_size_multiplier:.4f}, "
+                    f"vol_brake={volatility_brake_mult:.4f}, combined={combined_multiplier:.4f}"
+                )
 
             # === STEP 2: Map the agent's normalized actions to target DKK positions ===
             # ENHANCED: Apply Kelly position sizing + regime detection
@@ -2840,35 +2753,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 'hydro': 1.0
             }
 
-            # Extract forecast confidence from overlay output if available
-            if hasattr(self, '_last_overlay_output') and self._last_overlay_output:
-                overlay_out = self._last_overlay_output
-
-                # FIX: Use _forecast_errors (per-asset tracking) instead of _forecast_accuracy_tracker
-                # _forecast_errors is populated by _track_forecast_accuracy() and tracks by target (wind/solar/hydro)
-                # UPDATED: Use configurable confidence floor (default 0.6)
-                confidence_floor = getattr(self.config, 'confidence_floor', 0.6)
-
-                if hasattr(self, '_forecast_errors'):
-                    for asset in ['wind', 'solar', 'hydro']:
-                        # Get recent forecast errors for this asset
-                        asset_errors = self._forecast_errors.get(asset, [])
-                        if len(asset_errors) >= 10:
-                            # Lower MAPE = higher confidence
-                            recent_mape = np.mean(list(asset_errors)[-10:])
-                            # Map MAPE to confidence: 0% error = 1.0, 50% error = 0.5
-                            # Apply configurable floor (default 0.6)
-                            confidence = 1.0 - np.clip(recent_mape, 0.0, 0.5)
-                            confidence = np.clip(confidence, confidence_floor, 1.0)
-                            forecast_confidences[asset] = confidence
-
-                # Fallback: Use pred_reward if forecast errors not available
-                elif 'pred_reward' in overlay_out:
-                    pred_reward = float(overlay_out['pred_reward'].flatten()[0]) if isinstance(overlay_out['pred_reward'], np.ndarray) else float(overlay_out['pred_reward'])
-                    # Map predicted reward to confidence with floor
-                    confidence = 0.7 + 0.3 * np.clip(pred_reward / 100.0, 0.0, 1.0)
-                    confidence = max(confidence, confidence_floor)
-                    forecast_confidences = {'wind': confidence, 'solar': confidence, 'hydro': confidence}
+            # Forecast confidence: computed purely from forecast model errors (Tier 2/3 identical).
+            # NOTE: We do not use overlay outputs for sizing to keep Tier 3 a fair Tier 2 comparison.
+            confidence_floor = getattr(self.config, 'confidence_floor', 0.6)
+            if hasattr(self, '_forecast_errors'):
+                for asset in ['wind', 'solar', 'hydro']:
+                    asset_errors = self._forecast_errors.get(asset, [])
+                    if len(asset_errors) >= 10:
+                        recent_mape = np.mean(list(asset_errors)[-10:])
+                        confidence = 1.0 - np.clip(recent_mape, 0.0, 0.5)  # 0%->1.0, 50%->0.5
+                        forecast_confidences[asset] = float(np.clip(confidence, confidence_floor, 1.0))
 
             # Get current volatility regime
             vol_regime = self._current_regime.get('metrics', {}).get('volatility_regime', 1.0) if hasattr(self, '_current_regime') else 1.0
@@ -4043,28 +3937,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if len(self._overlay_feature_history) < 5:
                 return  # Need some history to compute meaningful targets
 
-            # 1. bridge_vec_target: Smooth recent agent actions
-            bridge_target = self._compute_bridge_target()
-
-            # 2. risk_budget_target: Based on recent P&L and drawdown
-            risk_target = self._compute_risk_budget_target()
-
-            # 3. pred_reward_target: Look-ahead reward signal
+            # FGB/FAMC-only overlay training:
+            # Only train what is needed for baseline correction, i.e., a predicted reward proxy.
             pred_reward_target = self._compute_pred_reward_target()
 
-            # 4. Strategy targets: Based on market regime
-            strat_targets = self._compute_strategy_targets()
-
-            # Create experience tuple (OPTIMAL: All 4 horizons)
             experience = {
                 'features': features[0].astype(np.float32),
-                'bridge_vec_target': bridge_target.astype(np.float32),
-                'risk_budget_target': float(risk_target),
                 'pred_reward_target': float(pred_reward_target),
-                'strat_immediate_target': strat_targets['immediate'].astype(np.float32),
-                'strat_short_target': strat_targets['short'].astype(np.float32),
-                'strat_medium_target': strat_targets['medium'].astype(np.float32),
-                'strat_long_target': strat_targets['long'].astype(np.float32),
                 'outcome': float(getattr(self.reward_calculator, 'recent_trading_gains', 0.0)) if self.reward_calculator else 0.0,
                 'timestamp': self.t
             }
@@ -4075,55 +3954,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # DEBUG: Log experience collection every 500 steps
             if self.t % 500 == 0:
                 buffer_size = self.overlay_trainer.buffer.size()
-                logger.info(f"[OVERLAY_EXPERIENCE] t={self.t} | buffer_size={buffer_size} | strat_immediate={strat_targets['immediate']}")
+                logger.info(f"[OVERLAY_EXPERIENCE] t={self.t} | buffer_size={buffer_size} | pred_reward_target={pred_reward_target:.3f}")
 
         except Exception as e:
             logger.debug(f"Experience collection failed: {e}")
             logger.debug(f"Full traceback: {traceback.format_exc()}")
-
-    def _compute_bridge_target(self) -> np.ndarray:
-        """
-        Compute bridge vector target (coordination signal).
-
-        TRULY FORWARD-LOOKING: Use forecast volatility to predict optimal coordination.
-        Computes volatility across forecast horizons (short/medium/long) to anticipate
-        market regime changes, not react to past volatility.
-        """
-        try:
-            # Get forecasts for next 3 horizons (short/medium/long)
-            # FIXED: Use centralized _get_forecast_safe() method
-            wind_forecasts = []
-            solar_forecasts = []
-            hydro_forecasts = []
-
-            for horizon in ["short", "medium", "long"]:
-                wind_forecasts.append(self._get_forecast_safe("wind", horizon))
-                solar_forecasts.append(self._get_forecast_safe("solar", horizon))
-                hydro_forecasts.append(self._get_forecast_safe("hydro", horizon))
-
-            # Compute forecast volatility (spread across horizons = anticipated regime uncertainty)
-            wind_vol = float(np.std(wind_forecasts)) if len(wind_forecasts) > 1 else 0.1
-            solar_vol = float(np.std(solar_forecasts)) if len(solar_forecasts) > 1 else 0.1
-            hydro_vol = float(np.std(hydro_forecasts)) if len(hydro_forecasts) > 1 else 0.1
-
-            # Normalize volatilities to [-1, 1]
-            max_vol = max(wind_vol, solar_vol, hydro_vol, 0.01)
-            bridge_target = np.array([
-                np.clip(wind_vol / max_vol - 0.5, -1.0, 1.0),
-                np.clip(solar_vol / max_vol - 0.5, -1.0, 1.0),
-                np.clip(hydro_vol / max_vol - 0.5, -1.0, 1.0),
-                0.0  # 4th dimension: neutral
-            ], dtype=np.float32)
-
-            # DEBUG: Log forecast-based volatility every 500 steps
-            if self.t % 500 == 0 and self.t > 0:
-                logger.debug(f"[BRIDGE_TARGET] t={self.t} forecast_vol: wind={wind_vol:.4f}, solar={solar_vol:.4f}, hydro={hydro_vol:.4f}")
-
-            return bridge_target[:self.config.overlay_bridge_dim]
-
-        except Exception as e:
-            logger.debug(f"Bridge target computation failed: {e}")
-            return np.zeros(self.config.overlay_bridge_dim, dtype=np.float32)
 
     def _compute_risk_budget_target(self) -> float:
         """
@@ -5062,938 +4897,20 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     forecast_usage_reason = 'engine_failure'
 
             elif enable_forecast_util:
-                # OPTION 2: Forward-looking reward alignment
-                # Use z-scores from historical timesteps that match forecast horizons
-                # - Short horizon (6 steps): Use z-scores from step i-6
-                # - Medium horizon (24 steps): Use z-scores from step i-24
-                # - Long horizon (144 steps): Use z-scores from step i-144
-                # This aligns rewards with what the forecast actually predicted
-                
-                # Get horizon steps from config
-                horizon_short = self.config.forecast_horizons.get('short', 6)
-                horizon_medium = self.config.forecast_horizons.get('medium', 24)
-                horizon_long = self.config.forecast_horizons.get('long', 144)
-                
-                # Look up historical z-scores matching forecast horizons
-                # Forecast generated at step i-horizon predicts price at step i
-                # so we align reward with z-scores stored at timestep i-horizon
-                t_short = i - horizon_short if i >= horizon_short else None  # = i - 6 for horizon=6
-                t_medium = i - horizon_medium if i >= horizon_medium else None  # = i - 24 for horizon=24
-                t_long = i - horizon_long if i >= horizon_long else None  # = i - 144 for horizon=144
-                
-                # Retrieve z-scores from history (fallback to current if not available)
-                if t_short is not None and t_short in self._z_score_history:
-                    z_short = float(self._z_score_history[t_short]['z_short'])
-                else:
-                    z_short = float(getattr(self, 'z_short_price', 0.0))  # Fallback to current
-                
-                if t_medium is not None and t_medium in self._z_score_history:
-                    z_medium = float(self._z_score_history[t_medium]['z_medium'])
-                else:
-                    z_medium = float(getattr(self, 'z_medium_price', 0.0))  # Fallback to current
-                
-                if t_long is not None and t_long in self._z_score_history:
-                    z_long = float(self._z_score_history[t_long]['z_long'])
-                else:
-                    z_long = float(getattr(self, 'z_long_price', 0.0))  # Fallback to current
-                
-                # Log horizon matching for debugging
-                if i % 1000 == 0 or i == 0:
-                    logger.info(f"[HORIZON_MATCHING] t={i} | Using z-scores from: "
-                               f"short={t_short if t_short is not None else 'current'}, "
-                               f"medium={t_medium if t_medium is not None else 'current'}, "
-                               f"long={t_long if t_long is not None else 'current'}")
-
-                # CRITICAL FIX: Correlation-based horizon weighting
-                # Higher correlation = higher weight (more predictive forecasts get more influence)
-                # Remove horizons with negative correlation (not predictive)
-                
-                # Get correlations for each horizon
-                corr_short = self._horizon_correlations.get('short', 0.0)
-                corr_medium = self._horizon_correlations.get('medium', 0.0)
-                corr_long = self._horizon_correlations.get('long', 0.0)
-                
-                # CRITICAL: Remove short horizon if correlation is negative
-                # Negative correlation means forecasts are counter-predictive (worse than random)
-                use_short = corr_short > 0.0
-                use_medium = corr_medium > 0.0
-                use_long = corr_long > 0.0
-                
-                # If no horizons have positive correlation, fall back to fixed weights
-                if not (use_short or use_medium or use_long):
-                    # Fallback: use fixed weights if no correlation data available
-                    weight_short = 0.7 if use_short else 0.0
-                    weight_medium = 0.2 if use_medium else 0.0
-                    weight_long = 0.1 if use_long else 0.0
-                else:
-                    # Convert correlation to weights (higher correlation = higher weight)
-                    # Use max(0, correlation) to ensure only positive correlations contribute
-                    epsilon = 1e-6
-                    weight_short_raw = max(0.0, corr_short) if use_short else 0.0
-                    weight_medium_raw = max(0.0, corr_medium) if use_medium else 0.0
-                    weight_long_raw = max(0.0, corr_long) if use_long else 0.0
-                    
-                    # Normalize weights to sum to 1.0
-                    total_weight = weight_short_raw + weight_medium_raw + weight_long_raw
-                    if total_weight > epsilon:
-                        weight_short = weight_short_raw / total_weight
-                        weight_medium = weight_medium_raw / total_weight
-                        weight_long = weight_long_raw / total_weight
-                    else:
-                        # Fallback: equal weights for available horizons
-                        num_horizons = sum([use_short, use_medium, use_long])
-                        if num_horizons > 0:
-                            weight_short = (1.0 / num_horizons) if use_short else 0.0
-                            weight_medium = (1.0 / num_horizons) if use_medium else 0.0
-                            weight_long = (1.0 / num_horizons) if use_long else 0.0
-                        else:
-                            weight_short = 0.0
-                            weight_medium = 0.0
-                            weight_long = 0.0
-                
-                # Use correlation-based weights for z-score combination
-                # If short horizon is excluded, it gets 0 weight
-                z_combined = float(weight_short * z_short + weight_medium * z_medium + weight_long * z_long)
-                
-                # Store z_combined as attribute for adaptive forecast weight calculation
-                self.z_combined = z_combined
-                
-                # Log correlation-based weights periodically for monitoring
-                if i % 1000 == 0 or i == 0:
-                    logger.info(f"[CORRELATION_BASED_WEIGHTS] t={i} | "
-                               f"Correlations: short={corr_short:.4f} (use={use_short}), medium={corr_medium:.4f} (use={use_medium}), long={corr_long:.4f} (use={use_long}) | "
-                               f"Weights: short={weight_short:.3f}, medium={weight_medium:.3f}, long={weight_long:.3f} | "
-                               f"z-values: short={z_short:.4f}, medium={z_medium:.4f}, long={z_long:.4f} | "
-                               f"z_combined={z_combined:.4f}")
-
-                # CRITICAL FIX V3: HYBRID REWARD (Alignment + PnL)
-                # Problem with V2: PnL-only reward is backward-looking and sparse
-                # - Only rewards AFTER price moves (delayed feedback)
-                # - Only non-zero when positions exist AND price moves (sparse signal)
-                # - Weak learning signal
+                # Fallback path when enable_forecast_utilisation=True but ForecastEngine is unavailable.
+                # In normal runs this should never execute because ForecastEngine is always constructed in __init__.
                 #
-                # NEW HYBRID APPROACH: Combine forward-looking + backward-looking rewards
-                #
-                # Component 1: ALIGNMENT REWARD (Forward-looking)
-                # - Rewards taking positions aligned with forecast direction
-                # - Dense signal (immediate feedback every step)
-                # - Encourages position-taking when forecast is confident
-                # - Formula: z_combined * position_exposure * 5.0
-                #
-                # Component 2: PnL REWARD (Backward-looking)
-                # - Rewards actual profitability from positions
-                # - Strong signal when trades work
-                # - Aligns with actual objective
-                # - Formula: actual_pnl * |z_combined| * 50.0
-                #
-                # TOTAL = Alignment + PnL
-                # This gives 6x stronger learning signal than PnL-only!
-                #
-                # Example scenarios:
-                # 1. Strong forecast + NO position → 0.0 (encourages taking position)
-                # 2. Strong forecast + SMALL position → 1.44 (6x stronger than V2!)
-                # 3. Strong forecast + LARGE position + profit → 2.88 (6x stronger!)
-
-                # Get current position exposure (normalized by initial budget)
-                max_pos = self.config.max_position_size * self.init_budget * self.config.capital_allocation_fraction if self.init_budget > 0 else 1.0
-                wind_pos_value = self.financial_positions.get('wind_instrument_value', 0.0)
-                solar_pos_value = self.financial_positions.get('solar_instrument_value', 0.0)
-                hydro_pos_value = self.financial_positions.get('hydro_instrument_value', 0.0)
-
-                # Normalize by max position size (KEEP SIGN for alignment check!)
-                wind_pos_norm = float(wind_pos_value / max(max_pos, 1.0))
-                solar_pos_norm = float(solar_pos_value / max(max_pos, 1.0))
-                hydro_pos_norm = float(hydro_pos_value / max(max_pos, 1.0))
-
-                # SIGNED total position (for alignment reward - checks direction match)
-                position_signed = float(wind_pos_norm + solar_pos_norm + hydro_pos_norm)
-
-                # UNSIGNED total position exposure (for PnL reward - checks size)
-                # CRITICAL FIX: Cap position exposure at 0.3 to prevent catastrophic losses from wrong forecasts
-                # Issue: Mean exposure was 0.4705, causing -$43.5M in large losses
-                # Solution: Cap at 0.3 to limit risk while still allowing meaningful positions
-                raw_position_exposure = float(abs(wind_pos_norm) + abs(solar_pos_norm) + abs(hydro_pos_norm))
-                position_exposure = float(np.clip(raw_position_exposure, 0.0, 0.3))  # Cap at 0.3 (30% of max position)
-
-                # Forecast confidence
-                forecast_confidence = float(abs(z_combined))
-
-                # COMPONENT 1: ALIGNMENT REWARD (Forward-looking)
-                # PROFITABILITY FIX: Scale alignment reward by unrealized P&L
-                # Problem: Agents were getting positive rewards for holding losing positions
-                # Solution: Reduce reward when position is losing money
-
-                # Calculate unrealized P&L for current positions
-                current_price = float(np.clip(self._price_raw[i], -1000.0, 1e9))
-                # Model B: Use the current MTM bucket as the unrealized P&L proxy.
-                unrealized_pnl_total = float(sum(getattr(self, 'financial_mtm_positions', {}).values()))
-
-                # Normalize unrealized P&L by max position size
-                max_pos = self.config.max_position_size * self.init_budget * self.config.capital_allocation_fraction if self.init_budget > 0 else 1.0
-                unrealized_pnl_norm = float(np.clip(unrealized_pnl_total / max(max_pos, 1.0), -3.0, 3.0))
-
-                # =====================================================================
-                # NOVEL: FORECAST-BASED TRADING FOR NAV GROWTH
-                # =====================================================================
-                # Goal: Use forecasts to increase NAV through profitable trading
-                # Approach: Multi-horizon consensus + MAPE filtering + PnL-based rewards
-
-                # DEBUG: Check why risk management is not active
-                has_risk_mgr = self.forecast_risk_manager is not None
-                has_mode_flag = getattr(self.config, 'forecast_risk_management_mode', False)
-                enable_forecast_util = getattr(self.config, 'enable_forecast_utilisation', False)
-                if i == 0:  # Log only on first step
-                    logger.info(f"[DEBUG_RISK_MGR] Step {i}:")
-                    logger.info(f"  has_risk_mgr={has_risk_mgr}")
-                    logger.info(f"  has_mode_flag={has_mode_flag}")
-                    logger.info(f"  enable_forecast_util={enable_forecast_util}")
-                    logger.info(f"  config object ID: {id(self.config)}")
-                    logger.info(f"  forecast_risk_manager object ID: {id(self.forecast_risk_manager) if has_risk_mgr else 'None'}")
-                    if not has_risk_mgr:
-                        logger.warning(f"[DEBUG_RISK_MGR] forecast_risk_manager is None!")
-                    if not has_mode_flag:
-                        logger.warning(f"[DEBUG_RISK_MGR] forecast_risk_management_mode is False!")
-                    if not enable_forecast_util:
-                        logger.warning(f"[DEBUG_RISK_MGR] enable_forecast_utilisation is False!")
-
-                use_risk_management = (self.forecast_risk_manager is not None and
-                                      getattr(self.config, 'forecast_risk_management_mode', False))
-
-                # DEBUG: Log risk management status
-                if i == 500:
-                    logger.debug(f"[DEBUG_RISK_MGR] use_risk_management={use_risk_management}")
-                    logger.debug(f"[DEBUG_RISK_MGR] forecast_risk_manager={self.forecast_risk_manager is not None}")
-                    logger.debug(f"[DEBUG_RISK_MGR] forecast_risk_management_mode={getattr(self.config, 'forecast_risk_management_mode', False)}")
-
-                # =====================================================================
-                # NOVEL: FORECAST RETURNS INTEGRATION (Bias-Immune)
-                # =====================================================================
-                # Instead of using absolute forecast levels (biased), use RETURNS
-                # Returns are stationary and bias cancels out in the division
-                # This focuses on what matters: price movements, not absolute levels
-
-                current_price = float(self._price_raw[i]) if i < len(self._price_raw) else 250.0
-
-                # Get forecast prices (raw DKK values)
-                forecast_price_short = 0.0
-                forecast_price_medium = 0.0
-                forecast_price_long = 0.0
-                if self.forecast_generator:
-                    try:
-                        fcast = self.forecast_generator.predict_all_horizons(timestep=i)
-                        if fcast:
-                            forecast_price_short = fcast.get('price_forecast_short', current_price)
-                            forecast_price_medium = fcast.get('price_forecast_medium', current_price)
-                            forecast_price_long = fcast.get('price_forecast_long', current_price)
-
-                            # DEBUG: Print forecast values every 500 steps
-                            if i % 500 == 0:
-                                logger.debug(f"[FORECAST_PRICES] t={i} current={current_price:.2f} short={forecast_price_short:.2f} med={forecast_price_medium:.2f} long={forecast_price_long:.2f}")
-                    except Exception as e:
-                        if i % 500 == 0:
-                            logger.warning(f"[FORECAST_PRICES] ERROR at t={i}: {e}")
-
-                # NOVEL: Compute FORECAST RETURNS instead of absolute deltas
-                # This is immune to bias because bias cancels out in the division
-                forecast_return_short = (forecast_price_short - current_price) / max(current_price, 1.0) if forecast_price_short > 0 else 0.0
-                forecast_return_medium = (forecast_price_medium - current_price) / max(current_price, 1.0) if forecast_price_medium > 0 else 0.0
-                forecast_return_long = (forecast_price_long - current_price) / max(current_price, 1.0) if forecast_price_long > 0 else 0.0
-
-                # Store for CSV logging (backward compatibility)
-                forecast_error_short = forecast_return_short
-                forecast_error_medium = forecast_return_medium
-                forecast_error_long = forecast_return_long
-
-                # ================================================================
-                # TIER 2: FORECAST INTEGRATION (ALWAYS ENABLED when enable_forecast_util=True)
-                # ================================================================
-                # CRITICAL FIX: Remove `if use_risk_management:` check
-                # This was causing Tier 2 to fall through to Tier 1 code!
-
-                # Get forecast data
-                forecast_deltas = getattr(self, '_forecast_deltas_raw', None)
-                mape_thresholds_capacity = getattr(self, '_mape_thresholds', None)
-
-                def _to_price_relative_mapes(mape_dict: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
-                    """Convert capacity-based MAPE values into price-relative percentages."""
-                    if not mape_dict:
-                        return None
-                    price_capacity = getattr(self.config, 'forecast_price_capacity', 6982.0)
-                    price_floor = getattr(self.config, 'minimum_price_floor', 50.0)
-                    denom = max(abs(current_price), price_floor, 1e-6)
-                    scale = price_capacity / denom
-                    converted: Dict[str, float] = {}
-                    for horizon, value in mape_dict.items():
-                        try:
-                            val = float(value)
-                        except (TypeError, ValueError):
-                            continue
-                        if not math.isfinite(val):
-                            continue
-                        converted[horizon] = float(val * scale)
-                    return converted if converted else None
-
-                mape_thresholds = _to_price_relative_mapes(mape_thresholds_capacity)
-                forecast_trust = float(getattr(self, '_forecast_trust', 0.5))
-
-                # Current positions for risk manager (Model B): use normalized exposures
-                max_pos_dkk = self.config.max_position_size * self.init_budget * self.config.capital_allocation_fraction if self.init_budget > 0 else 1.0
-                max_pos_dkk = max(float(max_pos_dkk), 1.0)
-                current_positions = {
-                    'wind': float(self.financial_positions.get('wind_instrument_value', 0.0) / max_pos_dkk),
-                    'solar': float(self.financial_positions.get('solar_instrument_value', 0.0) / max_pos_dkk),
-                    'hydro': float(self.financial_positions.get('hydro_instrument_value', 0.0) / max_pos_dkk),
-                }
-
-                # Compute investor strategy (NOVEL: multi-horizon consensus + MAPE thresholds)
-                quality_mult = 1.0
-
-                if forecast_deltas is not None and mape_thresholds is not None:
-                    # Build measured MAPE dictionary (prefer recent observed errors)
-                    def _recent_mape(h, n=10):
-                        try:
-                            seq = list(getattr(self, '_horizon_mape', {}).get(h, []))
-                            if len(seq) > 0:
-                                return float(np.mean(seq[-n:]))
-                        except Exception:
-                            pass
-                        return float('nan')
-
-                    mape_measured_capacity = {
-                        'short': _recent_mape('short'),
-                        'medium': _recent_mape('medium'),
-                        'long': _recent_mape('long')
-                    }
-
-                    # Where measured values are missing, fall back to configured thresholds
-                    for h in ['short', 'medium', 'long']:
-                        if np.isnan(mape_measured_capacity[h]):
-                            fallback = mape_thresholds_capacity.get(h, 0.02) if mape_thresholds_capacity else 0.02
-                            mape_measured_capacity[h] = float(fallback)
-
-                    mape_measured = _to_price_relative_mapes(mape_measured_capacity)
-                    if mape_measured is None:
-                        mape_measured = mape_thresholds.copy() if mape_thresholds is not None else None
-
-                    # CRITICAL FIX: Only call ForecastRiskManager if it exists
-                    # Tier 2/3 without risk management (observations only mode) have forecast_risk_manager = None
-                    if self.forecast_risk_manager is not None:
-                        # Pass measured MAPE into risk manager (it expects a dict of per-horizon MAPE)
-                        investor_strategy = self.forecast_risk_manager.compute_investor_strategy(
-                        forecast_deltas=forecast_deltas,
-                        mape_thresholds=mape_measured,
-                        current_positions=current_positions,
-                        forecast_trust=forecast_trust
-                        )
-
-                        # Store for later use in agent rewards
-                        self._current_investor_strategy = investor_strategy
-
-                        # Track when the MAPE/consensus gates permit using forecasts
-                        if investor_strategy is not None:
-                            forecast_gate_passed = forecast_gate_passed or bool(
-                                investor_strategy.get('trade_signal', False)
-                            )
-                    else:
-                        # Tier 2/3 observations-only mode: No risk manager, no strategy scaling
-                        investor_strategy = None
-                        self._current_investor_strategy = None
-                else:
-                    investor_strategy = None
-                    self._current_investor_strategy = None
-
-                # Compute risk adjustments (position scaling, exit signals, etc.)
-                # CRITICAL FIX: Only call ForecastRiskManager if it exists
-                if self.forecast_risk_manager is not None:
-                    risk_adj = self.forecast_risk_manager.compute_risk_adjustments(
-                        z_short=z_short,
-                        z_medium=z_medium,
-                        z_long=z_long,
-                        forecast_trust=forecast_trust,
-                        position_pnl=unrealized_pnl_total,
-                        timestep=i,
-                        forecast_deltas=forecast_deltas,
-                        mape_thresholds=mape_thresholds
-                    )
-
-                    if risk_adj is not None:
-                        forecast_gate_passed = forecast_gate_passed or bool(risk_adj.get('trade_signal', False))
-                else:
-                    # Tier 2/3 observations-only mode: No risk manager, no risk adjustments
-                    risk_adj = None
-
-                # ================================================================
-                # CRITICAL FIX: FORECAST-FIRST REWARD LOGIC
-                # Make forecasts the PRIMARY signal, PnL is SECONDARY validation
-                # This ensures Tier 2 learns to USE forecasts, not ignore them!
-                # ================================================================
-
-                # Get forecast data
-                max_pos = self.config.max_position_size * self.init_budget * self.config.capital_allocation_fraction if self.init_budget > 0 else 1.0
-                total_position = sum(current_positions.values())
-                position_normalized = total_position / max(max_pos, 1.0)
-                position_exposure = abs(position_normalized)
-
-                # Component 1: FORECAST ALIGNMENT REWARD (PRIMARY - 60%)
-                # Reward agent for aligning positions with forecast signals
-                forecast_alignment_reward = 0.0
-                alignment_score = 0.0
-                misalignment_penalty_total = 0.0
-
-                # ALWAYS compute forecast_direction from z-scores (even if investor_strategy is None)
-                delta_short = float(getattr(self, 'z_short_price', 0.0))
-                delta_medium = float(getattr(self, 'z_medium_price', 0.0))
-                delta_long = float(getattr(self, 'z_long_price', 0.0))
-
-                # DEBUG: Log z-scores at step 500
-                if i == 500:
-                    logger.debug(f"[DEBUG_Z_SCORES] t={i} delta_short={delta_short:.6f} delta_medium={delta_medium:.6f} delta_long={delta_long:.6f}")
-                    logger.debug(f"[DEBUG_Z_SCORES] t={i} z_short_price={getattr(self, 'z_short_price', 'NOT_SET')}")
-
-                # Weighted forecast direction (reduce short-horizon dominance)
-                forecast_direction = (
-                    0.35 * np.sign(delta_short) +
-                    0.40 * np.sign(delta_medium) +
-                    0.25 * np.sign(delta_long)
+                # Keep behavior explicit: no forecast reward shaping. Forecasts should help only via observations.
+                forecast_signal_score = 0.0
+                forecast_gate_passed = False
+                forecast_used_flag = False
+                forecast_usage_reason = 'no_forecast_engine'
+                self._debug_forecast_reward = {}
+                raise RuntimeError(
+                    "[FORECAST_ENGINE] Unexpected state: enable_forecast_utilisation=True but ForecastEngine is unavailable. "
+                    "This should not happen in normal runs because ForecastEngine is constructed in __init__. "
+                    "Fix ForecastEngine/forecaster wiring (or disable forecast utilisation)."
                 )
-                forecast_direction_normalized = np.clip(forecast_direction, -1.0, 1.0)
-
-                # DEBUG: Log forecast_direction at step 500
-                if i == 500:
-                    logger.debug(f"[DEBUG_FORECAST_DIR] t={i} forecast_direction={forecast_direction:.6f} (sign_short={np.sign(delta_short)}, sign_med={np.sign(delta_medium)}, sign_long={np.sign(delta_long)})")
-
-                # Helper for recent MAPE extraction (safe defaults)
-                def _mean_recent_mape(horizon, n=10):
-                    try:
-                        if hasattr(self, '_horizon_mape') and horizon in self._horizon_mape:
-                            seq = list(self._horizon_mape.get(horizon, []))
-                            if len(seq) > 0:
-                                return float(np.mean(seq[-n:]))
-                    except Exception:
-                        pass
-                    return float('nan')
-
-                mape_threshold_short = mape_thresholds.get('short', 0.02) if mape_thresholds else 0.02
-                mape_threshold_medium = mape_thresholds.get('medium', 0.02) if mape_thresholds else 0.02
-                mape_threshold_long = mape_thresholds.get('long', 0.02) if mape_thresholds else 0.02
-
-                measured_mape_short = _mean_recent_mape('short', n=10)
-                measured_mape_medium = _mean_recent_mape('medium', n=10)
-                measured_mape_long = _mean_recent_mape('long', n=10)
-
-                def _resolve_mape(measured_val, threshold_val):
-                    return measured_val if not np.isnan(measured_val) else threshold_val
-
-                weights = {'short': 0.5, 'medium': 0.3, 'long': 0.2}
-                ms = _resolve_mape(measured_mape_short, mape_threshold_short)
-                mm = _resolve_mape(measured_mape_medium, mape_threshold_medium)
-                ml = _resolve_mape(measured_mape_long, mape_threshold_long)
-                avg_mape = (weights['short'] * ms +
-                            weights['medium'] * mm +
-                            weights['long'] * ml)
-
-                # Default quality multiplier derived from avg_mape (applies even when investor_strategy missing)
-                if avg_mape < 0.03:
-                    quality_mult = 2.0
-                elif avg_mape < 0.08:
-                    quality_mult = 1.0
-                else:
-                    quality_mult = 0.3
-
-                if investor_strategy is not None and forecast_deltas is not None:
-
-                    # Position direction
-                    position_direction = np.sign(position_normalized)
-                    agent_followed_forecast = (
-                        forecast_direction_normalized * position_direction > 0
-                    ) if abs(forecast_direction_normalized) > 0.01 else False
-
-                    if forecast_gate_passed:
-                        alignment_value = position_direction * forecast_direction_normalized * position_exposure
-                        alignment_score = float(np.clip(alignment_value, -1.0, 1.0))
-                        forecast_alignment_reward = np.clip(5.0 * alignment_score * quality_mult, -5.0, 5.0)
-
-                        signal_strength = float(investor_strategy.get('signal_strength', 0.5)) if investor_strategy else 0.0
-                        trade_signal_active = bool(investor_strategy and investor_strategy.get('trade_signal', False))
-                        hedge_signal_active = bool(investor_strategy and investor_strategy.get('hedge_signal', False))
-                        direction_conflict = trade_signal_active and position_exposure >= 0.12 and not agent_followed_forecast
-
-                        if trade_signal_active and agent_followed_forecast:
-                            # FIXED: Increased reward for following forecasts with positions
-                            follow_scale = float(np.clip(position_exposure / 0.15, 0.0, 1.0))
-                            follow_bonus = 0.50 * signal_strength * quality_mult * max(follow_scale, 0.15)  # Increased from 0.35
-                            forecast_alignment_reward += follow_bonus
-                            
-                            # NEW: Additional bonus for taking meaningful positions (>0.05 exposure)
-                            if position_exposure > 0.05:
-                                position_bonus = 0.20 * signal_strength * quality_mult * min(position_exposure / 0.3, 1.0)
-                                forecast_alignment_reward += position_bonus
-
-                        if direction_conflict:
-                            penalty_scale = float(np.clip((position_exposure - 0.1) / 0.3, 0.0, 1.0))
-                            penalty = 0.35 * signal_strength * quality_mult * penalty_scale
-                            forecast_alignment_reward -= penalty
-                            misalignment_penalty_total += penalty
-                        elif trade_signal_active and position_exposure < 0.05:
-                            # FIXED: Stronger penalty when agent ignores strong entry signals
-                            entry_gap = float(np.clip(1.0 - (position_exposure / 0.05), 0.0, 1.0))
-                            penalty = 0.25 * signal_strength * quality_mult * entry_gap  # Increased from 0.12
-                            forecast_alignment_reward -= penalty
-                            misalignment_penalty_total += penalty
-
-                        if not trade_signal_active and not hedge_signal_active:
-                            # FIXED: Reduced penalty for positions when no signal (allow some positions)
-                            # Only penalize if position is very large (>0.2) when no signal
-                            neutral_penalty = np.clip(position_exposure - 0.2, 0.0, 1.0)  # Increased threshold from 0.1 to 0.2
-                            neutral_penalty_value = 0.6 * neutral_penalty * quality_mult  # Reduced from 1.2 to 0.6
-                            forecast_alignment_reward -= neutral_penalty_value
-                            misalignment_penalty_total += neutral_penalty_value
-                    else:
-                        forecast_alignment_reward = 0.0
-
-                # CRITICAL FIX: Use SAME base reward structure as Tier 1 for fair comparison
-                # Tier 2 should get the SAME base rewards as Tier 1, PLUS forecast bonuses when gate passes
-                # This ensures the only difference is forecast usage, not base reward structure
-                
-                # Component 1: BASE PnL REWARD (REVERTED: Original single-step price return)
-                # REVERTED: Back to original single-step price return calculation (no multi-step, no MTM delta)
-                current_price = float(np.clip(self._price_raw[i], 50.0, 1e9))
-                if i > 0:
-                    prev_price = float(np.clip(self._price_raw[i-1], 50.0, 1e9))
-                    price_return_raw = (current_price - prev_price) / max(abs(prev_price), 1e-6)
-                    price_return_calc = np.clip(price_return_raw, -0.1, 0.1)
-                else:
-                    price_return_calc = 0.0
-                
-                # Base PnL reward from realized returns (original single-step calculation)
-                base_pnl_reward = float(position_normalized * price_return_calc * 100.0)
-                
-                # Component 2: BASE EXPLORATION BONUS (SAME as Tier 1 for fair comparison)
-                # FAIR COMPARISON: Tier 2/3 get EXACTLY same exploration bonus as Tier 1
-                # Any performance difference must come from forecast observations + GNN architecture, NOT reward differences
-                episode_count = getattr(self, '_episode_counter', 0)
-                base_exploration_bonus = 0.0
-                if episode_count < 15:  # Same as Tier 1
-                    if total_position > 1e-6:  # Only if has positions
-                        position_ratio = float(np.clip(total_position / max(max_pos, 1.0), 0.0, 1.0))
-                        base_exploration_bonus = 0.05 * position_ratio  # SAME as Tier 1 (0.05)
-                
-                # BASE REWARD (identical to Tier 1)
-                base_forecast_score = base_pnl_reward + base_exploration_bonus
-                
-                # Component 3: FORECAST BONUS (only when gate passes)
-                # FAIR COMPARISON: Tier 2/3 get NO explicit forecast rewards in observations-only mode
-                # They must learn to use forecasts through better PnL outcomes only
-                forecast_bonus = 0.0
-                if forecast_gate_passed:
-                    # Use forecast_alignment_reward as bonus (not replacement for base)
-                    forecast_bonus = forecast_alignment_reward
-                
-                # Component 4: RISK MANAGEMENT REWARD (only when gate passes)
-                # For fair comparison: Only add risk/penalty components when forecasts are actually used
-                risk_reward = 0.0
-                extreme_delta_penalty = 0.0
-                
-                if forecast_gate_passed:
-                    # Only apply risk rewards and penalties when forecast gate passes
-                    # This ensures Tier 2 gets EXACTLY same base rewards as Tier 1 when gate is blocked
-                    risk_reward = risk_adj.get('risk_reward', 0.0) if risk_adj else 0.0
-                    
-                    # EXTREME DELTA PENALTY: Prevent trading on noise (deltas > 50%)
-                if forecast_deltas is not None and position_exposure > 0:
-                    delta_short_raw = abs(forecast_deltas.get('short', 0.0))
-                    delta_medium_raw = abs(forecast_deltas.get('medium', 0.0))
-                    delta_long_raw = abs(forecast_deltas.get('long', 0.0))
-
-                    if delta_short_raw > 0.5 or delta_medium_raw > 0.5 or delta_long_raw > 0.5:
-                        extreme_delta_penalty = -200.0 * position_exposure
-
-                # Combined forecast score: BASE (same as Tier 1) + FORECAST BONUS (only when gate passes)
-                # When gate blocked: EXACTLY same as Tier 1 (base_forecast_score only)
-                # When gate passes: base + forecast_bonus + risk + penalties
-                forecast_signal_score = (
-                    base_forecast_score +      # Same base rewards as Tier 1 (always)
-                    forecast_bonus +          # Additional forecast bonus (only when gate passes)
-                    0.1 * risk_reward +        # Risk component (only when gate passes)
-                    extreme_delta_penalty      # Penalties (only when gate passes)
-                )
-                
-                # For backward compatibility, also compute pnl_reward (used in logging)
-                pnl_reward = base_pnl_reward
-
-                # Get price_return_forecast from latest price returns (same as used in forecast engine)
-                latest_price_returns = getattr(self, '_latest_price_returns', None)
-                if latest_price_returns and 'price_return_forecast' in latest_price_returns:
-                    price_return_forecast = float(latest_price_returns['price_return_forecast'])
-                else:
-                    price_return_forecast = price_return_calc  # Fallback to actual return
-                realized_vs_forecast = float(price_return_calc - price_return_forecast)
-
-                # Store for debugging
-                self._last_forecast_risk_adj = risk_adj
-                self._last_pnl_reward = pnl_reward
-                self._last_forecast_alignment_reward = forecast_alignment_reward
-                self._last_risk_reward = risk_reward
-
-                # DIAGNOSTIC LOGGING: Track new reward components (every 500 steps)
-                if i % 500 == 0:
-                    logger.info(f"[FORECAST_REWARD] t={i} total={forecast_signal_score:.2f} base={base_forecast_score:.2f} forecast_bonus={forecast_bonus:.2f} pnl={pnl_reward:.2f}")
-                    logger.info(f"[FORECAST_REWARD_NEW] t={i} total={forecast_signal_score:.2f} "
-                               f"base={base_forecast_score:.2f} (same as Tier1) forecast_bonus={forecast_bonus:.2f} "
-                               f"risk={risk_reward:.2f} extreme_penalty={extreme_delta_penalty:.2f} gate_passed={forecast_gate_passed}")
-                    if investor_strategy is not None:
-                        logger.info(f"  strategy={investor_strategy['strategy']} signal={investor_strategy.get('signal_strength', 0.0):.3f} pos_exp={position_exposure:.3f}")
-                        logger.info(f"  strategy={investor_strategy['strategy']} signal_strength={investor_strategy.get('signal_strength', 0.0):.3f} "
-                                   f"consensus={investor_strategy.get('consensus', False)} position_exp={position_exposure:.3f}")
-                    if forecast_deltas:
-                        logger.debug(f"  deltas: short={forecast_deltas.get('short', 0.0):.4f} med={forecast_deltas.get('medium', 0.0):.4f} long={forecast_deltas.get('long', 0.0):.4f}")
-                    if mape_thresholds_capacity:
-                        logger.debug(f"  MAPE(capacity): short={mape_thresholds_capacity.get('short', 0.0):.4f} med={mape_thresholds_capacity.get('medium', 0.0):.4f} long={mape_thresholds_capacity.get('long', 0.0):.4f}")
-
-                    # Get MAPE values (for CSV logging) - log measured when available, else thresholds
-                mape_short = float(measured_mape_short) if not np.isnan(measured_mape_short) else float(mape_threshold_short)
-                mape_medium = float(measured_mape_medium) if not np.isnan(measured_mape_medium) else float(mape_threshold_medium)
-                mape_long = float(measured_mape_long) if not np.isnan(measured_mape_long) else float(mape_threshold_long)
-
-                # Check alignment: Did agent follow forecast?
-                # forecast_direction is already computed from z-scores on line 5329
-                position_direction = np.sign(total_position)
-                agent_followed_forecast = (forecast_direction * position_direction > 0) if abs(forecast_direction) > 0.01 else False
-                # Lower exposure requirement so hedged-but-correct positions still earn forecast credit
-                forecast_used_flag = bool(
-                    forecast_gate_passed and agent_followed_forecast and position_exposure > 0.02
-                )
-
-                if forecast_gate_passed:
-                    if forecast_used_flag:
-                        forecast_usage_reason = 'used'
-                    elif position_exposure <= 0.02:
-                        forecast_usage_reason = 'low_exposure'
-                    elif not agent_followed_forecast:
-                        forecast_usage_reason = 'direction_mismatch'
-                    else:
-                        forecast_usage_reason = 'risk_blocked'
-                else:
-                    forecast_usage_reason = 'gate_blocked'
-
-                def _direction_accuracy(pred_signal: float, realized_ret: float, min_abs: float = 1e-4) -> float:
-                    if pred_signal is None or realized_ret is None:
-                        return 0.0
-                    if abs(realized_ret) < min_abs or abs(pred_signal) < min_abs:
-                        return 0.0
-                    return 1.0 if np.sign(pred_signal) == np.sign(realized_ret) else 0.0
-
-                direction_accuracy_short = _direction_accuracy(z_short, price_return_short)
-                direction_accuracy_medium = _direction_accuracy(z_medium, price_return_medium)
-                direction_accuracy_long = _direction_accuracy(z_long, price_return_long)
-                combined_conf_debug = float(getattr(self, '_combined_confidence', 0.5))
-                reward_weights = getattr(self, 'reward_weights', {})
-                adaptive_multiplier_debug = float(
-                    getattr(self, '_adaptive_forecast_weight', reward_weights.get('forecast', 0.0))
-                )
-                warmup_factor_debug = float(getattr(self, '_forecast_warmup_factor', 1.0))
-
-                # FIX: Store Tier 2 debug info in _debug_forecast_reward for CSV logging
-                if i == 500:
-                    logger.debug(f"[DEBUG_DICT_TIER2] t={i} CREATING Tier 2 dictionary with forecast_direction={forecast_direction:.6f}")
-                self._debug_forecast_reward = {
-                    'position_signed': total_position,
-                    'position_exposure': position_exposure,
-                    'price_return_1step': price_return_calc,
-                    'price_return_forecast': price_return_forecast,
-                    'forecast_signal_score': forecast_signal_score,
-                    'wind_pos_norm': current_positions.get('wind', 0.0) / max(max_pos, 1.0),
-                    'solar_pos_norm': current_positions.get('solar', 0.0) / max(max_pos, 1.0),
-                    'hydro_pos_norm': current_positions.get('hydro', 0.0) / max(max_pos, 1.0),
-                    'z_short': delta_short,  # Use z-scores computed on line 5324
-                    'z_medium': delta_medium,  # Use z-scores computed on line 5325
-                    'z_long': delta_long,  # Use z-scores computed on line 5326
-                    'z_combined': 0.0,  # Not used in new approach
-                    # Store raw MAPE and a conventional confidence (higher is better)
-                    'forecast_mape': float(avg_mape) if 'avg_mape' in locals() else 0.0,
-                    'forecast_confidence': float(np.clip(1.0 / (1.0 + avg_mape), 0.0, 1.0)) if 'avg_mape' in locals() else 0.0,
-                    'forecast_trust': forecast_trust,
-                    'trust_scale': forecast_trust,
-                    'forecast_gate_passed': forecast_gate_passed,
-                    'forecast_used': forecast_used_flag,
-                    'forecast_not_used_reason': forecast_usage_reason,
-                    'forecast_usage_bonus': 0.0,
-                    'investor_strategy_multiplier': float(getattr(self, '_last_investor_strategy_multiplier', 1.0)),
-                    'alignment_reward': forecast_alignment_reward,
-                    'pnl_reward': pnl_reward,
-                    'base_alignment': alignment_score,
-                    'profitability_factor': pnl_reward,
-                    'alignment_multiplier': quality_mult,
-                    'misalignment_penalty_mult': misalignment_penalty_total,
-                    'strategy_reward': 0.0,  # Merged into alignment_reward
-                    'risk_reward': risk_reward,
-                    'exploration_bonus': 0.0,
-                    'position_size_bonus': 0.0,
-                    'signal_gate_multiplier': float(
-                        risk_adj.get('signal_gate_multiplier', getattr(self.forecast_risk_manager, '_last_gate_multiplier', 0.0) if self.forecast_risk_manager is not None else 0.0)
-                    ) if risk_adj else float(getattr(self.forecast_risk_manager, '_last_gate_multiplier', 0.0) if self.forecast_risk_manager is not None else 0.0),
-                    'adaptive_multiplier': adaptive_multiplier_debug,
-                    # NEW: Forecast vs actual comparison
-                    'current_price_dkk': current_price,
-                    'forecast_price_short_dkk': forecast_price_short,
-                    'forecast_price_medium_dkk': forecast_price_medium,
-                    'forecast_price_long_dkk': forecast_price_long,
-                    'forecast_error_short_pct': forecast_error_short,
-                    'forecast_error_medium_pct': forecast_error_medium,
-                    'forecast_error_long_pct': forecast_error_long,
-                    'forecast_error': realized_vs_forecast,
-                    'realized_vs_forecast': realized_vs_forecast,
-                    'mape_short': mape_short,
-                    'mape_medium': mape_medium,
-                    'mape_long': mape_long,
-                    'forecast_direction': forecast_direction,
-                    'position_direction': position_direction,
-                    'agent_followed_forecast': agent_followed_forecast,
-                    'combined_confidence': combined_conf_debug,
-                    'combined_forecast_score': forecast_signal_score,
-                    'warmup_factor': warmup_factor_debug,
-                    'direction_accuracy_short': direction_accuracy_short,
-                    'direction_accuracy_medium': direction_accuracy_medium,
-                    'direction_accuracy_long': direction_accuracy_long,
-                }
-
-                # LOG: Append Tier 2 portfolio attribution row to tier2/logs/tier2_portfolio_attrib_ep{episode}.csv
-                # FIXED: Use the log_dir passed to environment instead of hardcoded path
-                try:
-                    episode_idx = int(getattr(self, '_episode_counter', 0))
-                    # Use the same log_dir as RewardLogger (passed to environment constructor)
-                    # CRITICAL: Always use debug_tracker.log_dir - no hardcoded fallback
-                    if not (hasattr(self, 'debug_tracker') and hasattr(self.debug_tracker, 'log_dir')):
-                        # Should never happen, but if it does, skip this logging to avoid creating wrong folder
-                        logger.warning(f"[TIER2_LOG] debug_tracker.log_dir not available, skipping portfolio attribution log")
-                    else:
-                        log_dir = self.debug_tracker.log_dir
-                    os.makedirs(log_dir, exist_ok=True)
-                    csv_path = os.path.join(log_dir, f"tier2_portfolio_attrib_ep{episode_idx}.csv")
-                    # Prepare standardized schema for portfolio attribution
-                    episode_idx_val = episode_idx
-                    price_current_val = float(np.clip(self._price_raw[i], self.config.minimum_price_filter, self.config.maximum_price_cap))
-                    price_return_1step_val = float(self._price_return_1step[i]) if i < len(self._price_return_1step) else 0.0
-                    price_return_forecast_val = float(self._debug_forecast_reward.get('price_return_forecast', 0.0))
-
-                    fieldnames = [
-                        'episode','timestep',
-                        'nav_start','nav_end','pnl_total','pnl_battery','pnl_generation','pnl_hedge','cash_delta_ops',
-                        'position_exposure_norm','capital_alloc_frac','confidence_multiplier',
-                        'forecast_trust','forecast_gate_passed','combined_forecast_score','mape_short','mape_medium','mape_long',
-                        'battery_decision','battery_intensity','battery_spread','battery_adjusted_hurdle','battery_volatility_adj',
-                            'battery_energy','battery_capacity','battery_soc','battery_cash_delta','battery_throughput','battery_degradation_cost','battery_eta_charge','battery_eta_discharge',
-                        'price_current','price_return_1step','price_return_forecast'
-                    ]
-                    row = {
-                        'episode': episode_idx_val,
-                        'timestep': i,
-                        'nav_start': float(getattr(self, 'nav_start', getattr(self, 'init_budget', 0.0))),
-                        'nav_end': float(getattr(self, 'nav_end', getattr(self, 'budget', 0.0))),
-                        'pnl_total': float(getattr(self, '_last_total_pnl', 0.0)),
-                        'pnl_battery': float(getattr(self, '_last_battery_cash_delta', 0.0)),
-                        'pnl_generation': float(getattr(self, '_last_generation_pnl', 0.0)),
-                        'pnl_hedge': float(getattr(self, '_last_hedge_pnl', 0.0)),
-                        'cash_delta_ops': float(getattr(self, '_last_cash_ops', 0.0)),
-                        'position_exposure_norm': float(self._debug_forecast_reward.get('position_exposure', 0.0)),
-                        'capital_alloc_frac': float(getattr(self, 'capital_allocation_fraction', 0.0)),
-                        'confidence_multiplier': float(getattr(self, '_last_investor_strategy_multiplier', 1.0)),
-                        'forecast_trust': float(self._debug_forecast_reward.get('forecast_trust', 0.0)),
-                        'forecast_gate_passed': bool(self._debug_forecast_reward.get('forecast_gate_passed', False)),
-                        'combined_forecast_score': float(self._debug_forecast_reward.get('combined_forecast_score', 0.0)),
-                        'mape_short': float(self._debug_forecast_reward.get('mape_short', 0.0)),
-                        'mape_medium': float(self._debug_forecast_reward.get('mape_medium', 0.0)),
-                        'mape_long': float(self._debug_forecast_reward.get('mape_long', 0.0)),
-                        'battery_decision': str(getattr(self, '_last_battery_decision', 'idle')),
-                        'battery_intensity': float(getattr(self, '_last_battery_intensity', 0.0)),
-                        'battery_spread': float(getattr(self, '_last_battery_spread', 0.0)),
-                        'battery_adjusted_hurdle': float(getattr(self, '_last_battery_adjusted_hurdle', 0.0)),
-                        'battery_volatility_adj': float(getattr(self, '_last_battery_volatility_adj', 0.0)),
-                        'battery_energy': float(getattr(self, '_last_battery_energy', self.operational_state.get('battery_energy', 0.0))),
-                        'battery_capacity': float(getattr(self, '_last_battery_capacity', self.physical_assets.get('battery_capacity_mwh', 0.0))),
-                        'battery_soc': float(getattr(self, '_last_battery_soc', 0.0)),
-                        'battery_cash_delta': float(getattr(self, '_last_battery_cash_delta', 0.0)),
-                        'battery_throughput': float(getattr(self, '_last_battery_throughput', 0.0)),
-                        'battery_degradation_cost': float(getattr(self, '_last_battery_degradation_cost', 0.0)),
-                        'battery_eta_charge': float(getattr(self, '_last_battery_eta_charge', self.batt_eta_charge)),
-                        'battery_eta_discharge': float(getattr(self, '_last_battery_eta_discharge', self.batt_eta_discharge)),
-                        'price_current': price_current_val,
-                        'price_return_1step': price_return_1step_val,
-                        'price_return_forecast': price_return_forecast_val,
-                    }
-                    write_header = not os.path.exists(csv_path)
-                    with open(csv_path, 'a', newline='') as f:
-                        import csv
-                        w = csv.DictWriter(f, fieldnames=fieldnames)
-                        if write_header:
-                            w.writeheader()
-                        w.writerow(row)
-                except Exception:
-                    pass
-
-                # LOG: Mirror key NAV attribution into Tier 2 debug CSV as well
-                # FIXED: Use the log_dir passed to environment instead of hardcoded path
-                try:
-                    episode_idx = int(getattr(self, '_episode_counter', 0))
-                    # Use the same log_dir as RewardLogger (passed to environment constructor)
-                    # CRITICAL: Always use debug_tracker.log_dir - no hardcoded fallback
-                    if not (hasattr(self, 'debug_tracker') and hasattr(self.debug_tracker, 'log_dir')):
-                        # Should never happen, but if it does, skip this logging to avoid creating wrong folder
-                        logger.warning(f"[TIER2_LOG] debug_tracker.log_dir not available, skipping debug CSV log")
-                    else:
-                        log_dir = self.debug_tracker.log_dir
-                    os.makedirs(log_dir, exist_ok=True)
-                    csv_path_dbg = os.path.join(log_dir, f"tier2_debug_ep{episode_idx}.csv")
-                    dbg_row = {
-                        'timestep': i,
-                        'nav_start': float(getattr(self, 'nav_start', getattr(self, 'init_budget', 0.0))),
-                        'nav_end': float(getattr(self, 'nav_end', getattr(self, 'budget', 0.0))),
-                        'pnl_total': float(getattr(self, '_last_total_pnl', 0.0)),
-                        'pnl_battery': float(getattr(self, '_last_battery_cash_delta', 0.0)),
-                        'pnl_generation': float(getattr(self, '_last_generation_pnl', 0.0)),
-                        'pnl_hedge': float(getattr(self, '_last_hedge_pnl', 0.0)),
-                        'cash_delta_ops': float(getattr(self, '_last_cash_ops', 0.0)),
-                        'position_exposure_norm': float(self._debug_forecast_reward.get('position_exposure', 0.0)),
-                        'capital_alloc_frac': float(getattr(self, 'capital_allocation_fraction', 0.0)),
-                        'confidence_multiplier': float(getattr(self, '_last_investor_strategy_multiplier', 1.0)),
-                        'forecast_trust': float(self._debug_forecast_reward.get('forecast_trust', 0.0)),
-                        'forecast_gate_passed': bool(self._debug_forecast_reward.get('forecast_gate_passed', False)),
-                        'combined_forecast_score': float(self._debug_forecast_reward.get('combined_forecast_score', 0.0)),
-                        'mape_short': float(self._debug_forecast_reward.get('mape_short', 0.0)),
-                        'mape_medium': float(self._debug_forecast_reward.get('mape_medium', 0.0)),
-                        'mape_long': float(self._debug_forecast_reward.get('mape_long', 0.0)),
-                        'battery_decision': str(getattr(self, '_last_battery_decision', 'idle')),
-                        'battery_intensity': float(getattr(self, '_last_battery_intensity', 0.0)),
-                        'battery_spread': float(getattr(self, '_last_battery_spread', 0.0)),
-                        'battery_adjusted_hurdle': float(getattr(self, '_last_battery_adjusted_hurdle', 0.0)),
-                        'battery_volatility_adj': float(getattr(self, '_last_battery_volatility_adj', 0.0)),
-                    }
-                    write_header_dbg = not os.path.exists(csv_path_dbg)
-                    with open(csv_path_dbg, 'a', newline='') as f:
-                        import csv
-                        w = csv.DictWriter(f, fieldnames=list(dbg_row.keys()))
-                        if write_header_dbg:
-                            w.writeheader()
-                        w.writerow(dbg_row)
-                except Exception:
-                    pass
-
-            else:
-                # TIER 1: No forecasts - Pure PnL-based reward (FAIR COMPARISON)
-                # CRITICAL FIX: Remove exploration/position bonuses that give Tier 1 unfair advantage
-                # Both tiers should use IDENTICAL reward structure, just Tier 2 has forecast signals
-
-                # Get current position exposure
-                max_pos = self.config.max_position_size * self.init_budget * self.config.capital_allocation_fraction if self.init_budget > 0 else 1.0
-                wind_pos_value = self.financial_positions.get('wind_instrument_value', 0.0)
-                solar_pos_value = self.financial_positions.get('solar_instrument_value', 0.0)
-                hydro_pos_value = self.financial_positions.get('hydro_instrument_value', 0.0)
-
-                # Normalize positions
-                wind_pos_norm = float(wind_pos_value / max(max_pos, 1.0))
-                solar_pos_norm = float(solar_pos_value / max(max_pos, 1.0))
-                hydro_pos_norm = float(hydro_pos_value / max(max_pos, 1.0))
-
-                # SIGNED total position
-                position_signed = float(wind_pos_norm + solar_pos_norm + hydro_pos_norm)
-                position_exposure = float(abs(wind_pos_norm) + abs(solar_pos_norm) + abs(hydro_pos_norm))
-
-                # TIER 1: REVERTED to original single-step price return calculation
-                # REVERTED: Back to original single-step price return (no multi-step, no MTM delta)
-                current_price = float(np.clip(self._price_raw[i], 50.0, 1e9))
-                if i > 0:
-                    prev_price = float(np.clip(self._price_raw[i-1], 50.0, 1e9))
-                    price_return_raw = (current_price - prev_price) / max(abs(prev_price), 1e-6)
-                    price_return_calc = np.clip(price_return_raw, -0.1, 0.1)
-                else:
-                    price_return_calc = 0.0
-
-                # Current positions (Model B): use normalized exposures (DKK / max_pos_dkk)
-                max_pos_dkk = max(float(max_pos), 1.0)
-                current_positions = {
-                    'wind': float(wind_pos_value / max_pos_dkk),
-                    'solar': float(solar_pos_value / max_pos_dkk),
-                    'hydro': float(hydro_pos_value / max_pos_dkk),
-                }
-                total_position = float(sum(current_positions.values()))
-                position_normalized = float(total_position)  # already normalized by max_pos_dkk
-                
-                # Base PnL reward from realized returns (original single-step calculation)
-                pnl_reward = float(position_normalized * price_return_calc * 100.0)
-
-                # FAIR COMPARISON: Same exploration bonus for both tiers
-                # This ensures any performance difference is due to forecast integration, not exploration parameters
-                exploration_bonus_tier1 = 0.0
-                episode_count = getattr(self, '_episode_counter', 0)
-                if episode_count < 15:  # Same as Tier 2 for fair comparison
-                    if total_position > 1e-6:  # Only if has positions
-                        position_ratio_tier1 = float(np.clip(total_position / max(max_pos, 1.0), 0.0, 1.0))
-                        exploration_bonus_tier1 = 0.05 * position_ratio_tier1  # Same as Tier 2 for fair comparison
-                
-                # Tier 1 gets PnL reward + exploration bonus (no strategy/risk bonuses)
-                forecast_signal_score = pnl_reward + exploration_bonus_tier1
-
-                # FIX: Store Tier 1 debug info in _debug_forecast_reward for logging
-                if i == 500:
-                    logger.debug(f"[DEBUG_DICT_TIER1] t={i} CREATING Tier 1 dictionary (OVERWRITING Tier 2!)")
-                self._debug_forecast_reward = {
-                    'position_signed': position_signed,
-                    'position_exposure': position_exposure,
-                    'price_return_1step': price_return,
-                    'price_return_forecast': price_return,
-                    'forecast_signal_score': forecast_signal_score,
-                    'wind_pos_norm': wind_pos_norm,
-                    'solar_pos_norm': solar_pos_norm,
-                    'hydro_pos_norm': hydro_pos_norm,
-                    'z_short': 0.0,
-                    'z_medium': 0.0,
-                    'z_long': 0.0,
-                    'z_combined': 0.0,
-                    'forecast_confidence': 0.0,
-                    'forecast_trust': 0.0,
-                    'alignment_reward': 0.0,
-                    'pnl_reward': pnl_reward,
-                    'exploration_bonus': exploration_bonus_tier1,
-                    'position_size_bonus': 0.0,
-                }
-
-                # LOG: For Tier 1, append similar attribution for fair comparison
-                # FIXED: Use the log_dir passed to environment instead of hardcoded path
-                try:
-                    episode_idx = int(getattr(self, '_episode_counter', 0))
-                    # Use the same log_dir as RewardLogger (passed to environment constructor)
-                    # CRITICAL: Always use debug_tracker.log_dir - no hardcoded fallback
-                    if not (hasattr(self, 'debug_tracker') and hasattr(self.debug_tracker, 'log_dir')):
-                        # Should never happen, but if it does, skip this logging to avoid creating wrong folder
-                        logger.warning(f"[TIER1_LOG] debug_tracker.log_dir not available, skipping portfolio attribution log")
-                    else:
-                        log_dir = self.debug_tracker.log_dir
-                    os.makedirs(log_dir, exist_ok=True)
-                    csv_path = os.path.join(log_dir, f"tier1_portfolio_ep{episode_idx}.csv")
-                    row = {
-                        'timestep': i,
-                        'nav_start': float(getattr(self, 'nav_start', getattr(self, 'init_budget', 0.0))),
-                        'nav_end': float(getattr(self, 'nav_end', getattr(self, 'budget', 0.0))),
-                        'pnl_total': float(getattr(self, '_last_total_pnl', 0.0)),
-                        'pnl_battery': float(getattr(self, '_last_battery_cash_delta', 0.0)),
-                        'pnl_generation': float(getattr(self, '_last_generation_pnl', 0.0)),
-                        'pnl_hedge': float(getattr(self, '_last_hedge_pnl', 0.0)),
-                        'cash_delta_ops': float(getattr(self, '_last_cash_ops', 0.0)),
-                        'position_exposure_norm': float(self._debug_forecast_reward.get('position_exposure', 0.0)),
-                        'capital_alloc_frac': float(getattr(self, 'capital_allocation_fraction', 0.0)),
-                        'confidence_multiplier': float(getattr(self, '_last_investor_strategy_multiplier', 1.0)),
-                    }
-                    write_header = not os.path.exists(csv_path)
-                    with open(csv_path, 'a', newline='') as f:
-                        import csv
-                        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-                        if write_header:
-                            w.writeheader()
-                        w.writerow(row)
-                except Exception:
-                    pass
-            # END: TIER 1 (no forecasts)
-            # END: if enable_forecast_util
 
             # =====================================================================
             # AGENT-SPECIFIC REWARDS
@@ -6314,10 +5231,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self.reward_calculator = ProfitFocusedRewardCalculator(initial_budget=post_capex_nav, config=self.config)
                 logger.info(f"Emergency reward calculator initialized with NAV: {post_capex_nav:,.0f} DKK")
                 self.reward_weights = dict(getattr(self.reward_calculator, 'reward_weights', {}))
-
-            # Pass overlay history to reward calculator for predictive reward shaping
-            if hasattr(self, '_overlay_pred_r_hist'):
-                self.reward_calculator._overlay_pred_r_hist = self._overlay_pred_r_hist
 
             reward = self.reward_calculator.calculate_reward(
                 fund_nav=fund_nav,
@@ -7307,10 +6220,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Get trust from calibration tracker
             self._forecast_trust = float(self.calibration_tracker.get_trust(horizon="short"))
 
-            # Compute expected ΔNAV if we have overlay output
+            # Compute expected ΔNAV if we have overlay output.
+            # IMPORTANT: expected_dnav needs mwdir; attach it explicitly (overlay outputs do not include mwdir by default).
             if self._last_overlay_output:
+                overlay_out = dict(self._last_overlay_output)
+                overlay_out["mwdir"] = float(getattr(self, "mwdir", 0.0))
                 self._expected_dnav = float(self.calibration_tracker.expected_dnav(
-                    overlay_output=self._last_overlay_output,
+                    overlay_output=overlay_out,
                     positions=self.financial_positions,
                     costs={
                         'bps': self.config.transaction_cost_bps,

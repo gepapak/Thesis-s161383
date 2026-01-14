@@ -589,9 +589,9 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
         if self.forecaster is None:
             return 0
 
-        # CONDITIONAL: When using direct deltas (Tier 2/3), forecast features are embedded in base observations
-        # The environment already includes deltas in investor_0 base observations (13D = 6 base + 6 deltas + 1 trust)
-        # So wrapper should NOT add additional forecast dimensions
+        # CONDITIONAL: When enable_forecast_utilisation=True (Tier 2/3), the base environment already includes
+        # the forecast features in its observation space (e.g., investor_0 is 14D = 6 base + 8 forecast).
+        # So the wrapper should NOT add additional forecast dimensions.
         enable_forecast_util = getattr(self.base_env.config, 'enable_forecast_utilisation', False) if hasattr(self.base_env, 'config') else False
         if enable_forecast_util:
             # Tier 2/3: Deltas already in base observations, no additional forecasts needed
@@ -1029,11 +1029,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         FIX: Build STATIC observation spaces during initialization.
 
         This method calculates the FINAL, fully augmented observation space dimensions
-        for each agent, accounting for ALL augmentations:
-        - Base observations (from environment)
-        - Forecast features (from forecaster)
-        - Bridge vectors (if overlay_enabled)
-        - Expert suggestions (investor_0 only, 3 dims)
+        for each agent.
+        
+        IMPORTANT (fairness): Tier 3 is observation-identical to Tier 2.
+        There is no bridge-vector augmentation and no expert-suggestion augmentation.
 
         These spaces are defined ONCE at initialization and NEVER modified at runtime.
         This ensures compatibility with Stable Baselines3, which builds policy networks
@@ -1046,108 +1045,26 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         specs = self.obs_builder.validator.agent_observation_specs
 
         # ROBUST TIER DETECTION: Use centralized tier utilities
-        from tier_utils import get_tier_from_config, should_include_bridge_dimensions, get_tier_description
+        # NOTE: Tier 3 is observation-identical to Tier 2 (no bridge-vector augmentation).
+        from tier_utils import get_tier_from_config, get_tier_description
         
         tier = get_tier_from_config(self.env.config)
         logger.info(f"[OBS_SPACE_TIER] Detected: {tier} - {get_tier_description(tier)}")
         
-        # Determine bridge dimensions using centralized logic
-        if should_include_bridge_dimensions(self.env.config):
-            bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4)
-            bridge_enabled = True
-            logger.info(f"[OBS_SPACE_BRIDGE] Bridge dimensions enabled: {bridge_dim}D")
-        else:
-            bridge_dim = 0
-            bridge_enabled = False
-            logger.debug(f"[OBS_SPACE_BRIDGE] Bridge dimensions disabled (Tier 2 or Tier 1)")
-        
         enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
-        
-        # Battery bridge dimensions (optional, usually disabled)
-        battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False) and bridge_enabled
-        
-        # Store bridge_enabled for use in _augment_with_expert_suggestions
-        self._bridge_enabled = bridge_enabled
-        
-        # Log configuration
-        logger.info(f"[OBS_SPACE_CONFIG] tier={tier}, enable_forecast_util={enable_forecast_util}, "
-                   f"bridge_enabled={bridge_enabled}, bridge_dim={bridge_dim}, "
-                   f"battery_bridge_enabled={battery_bridge_enabled}")
+        logger.info(f"[OBS_SPACE_CONFIG] tier={tier}, enable_forecast_util={enable_forecast_util}")
 
         for agent, spec in specs.items():
             low, high = spec['bounds']
             total_dim = spec['total_dim']  # base_dim + forecast_dim (from EnhancedObservationValidator)
 
-            # FIX: Calculate FINAL observation space dimensions for each agent
-            if agent == "investor_0":
-                # investor_0 gets: base + forecasts + bridge_vec (if bridge_enabled) + expert_suggestions (if bridge_enabled)
-                # CONDITIONAL: bridge_vec and expert_suggestions only added when overlay_bridge_enable=True (disabled in Tier 2/3)
-                # Expert suggestions are forecast-based trading signals that interfere with PPO learning from direct deltas
-                # expert_suggestion_dim = 3 if (overlay_enabled and bridge_enabled) else 0
-                expert_suggestion_dim = 0 # FIX: Legacy expert suggestions are removed. This padding is no longer needed.
-                final_dim = total_dim + bridge_dim + expert_suggestion_dim
-
-                # Bounds: base/forecasts use original bounds, bridge/suggestions use [-1, 1]
-                extended_low = np.concatenate([
-                    low[:total_dim],
-                    np.full(bridge_dim, -1.0, dtype=np.float32),
-                    np.full(expert_suggestion_dim, -1.0, dtype=np.float32)
-                ])
-                extended_high = np.concatenate([
-                    high[:total_dim],
-                    np.full(bridge_dim, 1.0, dtype=np.float32),
-                    np.full(expert_suggestion_dim, 1.0, dtype=np.float32)
-                ])
-
-                self._obs_spaces[agent] = spaces.Box(
-                    low=extended_low, high=extended_high,
-                    shape=(final_dim,), dtype=np.float32
-                )
-
-                bridge_status = "enabled" if bridge_dim > 0 else "disabled"
-                logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
-                           f"bridge={bridge_dim} ({bridge_status}), expert_suggestions={expert_suggestion_dim}, TOTAL={final_dim}")
-
-            elif agent == "battery_operator_0" and battery_bridge_enabled:
-                # battery_operator_0 gets: base + forecasts + bridge_vec (if bridge_enabled)
-                # CONDITIONAL: bridge_vec only added when overlay_bridge_enable=True (disabled in Tier 2/3)
-                final_dim = total_dim + bridge_dim
-
-                extended_low = np.concatenate([
-                    low[:total_dim],
-                    np.full(bridge_dim, -1.0, dtype=np.float32)
-                ])
-                extended_high = np.concatenate([
-                    high[:total_dim],
-                    np.full(bridge_dim, 1.0, dtype=np.float32)
-                ])
-
-                self._obs_spaces[agent] = spaces.Box(
-                    low=extended_low, high=extended_high,
-                    shape=(final_dim,), dtype=np.float32
-                )
-
-                bridge_status = "enabled" if bridge_dim > 0 else "disabled"
-                logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
-                           f"bridge={bridge_dim} ({bridge_status}), TOTAL={final_dim}")
-
-            else:
-                # Battery operator without bridge, or other agents (risk_controller_0, meta_controller_0)
-                # NO runtime modifications - use total_dim as-is
-                final_dim = total_dim
-
-                self._obs_spaces[agent] = spaces.Box(
-                    low=low[:final_dim], high=high[:final_dim],
-                    shape=(final_dim,), dtype=np.float32
-                )
-
-                # Log battery operator specifically to verify correct dimension for Tier 2
-                if agent == "battery_operator_0":
-                    logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
-                               f"bridge=0 (disabled for Tier 2), TOTAL={final_dim}")
-                else:
-                    logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, "
-                               f"TOTAL={final_dim}")
+            # Static observation space is exactly base+forecast (no bridge augmentation).
+            final_dim = total_dim
+            self._obs_spaces[agent] = spaces.Box(
+                low=low[:final_dim], high=high[:final_dim],
+                shape=(final_dim,), dtype=np.float32
+            )
+            logger.info(f"[OBS_SPACE_STATIC] {agent}: base={spec['base_dim']}, forecast={spec['forecast_dim']}, TOTAL={final_dim}")
 
 
 
@@ -1167,14 +1084,11 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     
     def rebuild_observation_spaces(self):
         """
-        CRITICAL: Rebuild observation spaces after DL adapter is initialized.
-        
-        This ensures that observation spaces include bridge vectors for Tier 3
-        when the DL adapter is initialized AFTER the wrapper is created.
-        
-        Must be called after initialize_dl_overlay() is called.
+        Rebuild observation spaces after environment/forecaster changes.
+
+        NOTE: Tier 3 is observation-identical to Tier 2 (no bridge dims).
         """
-        logger.info("[OBS_SPACE_REBUILD] Rebuilding observation spaces to include bridge vectors if DL adapter is present")
+        logger.info("[OBS_SPACE_REBUILD] Rebuilding observation spaces")
         self._build_wrapper_observation_spaces()
         logger.info("[OBS_SPACE_REBUILD] Observation spaces rebuilt successfully")
 
@@ -1196,164 +1110,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         return getattr(self.env, "overlay_trainer", None)
 
     # ---- unified augmentation ----
-    def _augment_with_expert_suggestions(self, observations: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """
-        ROBUST DL GUIDANCE: Appends expert trade suggestions and bridge vectors to observations (28D only).
-
-        28D Forecast-Aware Mode:
-        - Returns DL model guidance [wind, solar, hydro] suggestions (first 3 dims of blended 4D strategy)
-        - Bridge vectors: Shared intelligence from DL overlay (appended to investor_0 and battery_operator_0)
-        - Confidence scaling: Scales guidance by forecast confidence with floor (default 0.30)
-        - Multi-horizon blending: Blends 4 horizons (immediate, short, medium, long) with config weights
-
-        This creates a unified observation space that allows the agent to learn with
-        expert guidance from multi-horizon forecasts.
-
-        Args:
-            observations: Dictionary of observations from all agents
-
-        Returns:
-            Dictionary of augmented observations with DL guidance and bridge vectors appended
-        """
-        try:
-            # ===== APPEND BRIDGE VECTORS (TIER-SPECIFIC) =====
-            # TIER-SPECIFIC LOGIC:
-            # Tier 1: No bridge (overlay disabled) → 6D observations
-            # Tier 2: No bridge (forecast integration without overlay) → 9D observations
-            # Tier 3: Bridge enabled (forecast integration + DL overlay) → 13D observations
-            # NO ZERO-PADDING: Bridge dimensions only added when actually enabled and available
-            # Use centralized tier utilities for consistency
-            from tier_utils import should_include_bridge_dimensions
-            
-            if should_include_bridge_dimensions(self.env.config):
-                bridge_dim = getattr(self.env.config, 'overlay_bridge_dim', 4)
-                bridge_enabled = True
-            else:
-                bridge_dim = 0
-                bridge_enabled = False
-
-            # TIER-SPECIFIC: Only append bridge vectors when they're actually enabled and available
-            # NO ZERO-PADDING: If bridge isn't enabled, observation space shouldn't include those dimensions
-            if 'investor_0' in observations and 'investor_0' in self._obs_spaces:
-                expected_dim = self._obs_spaces['investor_0'].shape[0]
-                current_dim = observations['investor_0'].shape[0]
-                
-                if expected_dim != current_dim:
-                    # Dimension mismatch - this should not happen if observation space is built correctly
-                    if expected_dim > current_dim:
-                        # Observation space expects more dimensions - this should only happen if bridge is enabled
-                        if self._bridge_enabled and hasattr(self.env, '_overlay_bridge_cache'):
-                            bridge_vec = self.env._overlay_bridge_cache.get("investor_0", None)
-                            if bridge_vec is not None and isinstance(bridge_vec, np.ndarray):
-                                bridge_vec = np.clip(bridge_vec.astype(np.float32), -1.0, 1.0)
-                                observations['investor_0'] = np.concatenate([observations['investor_0'], bridge_vec]).astype(np.float32)
-                            else:
-                                # Bridge cache exists but no vector available - this is an error condition
-                                # FAIL-FAST: Don't pad with zeros (would cause noise), raise error instead
-                                raise ValueError(f"[BRIDGE_VEC] Bridge enabled but cache missing for investor_0. "
-                                               f"Expected {expected_dim}D, got {current_dim}D. "
-                                               f"Observation space was built with bridge dimensions but bridge vectors are not available.")
-                        else:
-                            # Bridge dimensions in observation space but bridge not enabled - configuration error
-                            raise ValueError(f"[BRIDGE_VEC] Observation space mismatch: expected {expected_dim}D but bridge not enabled. "
-                                           f"Current dim: {current_dim}D. This indicates observation space was incorrectly built. "
-                                           f"overlay_enabled={overlay_enabled}, bridge_enabled={bridge_enabled}")
-                    elif expected_dim < current_dim:
-                        # Observation has more dimensions than expected - this happens when:
-                        # 1. Observation space was built WITHOUT bridge dimensions (Tier 2 mode)
-                        # 2. But bridge vectors are being appended (Tier 3 mode)
-                        # CRITICAL FIX: If bridge is enabled, the observation space was built incorrectly!
-                        # FAIL-FAST: Don't truncate - raise error to force proper initialization
-                        if self._bridge_enabled:
-                            # This is a configuration bug: observation space should have included bridge dimensions
-                            error_msg = (
-                                f"[BRIDGE_VEC] CRITICAL BUG: Observation space mismatch detected!\n"
-                                f"  Expected: {expected_dim}D (observation space)\n"
-                                f"  Actual: {current_dim}D (observation with bridge vectors)\n"
-                                f"  bridge_enabled={self._bridge_enabled}, bridge_dim={bridge_dim}\n"
-                                f"This indicates observation space was built BEFORE overlay was initialized.\n"
-                                f"SOLUTION: Call rebuild_observation_spaces() after initialize_dl_overlay(), or\n"
-                                f"ensure wrapper checks for dl_adapter_overlay when building spaces.\n"
-                                f"Cannot proceed with incorrect observation dimensions."
-                            )
-                            logger.error(error_msg)
-                            raise ValueError(error_msg)
-                        else:
-                            # Bridge not enabled but observation has more dimensions - configuration error
-                            error_msg = (
-                                f"[BRIDGE_VEC] Observation dimension mismatch: expected {expected_dim}D, got {current_dim}D.\n"
-                                f"Bridge is disabled but observation has extra dimensions. This indicates a configuration error.\n"
-                                f"Cannot proceed with incorrect observation dimensions."
-                            )
-                            logger.error(error_msg)
-                            raise ValueError(error_msg)
-
-                # Append bridge vector to battery_operator_0 if enabled
-                # CONDITIONAL: Only when overlay is enabled AND battery bridge is enabled
-                if 'battery_operator_0' in observations and 'battery_operator_0' in self._obs_spaces:
-                    expected_dim = self._obs_spaces['battery_operator_0'].shape[0]
-                    current_dim = observations['battery_operator_0'].shape[0]
-                    
-                    # CRITICAL: Validate dimension match BEFORE attempting augmentation
-                    if expected_dim != current_dim:
-                        battery_bridge_enabled = getattr(self.env.config, 'overlay_bridge_enable_battery', False)
-                        enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
-                        
-                        if expected_dim > current_dim:
-                            # Observation space expects more dimensions (bridge enabled)
-                            # Use bridge_enabled flag for consistency
-                            if self._bridge_enabled and battery_bridge_enabled:
-                                if hasattr(self.env, '_overlay_bridge_cache_batt'):
-                                    bridge_vec_batt = getattr(self.env, '_overlay_bridge_cache_batt', None)
-                                    if bridge_vec_batt is not None and isinstance(bridge_vec_batt, np.ndarray):
-                                        bridge_vec_batt = np.clip(bridge_vec_batt.astype(np.float32), -1.0, 1.0)
-                                        observations['battery_operator_0'] = np.concatenate([observations['battery_operator_0'], bridge_vec_batt]).astype(np.float32)
-                                    else:
-                                        logger.error(f"[BRIDGE_VEC] Battery bridge enabled but cache missing. "
-                                                   f"Expected {expected_dim}D, got {current_dim}D. "
-                                                   f"This indicates a configuration mismatch - observation space was built with bridge dimensions but bridge vectors are not available.")
-                                else:
-                                    logger.error(f"[BRIDGE_VEC] Battery bridge enabled but cache attribute missing. "
-                                               f"Expected {expected_dim}D, got {current_dim}D.")
-                            else:
-                                # CRITICAL ERROR: Observation space expects bridge dimensions but bridge is disabled
-                                # This happens when agent was initialized with wrong observation space (before fix)
-                                logger.error(f"[OBS_DIM_MISMATCH] Battery operator observation space mismatch: "
-                                           f"expected {expected_dim}D (with bridge) but environment provides {current_dim}D (no bridge). "
-                                           f"overlay_enabled={overlay_enabled}, bridge_enabled={bridge_enabled}, "
-                                           f"battery_bridge_enabled={battery_bridge_enabled}, enable_forecast_util={enable_forecast_util}. "
-                                           f"This indicates the agent was initialized with incorrect observation space. "
-                                           f"Please restart training with the fixed code.")
-                                # FAIL-FAST: Raise error to prevent silent failures
-                                raise ValueError(f"[OBS_DIM_MISMATCH] Battery operator observation dimension mismatch: "
-                                               f"expected {expected_dim}D but got {current_dim}D. "
-                                               f"The agent was initialized with an incorrect observation space. "
-                                               f"Please restart training with the fixed code.")
-                        else:
-                            # Observation has more dimensions than expected - configuration error
-                            error_msg = (
-                                f"[BRIDGE_VEC] Battery observation dimension mismatch: expected {expected_dim}D, got {current_dim}D.\n"
-                                f"This indicates a configuration error - observation space doesn't match actual observations.\n"
-                                f"Cannot proceed with incorrect observation dimensions."
-                            )
-                            logger.error(error_msg)
-                            raise ValueError(error_msg)
-
-            if 'investor_0' not in observations:
-                return observations
-
-            # REMOVED: Expert suggestion augmentation (legacy code removed)
-            # GNN encoder optionally learns feature relationships (works for both Tier 1 and Tier 2)
-            # (when --enable_gnn_encoder flag enabled, optionally combined with --enable_forecast_utilisation for Tier 2).
-            # Pre-trained ANN/LSTM forecasts provide additional observations.
-            # NOT rule-based expert suggestions. Expert suggestions interfered with PPO learning and are deprecated
-
-            return observations
-
-        except Exception as e:
-            logger.error(f"Error in _augment_with_expert_suggestions: {e}")
-            # Fallback: return observations unchanged
-            return observations
+        # No observation augmentation beyond the environment-provided observation space.
+        # Tier 3 is observation-identical to Tier 2 for fair comparison.
 
     # ---- verification methods ----
     def _verify_capacity_consistency(self):
@@ -1407,24 +1165,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._prev_forecasts_for_error = {}
         self._last_price_forecast_norm = 0.0
 
-        # LOG OVERLAY SHAPES ON FIRST EPISODE (28D only)
-        if self.episode_count == 1 and hasattr(self.base_env, 'dl_adapter_overlay'):
-            try:
-                overlay_adapter = self.base_env.dl_adapter_overlay
-                if overlay_adapter is not None:
-                    feature_dim = overlay_adapter.feature_dim
-                    bridge_dim = overlay_adapter.bridge_dim
-                    logger.info(f"[WRAPPER_SHAPES] Episode 1: DL Overlay 34D mode (28D base + 6D deltas)")
-                    logger.info(f"  - Input shape: (1, {feature_dim}) [6 market + 3 positions + 16 forecasts + 3 portfolio + 6 deltas]")
-                    logger.info(f"  - bridge_vec: (1, {bridge_dim})")
-                    logger.info(f"  - risk_budget: (1, 1) in [0.5, 1.5]")
-                    logger.info(f"  - pred_reward: (1, 1) in [-1, 1]")
-                    logger.info(f"  - strat_immediate: (1, 4) [wind, solar, hydro, price]")
-                    logger.info(f"  - strat_short: (1, 4) [wind, solar, hydro, price]")
-                    logger.info(f"  - strat_medium: (1, 4) [wind, solar, hydro, price]")
-                    logger.info(f"  - strat_long: (1, 4) [wind, solar, hydro, price] (risk-only)")
-            except Exception as e:
-                logger.warning(f"Could not log overlay shapes: {e}")
+        # DL overlay shape logging removed (bridge/risk/strategy heads removed; Tier 3 uses overlay for FGB/FAMC only).
         self._last_price_forecast_aligned = 0.0
 
         # Initialize forecaster history with sufficient data for predictions
@@ -1443,9 +1184,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # (they will be augmented after, and augmentation must produce exact static space size)
         validated = self._validate_observations_safe(enhanced, skip_investor_0=True, skip_battery=True)
 
-        # FIX: UNIFIED AUGMENTATION - Append bridge vectors and expert suggestions
-        # This MUST produce observations that exactly match the static spaces defined in __init__
-        validated = self._augment_with_expert_suggestions(validated)
+        # No additional observation augmentation (Tier 3 is observation-identical to Tier 2).
 
         # FIX: VALIDATION - Verify all observations match their static observation spaces
         # This is a safety check to catch any dimension mismatches
@@ -1517,9 +1256,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # (they will be augmented after, and augmentation must produce exact static space size)
         validated = self._validate_observations_safe(enhanced, skip_investor_0=True, skip_battery=True)
 
-        # FIX: UNIFIED AUGMENTATION - Append bridge vectors and expert suggestions
-        # This MUST produce observations that exactly match the static spaces defined in __init__
-        validated = self._augment_with_expert_suggestions(validated)
+        # No additional observation augmentation (Tier 3 is observation-identical to Tier 2).
 
         # FIX: VALIDATION - Verify all observations match their static observation spaces
         # This is a safety check to catch any dimension mismatches
@@ -1798,8 +1535,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
         This is a runtime safety check to catch:
         - Config changes between initialization and runtime
-        - Bridge vector dimension mismatches
-        - Expert suggestion dimension mismatches
+        - Observation dimension mismatches
         - Forecast augmentation errors
 
         Returns:
@@ -2071,7 +1807,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 # =========================
 def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
     """
-    Verify that forecasts are actually appended to observations in FGB mode.
+    Verify that forecast features are present and non-degenerate in observations.
 
     This function checks:
     1. Forecast features are present in observations
@@ -2100,24 +1836,27 @@ def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
         investor_obs = obs['investor_0']
         total_dim = len(investor_obs)
 
-        # Expected structure:
-        # - Base features: 6 dims (market state)
-        # - Forecast features: 16 dims (4 horizons × 4 targets)
-        # - Portfolio features: 3 dims
-        # - Delta features: 6 dims
-        # Total: 6 + 16 + 3 + 6 = 31 dims (or more with augmentation)
-
-        if total_dim < 22:
+        # Current expected layouts:
+        # - Tier 2 / Tier 3 (fair, obs-identical): investor_0 is 14D = 6 base + 8 forecast features
+        #   Forecast slice: indices [6:14)
+        # - Legacy/experimental layouts may have more dims; we only require that there is a non-empty
+        #   forecast slice immediately after the 6 base dims.
+        base_dim = 6
+        if total_dim <= base_dim:
             raise ValueError(
                 f"FGB validation: Observation too small ({total_dim} dims). "
-                f"Expected at least 22 dims (6 base + 16 forecasts). "
-                f"Forecasts may not be appended."
+                f"Expected > {base_dim} dims so forecast features can exist."
             )
 
-        # Forecast features are typically at indices 6-21 (16 dims)
-        forecast_start = 6
-        forecast_end = min(22, total_dim)  # At least 16 forecast dims
+        forecast_start = base_dim
+        # Prefer the canonical 14D slice when available; otherwise take all remaining dims after base.
+        forecast_end = 14 if total_dim >= 14 else total_dim
         forecast_features = investor_obs[forecast_start:forecast_end]
+        if forecast_features.size == 0:
+            raise ValueError(
+                f"FGB validation: Empty forecast feature slice. total_dim={total_dim}, "
+                f"slice=[{forecast_start}:{forecast_end}]"
+            )
 
         # Check 1: Forecast magnitude (should not be all zeros)
         forecast_magnitude = float(np.abs(forecast_features).sum())
@@ -2168,7 +1907,8 @@ def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
             f"  - Magnitude: {forecast_magnitude:.4f}\n"
             f"  - Std dev: {forecast_std:.4f}\n"
             f"  - Avg change/step: {avg_change:.6f}\n"
-            f"  - Observation dims: {total_dim} (forecast dims: {forecast_end - forecast_start})"
+            f"  - Observation dims: {total_dim} (forecast slice: [{forecast_start}:{forecast_end}] "
+            f"= {forecast_end - forecast_start} dims)"
         )
         return True
 

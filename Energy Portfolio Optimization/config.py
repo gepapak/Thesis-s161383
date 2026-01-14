@@ -53,16 +53,11 @@ DL_OVERLAY_WINDOW_SIZE_DEFAULT = 2016       # ~2 weeks @ 10-min steps
 DL_OVERLAY_INIT_BUDGET_DEFAULT = 1e8        # 100M DKK default budget
 DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT = 0.8   # 80% direction, 20% magnitude
 
-# DL Overlay loss weights (28D mode) - normalized to sum to 1.0
+# DL Overlay loss weights
+# Overlay is now FGB/FAMC-focused (pred_reward + optional meta head), so legacy multi-head weights are deprecated.
 DL_OVERLAY_LOSS_WEIGHTS = {
-    'bridge_vec': 0.083,       # ~8.3%: Bridge vector guidance
-    'risk_budget': 0.167,      # ~16.7%: Risk budget allocation
-    'pred_reward': 0.167,      # ~16.7%: Predicted reward
-    'strat_immediate': 0.208,  # ~20.8%: HIGHEST - Full forecast, most actionable
-    'strat_short': 0.167,      # ~16.7%: HIGH - 95% confidence tactical adjustments
-    'strat_medium': 0.125,     # ~12.5%: MEDIUM - 90% confidence strategic shifts
-    'strat_long': 0.083,       # ~8.3%: LOW - Risk-only long-term positioning
-}  # Total: 1.000
+    'pred_reward': 1.0,
+}
 
 # Wrapper cache defaults (fallback when no config)
 WRAPPER_FORECAST_CACHE_SIZE_DEFAULT = 1000
@@ -474,19 +469,11 @@ class EnhancedConfig:
         self.overlay_mode = "auto"  # "auto" | "defense" | "off"
         self.overlay_intensity = 1.0  # [0.5, 1.5] scales amplitude
 
-        # === Information Bridge (28D) ===
-        # CONDITIONAL: Disabled when using direct deltas (Tier 2/3) to prevent interference
-        # Bridge vectors force PPO to use DL overlay's representation instead of learning its own
-        self.overlay_bridge_dim = 4  # Dims appended per agent from shared embedding
-        self.overlay_bridge_enable_battery = True  # Append bridge to battery_operator_0
-        self.overlay_bridge_enable = True  # Master flag: disable when using direct deltas (auto-set)
+        # Bridge-vector observation augmentation has been removed (Tier 3 is observation-identical to Tier 2).
 
-        # === Predictive reward shaping (28D auxiliary) ===
-        # CONDITIONAL: Disabled when using direct deltas (Tier 2/3) to prevent reward contamination
-        # Pred_reward forces PPO to chase DL overlay's predictions instead of learning from actual outcomes
-        self.overlay_pred_reward_lambda = 0.4  # Weight for predictive shaping in reward calc - INCREASED FROM 0.1 TO 0.4 FOR STRONGER AGENT LEARNING
-        self.overlay_pred_reward_window = 20  # Steps to smooth overlay predicted reward
-        self.overlay_pred_reward_enable = True  # Master flag: disable when using direct deltas (auto-set)
+        # === FGB/FAMC only ===
+        # The overlay produces a pred_reward proxy used for FGB/FAMC baseline signals.
+        # It is never injected into the environment reward.
 
         # === Multi-horizon strategy blending (28D) ===
         # Blend weights for 4 horizons: immediate, short, medium, long
@@ -505,8 +492,7 @@ class EnhancedConfig:
         self.confidence_floor = 0.5  # Minimum confidence (50%) - lowered from 60% to allow more forecast-driven trades
         self.overlay_forecast_conf_thresh = 0.5  # Threshold for overlay strategy activation (50%)
 
-        # === Risk budget ===
-        self.risk_budget_minmax = (0.5, 1.5)  # Risk budget scaling range
+        # === Volatility brake (general risk control; independent of overlay) ===
         self.volatility_brake_threshold = 1.8  # Multiply size by 0.8 if vol > 1.8x median
 
         # === Per-horizon confidence thresholds (for future gating experiments) ===
@@ -686,9 +672,7 @@ class EnhancedConfig:
         self.forecast_usage_bonus_scale = 0.02  # Max extra reward added when MTM > 0 and forecast used
         self.forecast_usage_bonus_mtm_scale = 15000.0  # Normalization for MTM (DKK) when computing bonus
 
-        # === Overlay Risk Budget Application ===
-        # Control whether overlay's risk multiplier is always applied
-        self.overlay_apply_risk_budget = True # Always apply overlay risk budget (unless explicitly disabled)
+        # NOTE: overlay risk-budget sizing was removed for fair Tier 2 vs Tier 3 comparisons.
 
         # =============================================================================
         # REINFORCEMENT LEARNING PARAMETERS
@@ -925,8 +909,6 @@ class EnhancedConfig:
                 errors.append(f"forecast_horizons[{horizon_name}]={horizon_steps} not a positive integer")
 
         # 11. Overlay parameters should be valid
-        if self.overlay_bridge_dim <= 0:
-            errors.append(f"overlay_bridge_dim ({self.overlay_bridge_dim}) <= 0")
 
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)

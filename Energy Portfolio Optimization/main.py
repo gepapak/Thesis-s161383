@@ -855,6 +855,7 @@ def cooling_period(minutes, episode_num):
     """Thermal cooling period between episodes with enhanced memory monitoring"""
     import time
     import psutil
+    import sys
     # gc already imported at module level
 
     logger.info(f"\n[TEMP] Cooling period after Episode {episode_num}: {minutes} minutes")
@@ -878,14 +879,19 @@ def cooling_period(minutes, episode_num):
             cpu_percent = psutil.cpu_percent(interval=1)
             memory = psutil.virtual_memory()
             process_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-            logger.info(f"   [TIME] {remaining_min:.1f}min | CPU: {cpu_percent:.1f}% | RAM: {memory.percent:.1f}% | Process: {process_memory:.1f}MB", end='\r')
+            # logging.Logger does not support print-style `end=...`; use stdout for a single-line progress indicator.
+            sys.stdout.write(
+                f"\r   [TIME] {remaining_min:.1f}min | CPU: {cpu_percent:.1f}% | RAM: {memory.percent:.1f}% | Process: {process_memory:.1f}MB"
+            )
+            sys.stdout.flush()
 
             # Perform gentle cleanup during cooling if memory is high
             if process_memory > 4000:  # More than 4GB
                 gc.collect()
 
-        except:
-            logger.info(f"   [TIME] {remaining_min:.1f}min remaining", end='\r')
+        except Exception:
+            sys.stdout.write(f"\r   [TIME] {remaining_min:.1f}min remaining")
+            sys.stdout.flush()
 
         time.sleep(30)  # Check every 30 seconds
 
@@ -1989,7 +1995,6 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
         config.overlay_enabled = True
 
         feature_dim = 34  # HARD CONSTRAINT: 34D (28D base + 6D deltas)
-        bridge_dim = getattr(config, 'overlay_bridge_dim', 4)
 
         # FAMC: Get meta head parameters
         meta_head_dim = getattr(config, 'meta_baseline_head_dim', 32)
@@ -1998,7 +2003,6 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
         # Initialize DLAdapter for overlay inference (34D: 28D base + 6D deltas)
         overlay_adapter = DLAdapter(
             feature_dim=feature_dim,
-            bridge_dim=bridge_dim,
             verbose=False,
             meta_head_dim=meta_head_dim,
             enable_meta_head=enable_meta_head
@@ -2009,7 +2013,7 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
         # CRITICAL: Mirror feature_dim from adapter to environment (EXACTLY ONCE)
         env.feature_dim = feature_dim
 
-        logger.info(f"   [OK] DL Overlay adapter initialized (feature_dim={feature_dim}, bridge_dim={bridge_dim})")
+        logger.info(f"   [OK] DL Overlay adapter initialized (feature_dim={feature_dim})")
         logger.info(f"   [OK] Mode: 34D Forecast-Aware (28D base + 6D deltas)")
         logger.info(f"   [OK] Horizons: immediate (100%), short (95%), medium (90%), long (risk-only)")
 
@@ -2075,8 +2079,8 @@ def main():
     # NOTE: Reward weights are configured in config.py (profit_reward_weight, risk_penalty_weight)
     # Use optimized_params to override if needed
 
-    # DL Overlay - Hedge optimization parameters
-    parser.add_argument("--dl_overlay", action="store_true", help="Enable DL hedge optimization overlay")
+    # DL Overlay (Tier 3 only): used for FGB/FAMC baseline signals (not reward shaping, not sizing)
+    parser.add_argument("--dl_overlay", action="store_true", help="Enable DL overlay (Tier 3: FGB/FAMC baseline signals)")
     parser.add_argument("--expert_blend_weight", type=float, default=0.0, help="Expert suggestion blend weight (0.0=pure PPO, 1.0=pure expert, 0.3=30%% expert)")
     parser.add_argument("--expert_blend_mode", type=str, default="none", choices=["none", "fixed", "adaptive", "residual"],
                        help="Expert blending mode: none (passive hints), fixed (constant blend), adaptive (confidence-based), residual (PPO learns corrections)")
@@ -2346,9 +2350,7 @@ def main():
 
         # TIER 2 vs TIER 3: Different overlay usage
         # - Tier 2 (dl_overlay=False): Direct deltas only, NO DL overlay
-        #   → Disable overlay outputs to prevent interference
-        # - Tier 3 (dl_overlay=True): Direct deltas + DL overlay outputs
-        #   → Enable overlay outputs (bridge vectors, pred_reward, risk_budget)
+        # - Tier 3 (dl_overlay=True): Direct deltas + DL overlay outputs (pred_reward + optional meta head)
         #
         # CRITICAL FIX: Only disable overlay outputs for Tier 2, NOT Tier 3!
         # Tier 3's entire value proposition is using DL overlay outputs!
@@ -2360,33 +2362,15 @@ def main():
             #   3. ForecastEngine → processes z-scores into observation features (z_short, z_medium, trust)
             # DL overlay is ONLY for Tier 3 (when --dl_overlay flag is set)
             # Tier 2 does NOT need DL overlay - it learns directly from forecast deltas
-            config.overlay_bridge_enable = False
-            config.overlay_pred_reward_lambda = 0.0
-            config.overlay_pred_reward_enable = False
-            config.overlay_apply_risk_budget = False
             logger.info(f"[FORECAST_UTIL] Tier 2 uses direct deltas from ForecastGenerator (NO DL overlay needed)")
             logger.info(f"[FORECAST_UTIL]   ForecastGenerator → _compute_forecast_deltas() → ForecastEngine → observations")
             logger.info(f"[FORECAST_UTIL]   PPO learns directly from forecast z-scores (z_short, z_medium, trust)")
         else:
-            # TIER 3: Direct deltas + DL overlay outputs (bridge vectors, pred_reward, risk_budget, meta_adv)
-            # CRITICAL: Keep overlay outputs ENABLED for Tier 3!
-            # The DL overlay is initialized and running - we need to USE its outputs!
+            # TIER 3: Direct deltas + DL overlay outputs (pred_reward + optional meta head)
+            # IMPORTANT (fairness): Tier 3 does NOT inject overlay signals into env reward
+            # and does NOT change observation shapes versus Tier 2.
             #
-            # ROBUSTNESS: Verify config defaults are correct (should all be True)
-            # These are set in config.py defaults, but we verify here for safety
-            assert config.overlay_bridge_enable, "[TIER3] ERROR: overlay_bridge_enable must be True for Tier 3!"
-            assert config.overlay_pred_reward_enable, "[TIER3] ERROR: overlay_pred_reward_enable must be True for Tier 3!"
-            assert config.overlay_apply_risk_budget, "[TIER3] ERROR: overlay_apply_risk_budget must be True for Tier 3!"
-            
-            # CRITICAL: Enable battery bridge for Tier 3
-            # Battery operator should also use bridge vectors for full DL overlay integration
-            # This ensures both investor_0 and battery_operator_0 get DL overlay guidance
-            config.overlay_bridge_enable_battery = True
             logger.info(f"[TIER3] DL overlay enabled - overlay outputs will be used:")
-            logger.info(f"[TIER3]   - Bridge vectors (investor_0): {'enabled' if config.overlay_bridge_enable else 'disabled'} → 18D observations (14D base+forecast + 4D bridge)")
-            logger.info(f"[TIER3]   - Bridge vectors (battery_operator_0): {'enabled' if config.overlay_bridge_enable_battery else 'disabled'} → 14D observations (10D base+forecast + 4D bridge)")
-            logger.info(f"[TIER3]   - Predicted reward: {'enabled' if config.overlay_pred_reward_enable else 'disabled'} (lambda={config.overlay_pred_reward_lambda})")
-            logger.info(f"[TIER3]   - Risk budget: {'enabled' if config.overlay_apply_risk_budget else 'disabled'}")
             logger.info(f"[TIER3]   - Meta-critic (FAMC): {'enabled' if config.meta_baseline_enable else 'disabled'}")
     else:
         logger.info(f"[FORECAST_UTIL] Investor observations: 6D (baseline MARL)")
