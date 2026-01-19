@@ -587,11 +587,9 @@ class FinancialEngine:
                     use_medium = corr_medium > 0.0
                     use_long = corr_long > 0.0
                     
-                    if not (use_short or use_medium or use_long):
-                        weight_short = 0.7 if use_short else 0.0
-                        weight_medium = 0.2 if use_medium else 0.0
-                        weight_long = 0.1 if use_long else 0.0
-                    else:
+                    # If at least one horizon has positive correlation, weight by correlation strength.
+                    # Otherwise, fall back to default weights (do NOT collapse forecast return to 0.0).
+                    if (use_short or use_medium or use_long):
                         epsilon = 1e-6
                         weight_short_raw = max(0.0, corr_short) if use_short else 0.0
                         weight_medium_raw = max(0.0, corr_medium) if use_medium else 0.0
@@ -610,6 +608,9 @@ class FinancialEngine:
                                 weight_long = (1.0 / num_horizons) if use_long else 0.0
                             else:
                                 weight_short, weight_medium, weight_long = 0.0, 0.0, 0.0
+                    else:
+                        # No positive correlations: use safe defaults.
+                        weight_short, weight_medium, weight_long = 0.7, 0.2, 0.1
                 else:
                     weight_short, weight_medium, weight_long = 0.7, 0.2, 0.1
                     corr_short = corr_medium = corr_long = 0.0

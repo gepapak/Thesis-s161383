@@ -4,15 +4,17 @@ Episode-Specific Forecast Integration
 Helper functions for training episode-specific forecast models and generating cache.
 Integrated into main.py's episode training loop.
 
-CRITICAL BEHAVIOR:
-- Each episode trains forecast models FROM SCRATCH on its OWN 6-month period ONLY (not cumulative!)
-  * Episode 0: Only 2015 H1 (Jan 1 - Jun 30, 2015)
-  * Episode 1: Only 2015 H2 (Jul 1 - Dec 31, 2015)
-  * Episode 19: Only 2024 H2 (Jul 1 - Dec 31, 2024)
-- Forecast models are NOT loaded from previous episodes (unlike RL weights which are continuous)
-- Each episode has its own independent set of forecast models in forecast_models/episode_N/
+CRITICAL BEHAVIOR (NO-LEAKAGE ROLLING FORECAST TRAINING):
+- Forecast episode k trains forecast models FROM SCRATCH on forecast_training_dataset/forecast_scenario_{k:02d}.csv
+  which is a 1-year rolling window (two adjacent half-years).
+- MARL episode k (6-month) uses forecast models from forecast_models/episode_k (trained on forecast_scenario_{k:02d}).
+  Examples:
+  * MARL episode 0 (2015H1) uses forecast episode 0 trained on forecast_scenario_00 (2014H1+2014H2)
+  * MARL episode 19 (2024H2) uses forecast episode 19 trained on forecast_scenario_19 (2023H2+2024H1)
+- forecast_scenario_20 (2024H1+2024H2) is reserved for 2025 evaluation.
+- Forecast models are NOT loaded from previous episodes (unlike RL weights which are continuous).
+- Each forecast episode has its own independent set of models in forecast_models/episode_N/
 - The precomputed forecast cache is also episode-specific in forecast_cache/episode_N/
-- For evaluation on unseen 2025 data, use Episode 19 models (latest training period: 2024 H2)
 """
 
 import os
@@ -102,7 +104,7 @@ def train_episode_forecast_models(
         RuntimeError: If training fails (fail-fast, no fallback)
     """
     logger.info(f"   [FORECAST] Training models for Episode {episode_num}...")
-    logger.info(f"   [DATA] Using episode file: {episode_data_path}")
+    logger.info(f"   [DATA] Using forecast training file: {episode_data_path}")
     
     try:
         # Import training function directly (no subprocess)
@@ -161,13 +163,11 @@ def ensure_episode_forecasts_ready(
     """
     Ensure episode-specific forecast models are trained and ready.
     
-    CRITICAL: Each episode trains models FROM SCRATCH on its OWN 6-month period only (not cumulative!):
-    - Episode 0: Uses scenario_000.csv (2015 H1: Jan 1 - Jun 30, 2015)
-    - Episode 1: Uses scenario_001.csv (2015 H2: Jul 1 - Dec 31, 2015)
-    - Episode 19: Uses scenario_019.csv (2024 H2: Jul 1 - Dec 31, 2024)
-    
-    This ensures forecast models match each episode's data distribution exactly.
-    Each episode is independent - no loading from previous episodes (unlike RL weights).
+    CRITICAL (NO-LEAKAGE):
+    Each forecast episode trains models FROM SCRATCH on a 1-year rolling window:
+    - Forecast episode k uses forecast_training_dataset/forecast_scenario_{k:02d}.csv (caller passes the path)
+    - These models are then used for MARL episode k (6-month training episode)
+    - forecast_scenario_20 is reserved for evaluation (2025) and should not be used during MARL training
     
     This function:
     1. Checks if models exist for THIS episode
@@ -176,7 +176,7 @@ def ensure_episode_forecasts_ready(
     
     Args:
         episode_num: Episode number (0-19)
-        episode_data_path: Path to episode-specific scenario file (e.g., scenario_000.csv)
+        episode_data_path: Path to forecast training scenario file (e.g., forecast_scenario_00.csv)
         forecast_base_dir: Base directory for forecast models
         cache_base_dir: Base directory for forecast cache
     
@@ -215,14 +215,14 @@ def get_evaluation_forecast_paths(forecast_base_dir: str = "forecast_models"):
     """
     Get paths for evaluation on unseen 2025 data.
     
-    Uses Episode 19 models (latest training period: 2015-2024 H2).
-    These are the most recent forecast models trained on the full training dataset.
+    Uses Episode 20 models (trained on 2024H1+2024H2 via forecast_scenario_20).
+    This is reserved for 2025 evaluation (no leakage into MARL training).
     
     Args:
         forecast_base_dir: Base directory for forecast models
     
     Returns:
-        dict with 'model_dir', 'scaler_dir', 'metadata_dir' keys for Episode 19
+        dict with 'model_dir', 'scaler_dir', 'metadata_dir' keys for Episode 20
     """
-    return get_episode_forecast_paths(19, forecast_base_dir)
+    return get_episode_forecast_paths(20, forecast_base_dir)
 

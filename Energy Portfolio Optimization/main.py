@@ -1190,39 +1190,30 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 )
                 
                 logger.info(f"\n   [FORECAST] Preparing Episode {episode_num} forecast models...")
-                
-                # Use episode-specific scenario file directly (no filtering needed!)
-                # Episode 0 -> scenario_000.csv, Episode 1 -> scenario_001.csv, etc.
+
+                # NO-LEAKAGE FORECAST TRAINING (rolling 1-year windows):
+                # - MARL episode 0 (2015H1) uses forecast models trained on forecast_scenario_00 (2014H1+H2)
+                # - MARL episode k uses forecast models trained on forecast_scenario_{k:02d}
+                # - forecast_scenario_20 (2024H1+H2) is reserved for 2025 evaluation (not used in MARL training)
                 import os
-                episode_scenario_file = f"scenario_{episode_num:03d}.csv"
-                episode_data_path = os.path.join(args.episode_data_dir, episode_scenario_file)
-                
-                if not os.path.exists(episode_data_path):
-                    # Try alternative patterns
-                    alt_patterns = [
-                        f"episode_{episode_num}.csv",
-                        f"episode{episode_num}.csv",
-                        f"{episode_num}.csv",
-                    ]
-                    for alt_file in alt_patterns:
-                        alt_path = os.path.join(args.episode_data_dir, alt_file)
-                        if os.path.exists(alt_path):
-                            episode_data_path = alt_path
-                            break
-                    else:
-                        raise FileNotFoundError(
-                            f"Episode {episode_num} data file not found. "
-                            f"Tried: {episode_scenario_file} and alternatives in {args.episode_data_dir}"
-                        )
+                forecast_dataset_dir = getattr(args, "forecast_training_dataset_dir", "forecast_training_dataset")
+                forecast_scenario_file = f"forecast_scenario_{episode_num:02d}.csv"
+                forecast_data_path = os.path.join(forecast_dataset_dir, forecast_scenario_file)
+                if not os.path.exists(forecast_data_path):
+                    raise FileNotFoundError(
+                        f"[FORECAST] Missing forecast training scenario for MARL episode {episode_num}: {forecast_data_path}\n"
+                        f"Expected files: {forecast_dataset_dir}\\forecast_scenario_00.csv .. forecast_scenario_20.csv\n"
+                        f"Fix: regenerate forecast_training_dataset or set --forecast_training_dataset_dir correctly."
+                    )
                 
                 forecast_base_dir = getattr(args, 'forecast_base_dir', "forecast_models")
                 cache_base_dir = getattr(args, 'forecast_cache_dir', "forecast_cache")
                 
                 # Step 1: Ensure forecast models are trained FROM SCRATCH for this episode
-                # Models are trained using episode-specific scenario file (e.g., scenario_000.csv)
+                # Models are trained using rolling 1-year forecast scenario file (forecast_scenario_{episode_num:02d}.csv)
                 success, forecast_paths = ensure_episode_forecasts_ready(
                     episode_num=episode_num,
-                    episode_data_path=episode_data_path,
+                    episode_data_path=forecast_data_path,
                     forecast_base_dir=forecast_base_dir,
                     cache_base_dir=cache_base_dir
                 )
@@ -2057,6 +2048,17 @@ def main():
     parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers", help="Dir with trained scalers (NEW: Updated to Forecast_ANN structure)")
     parser.add_argument("--forecast_training_data", type=str, default="training_dataset/trainset.csv", help="Path to training dataset for episode-specific forecast training")
     parser.add_argument("--forecast_base_dir", type=str, default="forecast_models", help="Base directory for episode-specific forecast models (episode_N subdirectories)")
+    parser.add_argument(
+        "--forecast_training_dataset_dir",
+        type=str,
+        default="forecast_training_dataset",
+        help=(
+            "Directory containing rolling 1-year forecast training scenarios: "
+            "forecast_scenario_00.csv .. forecast_scenario_20.csv. "
+            "For MARL episode k, forecast models are trained on forecast_scenario_{k:02d} (no leakage). "
+            "forecast_scenario_20 is reserved for 2025 evaluation."
+        ),
+    )
 
     # Optimization
     parser.add_argument("--optimize", action="store_true", help="Run hyperparameter optimization before training")

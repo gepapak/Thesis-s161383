@@ -5,9 +5,9 @@ Run Tier1/Tier2 + Tier3 FGB ablations sequentially.
 This script is purpose-built for the FGB/FAMC ablation matrix:
 1) Tier 1 (baseline, no forecasts)
 2) Tier 2 (forecast observations)
-3) Tier 3 + FGB fixed    (--forecast_baseline_enable --fgb_mode fixed)
+3) Tier 3 + FAMC meta    (--forecast_baseline_enable --fgb_mode meta)   [auto-enables meta head in main.py]
 4) Tier 3 + FGB online   (--forecast_baseline_enable --fgb_mode online)
-5) Tier 3 + FAMC meta    (--forecast_baseline_enable --fgb_mode meta)  [auto-enables meta head in main.py]
+5) Tier 3 + FGB fixed    (--forecast_baseline_enable --fgb_mode fixed)
 
 It does NOT run the risk-uplift variants (those are in run_all_tiers.py).
 """
@@ -66,7 +66,7 @@ def run_command(cmd, name: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Run Tier1/Tier2 + Tier3 FGB ablations sequentially.")
-    parser.add_argument("--seed", type=int, default=789, help="Random seed to pass to main.py (default: 789)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed to pass to main.py (default: 42)")
     parser.add_argument("--start_episode", type=int, default=0, help="Start episode index (default: 0)")
     parser.add_argument("--end_episode", type=int, default=19, help="End episode index (default: 19)")
     parser.add_argument("--cooling_period", type=int, default=1, help="Cooling period between episodes (default: 1)")
@@ -121,16 +121,17 @@ def main():
             "--fgb_mode", mode,
         ]
 
+    # User-requested order: Tier 1, Tier 2, Tier 3 meta, Tier 3 online, Tier 3 fixed
     plan = [
         ("Tier 1 (baseline)", tier1),
         ("Tier 2 (forecast obs)", tier2),
-        ("Tier 3 + FGB fixed", tier3("fixed")),
-        ("Tier 3 + FGB online", tier3("online")),
         ("Tier 3 + FAMC meta", tier3("meta")),
+        ("Tier 3 + FGB online", tier3("online")),
+        ("Tier 3 + FGB fixed", tier3("fixed")),
     ]
 
     print("\n" + "=" * 90)
-    print("FGB/FAMC ABLATION RUN (Tier 1/2 + Tier 3 fixed/online/meta)")
+    print("FGB/FAMC ABLATION RUN (Tier 1/2 + Tier 3 meta/online/fixed)")
     print("=" * 90)
     print(f"Seed: {seed_value}")
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

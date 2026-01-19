@@ -47,7 +47,9 @@ class ObservationBuilder:
         REFACTORED: Normalize market features to [0, 1] or [-1, 1].
         
         Args:
-            price: Price z-score (already normalized)
+            price: Normalized price signal.
+                - Preferred: already scaled to [-1, 1] (as produced by `environment.py` via z-score clipping / 3.0)
+                - Backward-compatible: if caller still passes clipped z-score in [-3, 3], this function will scale it to [-1, 1]
             load: Load value
             wind: Wind generation value
             solar: Solar generation value
@@ -61,8 +63,13 @@ class ObservationBuilder:
             Dict with normalized features
         """
         try:
-            # Price: z-score already clipped to [-3,3], divide by 3 to get [-1,1]
-            price_n = float(np.clip(price / 3.0, -1.0, 1.0))
+            # Price: avoid double-normalization.
+            # - If input looks like a clipped z-score (magnitude > ~1.5), scale to [-1, 1] via /3.
+            # - Otherwise assume it is already normalized to [-1, 1].
+            price_f = float(price)
+            if abs(price_f) > 1.5:
+                price_f = price_f / 3.0
+            price_n = float(np.clip(price_f, -1.0, 1.0))
             
             # Load and generation: normalize to [0, 1]
             load_n = float(np.clip(SafeDivision.div(load, load_scale, 0.0), 0.0, 1.0))
