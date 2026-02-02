@@ -410,17 +410,18 @@ def train_episode_forecasts(episode_num, episode_data_path, output_base_dir="for
     """
     Train all forecast models FROM SCRATCH for a specific episode.
     
-    CRITICAL: Each episode trains ONLY on its own 6-month period (not cumulative!):
-    - Episode 0: Uses scenario_000.csv (2015 H1: Jan 1 - Jun 30, 2015)
-    - Episode 1: Uses scenario_001.csv (2015 H2: Jul 1 - Dec 31, 2015)
-    - Episode 19: Uses scenario_019.csv (2024 H2: Jul 1 - Dec 31, 2024)
-    
-    This ensures forecast models match the episode's data distribution exactly.
-    Models are trained independently - no loading from previous episodes.
+    CRITICAL (NO-LEAKAGE, ROLLING FORECAST TRAINING):
+    - The training file is passed in via `episode_data_path` and is used AS-IS (no date filtering).
+    - In the rolling scheme, `episode_data_path` should usually be:
+        forecast_training_dataset/forecast_scenario_{episode_num:02d}.csv
+      which is a 1-year rolling window (two adjacent half-years).
+    - Episode 20 is reserved for evaluation-only (e.g., 2024H1+2024H2 for 2025 evaluation).
+
+    Models are trained independently per episode - no loading from previous episodes.
     
     Args:
-        episode_num: Episode number (0-19)
-        episode_data_path: Path to episode-specific scenario file (e.g., scenario_000.csv)
+        episode_num: Forecast episode number (commonly 0-20 in rolling scheme)
+        episode_data_path: Path to episode-specific forecast training CSV (e.g., forecast_scenario_00.csv)
         output_base_dir: Base directory for episode outputs
     
     Returns:
@@ -429,11 +430,10 @@ def train_episode_forecasts(episode_num, episode_data_path, output_base_dir="for
     print("="*80)
     print(f"TRAINING FORECAST MODELS FOR EPISODE {episode_num}")
     print("="*80)
-    
-    # Get episode info
-    episode_info = get_episode_info(episode_num)
-    print(f"Episode: {episode_info['description']}")
-    print(f"Period: {episode_info['start_date']} to {episode_info['end_date']}")
+
+    # NOTE: In the rolling forecast scheme, episode numbers are NOT the same as MARL 6-month episodes.
+    # So we avoid printing get_episode_info() here (it would mislabel episode_20 as 2025H1).
+    print(f"Forecast Episode: {episode_num}")
     print(f"Data file: {episode_data_path}")
     
     # Load episode-specific scenario file directly (no filtering needed!)
@@ -556,8 +556,8 @@ def train_episode_forecasts(episode_num, episode_data_path, output_base_dir="for
 
 def main():
     parser = argparse.ArgumentParser(description='Train episode-specific forecast models')
-    parser.add_argument('--episode', type=int, nargs='+', help='Episode number(s) to train (0-19)')
-    parser.add_argument('--all', action='store_true', help='Train all episodes (0-19)')
+    parser.add_argument('--episode', type=int, nargs='+', help='Episode number(s) to train (0-20)')
+    parser.add_argument('--all', action='store_true', help='Train all episodes (0-20)')
     parser.add_argument('--data_path', type=str, default='training_dataset/trainset.csv',
                        help='Path to training dataset CSV')
     parser.add_argument('--output_dir', type=str, default='forecast_models',
@@ -567,7 +567,7 @@ def main():
     
     # Determine episodes to train
     if args.all:
-        episodes = list(range(20))  # Episodes 0-19
+        episodes = list(range(21))  # Episodes 0-20
     elif args.episode:
         episodes = args.episode
     else:
@@ -575,8 +575,8 @@ def main():
     
     # Validate episodes
     for ep in episodes:
-        if ep < 0 or ep > 19:
-            parser.error(f"Episode number must be 0-19, got {ep}")
+        if ep < 0 or ep > 20:
+            parser.error(f"Episode number must be 0-20, got {ep}")
     
     # Check data path
     if not os.path.exists(args.data_path):

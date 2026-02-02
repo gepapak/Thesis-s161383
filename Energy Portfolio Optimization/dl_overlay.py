@@ -327,7 +327,6 @@ class OverlayTrainer:
         # Loss weights: only pred_reward is trained here (meta head is trained in metacontroller).
         self.loss_weights = {'pred_reward': 1.0}
 
-        # (strategy-head metrics removed; only pred_reward is trained here)
         self.horizon_metrics = {}
 
         # Metrics

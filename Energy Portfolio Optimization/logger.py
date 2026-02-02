@@ -249,13 +249,25 @@ class RewardLogger:
                 # Price & returns
                 'price_current', 'price_return_1step', 'price_return_forecast'
             ],
-            'positions': ['episode', 'timestep', 'position_signed', 'position_exposure',
-                          'wind_pos_norm', 'solar_pos_norm', 'hydro_pos_norm',
-                          'investor_action', 'battery_action'],
+            'positions': [
+                'episode', 'timestep',
+                'position_signed', 'position_exposure',
+                'wind_pos_norm', 'solar_pos_norm', 'hydro_pos_norm',
+                'decision_step', 'exposure_exec', 'action_sign',
+                'trade_signal_active', 'trade_signal_sign',
+                'risk_multiplier', 'vol_brake_mult', 'strategy_multiplier',
+                'combined_multiplier', 'tradeable_capital', 'mtm_exit_count',
+                'investor_action', 'battery_action',
+                'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw', 'inv_tanh_mu', 'inv_tanh_a',
+                'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
+                'inv_reward_step', 'inv_value', 'inv_value_next', 'inv_td_error'
+                , 'probe_r2_base', 'probe_r2_base_plus_signal', 'probe_delta_r2'
+            ],
              'forecast': ['episode', 'timestep', 'z_short', 'z_medium', 'z_long', 'z_combined',
                           'forecast_confidence', 'forecast_mape', 'forecast_trust', 'signal_gate_multiplier',
                           'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason', 'agent_followed_forecast', 'forecast_usage_bonus', 'investor_strategy_multiplier',
-                         'mape_short', 'mape_medium', 'mape_long'],
+                          'mape_short', 'mape_medium', 'mape_long',
+                          'obs_trade_signal', 'obs_trade_action_corr', 'obs_trade_exposure_corr', 'obs_trade_delta_exposure_corr'],
             'rewards': ['episode', 'timestep', 'base_reward', 'investor_reward', 'battery_reward',
                         'alignment_reward', 'pnl_reward', 'forecast_signal_score', 'risk_score',
                         'operational_score']
@@ -283,6 +295,8 @@ class RewardLogger:
         self.current_episode = episode_num
         
         # Create new CSV file for this episode (renamed from _reward_debug_ to _debug_)
+        # Single canonical file name per episode.
+        # Desired behavior: re-running an episode overwrites its prior logs (e.g., after OOM/restart).
         self.csv_file = os.path.join(self.log_dir, f"{self.tier_name}_debug_ep{episode_num}.csv")
         
         try:
@@ -302,7 +316,9 @@ class RewardLogger:
         """Create category-specific CSV files for better organization."""
         try:
             for category, fields in self.category_fields.items():
+                # Single canonical file name per episode/category.
                 csv_file = os.path.join(self.log_dir, f"{self.tier_name}_{category}_ep{episode_num}.csv")
+
                 try:
                     handle = open(csv_file, 'w', newline='', encoding='utf-8')
                     writer = csv.DictWriter(handle, fieldnames=fields)
@@ -339,10 +355,32 @@ class RewardLogger:
                  z_combined: float = 0.0,
                  forecast_confidence: float = 0.0,
                  forecast_trust: float = 0.0,
+                 # OBSERVATION-LEVEL forecast signals (what the policy sees after warmup/ablation)
+                 obs_z_short: float = 0.0,
+                 # Deprecated: kept for backward-compat with older callers; not logged.
+                 obs_z_medium: float = 0.0,
+                 obs_z_long: float = 0.0,
+                 obs_forecast_trust: float = 0.0,
+                 obs_normalized_error: float = 0.0,
+                 obs_trade_signal: float = 0.0,
+                 obs_trade_action_corr: float = 0.0,
+                 obs_trade_exposure_corr: float = 0.0,
+                 obs_trade_delta_exposure_corr: float = 0.0,
                  signal_gate_multiplier: float = 0.0,
                  # Position info
                  position_signed: float = 0.0,
                  position_exposure: float = 0.0,
+                 decision_step: float = 0.0,
+                 exposure_exec: float = 0.0,
+                 action_sign: float = 0.0,
+                 trade_signal_active: float = 0.0,
+                 trade_signal_sign: float = 0.0,
+                 risk_multiplier: float = 1.0,
+                 vol_brake_mult: float = 1.0,
+                 strategy_multiplier: float = 1.0,
+                 combined_multiplier: float = 1.0,
+                 tradeable_capital: float = 0.0,
+                 mtm_exit_count: float = 0.0,
                  # Price data (for forward-looking accuracy analysis)
                  price_current: float = 0.0,  # Raw price at current timestep (DKK/MWh)
                  # Price returns
@@ -487,7 +525,7 @@ class RewardLogger:
                  pnl_generation: float = 0.0,
                  pnl_hedge: float = 0.0,
                  cash_delta_ops: float = 0.0,
-                 # NEW: Battery dispatch metrics (FIX #5 - volatility-aware battery)
+                 # NEW: Battery dispatch metrics (FIX #5)
                  battery_decision: str = 'idle',
                  battery_intensity: float = 0.0,
                  battery_spread: float = 0.0,
@@ -501,7 +539,28 @@ class RewardLogger:
                  battery_throughput: float = 0.0,
                  battery_degradation_cost: float = 0.0,
                  battery_eta_charge: float = 0.0,
-                 battery_eta_discharge: float = 0.0):
+                 battery_eta_discharge: float = 0.0,
+                 # NEW (anti-collapse verification): penalty diagnostics
+                 training_global_step: int = 0,
+                 inv_penalty_warm: float = 0.0,
+                 inv_pen_boundary: float = 0.0,
+                 inv_pen_exposure: float = 0.0,
+                 inv_pen_exposure_stuck: float = 0.0,
+                 inv_mu_raw: float = 0.0,
+                 inv_sigma_raw: float = 0.0,
+                 inv_a_raw: float = 0.0,
+                 inv_tanh_mu: float = 0.0,
+                 inv_tanh_a: float = 0.0,
+                 inv_sat_mean: float = 0.0,
+                 inv_sat_sample: float = 0.0,
+                 inv_sat_noise_only: float = 0.0,
+                 inv_reward_step: float = 0.0,
+                 inv_value: float = 0.0,
+                 inv_value_next: float = 0.0,
+                 inv_td_error: float = 0.0,
+                 probe_r2_base: float = 0.0,
+                 probe_r2_base_plus_signal: float = 0.0,
+                 probe_delta_r2: float = 0.0):
         """Log detailed step information"""
         # DEBUG to verify log_step is being called
         if timestep % 100 == 0:
@@ -556,6 +615,17 @@ class RewardLogger:
             # Position info
             'position_signed': position_signed,
             'position_exposure': position_exposure,
+            'decision_step': decision_step,
+            'exposure_exec': exposure_exec,
+            'action_sign': action_sign,
+            'trade_signal_active': trade_signal_active,
+            'trade_signal_sign': trade_signal_sign,
+            'risk_multiplier': risk_multiplier,
+            'vol_brake_mult': vol_brake_mult,
+            'strategy_multiplier': strategy_multiplier,
+            'combined_multiplier': combined_multiplier,
+            'tradeable_capital': tradeable_capital,
+            'mtm_exit_count': mtm_exit_count,
             # Price data (for forward-looking accuracy analysis)
             'price_current': price_current,  # Raw price at current timestep (DKK/MWh)
             # Price returns
@@ -575,6 +645,12 @@ class RewardLogger:
             'base_reward': base_reward,
             'investor_reward': investor_reward,
             'battery_reward': battery_reward,
+            # Penalty diagnostics (for episode-boundary collapse debugging)
+            'training_global_step': int(training_global_step),
+            'inv_penalty_warm': float(inv_penalty_warm),
+            'inv_pen_boundary': float(inv_pen_boundary),
+            'inv_pen_exposure': float(inv_pen_exposure),
+            'inv_pen_exposure_stuck': float(inv_pen_exposure_stuck),
             # Position breakdown
             'wind_pos_norm': wind_pos_norm,
             'solar_pos_norm': solar_pos_norm,
@@ -594,6 +670,15 @@ class RewardLogger:
             'z_combined': z_combined,
             'forecast_confidence': forecast_confidence,
             'forecast_trust': forecast_trust,
+            # OBSERVATION-LEVEL forecast signals (policy-visible; post-ablation)
+            'obs_z_short': obs_z_short,
+            'obs_z_long': obs_z_long,
+            'obs_forecast_trust': obs_forecast_trust,
+            'obs_normalized_error': obs_normalized_error,
+            'obs_trade_signal': obs_trade_signal,
+            'obs_trade_action_corr': obs_trade_action_corr,
+            'obs_trade_exposure_corr': obs_trade_exposure_corr,
+            'obs_trade_delta_exposure_corr': obs_trade_delta_exposure_corr,
             'signal_gate_multiplier': signal_gate_multiplier,
             # Forecast reward components
             'alignment_reward': alignment_reward,
@@ -692,6 +777,56 @@ class RewardLogger:
             'direction_accuracy_long': direction_accuracy_long,
             # NEW: Battery forecast bonus
             'battery_forecast_bonus': battery_forecast_bonus,
+            # NEW: Forecast vs actual comparison (for deep debugging)
+            'current_price_dkk': current_price_dkk,
+            'forecast_price_short_dkk': forecast_price_short_dkk,
+            'forecast_price_medium_dkk': forecast_price_medium_dkk,
+            'forecast_price_long_dkk': forecast_price_long_dkk,
+            'forecast_error_short_pct': forecast_error_short_pct,
+            'forecast_error_medium_pct': forecast_error_medium_pct,
+            'forecast_error_long_pct': forecast_error_long_pct,
+            'agent_followed_forecast': int(agent_followed_forecast),
+            # NEW: NAV attribution drivers (per-step financial breakdown)
+            'nav_start': nav_start,
+            'nav_end': nav_end,
+            'pnl_total': pnl_total,
+            'pnl_battery': pnl_battery,
+            'pnl_generation': pnl_generation,
+            'pnl_hedge': pnl_hedge,
+            'cash_delta_ops': cash_delta_ops,
+            # NEW: Battery dispatch metrics (FIX #5)
+            'battery_decision': battery_decision,
+            'battery_intensity': battery_intensity,
+            'battery_spread': battery_spread,
+            'battery_adjusted_hurdle': battery_adjusted_hurdle,
+            'battery_volatility_adj': battery_volatility_adj,
+            # NEW: Battery state metrics (BATTERY REWARD FIX)
+            'battery_energy': battery_energy,
+            'battery_capacity': battery_capacity,
+            'battery_soc': battery_soc,
+            'battery_cash_delta': battery_cash_delta,
+            'battery_throughput': battery_throughput,
+            'battery_degradation_cost': battery_degradation_cost,
+            'battery_eta_charge': battery_eta_charge,
+            'battery_eta_discharge': battery_eta_discharge,
+            # Investor policy distribution diagnostics (pre-tanh / pre-postprocess)
+            'inv_mu_raw': inv_mu_raw,
+            'inv_sigma_raw': inv_sigma_raw,
+            'inv_a_raw': inv_a_raw,
+            'inv_tanh_mu': inv_tanh_mu,
+            'inv_tanh_a': inv_tanh_a,
+            'inv_sat_mean': inv_sat_mean,
+            'inv_sat_sample': inv_sat_sample,
+            'inv_sat_noise_only': inv_sat_noise_only,
+            # Investor TD-error proxy (credit assignment diagnostics)
+            'inv_reward_step': inv_reward_step,
+            'inv_value': inv_value,
+            'inv_value_next': inv_value_next,
+            'inv_td_error': inv_td_error,
+            # Linear probe (forecast utilization): exposure_exec ~ base_obs (+ trade_signal)
+            'probe_r2_base': probe_r2_base,
+            'probe_r2_base_plus_signal': probe_r2_base_plus_signal,
+            'probe_delta_r2': probe_delta_r2,
         }
         
         # Add action info if available
@@ -888,7 +1023,10 @@ class RewardLogger:
             'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
             'depreciation_ratio', 'years_elapsed',
             # Position info (common to both tiers)
-            'position_signed', 'position_exposure',
+            'position_signed', 'position_exposure', 'decision_step', 'exposure_exec', 'action_sign',
+            'trade_signal_active', 'trade_signal_sign',
+            'risk_multiplier', 'vol_brake_mult', 'strategy_multiplier',
+            'combined_multiplier', 'tradeable_capital', 'mtm_exit_count',
             # Price data (for forward-looking accuracy analysis)
             'price_current',  # Raw price at current timestep (DKK/MWh)
             # Price returns (common to both tiers)
@@ -899,6 +1037,15 @@ class RewardLogger:
             'weight_operational', 'weight_risk', 'weight_hedging', 'weight_nav',
             # Final rewards (common to both tiers)
             'base_reward', 'investor_reward', 'battery_reward',
+            # Penalty diagnostics (for episode-boundary collapse debugging)
+            'training_global_step', 'inv_penalty_warm', 'inv_pen_boundary', 'inv_pen_exposure', 'inv_pen_exposure_stuck',
+            # Investor policy distribution diagnostics (pre-tanh / pre-postprocess)
+            'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw', 'inv_tanh_mu', 'inv_tanh_a',
+            'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
+            # Investor TD-error proxy (credit assignment diagnostics)
+            'inv_reward_step', 'inv_value', 'inv_value_next', 'inv_td_error',
+            # Linear probe (forecast utilization)
+            'probe_r2_base', 'probe_r2_base_plus_signal', 'probe_delta_r2',
             # Actions (common to both tiers)
             'inv_wind', 'inv_solar', 'inv_hydro', 'batt_charge', 'batt_discharge',
             'investor_action', 'battery_action',
@@ -912,6 +1059,11 @@ class RewardLogger:
             # ===================================================================
             # Forecast signals (0.0 for Tier 1, populated for Tier 2)
             'z_short', 'z_medium', 'z_long', 'z_combined', 'forecast_confidence', 'forecast_trust',
+            # OBSERVATION-LEVEL forecast signals (what the policy actually sees after ablations/warmup)
+            # These are critical for proving forecast usage and for causal ablations.
+            'obs_z_short', 'obs_z_long',
+            'obs_forecast_trust', 'obs_normalized_error', 'obs_trade_signal', 'obs_trade_action_corr',
+            'obs_trade_exposure_corr', 'obs_trade_delta_exposure_corr',
             'signal_gate_multiplier',
             # Forecast reward components (0.0 for Tier 1, populated for Tier 2)
             'alignment_reward', 'pnl_reward', 'forecast_signal_score', 'generation_forecast_score',

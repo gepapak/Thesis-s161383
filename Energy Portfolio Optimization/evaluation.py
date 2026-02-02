@@ -1032,6 +1032,32 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
     print(f"🔥 Loading models from checkpoint: {checkpoint_dir}")
     
     try:
+        # ------------------------------------------------------------------
+        # NumPy pickle compatibility shim
+        # ------------------------------------------------------------------
+        # Some SB3 checkpoints can embed pickled objects referencing internal NumPy module paths
+        # like `numpy._core.numeric` (NumPy 2.x). If this runtime uses a different NumPy layout,
+        # unpickling can fail with: "No module named 'numpy._core.numeric'".
+        #
+        # We install a minimal alias so older/newer checkpoints can load on this machine.
+        try:
+            import sys
+            import types
+            import numpy as _np  # noqa: F401
+            import numpy.core.numeric as _np_core_numeric
+
+            if "numpy._core.numeric" not in sys.modules:
+                sys.modules.setdefault("numpy._core", types.ModuleType("numpy._core"))
+                sys.modules["numpy._core.numeric"] = _np_core_numeric
+                # Expose as attribute for completeness (some loaders inspect numpy._core)
+                try:
+                    setattr(sys.modules["numpy"], "_core", sys.modules["numpy._core"])
+                except Exception:
+                    pass
+        except Exception:
+            # Never block evaluation due to a best-effort compatibility shim.
+            pass
+
         from stable_baselines3 import PPO, SAC
         print("✅ Successfully imported stable-baselines3")
         
@@ -1149,38 +1175,42 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     scaler_dir = forecast_paths.get("scaler_dir")
     metadata_dir = forecast_paths.get("metadata_dir")
 
-    # Optional: auto-train eval-only forecasts (episode_20) if missing.
-    # Default remains: NO training during evaluation.
-    if getattr(args, "auto_train_eval_forecasts", False):
-        try:
-            from episode_forecast_integration import check_episode_models_exist, ensure_episode_forecasts_ready
-
-            if not check_episode_models_exist(20, forecast_base_dir):
-                forecast_training_dataset_dir = getattr(args, "forecast_training_dataset_dir", "forecast_training_dataset")
-                eval_scenario = os.path.join(forecast_training_dataset_dir, "forecast_scenario_20.csv")
-                if not os.path.exists(eval_scenario):
-                    raise FileNotFoundError(
-                        f"Missing evaluation forecast training scenario: {eval_scenario}\n"
-                        f"Expected: {forecast_training_dataset_dir}\\forecast_scenario_20.csv"
-                    )
-                print_progress(f"🧠 Training evaluation-only forecast models (episode_20) from: {eval_scenario}")
-                ok, trained_paths = ensure_episode_forecasts_ready(
-                    episode_num=20,
-                    episode_data_path=eval_scenario,
-                    forecast_base_dir=forecast_base_dir,
-                    cache_base_dir=getattr(args, "forecast_cache_dir", "forecast_cache"),
-                )
-                if not ok:
-                    raise RuntimeError("auto_train_eval_forecasts=True but training episode_20 forecasts failed.")
-                # Use the freshly trained paths for evaluation
-                model_dir = trained_paths.get("model_dir")
-                scaler_dir = trained_paths.get("scaler_dir")
-                metadata_dir = trained_paths.get("metadata_dir")
-                print_progress("✅ Episode_20 forecast models ready for evaluation")
-        except Exception as e:
-            raise RuntimeError(f"auto_train_eval_forecasts failed: {e}")
+    # IMPORTANT: Evaluation should be "pure" evaluation: NO training side-effects.
+    # If episode_20 models are missing, train them beforehand using:
+    #   python train_evaluation_forecasts.py
+    if not (model_dir and scaler_dir and metadata_dir):
+        raise FileNotFoundError(
+            "Missing evaluation forecast model paths for episode_20.\n"
+            f"Looked under: {os.path.join(forecast_base_dir, 'episode_20')}\n"
+            "Fix: train evaluation-only forecasts first:\n"
+            "  python train_evaluation_forecasts.py\n"
+            "or point --forecast_base_dir to a directory that already contains episode_20."
+        )
     # Shared cache across Tier 2 and Tier 3 (same models + same unseen dataset)
-    shared_eval_cache_dir = os.path.join(args.output_dir, "forecast_cache_eval_episode20_2025_full")
+    # Users may optionally point it elsewhere via --forecast_cache_dir for convenience.
+    cache_root = getattr(args, "forecast_cache_dir", None) or args.output_dir
+    # Cache root for eval (nested per dataset name)
+    eval_cache_root = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
+    eval_basename = os.path.splitext(os.path.basename(str(args.eval_data)))[0]
+    if eval_basename.lower() in ("unseendata", "unseen", "evaluation", "eval"):
+        eval_basename = "full"
+    shared_eval_cache_dir = os.path.join(
+        eval_cache_root,
+        f"forecast_cache_eval_episode20_2025-{eval_basename}",
+    )
+    # Detect cache presence for transparency (precompute_offline loads it if present).
+    cache_precomputed = False
+    try:
+        if os.path.isdir(shared_eval_cache_dir):
+            for name in os.listdir(shared_eval_cache_dir):
+                if name.startswith("precomputed_forecasts_") and name.endswith(".csv"):
+                    cache_precomputed = True
+                    break
+    except Exception:
+        cache_precomputed = False
+    print_progress(
+        f"🧊 Forecast cache: {'FOUND' if cache_precomputed else 'MISSING'} at {shared_eval_cache_dir}"
+    )
 
     def _tier_eval(name: str, tier_dir: str, enable_forecast: bool, dl_overlay: bool) -> Dict[str, Any]:
         tier_out = os.path.join(args.output_dir, name)
@@ -1197,6 +1227,11 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         cfg.enable_forecast_utilisation = bool(enable_forecast)
         # Keep risk-management gate OFF for fair comparison (evaluation matches training tier2/3 in your run)
         cfg.forecast_risk_management_mode = False
+
+        # Optional ablation: modify forecast-derived OBSERVATIONS during evaluation while still running the same policy.
+        if bool(enable_forecast):
+            cfg.forecast_obs_mode = str(getattr(args, "forecast_obs_mode", "normal") or "normal").lower()
+            cfg.forecast_trade_signal_disable = bool(getattr(args, "forecast_trade_signal_disable", False))
 
         # FAIR EVALUATION:
         # Tier 3 overlay outputs are used only for FGB/FAMC baseline signals.
@@ -1218,7 +1253,6 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
             cfg.meta_baseline_enable = (cfg.fgb_mode == "meta")
             if cfg.meta_baseline_enable:
                 cfg.meta_baseline_head_dim = int(getattr(cfg, "meta_baseline_head_dim", 32))
-            # No risk-budget / bridge-vector ablations (removed for fair comparisons).
         else:
             cfg.fgb_mode = "fixed"
             cfg.overlay_enabled = False
@@ -1241,7 +1275,7 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         if enable_forecast:
             if not (model_dir and scaler_dir) or not os.path.exists(model_dir) or not os.path.exists(scaler_dir):
                 raise FileNotFoundError(
-                    f"Episode 19 forecast paths not found. model_dir={model_dir} scaler_dir={scaler_dir}"
+                    f"Episode 20 forecast paths not found. model_dir={model_dir} scaler_dir={scaler_dir}"
                 )
             env, _ = create_evaluation_environment(
                 eval_data,
@@ -1276,25 +1310,25 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         tier_metrics["tier_dir"] = tier_dir
         tier_metrics["final_models_dir"] = final_models_dir
         if enable_forecast:
-            tier_metrics["forecast_episode"] = 19
+            tier_metrics["forecast_episode"] = 20
             tier_metrics["forecast_model_dir"] = model_dir
             tier_metrics["forecast_scaler_dir"] = scaler_dir
         if dl_path:
             tier_metrics["dl_overlay_weights"] = dl_path
         return tier_metrics
 
-    print_section_header("Tier Suite Evaluation (Unseen 2025 H1)")
+    print_section_header("Tier Suite Evaluation (Unseen 2025 Full Year)")
     print_progress(f"📏 Evaluating for {steps} steps")
 
     # Tier 1: no forecasts, no overlay
     if getattr(args, "tiers_only", "all") in ("all", "tier1"):
         results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir, enable_forecast=False, dl_overlay=False)
 
-    # Tier 2: forecasts enabled (Episode 19), no overlay
+    # Tier 2: forecasts enabled (Episode 20), no overlay
     if getattr(args, "tiers_only", "all") in ("all", "tier2"):
         results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir, enable_forecast=True, dl_overlay=False)
 
-    # Tier 3: forecasts enabled (Episode 19) + overlay weights
+    # Tier 3: forecasts enabled (Episode 20) + overlay weights
     if getattr(args, "tiers_only", "all") in ("all", "tier3"):
         results["tiers"]["tier3"] = _tier_eval("tier3", args.tier3_dir, enable_forecast=True, dl_overlay=True)
 
@@ -1567,6 +1601,23 @@ def create_evaluation_environment(
             )
             print_progress("✅ Basic base environment created")
 
+        # Tier-2 eval trust: mirror training by initializing CalibrationTracker when forecasts are enabled.
+        if enable_forecasting and config is not None:
+            try:
+                from dl_overlay import CalibrationTracker
+
+                base_env.calibration_tracker = CalibrationTracker(
+                    window_size=getattr(config, "forecast_trust_window", 500),
+                    trust_metric=getattr(config, "forecast_trust_metric", "hitrate"),
+                    verbose=False,
+                    init_budget=getattr(config, "init_budget", None),
+                    direction_weight=getattr(config, "forecast_trust_direction_weight", 0.8),
+                )
+                print_progress("✅ CalibrationTracker initialized for evaluation (forecast trust)")
+            except Exception as e:
+                base_env.calibration_tracker = None
+                print_progress(f"⚠️ CalibrationTracker init failed: {e}")
+
         # Setup DL overlay if weights are provided
         if dl_overlay_weights_path and os.path.exists(dl_overlay_weights_path):
             try:
@@ -1589,7 +1640,6 @@ def create_evaluation_environment(
         # Wrap with forecasting if enabled
         if forecaster is not None and enable_forecasting:
             print_progress("🔄 Wrapping environment with forecasting...")
-            # NOTE: MultiHorizonWrapperEnv does not accept log_path (no CSV logging).
             # We rely on the base env's log_dir instead.
             eval_env = MultiHorizonWrapperEnv(base_env, forecaster)
             print_progress("✅ Environment created with forecasting wrapper")
@@ -2362,22 +2412,34 @@ def main():
         choices=["all", "tier1", "tier2", "tier3"],
         help="Run only a subset of tiers in --mode tiers (useful when Tier1/2 were already evaluated).",
     )
-    # Tier 3 risk-budget sizing ablation removed (risk-budget sizing no longer exists).
     parser.add_argument("--forecast_base_dir", type=str, default="forecast_models",
                        help="Base directory for episode-specific forecast models (evaluation uses episode_20 by default)")
     parser.add_argument(
-        "--forecast_training_dataset_dir",
+        "--forecast_cache_dir",
         type=str,
-        default="forecast_training_dataset",
-        help="Directory containing forecast_scenario_00.csv .. forecast_scenario_20.csv (used only if --auto_train_eval_forecasts is set).",
+        default=None,
+        help=(
+            "Optional directory to store evaluation-time forecast cache. "
+            "If omitted, cache is written under --output_dir."
+        ),
     )
     parser.add_argument(
-        "--auto_train_eval_forecasts",
+        "--forecast_obs_mode",
+        type=str,
+        default="normal",
+        choices=["normal", "zero", "invert"],
+        help=(
+            "Ablation for Tier2/Tier3: modify forecast-derived observation features during evaluation "
+            "while still running the same trained policies. "
+            "'zero' removes forecast info; 'invert' flips z-score directions to test sensitivity."
+        ),
+    )
+    parser.add_argument(
+        "--forecast_trade_signal_disable",
         action="store_true",
         help=(
-            "If set, evaluation will train forecast_models/episode_20 from "
-            "forecast_training_dataset/forecast_scenario_20.csv when episode_20 models are missing. "
-            "Default behavior is NO training during evaluation."
+            "Disable trade_signal in investor observations during evaluation while "
+            "keeping z_short (z_short-only test)."
         ),
     )
 
@@ -2469,7 +2531,6 @@ def main():
 
             analysis = None
             if args.analyze:
-                # Keep legacy analyzer optional; the tier report is the canonical summary.
                 analysis = analyze_comprehensive_results({"configurations": results.get("tiers", {})})
 
             save_results(results, args.output_dir, mode="tiers", analysis=analysis)
@@ -2481,7 +2542,6 @@ def main():
             raise
 
     # Create evaluation environment for other modes
-    # NOTE: Legacy behavior disables forecasting for some modes; tier-suite handles forecasting explicitly.
     enable_forecasting = (not args.no_forecast) and (args.mode not in ["agents", "checkpoint", "compare"])
 
     eval_env, forecaster = create_evaluation_environment(

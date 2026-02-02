@@ -93,20 +93,20 @@ class StabilizedObservationManager:
 
         if enable_forecast_util:
             # TIER 2: Forecasts enabled
-            # TEMPORAL ALIGNMENT + ENGINEERED FEATURES + TRADE SIGNAL: Investor: 14D = 6 base + 8 forecast
-            # Forecast features: z_short, z_medium_lagged, direction, momentum, strength, trust, normalized_error, trade_signal
-            specs["investor_0"] = {"base": 14}
+            # TEMPORAL ALIGNMENT + CALIBRATED TRADE SIGNAL: Investor: 8D = 6 base + 2 forecast
+            # Forecast features: trade_signal (calibrated z_short) + forecast_trust
+            specs["investor_0"] = {"base": 8}
 
-            # Battery: 10D = 4 base + 3 separate generation (wind, solar, hydro) + 3 price (all horizons)
+            # Battery: 8D = 4 base + 3 separate generation (wind, solar, hydro) + 1 price (short only)
             # CHANGE: Use separate generation signals to preserve asset-specific patterns and correlations
-            specs["battery_operator_0"] = {"base": 10}
+            specs["battery_operator_0"] = {"base": 8}
 
             # Risk Controller: 12D = 9 base + 3 forecast signals
-            # NEW: Added price trend, volatility forecast, and trust
+            # NEW: Added short and long price signals plus trust
             specs["risk_controller_0"] = {"base": 12}
 
             # Meta Controller: 13D = 11 base + 2 forecast signals
-            # NEW: Added trust and expected return
+            # NEW: Added trust and expected return (short + long)
             specs["meta_controller_0"] = {"base": 13}
         else:
             # TIER 1: Baseline MARL (no forecasts)
@@ -131,9 +131,9 @@ class StabilizedObservationManager:
 
         # CONDITIONAL: investor_0 space depends on forecast utilisation
         if enable_forecast_util:
-            # TIER 22: Full forecast features (14D = 6 base + 8 forecast)
+            # TIER 2: Compact forecast features (8D = 6 base + 2 forecast)
             # Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl
-            # Forecast (8D): z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal
+            # Forecast (2D): trade_signal (calibrated z_short) + forecast_trust
             inv_low  = np.array([
                 -1.0,  # price_current (normalized, can be negative)
                 0.0,   # budget_normalized (always positive, [0, 1])
@@ -141,14 +141,8 @@ class StabilizedObservationManager:
                 -1.0,  # solar_position_norm (can be short)
                 -1.0,  # hydro_position_norm (can be short)
                 -1.0,  # mtm_pnl_norm (can be negative)
-                -1.0,  # z_short_price (short-term price forecast z-score)
-                -1.0,  # z_medium_lagged (medium-term price forecast, temporally aligned)
-                -1.0,  # direction (sign of forecast signal: -1, 0, +1)
-                -1.0,  # momentum (change in forecast signal)
-                0.0,   # strength (absolute magnitude of forecast signal)
-                0.0,   # forecast_trust (forecast trust score)
-                0.0,   # normalized_error (recent forecast error normalized by threshold)
-                -1.0   # trade_signal (direction * strength * trust: composite actionable signal, [-1, 1])
+                -1.0,  # trade_signal (calibrated z_short, [-1, 1])
+                0.0    # forecast_trust (quality indicator, [0, 1])
             ], dtype=np.float32)
             inv_high = np.array([
                 1.0,   # price_current
@@ -157,16 +151,10 @@ class StabilizedObservationManager:
                 1.0,   # solar_position_norm
                 1.0,   # hydro_position_norm
                 1.0,   # mtm_pnl_norm
-                1.0,   # z_short_price
-                1.0,   # z_medium_lagged
-                1.0,   # direction
-                1.0,   # momentum
-                1.0,   # strength
-                1.0,   # forecast_trust
-                1.0,   # normalized_error (0.0 = perfect, 1.0 = at threshold or worse) - CRITICAL FIX: Changed from 2.0 to 1.0 to match observation scale
-                1.0    # trade_signal
+                1.0,   # trade_signal
+                1.0    # forecast_trust
             ], dtype=np.float32)
-            inv_shape = (14,)
+            inv_shape = (8,)
         else:
             # Tier 1: 6D baseline observations (same structure as Tier 2, just no forecasts)
             # Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl
@@ -190,10 +178,10 @@ class StabilizedObservationManager:
 
         # CONDITIONAL: battery_operator_0 space depends on forecast utilisation
         if enable_forecast_util:
-            # TIER 2: Battery with SEPARATE generation forecasts (10D)
+            # TIER 2: Battery with SEPARATE generation forecasts (8D)
             # Base (4D): price, energy, capacity, load
             # Generation forecasts (3D): z_short_wind, z_short_solar, z_short_hydro (SEPARATE signals)
-            # Price forecasts (3D): z_short, z_medium, z_long (ALL HORIZONS)
+            # Price forecasts (1D): z_short (short only)
             # CHANGE: Use separate generation signals instead of merged total to preserve asset-specific patterns
             bat_low  = np.array([
                 -1.0,  # price_current
@@ -203,9 +191,7 @@ class StabilizedObservationManager:
                 -1.0,  # z_short_wind (separate wind generation forecast)
                 -1.0,  # z_short_solar (separate solar generation forecast)
                 -1.0,  # z_short_hydro (separate hydro generation forecast)
-                -1.0,  # z_short_price (immediate arbitrage)
-                -1.0,  # z_medium_price (4-hour planning)
-                -1.0   # z_long_price (day-ahead planning)
+                -1.0   # z_short_price (short-term price forecast)
             ], dtype=np.float32)
             bat_high = np.array([
                 1.0,   # price_current
@@ -215,11 +201,9 @@ class StabilizedObservationManager:
                 1.0,   # z_short_wind
                 1.0,   # z_short_solar
                 1.0,   # z_short_hydro
-                1.0,   # z_short_price
-                1.0,   # z_medium_price
-                1.0    # z_long_price
+                1.0    # z_short_price
             ], dtype=np.float32)
-            bat_shape = (10,)
+            bat_shape = (8,)
         else:
             # TIER 1: Battery baseline (4D)
             bat_low  = np.array([-1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # price, soc_normalized, capacity, load
@@ -230,14 +214,14 @@ class StabilizedObservationManager:
         if enable_forecast_util:
             # TIER 2: Risk controller with forecast signals (12D)
             # Base (9D): price_n, vol, stress, positions (3), cap_frac, equity, risk_mult
-            # Forecast (3D): z_short_price, price_volatility_forecast, forecast_trust
+            # Forecast (3D): z_short_price, z_long_price, forecast_trust
             risk_low  = np.array([
                 -1.0,  # price_n
                 0.0, 0.0,  # vol, stress
                 0.0, 0.0, 0.0,  # wind_pos, solar_pos, hydro_pos
                 0.0, 0.0, 0.0,  # cap_frac, equity, risk_mult
                 -1.0,  # z_short_price (price trend)
-                0.0,   # price_volatility_forecast (expected volatility)
+                -1.0,  # z_long_price (long-horizon signal)
                 0.0    # forecast_trust (forecast quality)
             ], dtype=np.float32)
             risk_high = np.array([
@@ -246,7 +230,7 @@ class StabilizedObservationManager:
                 10.0, 10.0, 10.0,  # wind_pos, solar_pos, hydro_pos
                 10.0, 10.0, 10.0,  # cap_frac, equity, risk_mult
                 1.0,   # z_short_price
-                10.0,  # price_volatility_forecast
+                1.0,   # z_long_price
                 1.0    # forecast_trust
             ], dtype=np.float32)
             risk_shape = (12,)
@@ -260,7 +244,7 @@ class StabilizedObservationManager:
         if enable_forecast_util:
             # TIER 2: Meta controller with forecast signals (13D)
             # Base (11D): budget, positions (3), price_n, risks (4), cap_frac
-            # Forecast (2D): forecast_trust, expected_return
+            # Forecast (2D): forecast_trust, expected_return (short + long)
             meta_low  = np.array([
                 0.0, 0.0, 0.0, 0.0,  # budget, positions (3)
                 -1.0,  # price_n
@@ -320,7 +304,6 @@ class ProfitFocusedRewardCalculator:
         self.portfolio_peak = float(self.initial_budget)
         self.emergency_liquidation_enabled = False  # Disabled: can't liquidate wind farms instantly
         self.emergency_liquidation_threshold = 0.10  # Only for extreme cases (90% loss)
-        # NOTE: max_drawdown_threshold will be set from config below
 
         # Technology operational volatilities (daily-ish proxies)
         self.operational_vols = {'wind': 0.03, 'solar': 0.025, 'hydro': 0.015}
@@ -332,11 +315,13 @@ class ProfitFocusedRewardCalculator:
 
         if config and hasattr(config, 'profit_reward_weight'):
             # Use config-driven reward weights (fair by default)
+            # NAV-first objective (fair across tiers): emphasize NAV stability/return,
+            # keep risk + hedging as small penalties.
             base_weights = {
-                'operational_revenue': 0.35,
-                'risk_management': 0.25,
-                'hedging_effectiveness': 0.20,
-                'nav_stability': 0.20,
+                'operational_revenue': 0.05,
+                'risk_management': 0.15,
+                'hedging_effectiveness': 0.10,
+                'nav_stability': 0.70,
                 'cash_flow': 0.0,
             }
             # Fair comparison: keep reward identical across tiers.
@@ -350,11 +335,13 @@ class ProfitFocusedRewardCalculator:
             }
         else:
             # Non-config path mirrors logic above (fair by default)
+            # NAV-first objective (fair across tiers): emphasize NAV stability/return,
+            # keep risk + hedging as small penalties.
             base_weights = {
-                'operational_revenue': 0.35,
-                'risk_management': 0.25,
-                'hedging_effectiveness': 0.20,
-                'nav_stability': 0.20,
+                'operational_revenue': 0.05,
+                'risk_management': 0.15,
+                'hedging_effectiveness': 0.10,
+                'nav_stability': 0.70,
                 'cash_flow': 0.0,
             }
             # Fair comparison: keep reward identical across tiers.
@@ -519,7 +506,6 @@ class ProfitFocusedRewardCalculator:
         )
 
         # NOTE (fair comparison):
-        # Predicted-reward injection (auxiliary shaping) has been removed.
         # All tiers train/evaluate on the same economic reward signal.
 
         if hasattr(self, 'config') and self.config:
@@ -611,7 +597,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
     metadata = {"name": "renewable_hybrid_fund:v1"}
 
     # ----- meta/risk knob ranges used by meta controller -----
-    # NOTE: These will be moved to config in the constructor
     META_FREQ_MIN = 6       # every hour if 10-min data
     META_FREQ_MAX = 24      # FIXED: Max 4 hours (was daily=288) to ensure active trading
     META_CAP_MIN  = 0.10    # USER SPECIFIED: 10% minimum capital allocation
@@ -712,7 +697,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.debt_service_rate = self.config.debt_service_rate
         self.distribution_rate = self.config.distribution_rate
 
-        # REMOVED: Extra costs that were causing the 25M loss dip (not in PrototypeTestTuned)
         # self.regulatory_compliance_rate = 0.0002  # Removed to match PrototypeTestTuned
         # self.audit_legal_rate = 0.0001           # Removed to match PrototypeTestTuned
         # self.custody_fee_rate = 0.0001           # Removed to match PrototypeTestTuned
@@ -829,28 +813,45 @@ class RenewableMultiAgentEnv(ParallelEnv):
         
         # FAIR SPARSE REWARD FIX: Multi-step rolling return buffer
         # This makes rewards less sparse by using rolling average of price returns
-        # REMOVED: Multi-step rolling returns and MTM delta buffers (reverted to original single-step rewards)
 
-        # Calculate rolling statistics for normalization (30-day window = 4320 timesteps)
-        window_size = min(4320, len(price_dkk_filtered))
-        price_rolling_mean = price_dkk_filtered.rolling(window=window_size, min_periods=1).mean()
-        price_rolling_std = price_dkk_filtered.rolling(window=window_size, min_periods=1).std()
+        # Price normalization for agent observations
+        # - Default: rolling mean/std inside the episode (non-stationary across episode boundaries)
+        # - Episode training (optional): global mean/std computed once from full training_dataset
+        use_global_norm = bool(getattr(self.config, "use_global_normalization", False))
+        g_mean = getattr(self.config, "global_price_mean", None)
+        g_std = getattr(self.config, "global_price_std", None)
 
-        # FIXED: Handle NaN values in rolling statistics
-        price_rolling_mean = price_rolling_mean.fillna(price_dkk_filtered.mean())
-        price_rolling_std = price_rolling_std.fillna(price_dkk_filtered.std())
-        price_rolling_std = price_rolling_std.replace(0.0, price_dkk_filtered.std())  # Avoid zero std
+        if use_global_norm and (g_mean is not None) and (g_std is not None):
+            mean_val = float(g_mean)
+            std_val = float(max(float(g_std), 1e-6))
+            price_normalized = (price_dkk_filtered - mean_val) / std_val
+            price_normalized_clipped = np.clip(price_normalized, -3.0, 3.0)
+            self._price = (price_normalized_clipped / 3.0).to_numpy()
+            # store constant arrays for any code that expects per-timestep mean/std
+            self._price_mean = np.full(len(self._price_raw), mean_val, dtype=float)
+            self._price_std = np.full(len(self._price_raw), std_val, dtype=float)
+            window_size = min(4320, len(price_dkk_filtered))
+        else:
+            # Calculate rolling statistics for normalization (30-day window = 4320 timesteps)
+            window_size = min(4320, len(price_dkk_filtered))
+            price_rolling_mean = price_dkk_filtered.rolling(window=window_size, min_periods=1).mean()
+            price_rolling_std = price_dkk_filtered.rolling(window=window_size, min_periods=1).std()
 
-        # Normalize prices for agent observations (z-score with bounds)
-        price_normalized = (price_dkk_filtered - price_rolling_mean) / (price_rolling_std + 1e-6)
-        price_normalized_clipped = np.clip(price_normalized, -3.0, 3.0)  # ±3 sigma bounds
+            # FIXED: Handle NaN values in rolling statistics
+            price_rolling_mean = price_rolling_mean.fillna(price_dkk_filtered.mean())
+            price_rolling_std = price_rolling_std.fillna(price_dkk_filtered.std())
+            price_rolling_std = price_rolling_std.replace(0.0, price_dkk_filtered.std())  # Avoid zero std
 
-        # Ensure downstream components (wrapper/overlay) see identical [-1, 1] scaling
-        self._price = (price_normalized_clipped / 3.0).to_numpy()
+            # Normalize prices for agent observations (z-score with bounds)
+            price_normalized = (price_dkk_filtered - price_rolling_mean) / (price_rolling_std + 1e-6)
+            price_normalized_clipped = np.clip(price_normalized, -3.0, 3.0)  # ±3 sigma bounds
 
-        # Store normalization parameters for revenue calculations
-        self._price_mean = price_rolling_mean.to_numpy()
-        self._price_std = price_rolling_std.to_numpy()
+            # Ensure downstream components (wrapper/overlay) see identical [-1, 1] scaling
+            self._price = (price_normalized_clipped / 3.0).to_numpy()
+
+            # Store normalization parameters for revenue calculations
+            self._price_mean = price_rolling_mean.to_numpy()
+            self._price_std = price_rolling_std.to_numpy()
 
         # FIXED: Prices remain in DKK throughout system for consistency
         # Raw prices in _price_raw are DKK, normalized prices in _price are z-scores
@@ -906,10 +907,17 @@ class RenewableMultiAgentEnv(ParallelEnv):
             except Exception:
                 return 1.0
 
-        self.wind_scale  = p95_robust(self._wind, min_scale=0.1)
-        self.solar_scale = p95_robust(self._solar, min_scale=0.1)
-        self.hydro_scale = p95_robust(self._hydro, min_scale=0.1)
-        self.load_scale  = p95_robust(self._load, min_scale=0.1)
+        if use_global_norm:
+            # Prefer global p95 scales when available, fall back to per-episode robust p95.
+            self.wind_scale  = float(getattr(self.config, "global_wind_scale", None) or p95_robust(self._wind,  min_scale=0.1))
+            self.solar_scale = float(getattr(self.config, "global_solar_scale", None) or p95_robust(self._solar, min_scale=0.1))
+            self.hydro_scale = float(getattr(self.config, "global_hydro_scale", None) or p95_robust(self._hydro, min_scale=0.1))
+            self.load_scale  = float(getattr(self.config, "global_load_scale", None) or p95_robust(self._load,  min_scale=0.1))
+        else:
+            self.wind_scale  = p95_robust(self._wind, min_scale=0.1)
+            self.solar_scale = p95_robust(self._solar, min_scale=0.1)
+            self.hydro_scale = p95_robust(self._hydro, min_scale=0.1)
+            self.load_scale  = p95_robust(self._load, min_scale=0.1)
 
         # agents
         self.possible_agents = ["investor_0", "battery_operator_0", "risk_controller_0", "meta_controller_0"]
@@ -920,12 +928,19 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.observation_spaces = {a: self.obs_manager.obs_space(a) for a in self.possible_agents}
 
         # FIXED: Normalized action spaces - all agents use [-1, 1] range for consistent learning
+        # MINIMAL MODE: Investor action is exposure-only (single scalar).
+        investor_shape = (1,)
         self.action_spaces = {
-            "investor_0":         spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
+            # Investor action (structural anti-collapse):
+            # - exposure-only: [exposure_raw] in [-1,1]
+            "investor_0":         spaces.Box(low=-1.0, high=1.0, shape=investor_shape, dtype=np.float32),
             "battery_operator_0": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
             "risk_controller_0":  spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),  # FIXED: [-1,1] instead of [0,2]
             "meta_controller_0":  spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),  # FIXED: [-1,1] instead of [0,1]
         }
+
+        # Meta-controlled exposure (used when investor_exposure_controller="meta")
+        self.meta_exposure = 1.0
 
         # CRITICAL FIX: Reward calculator is now initialized AFTER asset deployment above
         # No need to set to None here as it's already properly initialized
@@ -957,6 +972,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
             'medium': deque(maxlen=100),  # Track last 100 MAPE values for medium horizon
             'long': deque(maxlen=100),    # Track last 100 MAPE values for long horizon
         }
+
+        # Observation/action diagnostics: rolling correlation between obs_trade_signal and investor action
+        self._obs_trade_signal_hist = deque(maxlen=500)
+        self._investor_action_dir_hist = deque(maxlen=500)
+        self._investor_exposure_hist = deque(maxlen=500)
+        self._investor_delta_exposure_hist = deque(maxlen=500)
+        self._last_investor_exposure = None
         # FIX #21: CRITICAL BUG - maxlen must be >= horizon length!
         # Long horizon = 144 steps, so we need at least 144 pairs stored
         # Using 200 for safety margin (allows for 200 - 144 = 56 extra pairs)
@@ -1570,12 +1592,24 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self._forecast_errors[target].append(float(np.clip(error, 0.0, 10.0)))
                 self._forecast_history_per_target[target].append(float(forecast_normalized))
 
-                # DIAGNOSTIC LOGGING: Track MAPE for all targets (every 500 steps)
+                # DIAGNOSTIC LOGGING (every 500 steps)
+                # IMPORTANT: this tracker is in *normalized space* (z-score for price; scaled for wind/solar/hydro/load).
+                # It is NOT the same as the horizon MAPE used for Tier2 trust/error (which is computed in raw price space).
                 if self.t % 500 == 0 and len(self._forecast_errors[target]) >= 10:
                     recent_mape = np.mean(list(self._forecast_errors[target])[-10:])
-                    logger.info(f"[MAPE_TRACKING] t={self.t} target={target} recent_mape={recent_mape:.4f} "
-                               f"samples={len(self._forecast_errors[target])} "
-                               f"actual={actual_normalized:.4f} forecast={forecast_normalized:.4f}")
+                    if target == "price":
+                        # Avoid confusion: this is z-space tracking, not raw-price MAPE.
+                        logger.info(
+                            f"[PRICE_ZSPACE_TRACKING] t={self.t} recent_err={recent_mape:.4f} "
+                            f"samples={len(self._forecast_errors[target])} "
+                            f"actual_z={actual_normalized:.4f} forecast_z={forecast_normalized:.4f}"
+                        )
+                    else:
+                        logger.info(
+                            f"[MAPE_TRACKING] t={self.t} target={target} recent_mape={recent_mape:.4f} "
+                            f"samples={len(self._forecast_errors[target])} "
+                            f"actual={actual_normalized:.4f} forecast={forecast_normalized:.4f}"
+                        )
         except Exception as e:
             # Log errors for debugging (MAPE tracking failures are critical)
             if self.t % 1000 == 0:
@@ -1599,7 +1633,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
     # PATCH: aligned-horizon forecast helpers
     # ------------------------------------------------------------------
     def _aligned_horizon_steps(self) -> int:
-        """DEPRECATED: Use config-driven horizon selection instead."""
         # This method is kept for backward compatibility but should use config
         try:
             inv_freq = int(max(1, getattr(self, "investment_freq", 6)))
@@ -1808,6 +1841,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
         if not hasattr(self, '_episode_counter') or self._episode_counter == -1:
             # First reset (Episode 0) - ensure t=0
             self.t = 0
+            # Ensure config-global step counter exists (persists across episodes, since config is reused).
+            if self.config is not None and not hasattr(self.config, "training_global_step"):
+                try:
+                    self.config.training_global_step = 0
+                except Exception:
+                    pass
 
         # Only reset time if true episode end
         if is_true_episode_end:
@@ -1950,7 +1989,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
         
-        # REMOVED: Buffer clearing (reverted to original - no buffers needed)
 
         # CRITICAL FIX: Recalculate NAV with current state (preserving financial gains)
         # Use current timestep for depreciation calculation
@@ -2134,8 +2172,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         try:
             i = self.t
+            # Persisting step counter for warmups/regularizers:
+            # Use config.training_global_step because episode training creates a NEW env each episode.
+            try:
+                if self.config is not None:
+                    self.config.training_global_step = int(getattr(self.config, "training_global_step", 0)) + 1
+            except Exception:
+                pass
 
-            # REMOVED: Expert suggestion cache clearing (legacy code removed)
 
             acts = self._validate_actions(actions)
 
@@ -2155,14 +2199,43 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 try:
                     if key == 'investor_0':
                         arr = np.array(v, dtype=np.float32).reshape(-1)
-                        # Map first 3 dims to wind/solar/hydro (ignore extra dims if any)
+                        # Exposure-only policy output (1D). Keep keys for logging compatibility.
+                        exposure_raw = float(arr[0]) if arr.size > 0 else 1.0
                         self._last_actions[key] = {
-                            'wind': float(arr[0]) if arr.size > 0 else 0.0,
-                            'solar': float(arr[1]) if arr.size > 1 else 0.0,
-                            'hydro': float(arr[2]) if arr.size > 2 else 0.0,
+                            'exposure_raw': exposure_raw,
+                            'wind': 0.0,
+                            'solar': 0.0,
+                            'hydro': 0.0,
                         }
                         # Preserve raw for debugging if needed
                         self._last_actions[key + '_raw'] = arr.astype(float).tolist()
+
+                        # ALSO compute executed allocation immediately (exposure-only mode).
+                        # Ensures logs reflect actual trades and penalties use executed exposure.
+                        try:
+                            exposure_controller = str(getattr(self.config, "investor_exposure_controller", "investor") or "investor").lower()
+                            if exposure_controller == "meta":
+                                exposure = float(np.clip(getattr(self, "meta_exposure", 1.0), -1.0, 1.0))
+                            else:
+                                exposure = float(np.clip(arr[0] if arr.size > 0 else 1.0, -1.0, 1.0))
+
+                            # Fixed equal weights across instruments (aggregate instrument behavior).
+                            w = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+                            w = (w / float(np.sum(np.abs(w)))).astype(np.float32)
+                            alloc = (exposure * w).astype(np.float32)
+
+                            self._last_actions["investor_0_exec"] = {
+                                "wind": float(alloc[0]),
+                                "solar": float(alloc[1]),
+                                "hydro": float(alloc[2]),
+                                "exposure": float(exposure),
+                                "w_wind": float(w[0]),
+                                "w_solar": float(w[1]),
+                                "w_hydro": float(w[2]),
+                            }
+                            self._last_investor_action_exec = alloc.copy()
+                        except Exception:
+                            pass
                     elif key == 'battery_operator_0':
                         arr = np.array(v, dtype=np.float32).reshape(-1)
                         u_raw = float(arr[0]) if arr.size > 0 else 0.0
@@ -2215,8 +2288,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # This ensures forecast deltas are always available when forecasts are loaded
             enable_forecast_util = getattr(self.config, 'enable_forecast_utilisation', False)
             if enable_forecast_util and self.forecast_generator is not None:
-                # Compute z-scores for Tier 2 observations (even if overlay is disabled)
-                self._compute_forecast_deltas(i)
+                # Compute z-scores for CURRENT timestep i (used for calibration/trust history, logging, etc.)
+                self._compute_forecast_deltas(i, update_calibration=True)
 
             # Run overlay inference once per step with 34D features (28D base + 6D deltas)
             # Use dl_adapter_overlay (DLAdapter) for overlay inference
@@ -2269,7 +2342,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
                                    f"mult={regime_info['position_multiplier']:.2f}, "
                                    f"hurst={regime_info['metrics'].get('hurst_exponent', 0.5):.3f})")
 
-            # NOTE: CALIBRATION TRACKER UPDATE MOVED TO AFTER z_short IS SET (line ~2930)
 
             # === ENHANCEMENT 6: DIAGNOSTIC LOGGING ===
             # Log overlay state for monitoring
@@ -2299,6 +2371,17 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self.step_in_episode = self.t
 
             index = max(0, self.t - 1)
+            # ------------------------------------------------------------------
+            # IMPORTANT: Ensure policy sees forecast features aligned to the same timestep as base obs
+            # ------------------------------------------------------------------
+            # After incrementing self.t, the next observation is for timestep `self.t`.
+            # We recompute forecast deltas for that timestep WITHOUT updating calibration/trust
+            # (to avoid double-counting within a single environment step).
+            if enable_forecast_util and self.forecast_generator is not None and self.t < self.max_steps:
+                try:
+                    self._compute_forecast_deltas(self.t, update_calibration=False)
+                except Exception:
+                    pass
             self._fill_obs()
 
             # CRITICAL FIX: Update forecast generator with current observations
@@ -2324,7 +2407,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self.forecast_engine.update_forecast_trust(
                     calibration_tracker=getattr(self, 'calibration_tracker', None)
                 )
-                self._compute_forecast_signals()
+                # FGB signals are Tier3-only (require overlay). Do NOT clobber Tier2 trust with FGB defaults.
+                if bool(getattr(self.config, 'overlay_enabled', False)):
+                    self._compute_forecast_signals()
 
             self._populate_info(index, financial, acts)
 
@@ -2428,53 +2513,24 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 # Forecast utilisation should help via better observations, not extra sizing mechanics.
                 disable_confidence_scaling=True
             )
+
+            # Meta-controlled exposure (structural anti-collapse):
+            # Interpret meta_action[0] as an exposure dial in [-1,1] when enabled.
+            try:
+                exposure_controller = str(getattr(self.config, "investor_exposure_controller", "investor") or "investor").lower()
+                if exposure_controller == "meta":
+                    a0 = float(np.array(meta_action, dtype=np.float32).reshape(-1)[0])
+                    # Signed exposure so meta can take short positions
+                    self.meta_exposure = float(np.clip(a0, -1.0, 1.0))
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"Meta control failed: {e}")
             # Keep current values on error
 
     # ------------------------------------------------------------------
-    # REMOVED: Old asset-specific hedging logic (conflicted with single-price approach)
     # Now using portfolio-level _calculate_portfolio_hedge_intensity() instead
     # ------------------------------------------------------------------
-
-
-
-    def _get_generation_exposure_weights(self) -> np.ndarray:
-        """
-        Calculate exposure weights based on expected generation (MWh)
-        Used for portfolio-level hedge intensity calculation
-        """
-        try:
-            # Get expected generation for each asset
-            wind_capacity = self.physical_assets.get('wind_capacity_mw', 0)
-            solar_capacity = self.physical_assets.get('solar_capacity_mw', 0)
-            hydro_capacity = self.physical_assets.get('hydro_capacity_mw', 0)
-
-            # Estimate annual generation (capacity factor assumptions)
-            wind_cf = 0.35  # 35% capacity factor for wind
-            solar_cf = 0.20  # 20% capacity factor for solar
-            hydro_cf = 0.45  # 45% capacity factor for hydro
-
-            wind_generation = wind_capacity * wind_cf * 8760  # MWh/year
-            solar_generation = solar_capacity * solar_cf * 8760
-            hydro_generation = hydro_capacity * hydro_cf * 8760
-
-            total_generation = wind_generation + solar_generation + hydro_generation
-
-            if total_generation > 0:
-                return np.array([
-                    wind_generation / total_generation,
-                    solar_generation / total_generation,
-                    hydro_generation / total_generation
-                ])
-            else:
-                # Fallback to equal weights
-                return np.array([1/3, 1/3, 1/3])
-
-        except Exception as e:
-            # Fallback to equal weights
-            return np.array([1/3, 1/3, 1/3])
-
     def _get_risk_budget_allocation(self) -> np.ndarray:
         """
         Get risk budget allocation for hedge distribution across sleeves
@@ -2546,7 +2602,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
     #     """CRITICAL: Set reference to wrapper for profit-seeking expert"""
     #     self._wrapper_ref = wrapper_env
 
-    # REMOVED: get_expert_suggestion() - Legacy expert suggestion system removed
     # GNN encoder optionally learns feature relationships (works for both Tier 1 and Tier 2)
     # (when --enable_gnn_encoder flag enabled, optionally combined with --enable_forecast_utilisation for Tier 2).
     # Pre-trained ANN/LSTM forecasts provide additional observations.
@@ -2579,17 +2634,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             amplitude = np.clip((intensity - 0.5) / 1.5, 0.0, 1.0)  # [0,1] from ~[0.5,2.0], weaker signals
 
             # ===== ADAPTIVE RISK BUDGETING (34D: 28D base + 6D deltas) =====
-            # CRITICAL FIX: Only apply risk_budget to legacy hedge calculations
             # This function is used for fallback hedging when overlay is not active
-            # When overlay_alpha=1.0, this function should NOT be called (expert suggestions used instead)
-            # When overlay_alpha<1.0, this provides baseline hedge that gets blended
 
-            # DECISION: Do NOT apply overlay risk_budget here
             # REASON: This creates triple-scaling:
-            #   1. risk_budget scales amplitude here
-            #   2. risk_budget scales positions in _execute_investor_trades (when alpha<1.0)
             #   3. Blending with expert suggestions (which already account for risk)
-            # SOLUTION: Remove risk_budget application from this legacy function
 
             # Defense gates are still valid (reduce hedging during losses/drawdowns)
             defense_multiplier = 1.0
@@ -2644,23 +2692,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # CRITICAL FIX: Use timestep parameter if provided, otherwise use self.t
         t = timestep if timestep is not None else getattr(self, 't', 0)
         
-        # === FGB: ACTION BLENDING REMOVED ===
-        # DEPRECATED: Action blending has been replaced by forecast-guided baseline.
-        # The DL overlay now informs the PPO baseline and risk sizing, not action execution.
-        # PPO remains the action decision-maker; we reduce advantage variance via baseline adjustment.
-        #
-        # Old code path (enable_action_blending) is disabled by default.
-        # If accidentally enabled, emit deprecation warning and skip.
-        if getattr(self.config, 'enable_action_blending', False):
-            if getattr(self.config, 'deprecation_warnings', True):
-                logger.warning(
-                    "[FGB] DEPRECATED: enable_action_blending is no longer supported. "
-                    "Action blending has been replaced by forecast-guided baseline. "
-                    "Set enable_action_blending=False and use forecast_baseline_enable=True instead."
-                )
-            # Do NOT blend actions - use RL policy directly
-            # Fall through to use original policy action
-
         # Trading is only allowed at the specified frequency
         # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
         # CRITICAL FIX: Prevent trading at timestep 0 to ensure identical initial NAV
@@ -2741,80 +2772,78 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     f"vol_brake={volatility_brake_mult:.4f}, combined={combined_multiplier:.4f}"
                 )
 
-            # === STEP 2: Map the agent's normalized actions to target DKK positions ===
-            # ENHANCED: Apply Kelly position sizing + regime detection
-            action_wind, action_solar, action_hydro = inv_action
+            # === STEP 2: Map the agent's normalized action to target DKK positions ===
+            # MINIMAL MODE: Investor action is exposure-only; allocation across wind/solar/hydro is fixed.
+            a = np.asarray(inv_action, dtype=np.float32).reshape(-1)
+            exposure_controller = str(getattr(self.config, "investor_exposure_controller", "investor") or "investor").lower()
+            if exposure_controller == "meta":
+                # Meta controls exposure in minimal mode as well.
+                exposure_raw = float(getattr(self, "meta_exposure", 1.0))
+            else:
+                exposure_raw = float(a[0]) if a.size >= 1 else 1.0
+            # Signed exposure: allow shorting to align with negative forecast signals.
+            exposure = float(np.clip(exposure_raw, -1.0, 1.0))
+            # Log exposure at decision cadence for action-scale debugging
+            try:
+                inv_freq = int(getattr(self, "investment_freq", 6))
+            except Exception:
+                inv_freq = 6
+            if t % inv_freq == 0:
+                logger.debug(
+                    f"[INVESTOR_EXPOSURE_RAW] t={t} exposure_raw={exposure_raw:.4f} exposure_clipped={exposure:.4f} "
+                    f"controller={exposure_controller}"
+                )
+            exposure_mag = abs(exposure)
+            tradeable_capital *= exposure_mag
 
-            # Get Kelly multipliers (asset-specific)
-            # FIX: Extract per-asset forecast confidence from overlay
-            forecast_confidences = {
-                'wind': 1.0,
-                'solar': 1.0,
-                'hydro': 1.0
-            }
+            self._last_risk_multiplier = float(risk_controller_mult)
+            self._last_vol_brake_mult = float(volatility_brake_mult)
+            self._last_strategy_multiplier = float(strategy_multiplier)
+            self._last_combined_multiplier = float(combined_multiplier)
+            self._last_tradeable_capital = float(tradeable_capital)
 
-            # Forecast confidence: computed purely from forecast model errors (Tier 2/3 identical).
-            # NOTE: We do not use overlay outputs for sizing to keep Tier 3 a fair Tier 2 comparison.
-            confidence_floor = getattr(self.config, 'confidence_floor', 0.6)
-            if hasattr(self, '_forecast_errors'):
-                for asset in ['wind', 'solar', 'hydro']:
-                    asset_errors = self._forecast_errors.get(asset, [])
-                    if len(asset_errors) >= 10:
-                        recent_mape = np.mean(list(asset_errors)[-10:])
-                        confidence = 1.0 - np.clip(recent_mape, 0.0, 0.5)  # 0%->1.0, 50%->0.5
-                        forecast_confidences[asset] = float(np.clip(confidence, confidence_floor, 1.0))
+            # Fixed equal weights across instruments (aggregate instrument behavior).
+            w = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            w = (w / float(np.sum(np.abs(w)))).astype(np.float32)
 
-            # Get current volatility regime
-            vol_regime = self._current_regime.get('metrics', {}).get('volatility_regime', 1.0) if hasattr(self, '_current_regime') else 1.0
+            alloc = (exposure * w).astype(np.float32)
+            action_wind, action_solar, action_hydro = float(alloc[0]), float(alloc[1]), float(alloc[2])
 
-            # Get Kelly multipliers (already includes vol_regime adjustment internally)
-            kelly_multipliers = self.kelly_sizer.get_multipliers(forecast_confidences, vol_regime)
+            # CRITICAL: Store executed (post-simplex) action for logging + penalties.
+            # Without this, logs/regularizers can target the raw policy output while the environment trades on
+            # a different normalized action, which breaks our saturation metrics and allows "penalty gaming".
+            try:
+                if not hasattr(self, "_last_actions") or not isinstance(getattr(self, "_last_actions", None), dict):
+                    self._last_actions = {}
+                self._last_actions["investor_0_exec"] = {
+                    # executed allocation (what the environment actually trades on)
+                    "wind": float(action_wind),
+                    "solar": float(action_solar),
+                    "hydro": float(action_hydro),
+                    # extra interpretability fields
+                    "exposure": float(exposure),
+                    "w_wind": float(w[0]),
+                    "w_solar": float(w[1]),
+                    "w_hydro": float(w[2]),
+                }
+                self._last_investor_action_exec = np.array([action_wind, action_solar, action_hydro], dtype=np.float32)
+            except Exception:
+                pass
 
-            # Get regime multiplier (market-wide)
-            regime_mult = self._current_regime.get('position_multiplier', 1.0) if hasattr(self, '_current_regime') else 1.0
+            # Single aggregate sizing: use one cap and split equally across assets.
+            max_pos_size = tradeable_capital * self.config.max_position_size
+            per_asset_cap = max_pos_size / 3.0
 
-            # FIX: Combine multipliers more carefully to avoid extreme values
-            # Strategy: Use geometric mean for independent factors, arithmetic for dependent
-            #
-            # combined_multiplier already includes: position_size_multiplier × overlay_risk × vol_brake
-            # kelly_multipliers already includes: kelly_fraction × confidence^2 × vol_adj × corr_adj
-            # regime_mult is: regime-based adjustment (0.5-1.5)
-            #
-            # Problem: Multiplicative stacking can give 0.125x - 3.375x range (too extreme!)
-            # Solution: Use weighted geometric mean to dampen extremes
-
-            final_multipliers = {}
-            for asset in ['wind', 'solar', 'hydro']:
-                # Geometric mean of kelly and regime (dampens extremes)
-                kelly_regime = np.sqrt(kelly_multipliers[asset] * regime_mult)
-
-                # Multiply by combined_multiplier (drawdown brake + overlay + vol brake)
-                # This is appropriate because combined_multiplier is a safety constraint
-                final_mult = combined_multiplier * kelly_regime
-
-                # Clip to reasonable range [0.3, 2.0]
-                final_multipliers[asset] = float(np.clip(final_mult, 0.3, 2.0))
-
-            # Apply asset-specific multipliers
-            max_pos_size_wind = tradeable_capital * self.config.max_position_size * final_multipliers['wind']
-            max_pos_size_solar = tradeable_capital * self.config.max_position_size * final_multipliers['solar']
-            max_pos_size_hydro = tradeable_capital * self.config.max_position_size * final_multipliers['hydro']
-
-            target_wind = action_wind * max_pos_size_wind
-            target_solar = action_solar * max_pos_size_solar
-            target_hydro = action_hydro * max_pos_size_hydro
+            target_wind = action_wind * per_asset_cap
+            target_solar = action_solar * per_asset_cap
+            target_hydro = action_hydro * per_asset_cap
 
             # Log combined multipliers periodically
             # CRITICAL FIX: Use t (timestep parameter) instead of self.t for consistency
             if t % 500 == 0 and t > 0:
-                kelly_regime_geom = np.sqrt(kelly_multipliers['wind'] * regime_mult)
-                logger.info(f"[SIZING] Step {t}: "
-                           f"conf={forecast_confidences['wind']:.2f}, "
-                           f"kelly={kelly_multipliers['wind']:.2f}, "
-                           f"regime={regime_mult:.2f}, "
-                           f"k×r_geom={kelly_regime_geom:.2f}, "
+                logger.info(f"[SIZING] Step {t}: exposure={exposure:.2f}, "
                            f"combined={combined_multiplier:.2f}, "
-                           f"final={final_multipliers['wind']:.2f}")
+                           f"max_pos={max_pos_size:,.0f}, per_asset={per_asset_cap:,.0f}")
 
             # === STEP 3: STRATEGY 3 - MTM Loss Management ===
             # Check for large unrealized losses and force exit if threshold exceeded
@@ -2860,6 +2889,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
                                 f"loss_pct={mtm_loss_pct:.2%} > thr={mtm_loss_threshold_pct:.2%}, "
                                 f"exposure={current_pos:,.0f} DKK, mtm_value={mtm_value:,.0f} DKK"
                             )
+
+            self._last_mtm_exit_count = int(len(mtm_exits_forced))
             
             # Update current positions after MTM exits
             current_wind = self.financial_positions.get('wind_instrument_value', 0.0)
@@ -2992,7 +3023,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         except Exception:
             return 0.0
 
-    def _compute_forecast_deltas(self, i: int) -> None:
+    def _compute_forecast_deltas(self, i: int, update_calibration: bool = True) -> None:
         """
         Compute forecast z-scores for Tier 2 observations.
 
@@ -3149,15 +3180,23 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # We still apply tanh for bounded z-scores, but with a different scale
 
             # Compute forecast returns (already computed in _forecast_deltas_raw)
-            forecast_return_short = delta_price_short_raw / max(abs(price_raw), 1.0)
-            forecast_return_medium = delta_price_medium_raw / max(abs(price_raw), 1.0)
-            forecast_return_long = delta_price_long_raw / max(abs(price_raw), 1.0)
+            # ANTI-SATURATION: use denominator floor + clip returns + configurable tanh scale.
+            denom_floor = float(getattr(self.config, 'forecast_return_denom_floor', 1.0) or 1.0)
+            denom = max(abs(price_raw), denom_floor, 1.0)
+            forecast_return_short = delta_price_short_raw / denom
+            forecast_return_medium = delta_price_medium_raw / denom
+            forecast_return_long = delta_price_long_raw / denom
 
-            # Apply tanh with scaling factor (typical returns are ±5%, so scale by 10x)
-            # This maps ±5% returns to ±0.46 z-scores, ±10% to ±0.76, ±20% to ±0.96
-            z_short = np.tanh(forecast_return_short * 10.0)
-            z_medium = np.tanh(forecast_return_medium * 10.0)
-            z_long = np.tanh(forecast_return_long * 10.0)
+            ret_clip = float(getattr(self.config, 'forecast_return_clip', 1e9) or 1e9)
+            if ret_clip > 0:
+                forecast_return_short = float(np.clip(forecast_return_short, -ret_clip, ret_clip))
+                forecast_return_medium = float(np.clip(forecast_return_medium, -ret_clip, ret_clip))
+                forecast_return_long = float(np.clip(forecast_return_long, -ret_clip, ret_clip))
+
+            tanh_scale = float(getattr(self.config, 'forecast_return_tanh_scale', 10.0) or 10.0)
+            z_short = np.tanh(forecast_return_short * tanh_scale)
+            z_medium = np.tanh(forecast_return_medium * tanh_scale)
+            z_long = np.tanh(forecast_return_long * tanh_scale)
 
             # Update EMA std using FORECAST RETURN magnitudes (for tracking typical return volatility)
             # This tracks the typical magnitude of forecast returns, not absolute deltas
@@ -3207,8 +3246,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if i == 500:
                 logger.debug(f"[DEBUG_COMPUTE_DELTAS] t={i} SET z_short_price={self.z_short_price:.6f} z_medium_price={self.z_medium_price:.6f}")
 
-            # DIAGNOSTIC: Log z-score computation (every 1000 steps)
-            if i % 1000 == 0:
+            # DIAGNOSTIC LOGGING
+            # We only emit heavy diagnostics on the "main" pass (update_calibration=True) to prevent duplicate logs.
+            if update_calibration and i % 1000 == 0:
                 logger.info(f"[Z_SCORE_COMPUTATION_RETURNS] t={i}")
                 logger.info(f"  forecast_return_short={forecast_return_short*100:.2f}%, ema_std_short={self.ema_std_short*100:.2f}%")
                 logger.info(f"  z_short_raw={z_short:.4f} → z_short_price={self.z_short_price:.4f} (clipped)")
@@ -3374,32 +3414,62 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self.mwdir = float(np.clip(mwdir, -1.0, 1.0))
             self.abs_mwdir = float(np.clip(abs(mwdir), 0.0, 1.0))
 
-            # CRITICAL FIX: Update calibration tracker HERE (not in _build_overlay_features)
-            # This ensures trust is computed even when overlay_enabled=False (Tier 2)
-            # The calibration tracker needs the EMA std values from BEFORE the update
-            # Store them for the calibration tracker
-            self._ema_std_short_for_calibration = self.ema_std_short
-            self._ema_std_medium_for_calibration = self.ema_std_medium
-            self._ema_std_long_for_calibration = self.ema_std_long
+            # ------------------------------------------------------------------
+            # Calibration / trust update
+            # ------------------------------------------------------------------
+            # IMPORTANT: We must NOT update calibration/trust twice per environment step.
+            # - During `step()`, we compute deltas once for the current timestep i (update_calibration=True),
+            #   then (after incrementing self.t) we may recompute deltas for the next observation (update_calibration=False)
+            #   to avoid a 1-step "staleness" in the policy-visible forecast features.
+            if update_calibration:
+                # CRITICAL FIX: Update calibration tracker HERE (not in _build_overlay_features)
+                # This ensures trust is computed even when overlay_enabled=False (Tier 2)
+                self._ema_std_short_for_calibration = self.ema_std_short
+                self._ema_std_medium_for_calibration = self.ema_std_medium
+                self._ema_std_long_for_calibration = self.ema_std_long
 
-            # Update calibration tracker with forecast/realized pairs
-            self._update_calibration_tracker(i)
+                # Update calibration tracker with forecast/realized pairs
+                self._update_calibration_tracker(i)
 
-            # Store forecast trust (from CalibrationTracker if available)
-            # This must come AFTER _update_calibration_tracker() to get the latest trust value
-            # FIX: Pass recent MAPE to make trust responsive to forecast quality
-            if hasattr(self, 'calibration_tracker') and self.calibration_tracker is not None:
-                # Get recent MAPE from short horizon (most relevant for trust)
-                recent_mape = None
-                if hasattr(self, '_horizon_mape') and len(self._horizon_mape.get('short', [])) > 0:
-                    # Use average of last 10 MAPE values for stability
-                    recent_mape_values = list(self._horizon_mape['short'])[-10:]
-                    if len(recent_mape_values) > 0:
-                        recent_mape = float(np.mean(recent_mape_values))
+                # Store forecast trust (from CalibrationTracker if available)
+                # This must come AFTER _update_calibration_tracker() to get the latest trust value
+                if hasattr(self, 'calibration_tracker') and self.calibration_tracker is not None:
+                    # Get recent MAPE from short horizon (most relevant for trust)
+                    recent_mape = None
+                    if hasattr(self, '_horizon_mape') and len(self._horizon_mape.get('short', [])) > 0:
+                        recent_mape_values = list(self._horizon_mape['short'])[-10:]
+                        if len(recent_mape_values) > 0:
+                            recent_mape = float(np.mean(recent_mape_values))
 
-                self._forecast_trust = self.calibration_tracker.get_trust(horizon="short", recent_mape=recent_mape)
-            else:
-                self._forecast_trust = 0.5  # Default neutral trust
+                    self._forecast_trust = self.calibration_tracker.get_trust(horizon="short", recent_mape=recent_mape)
+                else:
+                    # Tier 2 (no calibration tracker): derive trust from recent horizon MAPE (observation-only, no reward shaping).
+                    def _mean_last(h: str, n: int = 10) -> float:
+                        try:
+                            xs = list(getattr(self, '_horizon_mape', {}).get(h, []))[-n:]
+                            xs = [float(x) for x in xs if np.isfinite(x)]
+                            return float(np.mean(xs)) if len(xs) > 0 else float(getattr(self, '_mape_thresholds', {}).get(h, 0.12))
+                        except Exception:
+                            return float(getattr(self, '_mape_thresholds', {}).get(h, 0.12))
+
+                    mape_short = _mean_last('short', 10)
+                    mape_medium = _mean_last('medium', 10)
+                    mape_long = _mean_last('long', 10)
+                    weighted_mape = float(0.70 * mape_short + 0.20 * mape_medium + 0.10 * mape_long)
+
+                    if weighted_mape < 0.05:
+                        trust_target = 1.0
+                    elif weighted_mape < 0.10:
+                        trust_target = 0.8
+                    elif weighted_mape < 0.15:
+                        trust_target = 0.6
+                    elif weighted_mape < 0.20:
+                        trust_target = 0.4
+                    else:
+                        trust_target = 0.2
+
+                    prev = float(getattr(self, '_forecast_trust', 0.5))
+                    self._forecast_trust = float(0.7 * trust_target + 0.3 * prev)
 
             # =====================================================================
             # NOVEL: FORECAST RETURNS INTEGRATION (Bias-Immune)
@@ -3424,42 +3494,42 @@ class RenewableMultiAgentEnv(ParallelEnv):
             price_capacity = 6982.0  # Forecast model capacity (for MAPE calculation)
             self._current_price_floor = float(price_capacity)
 
-            # DIAGNOSTIC LOGGING: Track forecast returns (every 200 steps)
-            if i % 200 == 0:
-                logger.debug(f"[FORECAST_RETURNS] t={i} price={price_raw:.2f} short={forecast_return_short*100:.2f}% med={forecast_return_medium*100:.2f}% long={forecast_return_long*100:.2f}%")
-                logger.info(f"[FORECAST_RETURNS] t={i} price_raw={price_raw:.2f} "
-                           f"return_short={forecast_return_short:.6f} ({forecast_return_short*100:.2f}%) "
-                           f"return_medium={forecast_return_medium:.6f} ({forecast_return_medium*100:.2f}%) "
-                           f"return_long={forecast_return_long:.6f} ({forecast_return_long*100:.2f}%) "
-                           f"abs_short={delta_price_short_raw:.2f} abs_medium={delta_price_medium_raw:.2f} abs_long={delta_price_long_raw:.2f}")
+            # DIAGNOSTIC LOGGING: Track forecast returns (every 200 steps) — main pass only
+            if update_calibration and i % 200 == 0:
+                logger.debug(
+                    f"[FORECAST_RETURNS] t={i} price={price_raw:.2f} short={forecast_return_short*100:.2f}% "
+                    f"med={forecast_return_medium*100:.2f}% long={forecast_return_long*100:.2f}%"
+                )
+                logger.info(
+                    f"[FORECAST_RETURNS] t={i} price_raw={price_raw:.2f} "
+                    f"return_short={forecast_return_short:.6f} ({forecast_return_short*100:.2f}%) "
+                    f"return_medium={forecast_return_medium:.6f} ({forecast_return_medium*100:.2f}%) "
+                    f"return_long={forecast_return_long:.6f} ({forecast_return_long*100:.2f}%) "
+                    f"abs_short={delta_price_short_raw:.2f} abs_medium={delta_price_medium_raw:.2f} abs_long={delta_price_long_raw:.2f}"
+                )
 
-            # CRITICAL FIX: Store MAPE thresholds in CAPACITY-BASED form (Fix #18)
-            # FIX #19: MAPE and deltas now use same denominator (price_capacity)
-            # FIX #22: price_capacity = 6982 DKK (forecast model capacity)
-            # This ensures consistent comparison between forecast deltas and MAPE thresholds
-            self._mape_thresholds = {}
-            for horizon in ['short', 'medium', 'long']:
-                if hasattr(self, '_horizon_mape') and len(self._horizon_mape.get(horizon, [])) > 0:
-                    # Use average of last 10 MAPE values (capacity-based after Fix #18)
-                    recent_mape_values = list(self._horizon_mape[horizon])[-10:]
-                    if len(recent_mape_values) > 0:
-                        # MAPE is capacity-based (e.g., 0.005 = 10 DKK error / 2000 DKK capacity)
-                        mape_capacity = float(np.mean(recent_mape_values))
-                        self._mape_thresholds[horizon] = mape_capacity  # Store as capacity-based
-                    else:
-                        # Default: 0.01 (1% of capacity = 20 DKK error)
-                        self._mape_thresholds[horizon] = 0.01
-                else:
-                    # Default: 2% MAPE
-                    self._mape_thresholds[horizon] = 0.02
+            # Forecast quality thresholds (price-relative MAPE).
+            # These are fixed "acceptable error" bands used to normalize error features
+            # and to keep trust/error semantics stable across training + evaluation.
+            self._mape_thresholds = {
+                'short': float(getattr(self.config, 'forecast_mape_threshold_short', 0.08) or 0.08),
+                'medium': float(getattr(self.config, 'forecast_mape_threshold_medium', 0.12) or 0.12),
+                'long': float(getattr(self.config, 'forecast_mape_threshold_long', 0.20) or 0.20),
+            }
 
-            # DIAGNOSTIC LOGGING: Track MAPE thresholds (every 200 steps)
-            if i % 200 == 0:
-                logger.debug(f"[MAPE] t={i} short={self._mape_thresholds.get('short', 0.0)*100:.2f}% med={self._mape_thresholds.get('medium', 0.0)*100:.2f}% long={self._mape_thresholds.get('long', 0.0)*100:.2f}%")
-                logger.info(f"[MAPE_THRESHOLDS] t={i} "
-                           f"short={self._mape_thresholds.get('short', 0.0):.4f} ({len(self._horizon_mape.get('short', []))} samples) "
-                           f"medium={self._mape_thresholds.get('medium', 0.0):.4f} ({len(self._horizon_mape.get('medium', []))} samples) "
-                           f"long={self._mape_thresholds.get('long', 0.0):.4f} ({len(self._horizon_mape.get('long', []))} samples)")
+            # DIAGNOSTIC LOGGING: Track MAPE thresholds (every 200 steps) — main pass only
+            if update_calibration and i % 200 == 0:
+                logger.debug(
+                    f"[MAPE] t={i} short={self._mape_thresholds.get('short', 0.0)*100:.2f}% "
+                    f"med={self._mape_thresholds.get('medium', 0.0)*100:.2f}% "
+                    f"long={self._mape_thresholds.get('long', 0.0)*100:.2f}%"
+                )
+                logger.info(
+                    f"[MAPE_THRESHOLDS] t={i} "
+                    f"short={self._mape_thresholds.get('short', 0.0):.4f} ({len(self._horizon_mape.get('short', []))} samples) "
+                    f"medium={self._mape_thresholds.get('medium', 0.0):.4f} ({len(self._horizon_mape.get('medium', []))} samples) "
+                    f"long={self._mape_thresholds.get('long', 0.0):.4f} ({len(self._horizon_mape.get('long', []))} samples)"
+                )
 
             # Diagnostic logging (first step only)
             if i == 0:
@@ -3525,37 +3595,51 @@ class RenewableMultiAgentEnv(ParallelEnv):
             i: Current timestep index
         """
         # CRITICAL FIX: Horizon-matched calibration
-        # z_short at time t = tanh((price_forecast_short[t] - price[t]) / ema_std)
-        # This is a forecast of the price change from t to t+6
-        # We need to compare this with the REALIZED price change from t to t+6
-        if self.calibration_tracker is not None and hasattr(self, '_price_raw') and i >= 6:
+        #
+        # IMPORTANT: Our Tier2 forecast z-scores are RETURN-based (bias-immune):
+        #   forecast_return = (price_forecast - price_now) / max(|price_now|, denom_floor)
+        #   z_short = tanh(clip(forecast_return, ±ret_clip) * tanh_scale)
+        #
+        # Therefore the realized signal must be computed in the *same space*:
+        #   realized_return = (price_realized - price_now) / max(|price_now|, denom_floor)
+        #   realized_signal = tanh(clip(realized_return, ±ret_clip) * tanh_scale)
+        #
+        # Using delta/ema_std here would be a unit mismatch (ema_std is tracking return magnitudes),
+        # which saturates realized_signal to ±1 and makes trust meaningless.
+        # IMPORTANT:
+        # - Horizon-MAPE tracking must run for Tier2 as well (even when calibration_tracker is None).
+        # - calibration_tracker (FGB) is Tier3-only and should not gate basic forecast quality stats.
+        if hasattr(self, '_price_raw') and i >= 0:
             try:
-                # Get ema_std values that were used for forecast computation
-                # These are stored in _compute_forecast_deltas BEFORE the EMA update
-                ema_std_short_for_forecast = getattr(self, '_ema_std_short_for_calibration', getattr(self, 'ema_std_short', 10.0))
-                ema_std_medium_for_forecast = getattr(self, '_ema_std_medium_for_calibration', getattr(self, 'ema_std_medium', 10.0))
-                ema_std_long_for_forecast = getattr(self, '_ema_std_long_for_calibration', getattr(self, 'ema_std_long', 10.0))
+                # Return-based z-score parameters (must match _compute_forecast_deltas)
+                denom_floor = float(getattr(self.config, 'forecast_return_denom_floor', 1.0) or 1.0)
+                ret_clip = float(getattr(self.config, 'forecast_return_clip', 1e9) or 1e9)
+                tanh_scale = float(getattr(self.config, 'forecast_return_tanh_scale', 10.0) or 10.0)
+
+                price_now_raw = float(self._price_raw[i])
+                return_denom_now = float(max(abs(price_now_raw), denom_floor, 1.0))
 
                 # CRITICAL FIX: Store ema_std along with forecast for consistent normalization
-                # The forecast z_short was computed using ema_std at time t (BEFORE update)
-                # We must use the SAME ema_std when computing realized signal at t+6
-                # Otherwise, changing volatility creates systematic bias!
                 self._forecast_history.append({
                     't': i,
-                    'price_raw': float(self._price_raw[i]),
+                    'price_raw': price_now_raw,
                     'z_short': self.z_short,  # NOW using current step's value!
                     'z_medium': self.z_medium,
                     'z_long': self.z_long,
                     'mwdir': self.mwdir,
-                    'ema_std_short': ema_std_short_for_forecast,  # CRITICAL: Store ema_std BEFORE update
-                    'ema_std_medium': ema_std_medium_for_forecast,
-                    'ema_std_long': ema_std_long_for_forecast,
+                    # Return-space calibration metadata
+                    'return_denom': return_denom_now,
+                    'ret_clip': ret_clip,
+                    'tanh_scale': tanh_scale,
                 })
 
                 # Deque automatically keeps only last 200 steps (no manual trimming needed)
 
-                # OPTIMIZATION: Calculate per-horizon MAPE for adaptive weighting
-                # Compare stored forecasts with actual prices at matching horizons
+                # OPTIMIZATION: Calculate per-horizon MAPE for adaptive weighting (PRICE-RELATIVE)
+                # Compare stored forecasts with actual prices at matching horizons.
+                #
+                # We use price-relative MAPE with a denominator floor to avoid explosion at low prices:
+                #   mape = |actual - forecast| / max(|price_at_forecast_time|, floor)
                 horizon_short = self.config.forecast_horizons.get('short', 6)
                 horizon_medium = self.config.forecast_horizons.get('medium', 24)
                 horizon_long = self.config.forecast_horizons.get('long', 144)
@@ -3565,21 +3649,21 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 # Calculate MAPE for short horizon
                 # CRITICAL FIX: Forecast at step i-horizon_short predicts price at timestep i
                 # So we compare forecast from i-horizon_short with actual at i (matching horizon)
-                # FIX #18: Use CAPACITY-BASED MAPE (like forecast models) instead of STANDARD MAPE
-                # This prevents MAPE explosion at low prices (10-50 DKK)
-                # FIX #22: Use forecast model capacity (6982 DKK) to match training data
-                price_capacity = 6982.0  # Forecast model capacity (max price in training data)
+                denom_floor = float(getattr(self.config, 'minimum_price_floor', 50.0) or 50.0)
                 if i >= horizon_short and len(self._horizon_forecast_pairs['short']) > 0:
                     # Find forecast made at i-horizon_short (matches corrected horizon logic)
                     for pair in reversed(self._horizon_forecast_pairs['short']):
                         if pair['timestep'] == i - horizon_short:  # = i - 6 for horizon=6
                             forecast_price = pair['forecast_price']
-                            if abs(forecast_price) > 1e-6:
-                                # FIX #18: Capacity-based MAPE (matches forecast model training)
-                                # OLD: mape_short = abs(current_price_raw - forecast_price) / abs(forecast_price)
-                                # NEW: mape_short = abs(current_price_raw - forecast_price) / price_capacity
-                                mape_short = abs(current_price_raw - forecast_price) / price_capacity
-                                self._horizon_mape['short'].append(float(np.clip(mape_short, 0.0, 1.0)))
+                            try:
+                                fp = float(forecast_price)
+                                pt = float(pair.get('current_price', 0.0))
+                                if np.isfinite(fp) and np.isfinite(pt) and abs(fp) > 1e-6:
+                                    denom = max(abs(pt), denom_floor, 1.0)
+                                    mape_short = abs(current_price_raw - fp) / denom
+                                    self._horizon_mape['short'].append(float(np.clip(mape_short, 0.0, 1.0)))
+                            except Exception:
+                                pass
                             break
 
                 # Calculate MAPE for medium horizon (compare forecast from i-25 with actual at i)
@@ -3587,10 +3671,15 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     for pair in reversed(self._horizon_forecast_pairs['medium']):
                         if pair['timestep'] == i - horizon_medium:  # = i - 24 for horizon=24
                             forecast_price = pair['forecast_price']
-                            if abs(forecast_price) > 1e-6:
-                                # FIX #18: Capacity-based MAPE
-                                mape_medium = abs(current_price_raw - forecast_price) / price_capacity
-                                self._horizon_mape['medium'].append(float(np.clip(mape_medium, 0.0, 1.0)))
+                            try:
+                                fp = float(forecast_price)
+                                pt = float(pair.get('current_price', 0.0))
+                                if np.isfinite(fp) and np.isfinite(pt) and abs(fp) > 1e-6:
+                                    denom = max(abs(pt), denom_floor, 1.0)
+                                    mape_medium = abs(current_price_raw - fp) / denom
+                                    self._horizon_mape['medium'].append(float(np.clip(mape_medium, 0.0, 1.0)))
+                            except Exception:
+                                pass
                             break
 
                 # Calculate MAPE for long horizon (compare forecast from i-145 with actual at i)
@@ -3599,10 +3688,15 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     for pair in reversed(self._horizon_forecast_pairs['long']):
                         if pair['timestep'] == i - horizon_long:  # = i - 144 for horizon=144
                             forecast_price = pair['forecast_price']
-                            if abs(forecast_price) > 1e-6:
-                                # FIX #18: Capacity-based MAPE
-                                mape_long = abs(current_price_raw - forecast_price) / price_capacity
-                                self._horizon_mape['long'].append(float(np.clip(mape_long, 0.0, 1.0)))
+                            try:
+                                fp = float(forecast_price)
+                                pt = float(pair.get('current_price', 0.0))
+                                if np.isfinite(fp) and np.isfinite(pt) and abs(fp) > 1e-6:
+                                    denom = max(abs(pt), denom_floor, 1.0)
+                                    mape_long = abs(current_price_raw - fp) / denom
+                                    self._horizon_mape['long'].append(float(np.clip(mape_long, 0.0, 1.0)))
+                            except Exception:
+                                pass
                             break
                 
                 # CRITICAL FIX: Track forecast returns and actual returns for correlation-based weighting
@@ -3652,14 +3746,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
                                 
                                 break
 
-                # Update calibration tracker with SHORT HORIZON (6 steps ahead)
+                # Update calibration tracker with SHORT HORIZON (6 steps ahead) (Tier3/FGB only)
                 # At time t, we have:
                 # - forecast_signal = z_short[t] = tanh((price_forecast_short[t] - price[t]) / ema_std[t])
                 # - This predicts the price change from t to t+6
                 # At time t+6, we can compute:
                 # - realized_signal = tanh((price[t+6] - price[t]) / ema_std[t])  <-- SAME ema_std!
                 # - This is the actual price change from t to t+6
-                if len(self._forecast_history) >= 7:  # Need at least 7 entries (t-6 to t)
+                if self.calibration_tracker is not None and len(self._forecast_history) >= 7:  # Need at least 7 entries (t-6 to t)
                     forecast_entry = self._forecast_history[-7]  # Entry at time t-6
                     forecast_signal = forecast_entry['z_short']  # Forecast made at t-6 for price change from t-6 to t
 
@@ -3669,10 +3763,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     price_at_forecast_time = forecast_entry['price_raw']  # Price at t-6
                     realized_delta_raw = current_price_raw - price_at_forecast_time
 
-                    # CRITICAL FIX: Use ema_std from t-6 (when forecast was made) for consistent normalization
-                    # This ensures forecast and realized use the SAME volatility scaling
-                    ema_std_at_forecast_time = forecast_entry.get('ema_std_short', getattr(self, 'ema_std_short', 10.0))
-                    realized_signal = np.tanh(realized_delta_raw / (ema_std_at_forecast_time + 1e-6))
+                    # CRITICAL FIX: Compute realized signal in the SAME return-space as forecast z-scores
+                    denom_at_forecast_time = float(forecast_entry.get('return_denom', max(abs(price_at_forecast_time), denom_floor, 1.0)))
+                    realized_return = realized_delta_raw / max(denom_at_forecast_time, 1e-6)
+                    if ret_clip > 0:
+                        realized_return = float(np.clip(realized_return, -ret_clip, ret_clip))
+                    realized_signal = float(np.tanh(realized_return * tanh_scale))
 
                     # Update calibration tracker
                     self.calibration_tracker.update(
@@ -3686,7 +3782,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
                         current_trust = self.calibration_tracker.get_trust(horizon="short")
                         buffer_size = len(self.calibration_tracker.forecast_history)
 
-                        logger.info(f"[CALIBRATION] t={i} | trust={current_trust:.3f} | buffer_size={buffer_size}/2016 | forecast={forecast_signal:.3f} | realized={realized_signal:.3f} | delta_raw={realized_delta_raw:.2f} DKK | ema_std={ema_std_at_forecast_time:.2f}")
+                        logger.info(
+                            f"[CALIBRATION] t={i} | trust={current_trust:.3f} | buffer_size={buffer_size}/2016 | "
+                            f"forecast={forecast_signal:.3f} | realized={realized_signal:.3f} | "
+                            f"delta_raw={realized_delta_raw:.2f} DKK | denom={denom_at_forecast_time:.2f}"
+                        )
                         logger.info(f"[CALIBRATION_DEBUG] t={i} | price_now={current_price_raw:.2f} DKK | price_at_t-6={price_at_forecast_time:.2f} DKK | realized_delta={realized_delta_raw:.2f} DKK | forecast_t={forecast_entry['t']}")
 
                         # CRITICAL DEBUG: Check what the forecast models actually predict
@@ -3705,7 +3805,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                                     price_forecast_at_t = float(self._price_forecast_short[forecast_t_minus_6])
                                     price_at_t_minus_6 = forecast_entry['price_raw']
                                     delta_forecast_raw = price_forecast_at_t - price_at_t_minus_6
-                                    z_short_recomputed = np.tanh(delta_forecast_raw / (ema_std_at_forecast_time + 1e-6))
+                                    # Recompute z_short using the SAME return-based mapping as _compute_forecast_deltas
+                                    denom_for_check = float(forecast_entry.get('return_denom', max(abs(price_at_t_minus_6), denom_floor, 1.0)))
+                                    forecast_return_check = float(delta_forecast_raw / max(denom_for_check, 1e-6))
+                                    if ret_clip > 0:
+                                        forecast_return_check = float(np.clip(forecast_return_check, -ret_clip, ret_clip))
+                                    z_short_recomputed = float(np.tanh(forecast_return_check * tanh_scale))
 
                                     logger.info(f"[CALIBRATION_FORECAST_CHECK] t={i} | forecast_made_at_t={forecast_t_minus_6}")
                                     logger.info(f"[CALIBRATION_FORECAST_CHECK] price_at_t-6={price_at_t_minus_6:.2f} DKK | price_forecast_at_t={price_forecast_at_t:.2f} DKK | delta_forecast={delta_forecast_raw:.2f} DKK")
@@ -3959,73 +4064,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
         except Exception as e:
             logger.debug(f"Experience collection failed: {e}")
             logger.debug(f"Full traceback: {traceback.format_exc()}")
-
-    def _compute_risk_budget_target(self) -> float:
-        """
-        Compute risk budget target (optimal position sizing).
-
-        TRULY FORWARD-LOOKING: Use forecast volatility and forecast confidence
-        to predict optimal risk level. High forecast volatility or low confidence
-        → reduce risk. Low forecast volatility and high confidence → increase risk.
-        """
-        try:
-            base = 1.0
-
-            # Get price forecasts across horizons
-            # FIXED: Use centralized _get_forecast_safe() method
-            price_forecasts = []
-            for horizon in ["short", "medium", "long"]:
-                price_forecasts.append(self._get_forecast_safe("price", horizon))
-
-            # Compute forecast volatility (forward-looking market uncertainty)
-            if len(price_forecasts) > 1:
-                price_vol_forecast = float(np.std(price_forecasts))
-
-                # Scale risk inversely with forecast volatility
-                # High forecast volatility = uncertain future → reduce risk
-                # Low forecast volatility = stable future → increase risk
-                if price_vol_forecast > 15.0:  # High forecast volatility
-                    base = 0.7
-                elif price_vol_forecast > 10.0:
-                    base = 0.85
-                elif price_vol_forecast < 5.0:  # Low forecast volatility
-                    base = 1.2
-                elif price_vol_forecast < 8.0:
-                    base = 1.1
-                else:
-                    base = 1.0
-
-                # DEBUG: Log forecast volatility every 500 steps
-                if self.t % 500 == 0 and self.t > 0:
-                    logger.debug(f"[RISK_TARGET] t={self.t} price_vol_forecast={price_vol_forecast:.2f}, base_risk={base:.2f}")
-
-            # ALSO consider forecast confidence (forward-looking risk indicator)
-            # Low confidence = uncertain forecasts → reduce risk
-            # High confidence = reliable forecasts → can take more risk
-            forecast_conf = self._get_forecast_confidence()
-            if forecast_conf < 0.5:
-                base *= 0.8  # Low confidence: reduce risk
-                if self.t % 500 == 0 and self.t > 0:
-                    logger.debug(f"[RISK_TARGET] Low confidence ({forecast_conf:.2f}), reducing risk to {base:.2f}")
-            elif forecast_conf > 0.8:
-                base *= 1.1  # High confidence: can take more risk
-                if self.t % 500 == 0 and self.t > 0:
-                    logger.debug(f"[RISK_TARGET] High confidence ({forecast_conf:.2f}), increasing risk to {base:.2f}")
-
-            # SAFETY: Also consider current drawdown (backward-looking safety constraint)
-            # This is intentionally backward-looking as a safety brake
-            if self.reward_calculator:
-                current_dd = float(getattr(self.reward_calculator, 'current_drawdown', 0.0))
-                if current_dd > 0.05:
-                    base *= 0.6  # Severe drawdown: cut risk
-                elif current_dd > 0.02:
-                    base *= 0.8
-
-            return float(np.clip(base, 0.5, 1.5))
-
-        except Exception as e:
-            logger.debug(f"Risk budget target computation failed: {e}")
-            return 1.0
 
     def _compute_pred_reward_target(self) -> float:
         """
@@ -4727,7 +4765,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # 4) Battery operational costs (CASH FLOW) - from config
             battery_opex = self.config.battery_opex_rate * self.physical_assets['battery_capacity_mwh']
 
-            # 5) Net cash flow this step (REMOVED admin costs for better agent learning)
             net_cash_flow = generation_revenue + battery_cash_delta - txn_costs - battery_opex
 
             # FIXED: Separate operational revenue from trading cash
@@ -4789,7 +4826,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self.last_generation_revenue = generation_revenue
             self.last_mtm_pnl = mtm_pnl
 
-            # REMOVED: Multi-step rolling returns and MTM delta buffer updates (reverted to original)
 
             # CRITICAL: Update reward calculator with trading gains for DL training
             if hasattr(self, 'reward_calculator') and self.reward_calculator is not None:
@@ -4889,6 +4925,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     forecast_gate_passed = forecast_result.forecast_gate_passed
                     forecast_used_flag = forecast_result.forecast_used_flag
                     forecast_usage_reason = forecast_result.forecast_usage_reason
+                    # OBS-ONLY MODE: if gate passed, mark as used to reflect observation availability
+                    if enable_forecast_util and forecast_gate_passed and not forecast_used_flag:
+                        forecast_used_flag = True
+                        forecast_usage_reason = 'obs_only'
+                    # Periodic terminal log to surface usage (every 500 steps)
+                    if i % 500 == 0:
+                        logger.info(
+                            f"[FORECAST_USAGE] t={i} gate_passed={forecast_gate_passed} "
+                            f"used={forecast_used_flag} reason={forecast_usage_reason}"
+                        )
                     self._debug_forecast_reward = forecast_result.debug_payload or {}
                 else:
                     forecast_signal_score = 0.0
@@ -4912,6 +4958,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     "Fix ForecastEngine/forecaster wiring (or disable forecast utilisation)."
                 )
 
+            # Ensure observation-only runs mark forecasts as \"used\" for diagnostics, regardless of exposure filters
+            if enable_forecast_util:
+                forecast_used_flag = True
+                if not forecast_usage_reason or forecast_usage_reason in ('low_exposure', 'direction_mismatch', 'no_forecast', 'engine_failure', 'no_forecast_engine'):
+                    forecast_usage_reason = 'obs_only'
+
             # =====================================================================
             # AGENT-SPECIFIC REWARDS
             # =====================================================================
@@ -4919,7 +4971,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # (computed above in lines 5112-5335)
 
             # Continue to agent reward calculation below...
-            # All orphaned alignment code has been removed
 
             # =====================================================================
             # ACTUAL AGENT REWARD CALCULATION STARTS HERE
@@ -4927,7 +4978,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # The forecast_signal_score computed above (lines 5112-5335) is used
             # in the agent reward calculation below
 
-            # Orphaned logging code removed - forecast_signal_score is already computed above
 
             # =====================================================================
             # ACTUAL REWARD CALCULATION (STARTS HERE)
@@ -5116,7 +5166,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             time_step_hours = 10.0 / 60.0  # 10-minute timesteps
             annual_to_timestep = time_step_hours / 8760
 
-            # REMOVED: Minimal administration costs to match PrototypeTestTuned (no extra cost dip)
             # Only keep basic administration fees like PrototypeTestTuned
             administration_fees = self.init_budget * self.administration_fee_rate * annual_to_timestep
 
@@ -5285,6 +5334,91 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Small delta for MTM gains (trading performance)
             mtm_pnl = float(financial.get('mtm_pnl', 0.0))
             investor_mtm_delta = float(0.05 * np.clip(mtm_pnl / 10000.0, -1.0, 1.0))  # REDUCED: was 0.20
+
+            # Minimal anti-saturation regularizer (warmup):
+            # Penalize large-magnitude action vectors to discourage always-at-bounds allocations.
+            # This targets the observed failure mode: PPO collapsing to constant corner actions in ep1+.
+            investor_action_penalty = 0.0
+            investor_action_boundary_penalty = 0.0
+            investor_exposure_penalty = 0.0
+            investor_exposure_stuck_penalty = 0.0
+            warm = 0.0
+            try:
+                w = float(getattr(self.config, 'investor_action_l2_penalty', 0.0))
+                warm_steps = max(1, int(getattr(self.config, 'investor_action_penalty_warmup_steps', 2000)))
+                # IMPORTANT: use config.training_global_step so warmup does not reset at episode boundaries
+                t_now = int(getattr(self.config, 'training_global_step', getattr(self, 't', 0))) if self.config is not None else int(getattr(self, 't', 0))
+                warm = float(np.clip(t_now / warm_steps, 0.0, 1.0))
+                # IMPORTANT: penalize the executed (post-simplex) action, not the raw policy output.
+                a = getattr(self, '_last_actions', {}).get('investor_0_exec', getattr(self, '_last_actions', {}).get('investor_0', {}))
+                vec = None
+                if isinstance(a, dict):
+                    vec = np.array([a.get('wind', 0.0), a.get('solar', 0.0), a.get('hydro', 0.0)], dtype=np.float32)
+                else:
+                    arr = np.array(a, dtype=np.float32).reshape(-1)
+                    if arr.size >= 3:
+                        vec = arr[:3].astype(np.float32)
+                    else:
+                        vec = np.pad(arr, (0, 3 - arr.size), constant_values=0.0).astype(np.float32)
+
+                l2 = float(np.mean(vec * vec))
+                investor_action_penalty = float(warm * w * l2)
+
+                # Boundary-only penalty (novel surgical): punish only near-saturation, not interior exploration.
+                bw = float(getattr(self.config, 'investor_action_boundary_penalty', 0.0))
+                thr = float(getattr(self.config, 'investor_action_boundary_threshold', 0.85))
+                if bw > 0.0:
+                    excess = np.maximum(np.abs(vec) - thr, 0.0)
+                    investor_action_boundary_penalty = float(warm * bw * float(np.mean(excess * excess)))
+
+                # Exposure-only hinge penalty (targets new collapse mode: exposure pegged at 1.0 with fixed weights).
+                # Uses executed exposure if available; falls back to sum(abs(vec)) (which equals exposure under signed-simplex).
+                ew = float(getattr(self.config, 'investor_action_exposure_penalty', 0.0))
+                eth = float(getattr(self.config, 'investor_action_exposure_threshold', 0.0))
+                if ew > 0.0:
+                    exposure_val = None
+                    if isinstance(a, dict):
+                        exposure_val = a.get('exposure', None)
+                    if exposure_val is None:
+                        exposure_val = float(np.sum(np.abs(vec)))
+                    exposure_val = float(np.clip(exposure_val, 0.0, 1.0))
+                    excess_exp = float(max(exposure_val - eth, 0.0))
+                    investor_exposure_penalty = float(warm * ew * (excess_exp ** 2))
+
+                    # Collapse-breaker: if exposure stays near 1.0 for many consecutive steps,
+                    # ramp a penalty up to a fixed cap to force exploration away from the saturated fixed point.
+                    stuck_thr = float(getattr(self.config, 'investor_exposure_stuck_threshold', 0.95))
+                    stuck_steps = max(1, int(getattr(self.config, 'investor_exposure_stuck_steps', 2000)))
+                    stuck_w = float(getattr(self.config, 'investor_exposure_stuck_penalty', 0.0))
+                    if stuck_w > 0.0:
+                        if not hasattr(self, '_exposure_stuck_count'):
+                            self._exposure_stuck_count = 0
+                        if exposure_val >= stuck_thr:
+                            self._exposure_stuck_count = int(self._exposure_stuck_count) + 1
+                        else:
+                            self._exposure_stuck_count = 0
+                        ramp = float(np.clip(float(self._exposure_stuck_count) / float(stuck_steps), 0.0, 1.0))
+                        # Penalize squared exposure (0..1) scaled by ramp; at exposure=1, penalty ramps to stuck_w.
+                        investor_exposure_stuck_penalty = float(warm * stuck_w * ramp * (exposure_val ** 2))
+            except Exception:
+                investor_action_penalty = 0.0
+                investor_action_boundary_penalty = 0.0
+                investor_exposure_penalty = 0.0
+                investor_exposure_stuck_penalty = 0.0
+                warm = 0.0
+
+            # Store minimal penalty diagnostics for CSV logging / deep debugging
+            try:
+                if self.config is not None:
+                    self._last_penalty_diag = {
+                        'training_global_step': int(getattr(self.config, 'training_global_step', 0)),
+                        'inv_penalty_warm': float(warm),
+                        'inv_pen_boundary': float(investor_action_boundary_penalty),
+                        'inv_pen_exposure': float(investor_exposure_penalty),
+                        'inv_pen_exposure_stuck': float(investor_exposure_stuck_penalty),
+                    }
+            except Exception:
+                self._last_penalty_diag = {'training_global_step': 0, 'inv_penalty_warm': 0.0, 'inv_pen_boundary': 0.0, 'inv_pen_exposure': 0.0, 'inv_pen_exposure_stuck': 0.0}
             
             # Small delta for strategy alignment (forecast-driven positioning)
             investor_strategy_delta = 0.0
@@ -5433,7 +5567,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 if not hasattr(self, '_previous_nav'):
                     self._previous_nav = float(financial.get('fund_nav', self.equity))
             
-            agent_rewards['investor_0'] = investor_base + investor_mtm_delta + investor_strategy_delta + investor_nav_delta
+            agent_rewards['investor_0'] = (
+                investor_base
+                + investor_mtm_delta
+                + investor_strategy_delta
+                + investor_nav_delta
+                - investor_action_penalty
+                - investor_action_boundary_penalty
+                - investor_exposure_penalty
+                - investor_exposure_stuck_penalty
+            )
             
             # ===== BATTERY OPERATOR AGENT =====
             # FIXED: Improved battery reward calculation with stronger PnL signal
@@ -5571,7 +5714,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 
                 # Get actions from last step (stored in _last_actions)
                 last_actions = getattr(self, '_last_actions', {})
-                investor_action = last_actions.get('investor_0', {})
+                # Prefer executed (post-simplex) investor action if available
+                investor_action = last_actions.get('investor_0_exec', last_actions.get('investor_0', {}))
                 battery_action = last_actions.get('battery_operator_0', {})
                 
                 # Calculate current portfolio metrics (logged at every timestep)
@@ -5579,7 +5723,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 # CRITICAL FIX: At timestep 0, use the NAV from reset (before any trades)
                 # This ensures identical starting NAV values between Tier 1 and Tier 2
                 # After timestep 0, use the NAV from _update_finance (which includes trades)
-                # NOTE: self.t is still 0 here because it's incremented AFTER _assign_rewards is called
                 if int(self.t) == 0 and hasattr(self, '_initial_nav_from_reset'):
                     current_fund_nav_dkk = self._initial_nav_from_reset
                     tier_name = "TIER2" if getattr(self.config, 'enable_forecast_utilisation', False) else "TIER1"
@@ -5642,6 +5785,136 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 if debug_forecast:
                     forecast_usage_reason = str(debug_forecast.get('forecast_not_used_reason', forecast_usage_reason))
 
+                # Observation/action correlation (obs_trade_signal vs investor action/exposure)
+                obs_trade_signal_val = float(getattr(self, '_last_obs_trade_signal', 0.0))
+                action_dir = 0.0
+                exposure_val = 0.0
+                delta_exposure = 0.0
+                try:
+                    if isinstance(investor_action, dict):
+                        weights = []
+                        for k in ('wind', 'solar', 'hydro'):
+                            if k in investor_action:
+                                v = investor_action.get(k, 0.0)
+                                if isinstance(v, np.ndarray):
+                                    v = float(v.item() if v.size == 1 else v.flatten()[0])
+                                weights.append(float(v))
+                        if weights:
+                            action_dir = float(np.sign(np.sum(weights)))
+                        if 'exposure' in investor_action:
+                            exposure_val = float(investor_action.get('exposure', 0.0))
+                    else:
+                        arr = np.asarray(investor_action, dtype=np.float32).flatten()
+                        if arr.size >= 3:
+                            action_dir = float(np.sign(float(np.sum(arr[:3]))))
+                        if arr.size >= 1:
+                            exposure_val = float(arr[0])
+                except Exception:
+                    action_dir = 0.0
+                    exposure_val = 0.0
+
+                # Update rolling buffers and compute correlation
+                try:
+                    if np.isfinite(obs_trade_signal_val):
+                        self._obs_trade_signal_hist.append(float(obs_trade_signal_val))
+                        if np.isfinite(action_dir):
+                            self._investor_action_dir_hist.append(float(action_dir))
+                        if np.isfinite(exposure_val):
+                            self._investor_exposure_hist.append(float(exposure_val))
+                            if self._last_investor_exposure is not None:
+                                delta_exposure = float(exposure_val - self._last_investor_exposure)
+                            self._investor_delta_exposure_hist.append(float(delta_exposure))
+                            self._last_investor_exposure = float(exposure_val)
+                except Exception:
+                    pass
+
+                probe_r2_base = 0.0
+                probe_r2_base_plus_signal = 0.0
+                probe_delta_r2 = 0.0
+                try:
+                    if bool(getattr(self.config, 'enable_forecast_utilisation', False)):
+                        inv_obs = self._obs_buf.get('investor_0', None) if isinstance(getattr(self, '_obs_buf', None), dict) else None
+                        if inv_obs is not None:
+                            inv_obs = np.asarray(inv_obs, dtype=np.float32).reshape(-1)
+                            if inv_obs.size >= 8:
+                                base_x = inv_obs[:6].astype(np.float32)
+                                sig_x = float(inv_obs[6])
+
+                                if not hasattr(self, '_probe_base_x_hist'):
+                                    self._probe_base_x_hist = deque(maxlen=500)
+                                    self._probe_sig_x_hist = deque(maxlen=500)
+                                    self._probe_y_hist = deque(maxlen=500)
+
+                                if float(decision_step) > 0.0:
+                                    self._probe_base_x_hist.append(base_x.copy())
+                                    self._probe_sig_x_hist.append(float(sig_x))
+                                    self._probe_y_hist.append(float(exposure_exec))
+
+                                if len(self._probe_y_hist) >= 40:
+                                    Xb = np.stack(list(self._probe_base_x_hist), axis=0).astype(np.float64)
+                                    xs = np.asarray(list(self._probe_sig_x_hist), dtype=np.float64).reshape(-1, 1)
+                                    y = np.asarray(list(self._probe_y_hist), dtype=np.float64).reshape(-1, 1)
+
+                                    ones = np.ones((Xb.shape[0], 1), dtype=np.float64)
+                                    Xb_i = np.concatenate([ones, Xb], axis=1)
+                                    Xbs_i = np.concatenate([ones, Xb, xs], axis=1)
+
+                                    beta_b, _, _, _ = np.linalg.lstsq(Xb_i, y, rcond=None)
+                                    beta_bs, _, _, _ = np.linalg.lstsq(Xbs_i, y, rcond=None)
+
+                                    yhat_b = Xb_i @ beta_b
+                                    yhat_bs = Xbs_i @ beta_bs
+                                    ybar = float(np.mean(y))
+                                    ss_tot = float(np.sum((y - ybar) ** 2))
+                                    if ss_tot > 1e-12:
+                                        ss_res_b = float(np.sum((y - yhat_b) ** 2))
+                                        ss_res_bs = float(np.sum((y - yhat_bs) ** 2))
+                                        probe_r2_base = float(np.clip(1.0 - ss_res_b / ss_tot, -1.0, 1.0))
+                                        probe_r2_base_plus_signal = float(np.clip(1.0 - ss_res_bs / ss_tot, -1.0, 1.0))
+                                        probe_delta_r2 = float(np.clip(probe_r2_base_plus_signal - probe_r2_base, -1.0, 1.0))
+                except Exception:
+                    probe_r2_base = 0.0
+                    probe_r2_base_plus_signal = 0.0
+                    probe_delta_r2 = 0.0
+
+                obs_trade_action_corr = 0.0
+                obs_trade_exposure_corr = 0.0
+                obs_trade_delta_exposure_corr = 0.0
+                try:
+                    if len(self._obs_trade_signal_hist) >= 20 and len(self._investor_action_dir_hist) >= 20:
+                        a = np.asarray(self._obs_trade_signal_hist, dtype=np.float32)
+                        b = np.asarray(self._investor_action_dir_hist, dtype=np.float32)
+                        if np.std(a) > 1e-6 and np.std(b) > 1e-6:
+                            obs_trade_action_corr = float(np.corrcoef(a, b)[0, 1])
+                    if len(self._obs_trade_signal_hist) >= 20 and len(self._investor_exposure_hist) >= 20:
+                        a = np.asarray(self._obs_trade_signal_hist, dtype=np.float32)
+                        b = np.asarray(self._investor_exposure_hist, dtype=np.float32)
+                        if np.std(a) > 1e-6 and np.std(b) > 1e-6:
+                            obs_trade_exposure_corr = float(np.corrcoef(a, b)[0, 1])
+                    if len(self._obs_trade_signal_hist) >= 20 and len(self._investor_delta_exposure_hist) >= 20:
+                        a = np.asarray(self._obs_trade_signal_hist, dtype=np.float32)
+                        b = np.asarray(self._investor_delta_exposure_hist, dtype=np.float32)
+                        if np.std(a) > 1e-6 and np.std(b) > 1e-6:
+                            obs_trade_delta_exposure_corr = float(np.corrcoef(a, b)[0, 1])
+                except Exception:
+                    obs_trade_action_corr = 0.0
+                    obs_trade_exposure_corr = 0.0
+                    obs_trade_delta_exposure_corr = 0.0
+
+                decision_step = 1.0 if (self.t > 0 and self.t % self.investment_freq == 0) else 0.0
+                exposure_exec = 0.0
+                try:
+                    if isinstance(getattr(self, "_last_actions", None), dict):
+                        exec_action = self._last_actions.get("investor_0_exec", {})
+                        exposure_exec = float(exec_action.get("exposure", 0.0))
+                except Exception:
+                    exposure_exec = 0.0
+
+                action_sign = float(np.sign(exposure_exec)) if abs(exposure_exec) > 1e-9 else float(np.sign(exposure_val))
+                trade_signal_active_threshold = float(getattr(self.config, "forecast_trade_signal_active_threshold", 0.05))
+                trade_signal_active = 1.0 if abs(obs_trade_signal_val) >= trade_signal_active_threshold else 0.0
+                trade_signal_sign = float(np.sign(obs_trade_signal_val))
+
                 # Ensure all values are floats (not arrays) to avoid "ambiguous truth value" error
                 self.debug_tracker.log_step(
                     timestep=int(self.t),
@@ -5668,10 +5941,45 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     z_combined=float(debug_forecast.get('z_combined', 0.0)),
                     forecast_confidence=float(debug_forecast.get('forecast_confidence', 0.0)),
                     forecast_trust=float(debug_forecast.get('forecast_trust', 0.0)),
+                    # OBSERVATION-LEVEL forecast signals (what the POLICY actually sees after warmup/ablation)
+                    obs_z_short=float(getattr(self, '_last_obs_z_short', 0.0)),
+                    obs_z_long=float(getattr(self, '_last_obs_z_long', 0.0)),
+                    obs_forecast_trust=float(getattr(self, '_last_obs_forecast_trust', 0.0)),
+                    obs_normalized_error=float(getattr(self, '_last_obs_normalized_error', 0.0)),
+                    obs_trade_signal=float(getattr(self, '_last_obs_trade_signal', 0.0)),
+                    obs_trade_action_corr=float(obs_trade_action_corr),
+                    obs_trade_exposure_corr=float(obs_trade_exposure_corr),
+                    obs_trade_delta_exposure_corr=float(obs_trade_delta_exposure_corr),
                     signal_gate_multiplier=float(debug_forecast.get('signal_gate_multiplier', 0.0)),
                     # Position info (ensure floats)
                     position_signed=float(debug_forecast.get('position_signed', 0.0)),
-                    position_exposure=float(debug_forecast.get('position_exposure', 0.0)),
+                    # FIX: debug_forecast.position_exposure can be stale/zero. Recompute from current financial notional.
+                    position_exposure=float(
+                        np.clip(
+                            (
+                                sum(abs(float(v)) for v in getattr(self, 'financial_positions', {}).values())
+                                / max(
+                                    float(getattr(self.config, 'max_position_size', 0.0))
+                                    * float(self.init_budget)
+                                    * float(getattr(self.config, 'capital_allocation_fraction', 0.0)),
+                                    1.0,
+                                )
+                            ),
+                            0.0,
+                            1.0,
+                        )
+                    ),
+                    decision_step=float(decision_step),
+                    exposure_exec=float(exposure_exec),
+                    action_sign=float(action_sign),
+                    trade_signal_active=float(trade_signal_active),
+                    trade_signal_sign=float(trade_signal_sign),
+                    risk_multiplier=float(getattr(self, "_last_risk_multiplier", 1.0)),
+                    vol_brake_mult=float(getattr(self, "_last_vol_brake_mult", 1.0)),
+                    strategy_multiplier=float(getattr(self, "_last_strategy_multiplier", 1.0)),
+                    combined_multiplier=float(getattr(self, "_last_combined_multiplier", 1.0)),
+                    tradeable_capital=float(getattr(self, "_last_tradeable_capital", 0.0)),
+                    mtm_exit_count=float(getattr(self, "_last_mtm_exit_count", 0.0)),
                     # Price returns (ensure floats)
                     price_return_1step=float(debug_forecast.get('price_return_1step', 0.0)),
                     price_return_forecast=float(debug_forecast.get('price_return_forecast', 0.0)),
@@ -5821,11 +6129,33 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     investor_reward=float(agent_rewards.get('investor_0', base_reward)),
                     battery_reward=float(agent_rewards.get('battery_operator_0', base_reward)),
                     # Financial metrics (ensure floats)
-                    # Note: fund_nav, trading_gains, operating_gains removed - duplicates of checkpoint summary fields
                     # fund_nav = portfolio_value_usd_millions (just different units)
                     # trading_gains = trading_gains_usd_thousands (just different units)
                     # operating_gains = operating_gains_usd_thousands (just different units)
                     mtm_pnl=float(mtm_pnl),  # Per-step MTM PnL (not cumulative, different from trading_gains)
+                    # Penalty diagnostics (anti-collapse verification)
+                    training_global_step=int(getattr(self.config, 'training_global_step', 0)) if self.config is not None else 0,
+                    inv_penalty_warm=float(getattr(self, '_last_penalty_diag', {}).get('inv_penalty_warm', 0.0)),
+                    inv_pen_boundary=float(getattr(self, '_last_penalty_diag', {}).get('inv_pen_boundary', 0.0)),
+                    inv_pen_exposure=float(getattr(self, '_last_penalty_diag', {}).get('inv_pen_exposure', 0.0)),
+                    inv_pen_exposure_stuck=float(getattr(self, '_last_penalty_diag', {}).get('inv_pen_exposure_stuck', 0.0)),
+                    # Investor policy distribution diagnostics (pre-tanh / pre-postprocess)
+                    inv_mu_raw=float(getattr(self, '_inv_mu_raw', 0.0)),
+                    inv_sigma_raw=float(getattr(self, '_inv_sigma_raw', 0.0)),
+                    inv_a_raw=float(getattr(self, '_inv_a_raw', 0.0)),
+                    inv_tanh_mu=float(getattr(self, '_inv_tanh_mu', 0.0)),
+                    inv_tanh_a=float(getattr(self, '_inv_tanh_a', 0.0)),
+                    inv_sat_mean=float(getattr(self, '_inv_sat_mean', 0.0)),
+                    inv_sat_sample=float(getattr(self, '_inv_sat_sample', 0.0)),
+                    inv_sat_noise_only=float(getattr(self, '_inv_sat_noise_only', 0.0)),
+                    # Investor TD-error proxy (credit assignment diagnostics)
+                    inv_reward_step=float(getattr(self, '_inv_reward_step', 0.0)),
+                    inv_value=float(getattr(self, '_inv_value', 0.0)),
+                    inv_value_next=float(getattr(self, '_inv_value_next', 0.0)),
+                    inv_td_error=float(getattr(self, '_inv_td_error', 0.0)),
+                    probe_r2_base=float(probe_r2_base),
+                    probe_r2_base_plus_signal=float(probe_r2_base_plus_signal),
+                    probe_delta_r2=float(probe_delta_r2),
                     # Actions
                     investor_action=investor_action,
                     battery_action=battery_action,
@@ -5860,6 +6190,26 @@ class RenewableMultiAgentEnv(ParallelEnv):
                         pnl_reward=float(debug_forecast.get('pnl_reward', 0.0)),
                         forecast_signal_score=float(debug_forecast.get('forecast_signal_score', 0.0)),
                         base_reward=float(base_reward),
+                        # Penalty diagnostics (anti-collapse verification)
+                        training_global_step=int(getattr(self.config, 'training_global_step', 0)) if self.config is not None else 0,
+                        inv_penalty_warm=float(getattr(self, '_last_penalty_diag', {}).get('inv_penalty_warm', 0.0)),
+                        inv_pen_boundary=float(getattr(self, '_last_penalty_diag', {}).get('inv_pen_boundary', 0.0)),
+                        inv_pen_exposure=float(getattr(self, '_last_penalty_diag', {}).get('inv_pen_exposure', 0.0)),
+                        inv_pen_exposure_stuck=float(getattr(self, '_last_penalty_diag', {}).get('inv_pen_exposure_stuck', 0.0)),
+                        # Investor policy distribution diagnostics (pre-tanh / pre-postprocess)
+                        inv_mu_raw=float(getattr(self, '_inv_mu_raw', 0.0)),
+                        inv_sigma_raw=float(getattr(self, '_inv_sigma_raw', 0.0)),
+                        inv_a_raw=float(getattr(self, '_inv_a_raw', 0.0)),
+                        inv_tanh_mu=float(getattr(self, '_inv_tanh_mu', 0.0)),
+                        inv_tanh_a=float(getattr(self, '_inv_tanh_a', 0.0)),
+                        inv_sat_mean=float(getattr(self, '_inv_sat_mean', 0.0)),
+                        inv_sat_sample=float(getattr(self, '_inv_sat_sample', 0.0)),
+                        inv_sat_noise_only=float(getattr(self, '_inv_sat_noise_only', 0.0)),
+                        # Investor TD-error proxy (credit assignment diagnostics)
+                        inv_reward_step=float(getattr(self, '_inv_reward_step', 0.0)),
+                        inv_value=float(getattr(self, '_inv_value', 0.0)),
+                        inv_value_next=float(getattr(self, '_inv_value_next', 0.0)),
+                        inv_td_error=float(getattr(self, '_inv_td_error', 0.0)),
                         enable_forecast_util=bool(getattr(self.config, 'enable_forecast_utilisation', False)),
                         forecast_gate_passed=forecast_gate_flag,
                         forecast_used=forecast_used_flag,
@@ -6002,6 +6352,55 @@ class RenewableMultiAgentEnv(ParallelEnv):
             z_short_hydro_obs = float(getattr(self, 'z_short_hydro', 0.0))
             forecast_trust_obs = float(getattr(self, '_forecast_trust', getattr(self.forecast_engine, 'forecast_trust', 0.5)))
 
+            # --------------------------------------------------------------
+            # Forecast observation warmup (ANTI-SHOCK / ANTI-SATURATION)
+            # --------------------------------------------------------------
+            # Early in an episode/year, forecasts can be extremely noisy or pinned due to
+            # price floor + seed window behavior. This can push policies to saturate at
+            # action bounds. We therefore hide forecast-derived observation signals for
+            # the first N steps.
+            if enable_forecast_util:
+                warmup = int(getattr(self.config, 'forecast_obs_warmup_steps', 0) or 0)
+                if warmup > 0 and i < warmup:
+                    z_short_price_obs = 0.0
+                    z_medium_price_obs = 0.0
+                    z_long_price_obs = 0.0
+                    z_short_wind_obs = 0.0
+                    z_short_solar_obs = 0.0
+                    z_short_hydro_obs = 0.0
+                    forecast_trust_obs = 0.0
+
+                # Evaluation/debug ablations for forecast-derived observation signals
+                mode = str(getattr(self.config, 'forecast_obs_mode', 'normal') or 'normal').lower()
+                if mode == "zero":
+                    z_short_price_obs = 0.0
+                    z_medium_price_obs = 0.0
+                    z_long_price_obs = 0.0
+                    z_short_wind_obs = 0.0
+                    z_short_solar_obs = 0.0
+                    z_short_hydro_obs = 0.0
+                    forecast_trust_obs = 0.0
+                elif mode == "invert":
+                    z_short_price_obs *= -1.0
+                    z_medium_price_obs *= -1.0
+                    z_long_price_obs *= -1.0
+                    z_short_wind_obs *= -1.0
+                    z_short_solar_obs *= -1.0
+                    z_short_hydro_obs *= -1.0
+
+            # --------------------------------------------------------------
+            # Decision-cadence anchoring for investor signal
+            # --------------------------------------------------------------
+            z_short_price_obs_inv = float(z_short_price_obs)
+            if enable_forecast_util:
+                try:
+                    inv_freq = int(getattr(self, 'investment_freq', 1) or 1)
+                    if hasattr(self, '_forecast_history') and len(self._forecast_history) >= inv_freq + 1:
+                        entry = self._forecast_history[-(inv_freq + 1)]
+                        z_short_price_obs_inv = float(entry.get('z_short', z_short_price_obs))
+                except Exception:
+                    z_short_price_obs_inv = float(z_short_price_obs)
+
             # Compute normalized forecast error consistently with ForecastEngine.build_observation_features
             # CRITICAL FIX: Clip to [0.0, 1.0] to match observation space bounds and forecast_engine.py
             normalized_error_obs = 0.0
@@ -6013,32 +6412,85 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     normalized_error_obs = float(np.clip(recent_mape / max(mape_threshold_short, 1e-6), 0.0, 1.0))
             except Exception:
                 normalized_error_obs = 0.0
+            # Remove normalized error from policy input (kept for logging only).
+            normalized_error_obs = 0.0
             
-            # TEMPORAL ALIGNMENT: Get lagged z_medium from t-24 to align with return at t+24
-            # The forecast made 24 steps ago predicted what's happening now
-            z_medium_lagged = z_medium_price_obs  # Default to current if no lag available
-            horizon_medium = self.config.forecast_horizons.get('medium', 24)
-            if i >= horizon_medium:
-                lag_timestep = i - horizon_medium
-                if hasattr(self, '_z_score_history') and lag_timestep in self._z_score_history:
-                    z_medium_lagged = float(self._z_score_history[lag_timestep].get('z_medium', z_medium_lagged))
-            
-            # ENGINEERED FEATURES: Direction, Momentum, Strength
-            # Direction: sign of z_medium_lagged (-1 for down, +1 for up, 0 for neutral)
-            direction = float(np.sign(z_medium_lagged))
-            
-            # Momentum: change in z_medium (current - previous)
-            if not hasattr(self, '_z_medium_prev_obs'):
-                self._z_medium_prev_obs = z_medium_lagged
-            momentum = float(np.clip(z_medium_lagged - self._z_medium_prev_obs, -1.0, 1.0))
-            self._z_medium_prev_obs = z_medium_lagged  # Store for next iteration
-            
-            # Strength: absolute value of z_medium_lagged (magnitude of signal)
-            strength = float(np.clip(abs(z_medium_lagged), 0.0, 1.0))
-            
-            # TRADE SIGNAL: Composite feature combining direction, strength, and trust
-            # Range: [-1, 1] where positive = buy signal, negative = sell signal, magnitude = confidence
-            trade_signal = float(np.clip(direction * strength * forecast_trust_obs, -1.0, 1.0)) if enable_forecast_util else None
+            # ------------------------------------------------------------------
+            # IMPORTANT (Tier2 fairness + usefulness):
+            # Observations should reflect the FORECAST AVAILABLE AT DECISION TIME
+            # AND be aligned to the action cadence (investment_freq).
+            #
+            # We therefore blend the nearest forecast horizons to the investment cadence.
+            # This avoids feeding the policy a horizon it cannot act on.
+            # ------------------------------------------------------------------
+            z_medium_used = float(z_medium_price_obs)
+            try:
+                horizons = getattr(self.config, 'forecast_horizons', {}) or {}
+                h_short = int(horizons.get('short', 6))
+                h_medium = int(horizons.get('medium', 24))
+                h_long = int(horizons.get('long', 144))
+                inv_freq = int(getattr(self, 'investment_freq', 1) or 1)
+                candidates = [
+                    ('short', h_short, float(z_short_price_obs)),
+                    ('medium', h_medium, float(z_medium_price_obs)),
+                    ('long', h_long, float(z_long_price_obs)),
+                ]
+                # Sort by distance to investment frequency
+                candidates.sort(key=lambda x: abs(inv_freq - x[1]))
+                name1, h1, z1 = candidates[0]
+                if abs(inv_freq - h1) < 1e-6:
+                    z_medium_used = float(z1)
+                else:
+                    name2, h2, z2 = candidates[1]
+                    d1 = max(abs(inv_freq - h1), 1e-6)
+                    d2 = max(abs(inv_freq - h2), 1e-6)
+                    w1 = 1.0 / d1
+                    w2 = 1.0 / d2
+                    z_medium_used = float((w1 * z1 + w2 * z2) / (w1 + w2))
+            except Exception:
+                z_medium_used = float(z_medium_price_obs)
+
+            # TRADE SIGNAL: Calibrated z_short (decision cadence aligned).
+            # Range: [-1, 1] where positive = buy signal, negative = sell signal.
+            if enable_forecast_util:
+                trade_signal = float(np.clip(z_short_price_obs_inv, -1.0, 1.0))
+                if bool(getattr(self.config, 'forecast_trade_signal_disable', False)):
+                    trade_signal = 0.0
+                # Calibrate trade_signal scale to realized returns at decision steps.
+                try:
+                    inv_freq = int(getattr(self, 'investment_freq', 1) or 1)
+                    if hasattr(self, '_price_raw') and self.t >= inv_freq:
+                        price_now_raw = float(self._price_raw[self.t])
+                        price_prev_raw = float(self._price_raw[self.t - inv_freq])
+                        if abs(price_prev_raw) > 1e-6 and (self.t % inv_freq == 0):
+                            realized_ret = (price_now_raw - price_prev_raw) / price_prev_raw
+                            if not hasattr(self, '_realized_return_decision_hist'):
+                                self._realized_return_decision_hist = deque(maxlen=200)
+                            self._realized_return_decision_hist.append(float(realized_ret))
+                            if len(self._realized_return_decision_hist) >= 20:
+                                std_real = float(np.std(self._realized_return_decision_hist))
+                                denom_floor = float(getattr(self.config, 'forecast_return_denom_floor', 0.15))
+                                if std_real > 0.0:
+                                    scale = 1.0 / max(std_real, denom_floor)
+                                    scale = float(np.clip(scale, 0.5, 2.0))
+                                    trade_signal = float(np.clip(trade_signal * scale, -1.0, 1.0))
+                except Exception:
+                    pass
+            else:
+                trade_signal = None
+
+            # Persist "policy-visible" forecast observation values for logging/debugging.
+            # These are *post-ablation/post-warmup* values (i.e., what the policy actually sees).
+            try:
+                self._last_obs_z_short = float(z_short_price_obs)
+                self._last_obs_z_medium = 0.0
+                self._last_obs_z_long = float(z_long_price_obs)
+                self._last_obs_forecast_trust = float(forecast_trust_obs)
+                self._last_obs_normalized_error = float(normalized_error_obs)
+                self._last_obs_trade_signal = float(trade_signal) if trade_signal is not None else 0.0
+            except Exception:
+                # Never crash env on debug bookkeeping.
+                pass
             
             # REFACTORED: Use ObservationBuilder for investor observations
             inv = self._obs_buf['investor_0']
@@ -6053,25 +6505,19 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 max_position_size=self.config.max_position_size,
                 capital_allocation_fraction=self.config.capital_allocation_fraction,
                 enable_forecast_util=enable_forecast_util,
-                z_short_price=z_short_price_obs if enable_forecast_util else None,
-                z_medium_lagged=z_medium_lagged if enable_forecast_util else None,
-                direction=direction if enable_forecast_util else None,
-                momentum=momentum if enable_forecast_util else None,
-                strength=strength if enable_forecast_util else None,
-                forecast_trust=forecast_trust_obs if enable_forecast_util else None,
-                normalized_error=normalized_error_obs if enable_forecast_util else None,
                 trade_signal=trade_signal if enable_forecast_util else None,
+                forecast_trust=forecast_trust_obs if enable_forecast_util else None,
             )
+
+            # Note: forecast block boost removed to reduce saturation.
             
             # DIAGNOSTIC: Log investor observations periodically
             if self.t % 1000 == 0 or self.t == 0:
                 if enable_forecast_util:
                     logger.info(f"[INVESTOR_OBS_TIER2] t={self.t} | TOTAL_DIM={len(inv)}")
                     logger.info(f"  BASE (6D): price={inv[0]:.3f}, budget={inv[1]:.3f}, wind_pos={inv[2]:.3f}, solar_pos={inv[3]:.3f}, hydro_pos={inv[4]:.3f}, mtm_pnl={inv[5]:.3f}")
-                    if len(inv) >= 14:
-                        logger.info(f"  FORECAST (8D): z_short={inv[6]:.3f}, z_medium_lagged={inv[7]:.3f}, dir={inv[8]:.3f}, momentum={inv[9]:.3f}, strength={inv[10]:.3f}, trust={inv[11]:.3f}, err={inv[12]:.3f}, trade_signal={inv[13]:.3f}")
-                    elif len(inv) >= 8:
-                        logger.info(f"  FORECAST (2D): trade_signal={inv[6]:.3f}, normalized_error={inv[7]:.3f}")
+                    if len(inv) >= 8:
+                        logger.info(f"  FORECAST (2D): trade_signal={inv[6]:.3f}, trust={inv[7]:.3f}")
                     else:
                         logger.info(f"  FORECAST: unexpected dimension {len(inv)}")
                 else:
@@ -6092,22 +6538,14 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 z_short_solar=z_short_solar_obs if enable_forecast_util else None,
                 z_short_hydro=z_short_hydro_obs if enable_forecast_util else None,
                 z_short_price=z_short_price_obs if enable_forecast_util else None,
-                z_medium_price=z_medium_price_obs if enable_forecast_util else None,
-                z_long_price=z_long_price_obs if enable_forecast_util else None,
             )
             
             # DIAGNOSTIC: Log battery observations periodically
             if self.t % 1000 == 0 or self.t == 0:
                 if enable_forecast_util:
-                    if len(batt) >= 10:
-                        logger.info(f"[BATTERY_OBS] t={self.t} | price={batt[0]:.3f}, energy={batt[1]:.3f}, capacity={batt[2]:.3f}, load={batt[3]:.3f}")
-                        logger.info(f"  Generation forecasts: wind={batt[4]:.3f}, solar={batt[5]:.3f}, hydro={batt[6]:.3f}")
-                        logger.info(f"  Price forecasts: short={batt[7]:.3f}, med={batt[8]:.3f}, long={batt[9]:.3f}")
-                    else:
-                        # Backward compatibility: 8D format
-                        logger.info(f"[BATTERY_OBS] t={self.t} | price={batt[0]:.3f}, energy={batt[1]:.3f}, capacity={batt[2]:.3f}, load={batt[3]:.3f}")
-                        logger.info(f"  Total generation (short): {batt[4]:.3f}")
-                        logger.info(f"  Price forecasts: short={batt[5]:.3f}, med={batt[6]:.3f}, long={batt[7]:.3f}")
+                    logger.info(f"[BATTERY_OBS] t={self.t} | price={batt[0]:.3f}, energy={batt[1]:.3f}, capacity={batt[2]:.3f}, load={batt[3]:.3f}")
+                    logger.info(f"  Generation forecasts: wind={batt[4]:.3f}, solar={batt[5]:.3f}, hydro={batt[6]:.3f}")
+                    logger.info(f"  Price forecast: short={batt[7]:.3f}")
                 else:
                     logger.info(f"[BATTERY_OBS] t={self.t} | price={batt[0]:.3f}, energy={batt[1]:.3f}, capacity={batt[2]:.3f}, load={batt[3]:.3f}")
 
@@ -6133,13 +6571,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 # Price trend for regime detection
                 rsk[9] = z_short_price_obs
 
-                # Expected volatility from forecast spread (higher spread = higher uncertainty)
-                z_short = z_short_price_obs
-                z_medium = z_medium_price_obs
-                z_long = z_long_price_obs
-                forecast_spread = abs(z_short - z_medium) + abs(z_medium - z_long) + abs(z_short - z_long)
-                price_volatility_forecast = float(np.clip(forecast_spread / 3.0, 0.0, 1.0)) * 10.0
-                rsk[10] = price_volatility_forecast
+                # Long-horizon signal for risk outlook
+                rsk[10] = z_long_price_obs
 
                 # Forecast trust (quality indicator)
                 rsk[11] = forecast_trust_obs
@@ -6147,7 +6580,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 # DIAGNOSTIC: Log risk controller observations periodically
                 if self.t % 1000 == 0 or self.t == 0:
                     logger.info(f"[RISK_OBS] t={self.t} | price={rsk[0]:.3f}, vol={rsk[1]:.3f}, stress={rsk[2]:.3f}")
-                    logger.info(f"  Forecasts: z_short={rsk[9]:.3f}, vol_forecast={rsk[10]:.3f}, trust={rsk[11]:.3f}")
+                    logger.info(f"  Forecasts: z_short={rsk[9]:.3f}, z_long={rsk[10]:.3f}, trust={rsk[11]:.3f}")
 
             # PHASE 4: META CONTROLLER OBSERVATIONS
             perf_ratio = float(np.clip(SafeDivision.div(self.equity, self.init_budget, 1.0), 0.0, 10.0))
@@ -6176,12 +6609,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
                 # Expected return from forecasts (weighted combination of price forecasts)
                 z_short = z_short_price_obs
-                z_medium = z_medium_price_obs
                 z_long = z_long_price_obs
                 trust = forecast_trust_obs
 
                 # Weighted expected return (trust-scaled)
-                expected_return = (0.7 * z_short + 0.2 * z_medium + 0.1 * z_long) * trust
+                expected_return = (0.7 * z_short + 0.3 * z_long) * trust
                 meta[12] = float(np.clip(expected_return, -1.0, 1.0))
 
                 # DIAGNOSTIC: Log meta controller observations periodically
@@ -6359,6 +6791,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     'total_generation_mwh': financial.get('total_generation_mwh', 0.0),
                     'assets_deployed': self.assets_deployed,
                     'forecast_signal_score': financial.get('forecast_signal_score', 0.0),
+                    'price_return_1step': float(self._price_return_1step[i]) if hasattr(self, '_price_return_1step') and i < len(self._price_return_1step) else 0.0,
 
                     # FGB: Forecast-guided baseline signals
                     'forecast_trust': float(self._forecast_trust),  # τₜ ∈ [0,1]
@@ -6519,7 +6952,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
     @battery_capacity_mwh.setter
     def battery_capacity_mwh(self, value):
         self.physical_assets['battery_capacity_mwh'] = float(value)
-        self.battery_capacity = float(value)  # Keep legacy sync
+        self.battery_capacity = float(value)
 
     @property
     def wind_instrument_value(self):

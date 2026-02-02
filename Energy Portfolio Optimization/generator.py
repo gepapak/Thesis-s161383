@@ -1128,6 +1128,63 @@ class MultiHorizonForecastGenerator:
             if self.verbose:
                 print(f"[WARNING] Enhanced memory cleanup failed: {e}")
 
+    def cleanup_end_of_episode(self):
+        """
+        HEAVY cleanup intended to run BETWEEN EPISODES (episode training).
+
+        Rationale:
+        - CPU OOM around later episodes is typically due to retained references to:
+          - large in-memory precomputed forecast arrays (`self._precomputed`)
+          - pandas DataFrame refs (`self._data_df`)
+          - Keras model graphs/objects held in `self.models`
+          - scaler objects held in `self.scalers`
+        - The regular `_cleanup_memory()` is safe to call during an episode, but it is intentionally
+          conservative and does NOT drop these big structures.
+        - This method is safe because the episode-training loop recreates a new forecaster per episode.
+        """
+        try:
+            import gc
+
+            # Drop large, episode-sized arrays and data references
+            try:
+                if hasattr(self, "_precomputed") and isinstance(self._precomputed, dict):
+                    self._precomputed.clear()
+                self._data_df = None
+            except Exception:
+                pass
+
+            # Drop model/scaler references (largest CPU RAM holders)
+            try:
+                if hasattr(self, "models") and isinstance(self.models, dict):
+                    self.models.clear()
+                if hasattr(self, "scalers") and isinstance(self.scalers, dict):
+                    self.scalers.clear()
+            except Exception:
+                pass
+
+            # Clear caches aggressively
+            try:
+                if hasattr(self, "_global_cache") and hasattr(self._global_cache, "clear"):
+                    self._global_cache.clear()
+                if hasattr(self, "_agent_cache") and hasattr(self._agent_cache, "clear"):
+                    self._agent_cache.clear()
+            except Exception:
+                pass
+
+            # TensorFlow session cleanup (CPU or GPU)
+            try:
+                if self.tf is not None:
+                    self.tf.keras.backend.clear_session()
+            except Exception:
+                pass
+
+            # Final GC passes
+            for _ in range(3):
+                gc.collect()
+        except Exception:
+            # Never crash training on cleanup
+            pass
+
     # -------- public utils --------
 
     def update(self, row: Mapping[str, Any]):

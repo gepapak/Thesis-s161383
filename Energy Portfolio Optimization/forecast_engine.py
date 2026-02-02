@@ -33,10 +33,10 @@ class ForecastComputationResult:
 @dataclass
 class ForecastObservationFeatures:
     """Forecast features to add to observations."""
-    investor_features: Optional[np.ndarray] = None  # 8D (Tier 22): z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal
-    battery_features: Optional[np.ndarray] = None   # 6D: z_short_wind, z_short_solar, z_short_hydro, z_short_price, z_medium_price, z_long_price
-    risk_features: Optional[np.ndarray] = None     # 3D: z_short, vol_forecast, trust
-    meta_features: Optional[np.ndarray] = None      # 2D: trust, expected_return
+    investor_features: Optional[np.ndarray] = None  # 3D (Tier 2): z_short, forecast_trust, trade_signal
+    battery_features: Optional[np.ndarray] = None   # 4D: z_short_wind, z_short_solar, z_short_hydro, z_short_price
+    risk_features: Optional[np.ndarray] = None     # 3D: z_short, z_long, trust
+    meta_features: Optional[np.ndarray] = None      # 2D: trust, expected_return (short+long)
 
 
 class ForecastEngine:
@@ -87,7 +87,11 @@ class ForecastEngine:
         if self.enabled:
             logger.info("[FORECAST_ENGINE] Forecast integration ENABLED")
         else:
-            logger.info("[FORECAST_ENGINE] Forecast integration DISABLED (Tier 1 mode)")
+            # Distinguish between true Tier-1 disable vs per-episode forecaster init
+            if getattr(self.config, 'enable_forecast_utilisation', False) and self.forecast_generator is None:
+                logger.info("[FORECAST_ENGINE] Forecast integration PENDING (forecaster not initialized yet)")
+            else:
+                logger.info("[FORECAST_ENGINE] Forecast integration DISABLED (Tier 1 mode)")
     
     def is_enabled(self) -> bool:
         """Check if forecast integration is enabled."""
@@ -434,20 +438,16 @@ class ForecastEngine:
         # Only use forecasts when they're highly reliable (addresses reward mismatch)
         forecast_confidence = float(np.clip(1.0 / (1.0 + avg_mape), 0.0, 1.0))
         
-        # CRITICAL: Forecast rewards are blocked for fair comparison (observations only)
-        # Tier 2: Forecast observations only (no rewards) - agents learn from PnL correlation
-        # Tier 3: Forecast observations + FAMC (no forecast rewards) - FAMC handles variance reduction
-        # The difference is FAMC (variance reduction), not forecast rewards!
-        # Forecast features in observations alone should enable better decision-making through:
-        # 1. Predictive information (z-scores indicate future price movements)
-        # 2. Implicit learning (agents learn forecast→action mappings from PnL correlation)
-        # 3. GNN encoder learning (cross-attention fusion enables forecast→base interactions)
-        explicit_gate_passed = False  # Always block for BOTH tiers (fair comparison)
-        
-        # OR logic: Gate passes if risk manager approves (but no forecast rewards)
+        # CRITICAL: Fairness policy
+        # - Keep reward shaping OFF (shared reward structure with Tier 1).
+        # - Allow forecast OBSERVATIONS to flow (so the policy can learn from forecasts).
+        reward_shaping_enabled = bool(getattr(config, 'forecast_reward_shaping_enable', False))
+
+        # OBS gate: allow forecasts into observations regardless of reward shaping.
+        explicit_gate_passed = True
         forecast_gate_passed = forecast_gate_passed or explicit_gate_passed
 
-        if forecast_gate_passed:
+        if forecast_gate_passed and reward_shaping_enabled:
             alignment_value = position_normalized * forecast_direction_normalized * position_exposure
             alignment_score = float(np.clip(alignment_value, -1.0, 1.0))
             # FIX: Actually use config parameter instead of hardcoded 5.0
@@ -864,18 +864,24 @@ class ForecastEngine:
             price_medium = self._get_forecast_safe(forecasts, "price", "medium", default=current_price_raw)
             price_long = self._get_forecast_safe(forecasts, "price", "long", default=current_price_raw)
             
-            # Compute forecast returns: (forecast[t+h] - price[t]) / price[t]
-            # This gives the predicted return over the horizon period
-            forecast_return_short = (price_short - current_price_raw) / max(abs(current_price_raw), 1.0)
-            forecast_return_medium = (price_medium - current_price_raw) / max(abs(current_price_raw), 1.0)
-            forecast_return_long = (price_long - current_price_raw) / max(abs(current_price_raw), 1.0)
+            # Compute forecast returns: (forecast[t+h] - price[t]) / denom
+            # ANTI-SATURATION: use denominator floor + clip returns + configurable tanh scale.
+            denom_floor = float(getattr(self.config, 'forecast_return_denom_floor', 1.0) or 1.0)
+            denom = max(abs(current_price_raw), denom_floor, 1.0)
+            forecast_return_short = (price_short - current_price_raw) / denom
+            forecast_return_medium = (price_medium - current_price_raw) / denom
+            forecast_return_long = (price_long - current_price_raw) / denom
+
+            ret_clip = float(getattr(self.config, 'forecast_return_clip', 1e9) or 1e9)
+            if ret_clip > 0:
+                forecast_return_short = float(np.clip(forecast_return_short, -ret_clip, ret_clip))
+                forecast_return_medium = float(np.clip(forecast_return_medium, -ret_clip, ret_clip))
+                forecast_return_long = float(np.clip(forecast_return_long, -ret_clip, ret_clip))
             
-            # Apply tanh with scaling factor (typical returns are ±5%, so scale by 10x)
-            # This maps ±5% returns to ±0.46 z-scores, ±10% to ±0.76, ±20% to ±0.96
-            # This matches the approach in environment.py _compute_forecast_deltas()
-            z_short_price = float(np.tanh(forecast_return_short * 10.0))
-            z_medium_price = float(np.tanh(forecast_return_medium * 10.0))
-            z_long_price = float(np.tanh(forecast_return_long * 10.0))
+            tanh_scale = float(getattr(self.config, 'forecast_return_tanh_scale', 10.0) or 10.0)
+            z_short_price = float(np.tanh(forecast_return_short * tanh_scale))
+            z_medium_price = float(np.tanh(forecast_return_medium * tanh_scale))
+            z_long_price = float(np.tanh(forecast_return_long * tanh_scale))
             
             # Clip to reasonable range (tanh already bounds to [-1, 1], but clip for safety)
             z_short_price = float(np.clip(z_short_price, -1.0, 1.0))
@@ -993,9 +999,12 @@ class ForecastEngine:
         
         Returns ForecastObservationFeatures with arrays for each agent.
         Returns empty features if forecasts disabled.
-        
-        TEMPORAL ALIGNMENT FIX: Uses lagged z_medium (from t-24) to align with return at t+24.
-        This ensures the forecast that predicted current conditions is used.
+
+        IMPORTANT SEMANTICS NOTE (Tier2):
+        - Tier2 policy observations (source-of-truth) are constructed in `environment.py` + `ObservationBuilder`.
+        - There, we intentionally feed the decision-time medium-horizon signal into the policy (z_medium_used),
+          because it is the most actionable at the current decision step.
+        - This helper matches that convention to avoid having two competing definitions of "z_medium".
         """
         if not self.enabled:
             return ForecastObservationFeatures()
@@ -1020,38 +1029,30 @@ class ForecastEngine:
                 except Exception:
                     pass
             
-            # TEMPORAL ALIGNMENT: Get lagged z_medium from t-24 to align with return at t+24
-            # The forecast made 24 steps ago predicted what's happening now
-            z_medium_lagged = self.z_medium_price  # Default to current if no lag available
-            current_timestep = getattr(env, 't', None) if env is not None else None
-            horizon_medium = getattr(self.config, 'forecast_horizons', {}).get('medium', 24)
-            
-            if current_timestep is not None and current_timestep >= horizon_medium:
-                lag_timestep = current_timestep - horizon_medium
-                if hasattr(env, '_z_score_history') and lag_timestep in env._z_score_history:
-                    z_medium_lagged = float(env._z_score_history[lag_timestep].get('z_medium', z_medium_lagged))
+            # Decision-time medium-horizon signal (Tier2 convention)
+            z_medium_used = float(self.z_medium_price)
             
             # ENGINEERED FEATURES: Direction, Momentum, Strength
-            # Direction: sign of z_medium_lagged (-1 for down, +1 for up, 0 for neutral)
-            direction = float(np.sign(z_medium_lagged))
+            # Direction: sign of z_medium_used (-1 for down, +1 for up, 0 for neutral)
+            direction = float(np.sign(z_medium_used))
             
             # Momentum: change in z_medium (current - previous)
-            z_medium_prev = getattr(self, '_z_medium_prev', z_medium_lagged)
-            momentum = float(np.clip(z_medium_lagged - z_medium_prev, -1.0, 1.0))
-            self._z_medium_prev = z_medium_lagged  # Store for next iteration
+            z_medium_prev = getattr(self, '_z_medium_prev', z_medium_used)
+            momentum = float(np.clip(z_medium_used - z_medium_prev, -1.0, 1.0))
+            self._z_medium_prev = z_medium_used  # Store for next iteration
             
-            # Strength: absolute value of z_medium_lagged (magnitude of signal)
-            strength = float(np.clip(abs(z_medium_lagged), 0.0, 1.0))
+            # Strength: absolute value of z_medium_used (magnitude of signal)
+            strength = float(np.clip(abs(z_medium_used), 0.0, 1.0))
             
             # TRADE SIGNAL: Composite feature combining direction, strength, and trust
             # Range: [-1, 1] where positive = buy signal, negative = sell signal, magnitude = confidence
             trade_signal = float(np.clip(direction * strength * self.forecast_trust, -1.0, 1.0))
             
-            # TIER 22: Full forecast features (8D: z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal)
+        # Tier 2: Compact forecast features (3D: z_medium_lagged, forecast_trust, trade_signal)
             # All features provide rich context for the agent to learn from
             investor_features = np.array([
                 self.z_short_price,        # Short-term price forecast z-score
-                z_medium_lagged,           # Medium-term price forecast (temporally aligned)
+                z_medium_used,             # Medium-term price forecast (decision-time, Tier2 convention)
                 direction,                 # Sign of forecast signal (-1, 0, +1)
                 momentum,                  # Change in forecast signal
                 strength,                  # Absolute magnitude of forecast signal

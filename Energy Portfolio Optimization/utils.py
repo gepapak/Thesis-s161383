@@ -1353,6 +1353,70 @@ class MarketRegimeDetector:
 # EXPORTS
 # ============================================================================
 
+# ============================================================================
+# TIER UTILITIES (migrated from tier_utils.py)
+# ============================================================================
+
+TIER_1 = "TIER_1"
+TIER_2 = "TIER_2"
+TIER_3 = "TIER_3"
+
+
+def determine_tier(enable_forecast_utilisation: bool,
+                   forecast_baseline_enable: bool,
+                   dl_overlay_enabled: bool) -> str:
+    if forecast_baseline_enable or dl_overlay_enabled:
+        return TIER_3
+    elif enable_forecast_utilisation:
+        return TIER_2
+    else:
+        return TIER_1
+
+
+def get_expected_observation_dims(tier: str, agent_name: str) -> int:
+    base_dims = {
+        'investor_0': 6,
+        'battery_operator_0': 4,
+        'risk_controller_0': 9,
+        'meta_controller_0': 11,
+    }
+    if tier == TIER_1:
+        return base_dims.get(agent_name, 6)
+    forecast_dims = {
+        'investor_0': 2,
+        'battery_operator_0': 4,
+        'risk_controller_0': 3,
+        'meta_controller_0': 2,
+    }
+    return base_dims.get(agent_name, 6) + forecast_dims.get(agent_name, 0)
+
+
+def get_tier_from_config(config) -> str:
+    enable_forecast_util = getattr(config, 'enable_forecast_utilisation', False)
+    forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
+    overlay_enabled = getattr(config, 'overlay_enabled', False)
+    return determine_tier(enable_forecast_util, forecast_baseline_enable, overlay_enabled)
+
+
+def get_tier_from_env(env) -> str:
+    if not hasattr(env, 'config'):
+        return TIER_1
+    config = env.config
+    enable_forecast_util = getattr(config, 'enable_forecast_utilisation', False)
+    forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
+    overlay_enabled = getattr(config, 'overlay_enabled', False)
+    has_dl_adapter = hasattr(env, 'dl_adapter_overlay') and env.dl_adapter_overlay is not None
+    return determine_tier(enable_forecast_util, forecast_baseline_enable, overlay_enabled or has_dl_adapter)
+
+
+def get_tier_description(tier: str) -> str:
+    descriptions = {
+        TIER_1: "MARL Baseline - No forecasts, no DL overlay",
+        TIER_2: "MARL + Forecast Integration - Forecasts enabled, no DL overlay",
+        TIER_3: "MARL + Forecast + FAMC - Tier 2 observations + FGB/FAMC (DL-assisted baseline only)",
+    }
+    return descriptions.get(tier, f"Unknown tier: {tier}")
+
 __all__ = [
     # Safe operations
     'SafeDivision', 'safe_clip', 'safe_mean', 'safe_std', 'safe_percentile',
@@ -1377,4 +1441,3 @@ __all__ = [
     # Market regime detection
     'MarketRegimeDetector',
 ]
-

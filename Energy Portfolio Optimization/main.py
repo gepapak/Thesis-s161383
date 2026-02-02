@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import random
 import csv
+import glob
 from collections import deque
 import logging
 import traceback
@@ -398,7 +399,6 @@ def print_portfolio_summary(env, step_count):
         logger.error(f"\n[STATS] PORTFOLIO SUMMARY - Step {step_count:,}")
         logger.error(f"   Error calculating portfolio: {e}")
 
-# REMOVED: save_checkpoint_summary_to_csv function
 # Portfolio metrics are now logged at every timestep in the debug CSV (first columns)
 # No separate checkpoint summary file needed - all data is in the per-episode CSV files
 
@@ -503,7 +503,6 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
             # CRITICAL FIX: If preserve_agent_state=True (episode continuity), NEVER reset
             reset_agent_state = (checkpoint_count == 0) and not preserve_agent_state
 
-            # NOTE: assumes meta-controller treats this as a *relative* budget.
             agent.learn(total_timesteps=interval, callbacks=callbacks, reset_num_timesteps=reset_agent_state)
 
             end_time = datetime.now()
@@ -721,29 +720,6 @@ def analyze_training_performance(env, log_path: str, monitoring_dirs: Dict[str, 
 # =====================================================================
 
 # =====================================================================
-# OLD HEDGE ADAPTER CLASS REMOVED
-# =====================================================================
-# The HedgeAdapter class has been removed as it was not used in the
-# current DL overlay implementation. The new DLAdapter is used instead.
-
-
-# =====================================================================
-# HEDGE ADAPTER METHODS REMOVED
-# =====================================================================
-# All HedgeAdapter methods have been removed as the class is no longer used.
-# The new DLAdapter is used instead for DL overlay functionality.
-
-# =====================================================================
-# Memory Management Utilities
-# =====================================================================
-
-# =====================================================================
-# LEFTOVER HEDGE ADAPTER CODE REMOVED
-# =====================================================================
-# All remaining HedgeAdapter methods and code have been removed.
-# The new DLAdapter is used instead for DL overlay functionality.
-
-# =====================================================================
 # Memory Management Utilities
 # =====================================================================
 
@@ -915,6 +891,67 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
     logger.info(f"   Data directory: {args.episode_data_dir}")
     logger.info(f"   Cooling period: {args.cooling_period} minutes")
 
+    # ------------------------------------------------------------------
+    # GLOBAL NORMALIZATION (compute once per run for stable cross-episode learning)
+    # ------------------------------------------------------------------
+    try:
+        # Enable for episode training to avoid distribution shifts at episode boundaries.
+        # Compute if disabled OR if enabled but stats are missing (e.g., config toggled without populated values).
+        need_global_norm = bool(getattr(args, "episode_training", False))
+        has_stats = all(
+            hasattr(config, k) for k in ("global_price_mean", "global_price_std", "global_wind_scale", "global_solar_scale", "global_hydro_scale", "global_load_scale")
+        )
+        if need_global_norm and (not getattr(config, "use_global_normalization", False) or not has_stats):
+            scenario_paths = sorted(glob.glob(os.path.join(args.episode_data_dir, "scenario_*.csv")))
+            if len(scenario_paths) >= 2:
+                prices = []
+                wind = []
+                solar = []
+                hydro = []
+                load = []
+                for sp in scenario_paths:
+                    df = pd.read_csv(sp)
+                    if "price" in df.columns:
+                        prices.append(df["price"].astype(float).to_numpy())
+                    if "wind" in df.columns:
+                        wind.append(df["wind"].astype(float).to_numpy())
+                    if "solar" in df.columns:
+                        solar.append(df["solar"].astype(float).to_numpy())
+                    if "hydro" in df.columns:
+                        hydro.append(df["hydro"].astype(float).to_numpy())
+                    if "load" in df.columns:
+                        load.append(df["load"].astype(float).to_numpy())
+
+                import numpy as np
+
+                if prices:
+                    price_all = np.concatenate(prices)
+                    config.global_price_mean = float(np.nanmean(price_all))
+                    config.global_price_std = float(max(np.nanstd(price_all), 1e-6))
+
+                def p95(x):
+                    if not x:
+                        return None
+                    arr = np.concatenate(x)
+                    return float(max(np.nanpercentile(arr, 95), 1e-6))
+
+                config.global_wind_scale = p95(wind)
+                config.global_solar_scale = p95(solar)
+                config.global_hydro_scale = p95(hydro)
+                config.global_load_scale = p95(load)
+
+                config.use_global_normalization = True
+                logger.info(
+                    "[GLOBAL_NORM] Enabled global normalization for episode training: "
+                    f"price_mean={config.global_price_mean:.3f} price_std={config.global_price_std:.3f} "
+                    f"| p95 scales: wind={config.global_wind_scale} solar={config.global_solar_scale} "
+                    f"hydro={config.global_hydro_scale} load={config.global_load_scale}"
+                )
+            else:
+                logger.warning("[GLOBAL_NORM] Not enough scenario_*.csv files found to compute global normalization; leaving disabled.")
+    except Exception as e:
+        logger.warning(f"[GLOBAL_NORM] Failed to compute global normalization stats: {e}")
+
     # Handle episode restart
     if args.resume_episode is not None:
         logger.info(f"   [CYCLE] Resume mode: Starting from Episode {args.resume_episode}")
@@ -1044,7 +1081,6 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
         logger.warning(f"   [ALERT] AGGRESSIVE MEMORY CLEANUP BEFORE EPISODE {episode_num}")
         try:
             import psutil
-            # NOTE: gc and os are already imported at module level (lines 4, 13), don't re-import here
 
             # Get initial memory
             initial_mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
@@ -1068,7 +1104,6 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 
             # 1. Clear TensorFlow completely
             # REASON: TensorFlow maintains computation graphs and cached tensors between episodes
-            # NOTE: This clears the session but weights will be reloaded from previous episode checkpoint
             try:
                 import tensorflow as tf
                 tf.keras.backend.clear_session()
@@ -1726,6 +1761,10 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         # Clear only in-memory forecaster caches (preserve disk cache for reuse)
                         if hasattr(forecaster, '_cleanup_memory'):
                             forecaster._cleanup_memory()
+                        # NEW: Heavy end-of-episode cleanup to prevent CPU RAM creep across episodes
+                        # (drops precomputed arrays + model/scaler refs; safe because forecaster is recreated per-episode)
+                        if hasattr(forecaster, 'cleanup_end_of_episode'):
+                            forecaster.cleanup_end_of_episode()
                         if hasattr(forecaster, '_global_cache'):
                             forecaster._global_cache.clear()
                         if hasattr(forecaster, '_agent_cache'):
@@ -1739,6 +1778,14 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 
                     except Exception as e:
                         logger.warning(f"   [WARN] Forecaster cleanup error: {e}")
+
+                    # IMPORTANT: Drop reference so Python can reclaim RAM
+                    # (forecaster is recreated at the start of the next episode anyway)
+                    try:
+                        del forecaster
+                    except Exception:
+                        pass
+                    forecaster = None
 
                 # 3. NUCLEAR AGENT CLEANUP
                 try:
@@ -2072,13 +2119,11 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None, help="Resume training from checkpoint directory")
     parser.add_argument("--validate_env", action="store_true", default=True, help="Validate env setup before training")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    # NOTE: Experience replay is not implemented - PPO uses on-policy learning
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
 
     # Rewards
     parser.add_argument("--adapt_rewards", action="store_true", default=True, help="Enable adaptive reward weights")
     parser.add_argument("--reward_analysis_freq", type=int, default=2000, help="Analyze rewards every N steps")
-    # NOTE: Reward weights are configured in config.py (profit_reward_weight, risk_penalty_weight)
     # Use optimized_params to override if needed
 
     # DL Overlay (Tier 3 only): used for FGB/FAMC baseline signals (not reward shaping, not sizing)
@@ -2088,7 +2133,6 @@ def main():
                        help="Expert blending mode: none (passive hints), fixed (constant blend), adaptive (confidence-based), residual (PPO learns corrections)")
     # OPTIMIZED: Train 10x more frequently (every 500 steps) for faster adaptation
     parser.add_argument("--dl_train_every", type=int, default=500, help="OPTIMIZED: DL training frequency")
-    # NOTE: DL overlay training parameters (buffer_size, batch_size, learning_rate) are hardcoded in dl_overlay.py
     # OverlayExperienceBuffer: max_size=10,000
     # OverlayTrainer: learning_rate=3e-3, batch_size from buffer sampling
 
@@ -2124,14 +2168,26 @@ def main():
 
     # === 3-TIER SYSTEM: Forecast Utilisation ===
     # Tier 1 (Baseline MARL): No forecasts, 6D investor observations (default - no flag needed)
-    # Tier 2 (Forecast-Enhanced Observations): --enable_forecast_utilisation, 14D investor observations (6 base + 8 forecast features)
+    # Tier 2 (Forecast-Enhanced Observations): --enable_forecast_utilisation, 7D investor observations (6 base + 1 forecast feature)
     # Tier 3 (FGB/FAMC): --enable_forecast_utilisation + --forecast_baseline_enable (+ --fgb_mode), uses DL overlay for baseline adjustment
     parser.add_argument("--enable_forecast_utilisation", action="store_true", default=False,
-                       help="TIER 2: Enable forecast model loading + forecast-enhanced observations (14D = 6 base + 8 forecast features)")
+                       help="TIER 2: Enable forecast model loading + forecast-enhanced observations (7D = 6 base + 1 forecast feature)")
 
     # GNN Encoder (independent add-on - works with all tiers)
     parser.add_argument("--enable_gnn_encoder", action="store_true", default=False,
                        help="ADD-ON (All Tiers): Enable GNN observation encoder (works with Tier 1, Tier 2, or Tier 3)")
+
+    # PPO exploration controls (helps avoid near-constant actions / saturation)
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Override learning rate (default: config.lr).")
+    parser.add_argument("--ent_coef", type=float, default=None,
+                        help="Override PPO entropy coefficient (default: config.ent_coef). Useful to prevent action collapse.")
+    parser.add_argument("--ppo_use_sde", action="store_true", default=False,
+                        help="Enable PPO gSDE (state-dependent exploration) for continuous actions.")
+    parser.add_argument("--ppo_sde_sample_freq", type=int, default=4,
+                        help="PPO gSDE: sample a new noise matrix every n steps (default: 4).")
+    parser.add_argument("--ppo_log_std_init", type=float, default=None,
+                        help="Override PPO policy log_std_init for continuous actions (e.g., -0.3 to increase exploration).")
 
     # Forecasting Control (requires --enable_forecast_utilisation)
     parser.add_argument("--confidence_floor", type=float, default=0.6, help="Minimum confidence floor (0.0-1.0, default 0.6). MAPE-based confidence cannot go below this value.")
@@ -2346,9 +2402,9 @@ def main():
     config.enable_forecast_utilisation = args.enable_forecast_utilisation
     logger.info(f"[FORECAST_UTIL] Enabled: {config.enable_forecast_utilisation}")
     if config.enable_forecast_utilisation:
-        logger.info(f"[FORECAST_UTIL] Investor observations: 14D (6 base + 8 forecast) - TIER 22 (Full Features)")
+        logger.info(f"[FORECAST_UTIL] Investor observations: 7D (6 base + 1 forecast) - TIER 2 (Compact Features)")
         logger.info(f"[FORECAST_UTIL]   Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl")
-        logger.info(f"[FORECAST_UTIL]   Forecast (8D): z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal")
+        logger.info(f"[FORECAST_UTIL]   Forecast (1D): trade_signal (calibrated z_short)")
 
         # TIER 2 vs TIER 3: Different overlay usage
         # - Tier 2 (dl_overlay=False): Direct deltas only, NO DL overlay
@@ -2365,8 +2421,8 @@ def main():
             # DL overlay is ONLY for Tier 3 (when --dl_overlay flag is set)
             # Tier 2 does NOT need DL overlay - it learns directly from forecast deltas
             logger.info(f"[FORECAST_UTIL] Tier 2 uses direct deltas from ForecastGenerator (NO DL overlay needed)")
+            logger.info(f"[FORECAST_UTIL]   PPO learns directly from calibrated trade_signal (z_short only)")
             logger.info(f"[FORECAST_UTIL]   ForecastGenerator → _compute_forecast_deltas() → ForecastEngine → observations")
-            logger.info(f"[FORECAST_UTIL]   PPO learns directly from forecast z-scores (z_short, z_medium, trust)")
         else:
             # TIER 3: Direct deltas + DL overlay outputs (pred_reward + optional meta head)
             # IMPORTANT (fairness): Tier 3 does NOT inject overlay signals into env reward
@@ -2374,17 +2430,34 @@ def main():
             #
             logger.info(f"[TIER3] DL overlay enabled - overlay outputs will be used:")
             logger.info(f"[TIER3]   - Meta-critic (FAMC): {'enabled' if config.meta_baseline_enable else 'disabled'}")
+            logger.info(f"[FORECAST_UTIL]   PPO learns directly from calibrated trade_signal (z_short only)")
     else:
         logger.info(f"[FORECAST_UTIL] Investor observations: 6D (baseline MARL)")
+
+    # PPO exploration overrides (optional)
+    if args.lr is not None:
+        config.lr = float(args.lr)
+        logger.info(f"[PPO] Overriding lr -> {config.lr}")
+    if args.ent_coef is not None:
+        config.ent_coef = float(args.ent_coef)
+        logger.info(f"[PPO] Overriding ent_coef -> {config.ent_coef}")
+    config.ppo_use_sde = bool(getattr(args, "ppo_use_sde", False))
+    config.ppo_sde_sample_freq = int(getattr(args, "ppo_sde_sample_freq", 4))
+    config.ppo_log_std_init = getattr(args, "ppo_log_std_init", None)
+    if bool(getattr(config, "force_disable_sde", False)):
+        if config.ppo_use_sde:
+            logger.info("[PPO] force_disable_sde=True: overriding use_sde -> False")
+        config.ppo_use_sde = False
+    logger.info(f"[PPO] use_sde={config.ppo_use_sde} sde_sample_freq={config.ppo_sde_sample_freq} log_std_init={config.ppo_log_std_init}")
 
     # === GNN Encoder: Apply GNN configuration (works for both Tier 1 and Tier 2) ===
     logger.info("\nApplying GNN encoder configuration...")
     config.enable_gnn_encoder = args.enable_gnn_encoder
     if config.enable_gnn_encoder:
         # GNN encoder is independent of forecast integration
-        # It can work on base observations (6D) OR forecast-enhanced observations (9D)
+        # It can work on base observations (6D) OR forecast-enhanced observations (7D = 6 base + 1 forecast)
         # This makes GNN encoder a true add-on that can be used with or without forecasts
-        obs_type = "14D (with forecasts)" if config.enable_forecast_utilisation else "6D (base)"
+        obs_type = "7D (with forecasts)" if config.enable_forecast_utilisation else "6D (base)"
         tier_label = "Tier 2 (forecast-enhanced)" if config.enable_forecast_utilisation else "Tier 1 (base observations)"
         logger.info(f"[GNN] Enabled: Graph Attention Network encoder ({tier_label})")
         logger.info(f"[GNN]   Observation type: {obs_type}")
@@ -2394,7 +2467,7 @@ def main():
             logger.info(f"[GNN]   Hidden dim: {config.gnn_hidden_dim_tier2} (Tier 2 optimized)")
             logger.info(f"[GNN]   Layers: {config.gnn_num_layers_tier2} (Tier 2 optimized)")
             logger.info(f"[GNN]   Graph type: {config.gnn_graph_type_tier2} (Tier 2: hierarchical - separate base/forecast encoders + cross-attention)")
-            logger.info(f"[GNN]   Architecture: 6D base features → GNN → 12D | 8D forecast features → GNN → 12D | Cross-attention → 24D")
+            logger.info(f"[GNN]   Architecture: 6D base features -> GNN -> 12D | 1D forecast features -> GNN -> 12D | Cross-attention -> 24D")
             logger.info(f"[GNN]   Dropout: {config.gnn_dropout_tier2} (Tier 2 optimized)")
             logger.info(f"[GNN]   MLP arch: {config.gnn_net_arch_tier2} (Tier 2 optimized)")
         else:
@@ -2459,8 +2532,6 @@ def main():
         logger.info(f"[EXPERT_BLEND] Weight: {config.expert_blend_weight}")
 
     # FGB: Emit deprecation warnings if old blending flags are used
-    if hasattr(args, 'overlay_alpha') and args.overlay_alpha is not None and args.overlay_alpha != 0.0:
-        logger.warning("[WARN] DEPRECATED: --overlay_alpha is no longer supported.")
         logger.warning("       Action blending has been replaced by forecast-guided baseline.")
         logger.warning("       Set --forecast_baseline_enable to use the new approach.")
 
@@ -2709,16 +2780,20 @@ def main():
         # Create logs subdirectory inside save_dir
         logs_dir = os.path.join(args.save_dir, 'logs')
         os.makedirs(logs_dir, exist_ok=True)
+        # IMPORTANT: In episode training, base_env is a bootstrap env (used for init/wiring).
+        # It should NOT write episode logs into the main logs directory, otherwise it can clobber
+        # tier*_debug_ep0.csv when resuming at a later episode.
+        bootstrap_logs_dir = os.path.join(logs_dir, "_bootstrap") if args.episode_training else logs_dir
+        os.makedirs(bootstrap_logs_dir, exist_ok=True)
         base_env = RenewableMultiAgentEnv(
             data,
             investment_freq=args.investment_freq,
             forecast_generator=forecaster,
             dl_adapter=None,  # No adapter yet
             config=config,  # Pass config to environment
-            log_dir=logs_dir  # NEW: Save debug logs in logs folder
+            log_dir=bootstrap_logs_dir  # Keep bootstrap logs isolated in episode training
         )
 
-        # NOTE: Forecast confidence threshold will be set after reward calculator initialization
 
         # Step 2: Initialize DLAdapter for overlay inference (28D Forecast-Aware mode)
         # This provides shared intelligence, adaptive risk budgeting, and predictive reward shaping

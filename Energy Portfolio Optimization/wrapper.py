@@ -8,7 +8,6 @@ Provides:
 - Memory-optimized observation building with caching
 - Enhanced monitoring (optional)
 
-Note: Step-by-step CSV logging has been removed. Only checkpoint summaries are saved.
 """
 
 from gymnasium import spaces
@@ -580,9 +579,10 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
 
         except Exception as e:
             # FAIL-FAST: No fallbacks allowed for production safety
-            raise ValueError(f"Failed to get validated base dimension for agent '{agent}': {str(e)}. "
-                           f"This indicates environment/wrapper configuration issues that must be fixed. "
-                           f"Static dimension fallbacks removed for production safety.")
+            raise ValueError(
+                f"Failed to get validated base dimension for agent '{agent}': {str(e)}. "
+                "This indicates environment/wrapper configuration issues that must be fixed."
+            )
 
     def _calculate_forecast_dimension(self, agent: str) -> int:
         # If no forecaster, return 0 forecast dimensions (baseline mode)
@@ -590,7 +590,7 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
             return 0
 
         # CONDITIONAL: When enable_forecast_utilisation=True (Tier 2/3), the base environment already includes
-        # the forecast features in its observation space (e.g., investor_0 is 14D = 6 base + 8 forecast).
+        # the forecast features in its observation space (e.g., investor_0 is 8D = 6 base + 2 forecast).
         # So the wrapper should NOT add additional forecast dimensions.
         enable_forecast_util = getattr(self.base_env.config, 'enable_forecast_utilisation', False) if hasattr(self.base_env, 'config') else False
         if enable_forecast_util:
@@ -682,9 +682,10 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 raise ValueError(f"Cannot determine base observation dimension for agent '{agent}': "
                                f"environment missing observation_space or _get_base_observation_dimension method")
         except Exception as e:
-            raise ValueError(f"Cannot create fallback spec for agent '{agent}': "
-                           f"failed to get base dimension dynamically. {str(e)}. "
-                           f"Static dimension estimates removed for production safety.")
+            raise ValueError(
+                f"Cannot create fallback spec for agent '{agent}': "
+                f"failed to get base dimension dynamically. {str(e)}."
+            )
         # DYNAMIC: Calculate forecast dimensions from actual forecaster configuration
         try:
             if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
@@ -730,7 +731,10 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 v = f_proc.get(key, 0.0)
                 out[bd + j] = float(v if np.isfinite(v) else 0.0)
 
-        # FIX #7: Append consensus signals (direction, confidence) after forecast features
+        # Optional: Append consensus signals (direction, confidence) after forecast features.
+        # IMPORTANT: Only write these if the declared spec/space already includes room for them.
+        # In Tier 2/3, the base env already includes all forecast-related features and the wrapper
+        # must NOT silently expand the observation vector.
         try:
             if agent != "risk_controller_0":
                 # Consensus derived from forecast engine's quality-weighted signal and trust
@@ -768,11 +772,11 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                     consensus_direction = float(np.sign(avg_signal))
                     consensus_confidence = 0.5
 
-                # Append to observation vector safely
-                # Place after existing total_dim; expand buffer if needed
-                if out.size < (bd + fd + 2):
-                    out = np.pad(out, (0, bd + fd + 2 - out.size)).astype(np.float32)
-                out[bd + fd: bd + fd + 2] = np.array([consensus_direction, consensus_confidence], dtype=np.float32)
+                # Append ONLY if the observation spec already includes these two dims
+                if td >= (bd + fd + 2):
+                    out[bd + fd: bd + fd + 2] = np.array(
+                        [consensus_direction, consensus_confidence], dtype=np.float32
+                    )
         except Exception:
             # Keep observations valid even if consensus computation fails
             pass
@@ -950,6 +954,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self.env = base_env
         self.base_env = base_env  # Alias for compatibility
         self.forecaster = multi_horizon_forecaster
+        # CRITICAL: Forward config for code paths that expect env.config (e.g., action validation toggles).
+        # The base env owns config; the wrapper should expose it transparently.
+        self.config = getattr(base_env, "config", None)
 
         # Agents
         self._possible_agents = self.env.possible_agents[:]
@@ -1032,7 +1039,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         for each agent.
         
         IMPORTANT (fairness): Tier 3 is observation-identical to Tier 2.
-        There is no bridge-vector augmentation and no expert-suggestion augmentation.
 
         These spaces are defined ONCE at initialization and NEVER modified at runtime.
         This ensures compatibility with Stable Baselines3, which builds policy networks
@@ -1045,8 +1051,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         specs = self.obs_builder.validator.agent_observation_specs
 
         # ROBUST TIER DETECTION: Use centralized tier utilities
-        # NOTE: Tier 3 is observation-identical to Tier 2 (no bridge-vector augmentation).
-        from tier_utils import get_tier_from_config, get_tier_description
+        from utils import get_tier_from_config, get_tier_description
         
         tier = get_tier_from_config(self.env.config)
         logger.info(f"[OBS_SPACE_TIER] Detected: {tier} - {get_tier_description(tier)}")
@@ -1058,7 +1063,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
             low, high = spec['bounds']
             total_dim = spec['total_dim']  # base_dim + forecast_dim (from EnhancedObservationValidator)
 
-            # Static observation space is exactly base+forecast (no bridge augmentation).
             final_dim = total_dim
             self._obs_spaces[agent] = spaces.Box(
                 low=low[:final_dim], high=high[:final_dim],
@@ -1086,7 +1090,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         """
         Rebuild observation spaces after environment/forecaster changes.
 
-        NOTE: Tier 3 is observation-identical to Tier 2 (no bridge dims).
         """
         logger.info("[OBS_SPACE_REBUILD] Rebuilding observation spaces")
         self._build_wrapper_observation_spaces()
@@ -1165,7 +1168,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._prev_forecasts_for_error = {}
         self._last_price_forecast_norm = 0.0
 
-        # DL overlay shape logging removed (bridge/risk/strategy heads removed; Tier 3 uses overlay for FGB/FAMC only).
         self._last_price_forecast_aligned = 0.0
 
         # Initialize forecaster history with sufficient data for predictions
@@ -1299,7 +1301,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         step_time = (time.perf_counter() - t0)
         self._last_step_wall_ms = step_time * 1000.0
 
-        # No fast mode progress display - removed
 
         # Enhanced monitoring (optional)
         if self.enhanced_monitor:
@@ -1493,6 +1494,10 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                 arr = arr.flatten()
 
             arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Anti-collapse: smooth-squash only if out of bounds.
+            # Prevents hard clipping from turning near-constant out-of-range outputs into perfectly constant actions.
+            if bool(getattr(self.config, "enable_action_tanh_squash", True)) and np.any(np.abs(arr) > 1.0 + 1e-6):
+                arr = np.tanh(arr).astype(np.float32)
             need = int(np.prod(space.shape))
             if arr.size != need:
                 if arr.size < need:
@@ -1837,8 +1842,8 @@ def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
         total_dim = len(investor_obs)
 
         # Current expected layouts:
-        # - Tier 2 / Tier 3 (fair, obs-identical): investor_0 is 14D = 6 base + 8 forecast features
-        #   Forecast slice: indices [6:14)
+        # - Tier 2 / Tier 3 (fair, obs-identical): investor_0 is 8D = 6 base + 2 forecast features
+        #   Forecast slice: indices [6:8]
         # - Legacy/experimental layouts may have more dims; we only require that there is a non-empty
         #   forecast slice immediately after the 6 base dims.
         base_dim = 6
@@ -1849,8 +1854,8 @@ def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
             )
 
         forecast_start = base_dim
-        # Prefer the canonical 14D slice when available; otherwise take all remaining dims after base.
-        forecast_end = 14 if total_dim >= 14 else total_dim
+        # Prefer the canonical 8D slice when available; otherwise take all remaining dims after base.
+        forecast_end = 8 if total_dim >= 8 else total_dim
         forecast_features = investor_obs[forecast_start:forecast_end]
         if forecast_features.size == 0:
             raise ValueError(

@@ -6,11 +6,11 @@ that uses the GNN to preprocess observations before feeding them to the standard
 actor-critic network.
 
 Architecture:
-    Tier 1: 6D → GNN (18D output) → [128, 64] MLP
+    Tier 1: 6D -> GNN (18D output) -> [128, 64] MLP
     Tier 2 (Hierarchical): 
-        - 6D base features → GNN (12D) 
-        - 8D forecast features → GNN (12D)
-        - Cross-attention fusion → 24D → [256, 128] MLP
+        - 6D base features -> GNN (12D) 
+        - 1D forecast feature -> GNN (12D)
+        - Cross-attention fusion -> 24D -> [256, 128] MLP
         - Allows separate processing of base vs forecast features with learned interactions
 
 Compatible with Stable Baselines3 PPO.
@@ -27,6 +27,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Type, Union, Optional
 from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.distributions import DiagGaussianDistribution
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
@@ -122,7 +123,7 @@ class GNNObservationEncoder(nn.Module):
     Converts raw observations into graph, applies GAT layers, and outputs encoded features.
     
     Args:
-        obs_dim: Input observation dimension (6 for Tier 1, 14 for Tier 2)
+        obs_dim: Input observation dimension (6 for Tier 1, 7 for Tier 2)
         hidden_dim: Hidden dimension for GAT layers (default: 32)
         output_dim: Output encoded feature dimension (default: 16)
         num_layers: Number of GAT layers (default: 2)
@@ -130,7 +131,7 @@ class GNNObservationEncoder(nn.Module):
         graph_type: 'full' (fully-connected) or 'learned' (learnable adjacency) or 'hierarchical' (Tier 2 structured)
         num_heads: Number of attention heads (default: 3)
         use_attention_pooling: Use attention pooling instead of mean (default: True)
-        base_feature_dim: For Tier 2, number of base features (6) before forecast features (8)
+        base_feature_dim: For Tier 2, number of base features (6) before forecast features (1)
     """
     
     def __init__(
@@ -143,7 +144,20 @@ class GNNObservationEncoder(nn.Module):
         graph_type: str = 'full',
         num_heads: int = 3,
         use_attention_pooling: bool = True,
-        base_feature_dim: Optional[int] = None
+        base_feature_dim: Optional[int] = None,
+        # OBS-ONLY (FAIR) ENHANCEMENT:
+        # Forecast-conditioned modulation (FiLM) of the base stream using the forecast stream embedding.
+        # This changes ONLY the observation encoder (policy architecture), not rewards/dynamics.
+        forecast_conditioning_enable: bool = False,
+        forecast_conditioning_strength: float = 1.0,
+        forecast_conditioning_hidden_dim: int = 0,
+        # Novel obs-only forecast integration (no reward shaping):
+        # 1) Forecast encoder + multiplicative gate on fused embedding
+        # 2) Auxiliary self-supervised head to predict short-horizon return sign
+        forecast_gate_enable: bool = True,
+        forecast_gate_hidden: int = 8,
+        forecast_norm_enable: bool = True,
+        aux_head_enable: bool = True,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -154,14 +168,20 @@ class GNNObservationEncoder(nn.Module):
         self.num_heads = num_heads
         self.use_attention_pooling = use_attention_pooling
         self.base_feature_dim = base_feature_dim if base_feature_dim is not None else 6  # Default for Tier 2
+        self.forecast_conditioning_enable = bool(forecast_conditioning_enable)
+        self.forecast_conditioning_strength = float(forecast_conditioning_strength)
+        self.forecast_conditioning_hidden_dim = int(forecast_conditioning_hidden_dim or 0)
+        self.forecast_gate_enable = bool(forecast_gate_enable)
+        self.forecast_gate_hidden = int(forecast_gate_hidden)
+        self.aux_head_enable = bool(aux_head_enable)
+        self.last_aux_logits: Optional[torch.Tensor] = None
         
         # Determine if this is hierarchical structure
         # Hierarchical GNN works for any observation space with a base/forecast split
-        # - Investor: 14D (6 base + 8 forecast)
-        # - Battery: 10D (4 base + 6 forecast)
+        # - Investor: 7D (6 base + 1 forecast)
+        # - Battery: 8D (4 base + 4 forecast)
         self.is_hierarchical = (graph_type == 'hierarchical') and (base_feature_dim is not None)
         
-        # Tier 3 is observation-identical to Tier 2 (no bridge-vector augmentation).
         # So forecast_feature_dim is simply the remainder after base features.
         self.forecast_feature_dim = None  # Initialize to None (will be set below)
         if self.is_hierarchical:
@@ -327,7 +347,6 @@ class GNNObservationEncoder(nn.Module):
             self.output_dim = output_dim  # Final output is the concatenation, which equals output_dim
             actual_output_dim = output_dim  # Set actual_output_dim for use in fusion layers
             
-            # No bridge-vector processor (Tier 3 is observation-identical to Tier 2).
             self.bridge_processor = None
             
             # IMPROVED: Cross-attention fusion layer with MULTI-HEAD for better capacity
@@ -376,10 +395,27 @@ class GNNObservationEncoder(nn.Module):
             else:
                 self.cross_attn_proj = nn.Identity()
             
-            # IMPROVED: Layer normalization before cross-attention for stability
-            # Use actual encoder output dimensions
+            # IMPROVED: Layer normalization for stability (separate base/forecast streams)
+            # Pre-norm forecast inputs to avoid magnitude domination by base features.
+            # Optionally disable if forecast features are already small / calibrated.
+            self.forecast_norm_enable = bool(forecast_norm_enable)
+            self.forecast_norm_pre = nn.LayerNorm(self.forecast_feature_dim) if self.forecast_norm_enable else nn.Identity()
+            # Post-encoding norms (use actual encoder output dimensions)
             self.base_norm = nn.LayerNorm(base_enc_output_dim)
-            self.forecast_norm = nn.LayerNorm(forecast_enc_output_dim)
+            self.forecast_norm_post = nn.LayerNorm(forecast_enc_output_dim)
+
+            # OBS-ONLY (FAIR): Forecast-conditioned FiLM modulation of the base stream (two-stream fusion)
+            # This makes it easier for the policy to leverage forecast observation channels without adding reward shaping.
+            self.film_gen = None
+            if self.forecast_conditioning_enable:
+                hdim = self.forecast_conditioning_hidden_dim
+                if hdim <= 0:
+                    hdim = max(32, int(forecast_enc_output_dim))
+                self.film_gen = nn.Sequential(
+                    nn.Linear(int(forecast_enc_output_dim), int(hdim)),
+                    nn.ReLU(),
+                    nn.Linear(int(hdim), int(base_enc_output_dim) * 2),
+                )
             
             # IMPROVED: Gated fusion mechanism to learn optimal base-forecast combination
             # Gate learns when to trust forecast-enhanced features vs original encodings
@@ -403,12 +439,31 @@ class GNNObservationEncoder(nn.Module):
             
             # Residual connection projection (identity since dimensions match)
             self.residual_proj = nn.Identity()  # No projection needed since input and output dimensions are the same
+
+            # Forecast gate (obs-only; keeps reward fairness)
+            if self.forecast_gate_enable:
+                gate_in = forecast_output_dim
+                self.forecast_gate_mlp = nn.Sequential(
+                    nn.Linear(gate_in, self.forecast_gate_hidden),
+                    nn.GELU(),
+                    nn.Linear(self.forecast_gate_hidden, actual_output_dim),
+                )
+
+            # Auxiliary head (self-supervised; obs-only)
+            if self.aux_head_enable:
+                self.aux_head = nn.Sequential(
+                    nn.LayerNorm(actual_output_dim),
+                    nn.GELU(),
+                    nn.Linear(actual_output_dim, 16),
+                    nn.GELU(),
+                    nn.Linear(16, 1),  # logits for sign(price_return_1step)
+                )
         else:
             # Standard GNN encoder (Tier 1 or non-hierarchical Tier 2)
             # Build GAT layers with multi-head attention
             # Each observation dimension is a node with 1 feature (its value)
             # So input to first GAT layer is 1 feature per node
-            
+
             # ROBUST FIX: Ensure hidden_dim is divisible by num_heads for intermediate layers
             adjusted_hidden_dim = hidden_dim
             if adjusted_hidden_dim % num_heads != 0:
@@ -418,35 +473,37 @@ class GNNObservationEncoder(nn.Module):
                     adjusted_hidden_dim = num_heads  # At least num_heads
                 # Update self.hidden_dim to reflect the actual hidden dimension
                 self.hidden_dim = adjusted_hidden_dim
-            
+
             self.gat_layers = nn.ModuleList()
 
             # First layer: 1 feature per node → adjusted_hidden_dim (with multi-head)
             self.gat_layers.append(GraphAttentionLayer(1, adjusted_hidden_dim, dropout, num_heads=num_heads))
 
             # Middle layers: adjusted_hidden_dim → adjusted_hidden_dim (with multi-head)
-            for _ in range(num_layers - 2):
-                self.gat_layers.append(GraphAttentionLayer(adjusted_hidden_dim, adjusted_hidden_dim, dropout, num_heads=num_heads))
+            for _ in range(max(0, num_layers - 2)):
+                self.gat_layers.append(
+                    GraphAttentionLayer(adjusted_hidden_dim, adjusted_hidden_dim, dropout, num_heads=num_heads)
+                )
 
             # Last layer: hidden_dim → output_dim (with multi-head)
             # ROBUST FIX: Ensure output_dim is divisible by num_heads
             final_output_dim = output_dim
             if final_output_dim % num_heads != 0:
-                # Round down to nearest value divisible by num_heads
                 final_output_dim = (final_output_dim // num_heads) * num_heads
                 if final_output_dim == 0:
                     final_output_dim = num_heads  # At least num_heads
-                # Update self.output_dim to reflect the actual output dimension
                 self.output_dim = final_output_dim
-            
+
             if num_layers > 1:
                 # Use adjusted_hidden_dim (may have been adjusted above)
                 actual_hidden_dim = getattr(self, 'hidden_dim', adjusted_hidden_dim)
-                self.gat_layers.append(GraphAttentionLayer(actual_hidden_dim, final_output_dim, dropout, num_heads=num_heads))
+                self.gat_layers.append(
+                    GraphAttentionLayer(actual_hidden_dim, final_output_dim, dropout, num_heads=num_heads)
+                )
             else:
                 # Single layer case
                 self.gat_layers[0] = GraphAttentionLayer(1, final_output_dim, dropout, num_heads=num_heads)
-            
+
             # Adjacency matrix (fully-connected or learnable)
             if graph_type == 'full':
                 # Fully-connected graph (all nodes connected)
@@ -460,10 +517,9 @@ class GNNObservationEncoder(nn.Module):
                     self.adj = nn.Parameter(torch.ones(obs_dim, obs_dim))
             else:
                 raise ValueError(f"Unknown graph_type: {graph_type}")
-            
+
             # IMPROVED: Attention pooling instead of mean pooling
             # This learns which features are most important for the task
-            # ROBUST FIX: Use actual output_dim (may have been adjusted)
             actual_output_dim = getattr(self, 'output_dim', output_dim)
             if use_attention_pooling:
                 self.attention_pool = nn.Sequential(
@@ -484,7 +540,7 @@ class GNNObservationEncoder(nn.Module):
         """
         adj = torch.ones(self.obs_dim, self.obs_dim)
         base_dim = self.base_feature_dim  # 6 for investor, 4 for battery
-        forecast_dim = self.obs_dim - base_dim  # 8 for investor, 4 for battery
+        forecast_dim = self.obs_dim - base_dim  # 2 for investor, 4 for battery
         
         # Base-to-base: strong connections (2.0)
         adj[:base_dim, :base_dim] = 2.0
@@ -506,12 +562,17 @@ class GNNObservationEncoder(nn.Module):
         Returns:
             encoded: Encoded features (batch, output_dim)
         """
+        # Reset aux logits cache each call
+        self.last_aux_logits = None
+
         if self.is_hierarchical:
             # TIER 2/3 IMPROVED: Enhanced hierarchical processing with residual connections and gated fusion
             # Split base and forecast features
             base_obs = obs[:, :self.base_feature_dim]  # (batch, base_feature_dim)
             
             forecast_obs = obs[:, self.base_feature_dim:]  # remaining dims are forecast features
+            # Pre-normalize forecast features to preserve signal scale before encoding.
+            forecast_obs = self.forecast_norm_pre(forecast_obs)
             
             # Encode separately
             base_encoded = self.base_encoder(base_obs)  # (batch, base_enc_output_dim)
@@ -519,7 +580,16 @@ class GNNObservationEncoder(nn.Module):
             
             # IMPROVED: Layer normalization before cross-attention for stability
             base_encoded_norm = self.base_norm(base_encoded)
-            forecast_encoded_norm = self.forecast_norm(forecast_encoded)
+            forecast_encoded_norm = self.forecast_norm_post(forecast_encoded)
+
+            # OBS-ONLY (FAIR): Forecast-conditioned modulation (FiLM) of base stream
+            if getattr(self, "film_gen", None) is not None and self.forecast_conditioning_strength != 0.0:
+                gamma_beta = self.film_gen(forecast_encoded_norm)  # (batch, 2*base_enc_output_dim)
+                gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+                s = float(self.forecast_conditioning_strength)
+                gamma = 1.0 + s * torch.tanh(gamma)   # multiplicative modulation (bounded)
+                beta = s * torch.tanh(beta)           # additive modulation (bounded)
+                base_encoded_norm = gamma * base_encoded_norm + beta
             
             # ROBUST FIX: Project to cross-attention dimension if needed
             base_for_cross = self.base_cross_proj(base_encoded_norm)  # (batch, cross_embed_dim)
@@ -560,6 +630,13 @@ class GNNObservationEncoder(nn.Module):
             # Compute gate values (learns when to trust enhanced vs original)
             gate_input = torch.cat([combined_enhanced, combined_original], dim=1)  # (batch, output_dim * 2)
             gate_values = self.fusion_gate(gate_input)  # (batch, output_dim) - one gate value per dimension
+            # Track gate statistics for debugging (used by metacontroller logs)
+            try:
+                self.last_gate_mean = gate_values.mean().detach()
+                self.last_gate_std = gate_values.std().detach()
+            except Exception:
+                self.last_gate_mean = None
+                self.last_gate_std = None
             
             # Apply gating: weighted combination of enhanced and original
             # Gate learns per-dimension how much to trust enhanced features
@@ -568,6 +645,15 @@ class GNNObservationEncoder(nn.Module):
             # Final fusion with residual connection
             fused = self.fusion_layer(gated_combined)  # (batch, output_dim)
             encoded = fused + self.residual_proj(gated_combined)  # Residual connection
+
+            # Forecast gate modulation (multiplicative)
+            if getattr(self, "forecast_gate_mlp", None) is not None:
+                gate = torch.sigmoid(self.forecast_gate_mlp(forecast_encoded_norm))  # (batch, output_dim)
+                encoded = encoded * gate
+
+            # Auxiliary head for short-horizon sign prediction (obs-only)
+            if getattr(self, "aux_head", None) is not None:
+                self.last_aux_logits = self.aux_head(encoded)
             
             # ROBUST VERIFICATION: Ensure output dimension matches expected
             if encoded.shape[1] != self.output_dim:
@@ -597,7 +683,7 @@ class GNNObservationEncoder(nn.Module):
                 # Compute attention weights for each node
                 attention_scores = self.attention_pool(h)  # (batch, obs_dim, 1)
                 attention_weights = F.softmax(attention_scores, dim=1)  # (batch, obs_dim, 1)
-                
+
                 # Weighted sum of node features
                 encoded = torch.sum(attention_weights * h, dim=1)  # (batch, output_dim)
             else:
@@ -628,14 +714,21 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
         graph_type: str = 'full',
         num_heads: int = 3,
         use_attention_pooling: bool = True,
-        base_feature_dim: Optional[int] = None
+        base_feature_dim: Optional[int] = None,
+        forecast_conditioning_enable: bool = False,
+        forecast_conditioning_strength: float = 1.0,
+        forecast_conditioning_hidden_dim: int = 0,
+        forecast_gate_enable: bool = True,
+        forecast_gate_hidden: int = 8,
+        forecast_norm_enable: bool = True,
+        aux_head_enable: bool = True,
     ):
         super().__init__(observation_space, features_dim)
         
         obs_dim = observation_space.shape[0]
         
         # IMPROVED: GNN encoder with multi-head attention and attention pooling
-        # For Tier 2 (14D), pass base_feature_dim to enable hierarchical processing
+        # For Tier 2 (7D), pass base_feature_dim to enable hierarchical processing
         self.gnn_encoder = GNNObservationEncoder(
             obs_dim=obs_dim,
             hidden_dim=hidden_dim,
@@ -645,7 +738,14 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
             graph_type=graph_type,
             num_heads=num_heads,
             use_attention_pooling=use_attention_pooling,
-            base_feature_dim=base_feature_dim
+            base_feature_dim=base_feature_dim,
+            forecast_conditioning_enable=forecast_conditioning_enable,
+            forecast_conditioning_strength=forecast_conditioning_strength,
+            forecast_conditioning_hidden_dim=forecast_conditioning_hidden_dim,
+            forecast_gate_enable=forecast_gate_enable,
+            forecast_gate_hidden=forecast_gate_hidden,
+            forecast_norm_enable=forecast_norm_enable,
+            aux_head_enable=aux_head_enable,
         )
         
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -659,7 +759,42 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
         return self.gnn_encoder(observations)
 
 
-class GNNActorCriticPolicy(ActorCriticPolicy):
+class ClampedActorCriticPolicy(ActorCriticPolicy):
+    """
+    PPO policy that prevents action-collapse by:
+    - clamping learned log_std to a minimum (std floor)
+    - clamping learned log_std to a maximum (std ceiling)
+    - clamping mean action logits to a reasonable range
+
+    This helps avoid perfectly constant +/-1 actions after episode boundary distribution shifts.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._log_std_min = float(kwargs.pop("log_std_min", -1.0))
+        self._log_std_max = float(kwargs.pop("log_std_max", 10.0))
+        self._mean_clip = float(kwargs.pop("mean_clip", 5.0))
+        super().__init__(*args, **kwargs)
+
+    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
+        mean_actions = self.action_net(latent_pi)
+        if self._mean_clip is not None and self._mean_clip > 0:
+            mean_actions = torch.clamp(mean_actions, -self._mean_clip, self._mean_clip)
+
+        # Continuous only: DiagGaussianDistribution
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            log_std = self.log_std
+            if self._log_std_min is not None or self._log_std_max is not None:
+                log_std = torch.clamp(
+                    log_std,
+                    min=self._log_std_min if self._log_std_min is not None else None,
+                    max=self._log_std_max if self._log_std_max is not None else None,
+                )
+            return self.action_dist.proba_distribution(mean_actions, log_std)
+
+        return super()._get_action_dist_from_latent(latent_pi)
+
+
+class GNNActorCriticPolicy(ClampedActorCriticPolicy):
     """
     Custom Actor-Critic policy with GNN feature extraction.
     
@@ -725,7 +860,14 @@ def get_gnn_policy_kwargs(
     num_heads: int = 3,
     use_attention_pooling: bool = True,
     net_arch: Optional[List[int]] = None,
-    base_feature_dim: Optional[int] = None
+    base_feature_dim: Optional[int] = None,
+    forecast_conditioning_enable: bool = False,
+    forecast_conditioning_strength: float = 1.0,
+    forecast_conditioning_hidden_dim: int = 0,
+    forecast_gate_enable: bool = True,
+    forecast_gate_hidden: int = 8,
+    forecast_norm_enable: bool = True,
+    aux_head_enable: bool = True,
 ) -> Dict:
     """
     Helper function to get policy_kwargs for GNN policy.
@@ -739,7 +881,7 @@ def get_gnn_policy_kwargs(
         num_heads: Number of attention heads (default: 3)
         use_attention_pooling: Use attention pooling instead of mean (default: True)
         net_arch: MLP architecture after GNN (default: [128, 64])
-        base_feature_dim: For Tier 2 hierarchical mode, number of base features (6) before forecast features (8)
+    base_feature_dim: For Tier 2 hierarchical mode, number of base features (6) before forecast features (1)
         
     Returns:
         policy_kwargs: Dict to pass to PPO(..., policy_kwargs=...)
@@ -761,7 +903,14 @@ def get_gnn_policy_kwargs(
             "graph_type": graph_type,
             "num_heads": num_heads,
             "use_attention_pooling": use_attention_pooling,
-            "base_feature_dim": base_feature_dim
+        "base_feature_dim": base_feature_dim,
+        "forecast_conditioning_enable": forecast_conditioning_enable,
+        "forecast_conditioning_strength": forecast_conditioning_strength,
+        "forecast_conditioning_hidden_dim": forecast_conditioning_hidden_dim,
+        "forecast_gate_enable": forecast_gate_enable,
+        "forecast_gate_hidden": forecast_gate_hidden,
+        "forecast_norm_enable": forecast_norm_enable,
+        "aux_head_enable": aux_head_enable,
         },
         "net_arch": net_arch,
         "activation_fn": nn.ReLU,
@@ -769,4 +918,3 @@ def get_gnn_policy_kwargs(
         "optimizer_class": torch.optim.Adam,
         "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0}
     }
-

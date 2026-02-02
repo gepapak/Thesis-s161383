@@ -21,7 +21,7 @@ RISK_LOOKBACK_WINDOW_DEFAULT = 144  # Default lookback window for risk calculati
 RISK_LOOKBACK_WINDOW_MAX = 200      # Maximum lookback window (memory cap)
 
 # Adaptive scaling constants
-ADAPTIVE_SCALE_SATURATION_THRESHOLD = 0.95  # Threshold for adaptive scaling saturation prevention
+ADAPTIVE_SCALE_SATURATION_THRESHOLD = 0.95
 ADAPTIVE_SCALE_MIN_OFFSET = 0.01            # Small offset from min/max boundaries
 ADAPTIVE_SCALE_COMPRESSION_FACTOR = 5.0     # Compression factor for values near boundaries
 
@@ -54,7 +54,6 @@ DL_OVERLAY_INIT_BUDGET_DEFAULT = 1e8        # 100M DKK default budget
 DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT = 0.8   # 80% direction, 20% magnitude
 
 # DL Overlay loss weights
-# Overlay is now FGB/FAMC-focused (pred_reward + optional meta head), so legacy multi-head weights are deprecated.
 DL_OVERLAY_LOSS_WEIGHTS = {
     'pred_reward': 1.0,
 }
@@ -68,7 +67,7 @@ WRAPPER_MEMORY_LIMIT_MB_DEFAULT = 1024.0
 ENV_MARKET_STRESS_DEFAULT = 0.5
 ENV_OVERALL_RISK_DEFAULT = 0.5
 ENV_MARKET_RISK_DEFAULT = 0.5
-ENV_POSITION_EXPOSURE_THRESHOLD = 0.001     # Threshold for exploration bonus
+ENV_POSITION_EXPOSURE_THRESHOLD = 0.001
 ENV_EXPLORATION_BONUS_MULTIPLIER = 0.5      # Multiplier for exploration bonus
 
 def normalize_price(price_raw: float) -> float:
@@ -213,7 +212,6 @@ class EnhancedConfig:
         self.mtm_update_threshold = 1e-9  # Threshold for applying MTM updates to positions
 
         # NAV bounds for renewable energy fund - INFRASTRUCTURE REALISTIC
-        # NOTE: These are currently UNUSED by design (THESIS MODE)
         # The environment intentionally uses unconstrained NAV to allow realistic fund dynamics
         # Only prevents negative NAV; no artificial min/max bounds applied
         self.nav_min_ratio = 0.90  # INFRASTRUCTURE: Minimum 90% of initial (conservative downside protection) [UNUSED]
@@ -236,9 +234,9 @@ class EnhancedConfig:
         self.investment_freq = 6   # CAPITAL PRESERVATION: Every 4 hours for careful positioning
         self.min_investment_freq = 4   # CAPITAL PRESERVATION: 2 hour minimum
         self.max_investment_freq = 12  # CAPITAL PRESERVATION: 48 hours maximum (very patient)
-        self.capital_allocation_fraction = 0.40  # INCREASED: 40% (from 35%) to allow larger positions for Tier 2/3 forecast learning
+        self.capital_allocation_fraction = 0.55  # 55% to increase tradeable capital for signal response
         self.risk_multiplier = 0.5  # CAPITAL PRESERVATION: Minimal risk multiplier
-        self.no_trade_threshold = 0.02  # 2% of target position - trades below this are ignored
+        self.no_trade_threshold = 0.01  # 1% of target position - trades below this are ignored
 
         # Battery operational parameters
         self.batt_soc_min = 0.1  # 10% minimum state of charge
@@ -270,7 +268,7 @@ class EnhancedConfig:
         # OPERATIONAL EXCELLENCE: Capital preservation risk management
         self.max_drawdown_threshold = 0.10  # CAPITAL PRESERVATION: 10% maximum drawdown
         self.volatility_lookback = 60  # CAPITAL PRESERVATION: 60 days for very stable calculations
-        self.max_position_size = 0.08  # INCREASED: 8% maximum single position size (from 5%) to encourage larger positions for Tier 2/3
+        self.max_position_size = 0.10  # 10% maximum single position size to allow stronger positioning
         self.volatility_scaling = 0.8   # CAPITAL PRESERVATION: High scaling for minimal risk
         self.target_sharpe_ratio = 2.0  # CAPITAL PRESERVATION: High target for excellent risk-adjusted returns
         self.risk_free_rate = 0.02      # 2% risk-free rate (Danish government bonds)
@@ -319,7 +317,6 @@ class EnhancedConfig:
         self.liquidity_risk_buffer_weight = 0.6
         self.liquidity_risk_cashflow_weight = 0.4
 
-        # REMOVED: Duplicate risk_budget_allocation (consolidated above)
 
         # NEW: Infrastructure fund performance targets
         self.annual_return_target = 0.06   # INFRASTRUCTURE: 6% annual return target (conservative infrastructure)
@@ -342,7 +339,6 @@ class EnhancedConfig:
         # PRICE NORMALIZATION: Unified rule across all code paths
         # Actual implementation: price_n = clip(z_score, -3, 3) / 3 → [-1, 1]
         # This ensures consistent feature scaling across environment, wrapper, and DL overlay
-        # NOTE: price_normalization_divisor and price_z_score_clip below are LEGACY and UNUSED
         # The actual pipeline uses: z_score clipped to ±3σ, then divided by 3 to get [-1,1]
         self.price_normalization_divisor = 10.0  # LEGACY: Kept for compatibility only [UNUSED]
         self.price_z_score_clip = 3.0  # ACTUAL: Clip z-scores to ±3σ before dividing by 3
@@ -435,7 +431,6 @@ class EnhancedConfig:
         # REWARD AND FORECAST PARAMETERS
         # =============================================================================
 
-        # Forecast confidence thresholds - REMOVED legacy unused parameters
         # Actual confidence control via confidence_floor (0.6) in MAPE-based calculation below
 
         # Reward calculation parameters - CAPITAL PRESERVATION FOCUS
@@ -469,7 +464,6 @@ class EnhancedConfig:
         self.overlay_mode = "auto"  # "auto" | "defense" | "off"
         self.overlay_intensity = 1.0  # [0.5, 1.5] scales amplitude
 
-        # Bridge-vector observation augmentation has been removed (Tier 3 is observation-identical to Tier 2).
 
         # === FGB/FAMC only ===
         # The overlay produces a pred_reward proxy used for FGB/FAMC baseline signals.
@@ -503,17 +497,6 @@ class EnhancedConfig:
             'long': 0.50,       # Long: Low confidence (risk-only anyway)
         }
 
-        # === DEPRECATED: Action blending (replaced by forecast-guided baseline) ===
-        # FGB: These parameters are deprecated and will be removed in a future version.
-        # Action blending has been replaced by forecast-guided value baseline.
-        # The DL overlay now informs the PPO baseline and risk sizing, not action execution.
-        # CRITICAL: These are ALWAYS disabled. Do NOT change these values.
-        self.enable_action_blending = False  # DEPRECATED: ALWAYS False (use forecast baseline instead)
-        self.overlay_alpha = 0.0             # DEPRECATED: ALWAYS 0.0 (no action blending)
-        self.force_positive_alpha = False    # DEPRECATED: ALWAYS False (no longer used)
-        self.log_overlay_blend = False       # DEPRECATED: ALWAYS False (no longer used)
-        self.deprecation_warnings = True     # Emit one-time warnings for deprecated parameters
-
         # === FGB: Forecast-Guided Baseline (replaces action blending) ===
         # The DL overlay remains a forecaster, not a controller.
         # PPO remains the action decision-maker; we reduce advantage variance via baseline adjustment.
@@ -542,6 +525,51 @@ class EnhancedConfig:
         #
         # Typical episode has ~26,000 timesteps, so 5,000 steps is a gentle warmup.
         self.forecast_reward_warmup_steps = 5000
+
+        # === Forecast Observation Warmup (ANTI-SHOCK / ANTI-SATURATION) ===
+        # At the start of an episode/year, forecast models can produce extreme deltas
+        # (e.g., because of price floor logic + seed windows), pinning z-scores at +/-1.
+        # This can cause the policy to saturate to action bounds early.
+        #
+        # We therefore zero-out forecast-derived OBSERVATION features for the first N steps.
+        # (This does not alter environment dynamics; only what the agent sees.)
+        self.forecast_obs_warmup_steps = 24  # ~4 hours @ 10-min resolution
+
+        # Forecast observation ablations (evaluation/debug only)
+        # - "normal": use forecast-derived obs as-is
+        # - "zero": force forecast-derived obs features to 0.0 (removes forecast info at decision time)
+        # - "invert": invert forecast-derived z-score signals (tests sensitivity to forecast info)
+        self.forecast_obs_mode = "normal"
+        # Eval-only toggle: drop trade_signal (investor forecast feature)
+        self.forecast_trade_signal_disable = False
+        # Logging threshold: when trade_signal is considered "active" for diagnostics
+        self.forecast_trade_signal_active_threshold = 0.05
+
+        # --------------------------------------------------------------
+        # Forecast quality thresholds (price-relative MAPE)
+        # --------------------------------------------------------------
+        # These thresholds must be in the SAME units as the MAPE we compute online.
+        # We use price-relative MAPE with a denominator floor (see environment._update_calibration_tracker),
+        # which makes the signal robust even when spot prices approach 0.
+        #
+        # These values intentionally match the gating thresholds used inside `forecast_engine.py`
+        # (compute_quality_weighted_signal), so trust/error signals are consistent across the stack.
+        self.forecast_mape_threshold_short = 0.08   # 8%
+        self.forecast_mape_threshold_medium = 0.12  # 12%
+        self.forecast_mape_threshold_long = 0.20    # 20%
+
+        # === Anti-saturation: Forecast return -> z-score mapping ===
+        # Problem: z_short/z_medium were often pinned at +/-1 due to extreme return spikes
+        # (e.g., low price denominators / floor behavior) + aggressive tanh scaling.
+        #
+        # Fix: (a) clip forecast returns to a reasonable bound, (b) use configurable tanh scale,
+        # (c) use a denominator floor so returns can't explode when prices are low.
+        # This makes forecast-derived obs informative (not binary), improving policy sensitivity.
+        # Increased signal strength (Tier2 obs-only usage): higher scale + slightly looser clip + lower denom floor.
+        # This makes forecast z-scores less "washed out" while staying bounded.
+        self.forecast_return_clip = 0.15              # tighter clip to curb saturation at decision cadence
+        self.forecast_return_tanh_scale = 1.5         # lower tanh scale for smoother signal
+        self.forecast_return_denom_floor = 0.25       # lower floor to keep calibrated trade_signal visible
 
         # === FGB: Risk Uplift (trust-weighted position sizing) ===
         # Modulate risk budget conservatively when forecasts are credible (no action blending)
@@ -604,10 +632,9 @@ class EnhancedConfig:
         # === Forecast Utilisation (2-TIER SYSTEM) ===
         # Tier 1 (Baseline MARL): enable_forecast_utilisation=False
         # Tier 2 (Forecast-Enhanced Observations): enable_forecast_utilisation=True
-        #   - Forecast features added to observations (14D = 6 base + 8 forecast)
+        #   - Forecast features added to observations (7D = 6 base + 1 forecast)
         #   - Optional add-ons: forecast_risk_management_mode, risk_uplift_enable
         self.enable_forecast_utilisation = False  # Master flag: enables forecast loading + observation features
-        # NOTE: When enabled, uses full forecast features (Tier 22): z_short, z_medium_lagged, direction, momentum, strength, forecast_trust, normalized_error, trade_signal (14D total = 6 base + 8 forecast)
 
         # === Forecast Risk Management Mode (OPTIONAL ADD-ON - SEPARATE FLAG) ===
         # Controlled by --enable_forecast_risk_management flag (separate from enable_forecast_utilisation)
@@ -672,7 +699,6 @@ class EnhancedConfig:
         self.forecast_usage_bonus_scale = 0.02  # Max extra reward added when MTM > 0 and forecast used
         self.forecast_usage_bonus_mtm_scale = 15000.0  # Normalization for MTM (DKK) when computing bonus
 
-        # NOTE: overlay risk-budget sizing was removed for fair Tier 2 vs Tier 3 comparisons.
 
         # =============================================================================
         # REINFORCEMENT LEARNING PARAMETERS
@@ -696,12 +722,92 @@ class EnhancedConfig:
         self.n_epochs = 10  # STRENGTHENED: Increased from default 5 for more gradient updates
         self.n_steps = 1024  # STRENGTHENED: Increased from 512 for more experience per update
 
+        # PPO exploration knobs (optional; recommended for Tier2 to avoid action collapse)
+        # - gSDE tends to produce smoother, state-conditioned exploration in continuous control.
+        # - log_std_init controls initial action noise scale (std = exp(log_std_init)).
+        self.ppo_use_sde = False
+        self.ppo_sde_sample_freq = 4
+        self.ppo_log_std_init = -1.0  # std init ~= 0.37 (overrides SB3 default)
+        # Debug: force-disable gSDE regardless of CLI flags
+        self.force_disable_sde = True
+
+        # Anti-collapse: prevent PPO exploration std from shrinking to ~0 (which makes actions effectively deterministic).
+        # This is especially important across episode boundaries where state distribution shifts.
+        # Anti-saturation (critical for avoiding "static +/-1 actions" in evaluation and across episodes)
+        # These tighter defaults keep actions in a learnable interior region while preserving exploration.
+        self.ppo_log_std_min = -2.0    # std >= exp(-2.0) ~= 0.14
+        self.ppo_log_std_max = -0.2    # std <= exp(-0.2) ~= 0.82 (tighter ceiling to curb saturation)
+        self.ppo_mean_clip = 0.7       # clamp mean action logits; tanh(0.7) ~= 0.604
+
+        # Minimal, thesis-defensible regularizer to discourage always-at-bounds allocations.
+        # Interpretable as a soft leverage/turnover proxy; applied with warmup in the env reward.
+        self.investor_action_l2_penalty = 0.0
+        self.investor_action_penalty_warmup_steps = 200
+
+        # Global training step counter (persists across episode environments in episode training).
+        # Needed because episode training creates a NEW env each episode, so env-local counters reset.
+        self.training_global_step = 0
+
+        # Investor action is exposure-only (single scalar). Allocation is fixed internally.
+        # Exposure controller:
+        # - "investor": investor policy outputs exposure scalar (1D action)
+        # - "meta": meta-controller outputs exposure; investor outputs weights only (3D action)
+        self.investor_exposure_controller = "investor"
+
+        # Action squashing (anti-clip artifact). If True, continuous actions that exceed [-1,1]
+        # are smoothly squashed with tanh before clipping. If False, we rely on clipping alone.
+        # Default OFF: with meta-controlled exposure, we generally prefer not to soften actions unless needed.
+        # Turn ON for an ablation if you see hard-clip induced saturation again.
+        self.enable_action_tanh_squash = True
+
+        # Novel surgical fix: "boundary barrier" penalty to prevent PPO collapsing to constant +/-1 actions.
+        # Penalizes only the portion of |a| above a threshold (e.g., 0.85), so interior actions are unaffected.
+        self.investor_action_boundary_penalty = 0.12
+        self.investor_action_boundary_threshold = 0.70
+
+        # Structural collapse fix (post 4D action redesign): penalize exposure pegging at 1.0.
+        # Hinge penalty: no penalty below threshold; only punishes "always max exposure" failure mode.
+        # Stronger default now that warmup is global (won't reset in ep1).
+        self.investor_action_exposure_penalty = 0.12
+        self.investor_action_exposure_threshold = 0.35
+
+        # Episode-boundary collapse breaker (targets: exposure stuck at ~1.0 for long stretches).
+        # This ramps up ONLY when exposure stays above a high threshold for consecutive steps.
+        # It is designed to "unstick" PPO in ep1+ without affecting normal, dynamic regimes.
+        self.investor_exposure_stuck_threshold = 0.95
+        self.investor_exposure_stuck_steps = 150
+        self.investor_exposure_stuck_penalty = 0.50
+
+        # Meta exposure alignment (auxiliary shaping): encourage meta exposure to follow forecast trade_signal.
+        # This does NOT add new environment rewards; it only biases training for the meta controller.
+        self.meta_exposure_align_weight = 0.02
+        self.meta_exposure_align_only_action_steps = True
+
+        # =============================================================================
+        # GLOBAL NORMALIZATION (ANTI EPISODE-BOUNDARY DISTRIBUTION SHIFT)
+        # =============================================================================
+        # Episode training currently normalizes price via rolling mean/std computed inside each 6-month episode.
+        # That makes the observation distribution non-stationary across episodes (ep0 vs ep1), which can trigger
+        # policy saturation/collapse even when weights are carried over correctly.
+        #
+        # When enabled, the environment uses global normalization statistics (computed once from the full
+        # training_dataset) for price z-scoring, and fixed p95 scales for load/wind/solar/hydro. This makes
+        # the observation distribution consistent across episodes and improves continual learning stability.
+        self.use_global_normalization = True
+        self.global_price_mean = 485.22962686711367
+        self.global_price_std = 589.9661249957974
+        # Fixed p95 scales derived from full training_dataset (scenario_*.csv, seed 789 set)
+        self.global_wind_scale = 1500.0
+        self.global_solar_scale = 654.4126
+        self.global_hydro_scale = 867.15735
+        self.global_load_scale = 4088.5974563779437
+
         # Network architecture
         self.net_arch = [256, 128, 64]  # Deeper network for better pattern recognition
         self.activation_fn = "relu"  # Changed from tanh for better gradient flow
 
         # GNN Encoder (works for both Tier 1 and Tier 2)
-        self.enable_gnn_encoder = False  # Enable GNN observation encoder for relationship learning (works on 6D base or 14D forecast-enhanced observations)
+        self.enable_gnn_encoder = True  # Enable GNN observation encoder for relationship learning (works on 6D base or 7D forecast-enhanced observations)
         
         # Tier 1 defaults (6D base observations)
         self.gnn_features_dim = 18  # Output dimension of GNN encoder (divisible by num_heads=3)
@@ -713,11 +819,11 @@ class EnhancedConfig:
         self.gnn_use_attention_pooling = True  # IMPROVED: Use attention pooling instead of mean pooling
         self.gnn_net_arch = [128, 64]  # Smaller MLP after GNN (GNN does feature extraction)
         
-        # Tier 2 settings (14D: 6 base + 8 forecast features)
+        # Tier 2 settings (7D: 6 base + 1 forecast feature)
         # PUBLICATION-FAIR: Match Tier 1 output capacity while keeping hierarchical structure
         # The hierarchical architecture is the KEY DIFFERENCE needed to utilize forecast features
         # Matched capacities (output_dim, MLP) isolate the architecture effect
-        self.gnn_features_dim_tier2 = 18  # MATCHED: Same final output as Tier 1 (each sub-encoder → 9D, fused → 18D)
+        self.gnn_features_dim_tier2 = 18  # MATCHED: Same final output as Tier 1 (base/forecast encoders fused → 18D)
         self.gnn_hidden_dim_tier2 = 30  # MATCHED: Same as Tier 1 (each sub-encoder uses 15)
         self.gnn_num_layers_tier2 = 2  # MATCHED: Same depth (sub-encoders use full 2 layers each, fusion adds structure)
         self.gnn_num_heads_tier2 = 3  # MATCHED: Same as Tier 1
@@ -725,6 +831,18 @@ class EnhancedConfig:
         self.gnn_graph_type_tier2 = 'hierarchical'  # KEY DIFFERENCE: Hierarchical structure (only architectural difference)
         self.gnn_use_attention_pooling_tier2 = True  # MATCHED: Same as Tier 1
         self.gnn_net_arch_tier2 = [128, 64]  # MATCHED: Same MLP as Tier 1
+
+        # ------------------------------------------------------------------
+        # OBS-ONLY (FAIR) ENHANCEMENT: Forecast-conditioned modulation (FiLM)
+        # ------------------------------------------------------------------
+        # Two-stream idea:
+        # - Base stream: encodes base features
+        # - Forecast stream: encodes forecast features
+        # Then the forecast embedding modulates the base embedding (FiLM) before cross-attention.
+        # This keeps reward/dynamics unchanged and makes forecast obs easier to exploit.
+        self.gnn_forecast_conditioning_enable_tier2 = True
+        self.gnn_forecast_conditioning_strength_tier2 = 1.0
+        self.gnn_forecast_conditioning_hidden_dim_tier2 = 64
         
         # NOTE FOR PUBLICATION:
         # - Output dimensions matched: Both produce 18D final representation
@@ -973,145 +1091,3 @@ class EnhancedConfig:
 # Tier 1: EnhancedConfig() with enable_forecast_utilisation=False
 # Tier 2: EnhancedConfig() with enable_forecast_utilisation=True (auto-enables risk management)
 #
-# The ImprovedTier2Config class below is DEPRECATED and kept only for backward compatibility.
-# Just use: config = EnhancedConfig(); config.enable_forecast_utilisation = True
-
-class ImprovedTier2Config(EnhancedConfig):
-    """
-    Improved Tier 2 configuration that uses forecasts for risk management.
-
-    Key changes from original Tier 2:
-    1. Disable forecast alignment rewards (was causing -$643K losses)
-    2. Enable forecast risk management mode
-    3. Use forecasts to adjust position sizes based on confidence
-    4. Use forecasts to detect volatility and reduce exposure
-    5. NOVEL: Multi-horizon signal filtering (only trade when delta > MAPE)
-    6. Reward risk-adjusted performance, not forecast alignment
-
-    Expected outcome: Tier 2 should outperform Tier 1 by $60K-$110K per episode
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        # ============================================================
-        # PHASE 1: DISABLE BROKEN FORECAST REWARDS
-        # ============================================================
-
-        # CRITICAL FIX: Disable forecast alignment rewards for INVESTORS
-        # Original: 20.0 (caused agent to get +20.91 reward for losing $13,625)
-        # New: 0.0 (no rewards for forecast alignment)
-        self.forecast_alignment_multiplier = 0.0
-
-        # Battery keeps using forecasts (arbitrage works differently)
-        self.forecast_alignment_multiplier_battery = 15.0
-
-        # Enable risk management mode
-        self.forecast_risk_management_mode = True
-
-        # Keep forecasts enabled for observations
-        self.enable_forecast_utilisation = True
-
-        # ============================================================
-        # PHASE 2: RISK MANAGEMENT PARAMETERS
-        # ============================================================
-
-        # Position sizing based on forecast confidence (MADE MORE AGGRESSIVE)
-        self.forecast_confidence_high_threshold = 0.40  # Above this: normal positions (lowered from 0.48)
-        self.forecast_confidence_medium_threshold = 0.35  # Above this: 70% positions (lowered from 0.45)
-        self.forecast_confidence_low_scale = 0.7  # Below medium: 70% positions (increased from 0.5)
-
-        # Volatility-based position scaling
-        self.forecast_volatility_high_threshold = 1.5  # Above this: 50% positions
-        self.forecast_volatility_medium_threshold = 1.0  # Above this: 75% positions
-
-        # Exit signals on forecast direction changes
-        self.forecast_direction_change_exit_fraction = 0.5  # Exit 50% on direction flip
-        self.forecast_direction_change_min_strength = 0.5  # Min z-score to trigger
-
-        # Profit-taking on extreme forecasts
-        self.forecast_extreme_threshold = 2.0  # z-score threshold for extremes
-        self.forecast_extreme_profit_taking_fraction = 0.3  # Take 30% profits
-
-        # Risk management reward weight
-        self.forecast_risk_management_weight = 0.20
-        
-        # NOTE: ent_coef is inherited from EnhancedConfig (0.010) - same for both tiers for fair comparison  # 20% of total reward
-
-        # ============================================================
-        # NOVEL: MULTI-HORIZON SIGNAL FILTERING
-        # ============================================================
-
-        # Only trade when forecast delta > MAPE threshold (statistically significant)
-        self.enable_signal_filtering = True
-        self.signal_filter_mape_multiplier = 1.0  # Trade when |delta| > 1.0 * MAPE
-        self.signal_filter_horizon_weights = {
-            'short': 0.5,   # Short-term (6 steps) gets 50% weight
-            'medium': 0.3,  # Medium-term (24 steps) gets 30% weight
-            'long': 0.2     # Long-term (144 steps) gets 20% weight
-        }
-        self.signal_filter_min_horizons = 1  # Minimum number of horizons with significant signals
-        self.signal_filter_neutral_position_scale = 0.6  # Scale positions to 60% when no signal (increased from 0.1)
-
-        # ============================================================
-        # REWARD WEIGHTS (ADJUSTED FOR RISK MANAGEMENT)
-        # ============================================================
-
-        # Rebalance weights to emphasize risk management
-        # Total should sum to 1.0
-        self.profit_reward_weight = 0.35  # Operational revenue (same as Tier 1)
-        self.risk_reward_weight = 0.30    # Risk management (increased from 0.25)
-        self.hedging_reward_weight = 0.15  # Hedging effectiveness
-        self.nav_stability_weight = 0.20   # NAV stability (reduced from 0.25)
-
-        # NO forecast directional reward
-        self.forecast_directional_weight = 0.0  # Disabled
-
-        # ============================================================
-        # POSITION SIZING (MORE CONSERVATIVE)
-        # ============================================================
-
-        # Reduce max position size to be more conservative
-        # Tier 1 takes up to 66% positions, Tier 2 will be more adaptive
-        self.max_position_size = 0.008  # 0.8% (reduced from 1.0%)
-
-        # This will be scaled by forecast confidence and volatility
-        # Effective range: 0.4% - 0.8% depending on conditions
-
-        # ============================================================
-        # FORECAST TRUST CALIBRATION (FASTER ADAPTATION)
-        # ============================================================
-
-        # Faster trust adaptation for quicker response to forecast quality
-        self.forecast_trust_window = 300  # 300 steps (~2 days)
-        self.forecast_trust_min = 0.45  # Minimum trust threshold (aligns with medium band)
-
-        # ============================================================
-        # LOGGING AND DEBUGGING
-        # ============================================================
-
-        # Enable detailed logging for risk management decisions
-        self.log_forecast_risk_management = True
-        self.log_position_scaling_decisions = True
-
-        print("\n" + "="*70)
-        print("IMPROVED TIER 2 CONFIGURATION LOADED")
-        print("="*70)
-        print("Forecast Mode: RISK MANAGEMENT (not directional trading)")
-        print(f"Alignment Multiplier: {self.forecast_alignment_multiplier} (disabled)")
-        print(f"Risk Management Weight: {self.forecast_risk_management_weight}")
-        print(f"Max Position Size: {self.max_position_size*100:.1f}%")
-        print(f"Confidence Thresholds: High={self.forecast_confidence_high_threshold}, Med={self.forecast_confidence_medium_threshold}")
-        print(f"Volatility Thresholds: High={self.forecast_volatility_high_threshold}, Med={self.forecast_volatility_medium_threshold}")
-        print(f"Signal Filtering: Enabled (trade when |delta| > {self.signal_filter_mape_multiplier}x MAPE)")
-        print("="*70 + "\n")
-
-
-def get_improved_tier2_config():
-    """
-    Get the improved Tier 2 configuration.
-
-    Returns:
-        ImprovedTier2Config instance
-    """
-    return ImprovedTier2Config()
