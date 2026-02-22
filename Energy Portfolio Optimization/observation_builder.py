@@ -5,7 +5,6 @@ Observation Builder Module
 Handles observation building for renewable energy portfolio agents:
 - Normalize features
 - Build agent-specific observations
-- Handle forecast integration
 
 Extracted from environment.py to improve code organization and maintainability.
 """
@@ -104,19 +103,9 @@ class ObservationBuilder:
         cumulative_mtm_pnl: float,
         max_position_size: float,
         capital_allocation_fraction: float,
-        enable_forecast_util: bool,
-        z_short_price: Optional[float] = None,
-        direction: Optional[float] = None,
-        momentum: Optional[float] = None,
-        strength: Optional[float] = None,
-        normalized_error: Optional[float] = None,
-        trade_signal: Optional[float] = None,
-        forecast_trust: Optional[float] = None,
     ) -> None:
         """
         REFACTORED: Build investor agent observations.
-        
-        TIER 2: Compact forecast features - uses 2 forecast features (8D total = 6 base + 2 forecast).
         
         Args:
             obs_array: Observation array to fill (modified in-place)
@@ -127,13 +116,6 @@ class ObservationBuilder:
             cumulative_mtm_pnl: Cumulative MTM P&L
             max_position_size: Maximum position size multiplier
             capital_allocation_fraction: Capital allocation fraction
-            enable_forecast_util: Whether forecast utilization is enabled
-            z_short_price: Short-term price forecast z-score (optional)
-            direction: Sign of forecast signal (-1, 0, +1) (optional; not used in compact obs)
-            momentum: Change in forecast signal (optional; not used in compact obs)
-            strength: Absolute magnitude of forecast signal (optional; not used in compact obs)
-            normalized_error: Recent forecast error (optional; not used in compact obs)
-            trade_signal: Calibrated trade signal (derived from z_short) (optional)
         """
         try:
             # Normalize budget to [0, 1]
@@ -155,14 +137,6 @@ class ObservationBuilder:
             obs_array[3] = solar_pos_norm
             obs_array[4] = hydro_pos_norm
             obs_array[5] = mtm_pnl_norm
-            
-            # Add forecast features if enabled
-            # Tier 2: Compact forecast features (2D: trade_signal + forecast_trust)
-            if enable_forecast_util and len(obs_array) >= 8:
-                # Boost trade_signal amplitude to a comparable scale (no reward change)
-                ts_scaled = float(np.clip((trade_signal if trade_signal is not None else 0.0) * 3.0, -1.0, 1.0))
-                obs_array[6] = ts_scaled
-                obs_array[7] = float(np.clip(forecast_trust if forecast_trust is not None else 0.0, 0.0, 1.0))
                 
         except Exception as e:
             logger.warning(f"Investor observation building failed: {e}")
@@ -174,11 +148,6 @@ class ObservationBuilder:
         battery_energy: float,
         battery_capacity_mwh: float,
         load_n: float,
-        enable_forecast_util: bool,
-        z_short_wind: Optional[float] = None,
-        z_short_solar: Optional[float] = None,
-        z_short_hydro: Optional[float] = None,
-        z_short_price: Optional[float] = None
     ) -> None:
         """
         REFACTORED: Build battery operator observations.
@@ -189,11 +158,6 @@ class ObservationBuilder:
             battery_energy: Current battery energy (MWh)
             battery_capacity_mwh: Battery capacity (MWh)
             load_n: Normalized load
-            enable_forecast_util: Whether forecast utilization is enabled
-            z_short_wind: Short-term wind z-score (optional)
-            z_short_solar: Short-term solar z-score (optional)
-            z_short_hydro: Short-term hydro z-score (optional)
-            z_short_price: Short-term price z-score (optional)
         """
         try:
             # Base observations (4D)
@@ -215,16 +179,6 @@ class ObservationBuilder:
             # soc_distance_to_min = float(np.clip((soc_normalized - soc_min) / max(soc_max - soc_min, 0.01), 0.0, 1.0))
             # soc_distance_to_max = float(np.clip((soc_max - soc_normalized) / max(soc_max - soc_min, 0.01), 0.0, 1.0))
             
-            # Add forecast features if enabled (8D total: 4 base + 3 gen + 1 price)
-            if enable_forecast_util and len(obs_array) >= 8:
-                # Separate generation forecasts (wind, solar, hydro)
-                obs_array[4] = float(np.clip(z_short_wind if z_short_wind is not None else 0.0, -1.0, 1.0))
-                obs_array[5] = float(np.clip(z_short_solar if z_short_solar is not None else 0.0, -1.0, 1.0))
-                obs_array[6] = float(np.clip(z_short_hydro if z_short_hydro is not None else 0.0, -1.0, 1.0))
-
-                # Price forecast (short only)
-                obs_array[7] = float(z_short_price if z_short_price is not None else 0.0)
-                
         except Exception as e:
             logger.warning(f"Battery observation building failed: {e}")
 

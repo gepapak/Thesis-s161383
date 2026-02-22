@@ -382,8 +382,11 @@ class MultiHorizonForecastGenerator:
         self._training_caps: Dict[str, float] = {}  # target -> cap value from training
 
         # caches (LRU-based for better memory management)
-        self._global_cache = LRUCache(max_size=8000)  # Increased size for better hit rate
-        self._agent_cache = LRUCache(max_size=4000)   # Increased size for better hit rate
+        # Use config as single source of truth for cache sizing so memory can be tuned centrally.
+        global_cache_size = max(1, int(getattr(self.config, "forecast_cache_size", 8000)))
+        agent_cache_size = max(1, int(getattr(self.config, "agent_forecast_cache_size", 4000)))
+        self._global_cache = LRUCache(max_size=global_cache_size)
+        self._agent_cache = LRUCache(max_size=agent_cache_size)
         self._last_agent_step: Dict[str, int] = {}
 
         # Memory management
@@ -392,7 +395,8 @@ class MultiHorizonForecastGenerator:
 
         # NEW: offline precomputed forecasts (target, horizon) -> np.ndarray of shape (T,)
         self._precomputed: Dict[Tuple[str, str], np.ndarray] = {}
-        self._data_df: Optional[pd.DataFrame] = None  # Store data for debiasing
+        # Keep only the minimal series needed for bounded debiasing (avoid copying whole DataFrames).
+        self._price_series: Optional[np.ndarray] = None  # raw price series (float32) for local bounds
 
         # Timing instrumentation (optional)
         self.timing_log_path = timing_log_path
@@ -1135,7 +1139,7 @@ class MultiHorizonForecastGenerator:
         Rationale:
         - CPU OOM around later episodes is typically due to retained references to:
           - large in-memory precomputed forecast arrays (`self._precomputed`)
-          - pandas DataFrame refs (`self._data_df`)
+          - retained data refs (e.g., `_price_series` for bounded debiasing)
           - Keras model graphs/objects held in `self.models`
           - scaler objects held in `self.scalers`
         - The regular `_cleanup_memory()` is safe to call during an episode, but it is intentionally
@@ -1149,7 +1153,7 @@ class MultiHorizonForecastGenerator:
             try:
                 if hasattr(self, "_precomputed") and isinstance(self._precomputed, dict):
                     self._precomputed.clear()
-                self._data_df = None
+                self._price_series = None
             except Exception:
                 pass
 
@@ -1548,13 +1552,30 @@ class MultiHorizonForecastGenerator:
         """
         # Get recent actual prices for bounds calculation
         recent_prices = []
-        if self._data_df is not None and 'price' in self._data_df.columns:
-            lookback = min(144, max(10, t))
-            start_idx = max(0, t - lookback)
-            end_idx = t
-            if end_idx <= len(self._data_df) and start_idx < end_idx:
-                recent_prices = self._data_df['price'].iloc[start_idx:end_idx].values.tolist()
-                recent_prices = [p for p in recent_prices if np.isfinite(p)]
+        try:
+            price_series = getattr(self, "_price_series", None)
+            if isinstance(price_series, np.ndarray) and price_series.size > 0:
+                lookback = min(144, max(10, int(t)))
+                end_idx = max(0, min(int(t), int(price_series.size)))
+                start_idx = max(0, end_idx - lookback)
+                if start_idx < end_idx:
+                    window = price_series[start_idx:end_idx]
+                    if isinstance(window, np.ndarray):
+                        window = window[np.isfinite(window)]
+                        recent_prices = window.tolist()
+        except Exception:
+            recent_prices = []
+        
+        # Fallback: use rolling history if no series is available
+        if len(recent_prices) < 5:
+            try:
+                h = self.history.get("price", None)
+                if h and len(h) > 0:
+                    window = np.asarray(list(h)[-min(144, len(h)):], dtype=np.float32)
+                    window = window[np.isfinite(window)]
+                    recent_prices = window.tolist()
+            except Exception:
+                pass
         
         if len(recent_prices) >= 5:
             local_mean = float(np.mean(recent_prices))
@@ -1785,8 +1806,14 @@ class MultiHorizonForecastGenerator:
                 print("precompute_offline: empty dataframe; skipping.")
             return
 
-        # Store data for debiasing
-        self._data_df = df.copy()
+        # Store minimal series for bounded debiasing (avoid copying the full dataframe).
+        try:
+            if 'price' in df.columns:
+                self._price_series = df['price'].to_numpy(dtype=np.float32, copy=True)
+            else:
+                self._price_series = None
+        except Exception:
+            self._price_series = None
 
         # Check for cached forecasts first
         if self._load_cached_forecasts(df, cache_dir):
@@ -1835,26 +1862,28 @@ class MultiHorizonForecastGenerator:
             np.nan_to_num(X, copy=False, nan=mean_val, posinf=1e6, neginf=-1e6)
             return X
 
-        target_series: Dict[str, np.ndarray] = {
-            t: df[t].to_numpy(dtype=np.float32, copy=False) for t in self.targets
-        }
-        target_windows: Dict[str, np.ndarray] = {
-            t: make_windows(target_series[t], look_back) for t in self.targets
-        }
-
         # for each (target, horizon), run batched predict (or fast fallback)
+        # Memory: build windows one target at a time (avoid holding 5x (T, look_back) arrays in RAM).
         for target in self.targets:
-            X_full = target_windows[target]
+            series = df[target].to_numpy(dtype=np.float32, copy=False)
+            X_full = make_windows(series, look_back)
+
+            # Precompute a fallback once per target to reuse across horizons/exception paths.
+            fallback_mean = np.nanmean(X_full, axis=1).astype(np.float32)
+            fallback_mean = np.nan_to_num(fallback_mean, nan=self._default_for_target(target)).astype(np.float32)
+
             for hname in self.horizons.keys():
                 key = (target, hname)
                 model_key = f"{target}_{hname}"
                 use_model = bool(self._model_available.get(model_key, False))
 
                 if not use_model or self.tf is None or model_key not in self.models:
-                    # fallback: simple rolling-mean proxy (consistent with runtime fallback spirit)
-                    out = np.nanmean(X_full, axis=1).astype(np.float32)
+                    out = fallback_mean.copy()
                     for i in range(T):
                         out[i] = self._constrain_target(target, out[i])
+                    if target == 'price' and isinstance(getattr(self, "_price_series", None), np.ndarray) and getattr(self, "_price_series").size > 0:
+                        for i in range(T):
+                            out[i] = self._debias_price_forecast(out[i], i)
                     self._precomputed[key] = out
                     continue
 
@@ -1863,27 +1892,30 @@ class MultiHorizonForecastGenerator:
                 model = self.models.get(model_key, None)
 
                 if model is None:
-                    out = np.nanmean(X_full, axis=1).astype(np.float32)
+                    out = fallback_mean.copy()
                     for i in range(T):
                         out[i] = self._constrain_target(target, out[i])
+                    if target == 'price' and isinstance(getattr(self, "_price_series", None), np.ndarray) and getattr(self, "_price_series").size > 0:
+                        for i in range(T):
+                            out[i] = self._debias_price_forecast(out[i], i)
                     self._precomputed[key] = out
                     continue
-
-                X_scaled = X_full if scaler_X is None else scaler_X.transform(X_full)
 
                 bs = max(1, int(batch_size))
                 preds_scaled = np.empty(T, dtype=np.float32)
 
                 for start in range(0, T, bs):
                     end = min(start + bs, T)
-                    batch_X = X_scaled[start:end]
+                    batch_X = X_full[start:end]
                     try:
-                        batch_preds = model.predict(batch_X, verbose=0)
+                        # Avoid allocating a full X_scaled array (transform per batch).
+                        batch_in = batch_X if scaler_X is None else scaler_X.transform(batch_X)
+                        batch_preds = model.predict(batch_in, verbose=0)
                         if isinstance(batch_preds, np.ndarray):
                             batch_preds = np.ravel(batch_preds)
                         preds_scaled[start:end] = batch_preds[:end - start]
                     except Exception:
-                        preds_scaled[start:end] = np.nanmean(X_full[start:end], axis=1)
+                        preds_scaled[start:end] = fallback_mean[start:end]
 
                 if scaler_y is not None:
                     try:
@@ -1895,14 +1927,20 @@ class MultiHorizonForecastGenerator:
 
                 for i in range(T):
                     preds[i] = self._constrain_target(target, preds[i])
-                
+
                 # CRITICAL FIX: Apply debiasing for price forecasts during precomputation
                 # This ensures precomputed forecasts have proper bias correction applied
-                if target == 'price' and self._data_df is not None and 'price' in self._data_df.columns:
+                if target == 'price' and isinstance(getattr(self, "_price_series", None), np.ndarray) and getattr(self, "_price_series").size > 0:
                     for i in range(T):
                         preds[i] = self._debias_price_forecast(preds[i], i)
 
                 self._precomputed[key] = preds
+
+            # Help GC: X_full can be large; drop reference per target.
+            try:
+                del X_full
+            except Exception:
+                pass
 
         if self.verbose:
             total_forecasts = len(self.targets) * len(self.horizons)
@@ -1947,8 +1985,8 @@ class MultiHorizonForecastGenerator:
                     print(f"No cached forecasts found: {cache_filename}")
                 return False
 
-            # Load cached forecasts
-            cached_df = pd.read_csv(cache_file)
+            # Load cached forecasts (forecast columns only, float32 to reduce memory peak)
+            cached_df = pd.read_csv(cache_file, dtype=np.float32)
 
             # Validate cache matches current data
             if len(cached_df) != len(df):
@@ -1989,13 +2027,25 @@ class MultiHorizonForecastGenerator:
                     else:
                         self._precomputed[(target, hname)] = series
 
-            # Store data for debiasing
-            self._data_df = df.copy()
+            # Store minimal series for bounded debiasing (avoid copying the full dataframe).
+            try:
+                if 'price' in df.columns:
+                    self._price_series = df['price'].to_numpy(dtype=np.float32, copy=True)
+                else:
+                    self._price_series = None
+            except Exception:
+                self._price_series = None
 
             if self.verbose:
                 total_series = len(self._precomputed)
                 file_size_mb = os.path.getsize(cache_file) / (1024 * 1024)
                 print(f"✅ Loaded {total_series} forecast series from CSV cache ({file_size_mb:.1f}MB)")
+
+            # Help GC: cached_df can be large; we only keep the float32 arrays in _precomputed.
+            try:
+                del cached_df
+            except Exception:
+                pass
 
             return True
 

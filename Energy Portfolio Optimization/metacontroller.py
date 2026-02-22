@@ -30,31 +30,16 @@ import optuna
 from config import EnhancedConfig
 from logger import get_logger
 from utils import UnifiedMemoryManager, UnifiedObservationValidator, ErrorHandler, safe_operation  # UNIFIED: Import from single source of truth
-
-# Auxiliary loss for forecast gate (obs-only)
-import torch.nn.functional as F
+from clamped_policy import ClampedActorCriticPolicy
 
 # Centralized logging - ALL logging goes through logger.py
 logger = get_logger(__name__)
-
-# GNN Policy (Tier 2 only)
-try:
-    from gnn_encoder import GNNActorCriticPolicy, get_gnn_policy_kwargs
-    GNN_AVAILABLE = True
-except ImportError:
-    GNN_AVAILABLE = False
-    logger.warning("[GNN] gnn_encoder.py not found - GNN encoder disabled")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 LEARNING_MODES = ["PPO", "SAC", "TD3"]
 
 __all__ = ["MultiESGAgent", "HyperparameterOptimizer"]
-
-# Default weight for auxiliary forecast BCE loss (obs-only, keeps reward fairness)
-# Raised slightly to give the aux signal enough influence now that saturation is tamed.
-DEFAULT_AUX_COEFF = 0.05
-
 
 # UNIFIED MEMORY MANAGER (NEW)
 # EnhancedMemoryTracker is now replaced by UnifiedMemoryManager from memory_manager.py
@@ -201,6 +186,9 @@ class MultiESGAgent:
         self.training = bool(training)
         self.total_steps = 0
         self.max_steps = int(getattr(env, "max_steps", 100000))
+        # gSDE (SB3) normally resets noise inside the SB3 rollout collector.
+        # This repo uses a custom multi-agent collector, so we must do it explicitly.
+        self._last_sde_noise_reset_t = None
 
         # Progress
         self._global_target_steps: Optional[int] = None
@@ -315,6 +303,17 @@ class MultiESGAgent:
                     # FAMC: Clear policy-specific FAMC step data
                     if hasattr(policy, '_famc_step_data'):
                         policy._famc_step_data.clear()
+
+                    # FAMC: Reset per-policy EMA state (keeps moments isolated per agent).
+                    if hasattr(policy, "_famc_state") and isinstance(getattr(policy, "_famc_state", None), dict):
+                        policy._famc_state = {
+                            "ema_mA": 0.0,
+                            "ema_mC": 0.0,
+                            "ema_mA2": 0.0,
+                            "ema_mC2": 0.0,
+                            "ema_mAC": 0.0,
+                            "lambda_star_prev": 0.0,
+                        }
 
                     # CRITICAL FIX: DO NOT reset optimizer state
                     # Resetting optimizer wipes out Adam's momentum/variance estimates
@@ -478,10 +477,10 @@ class MultiESGAgent:
             try:
                 if hasattr(policy, 'policy') and hasattr(policy.policy, 'features_extractor'):
                     fe = policy.policy.features_extractor
-                    # Check GNN encoder input dimension
-                    if hasattr(fe, 'gnn_encoder') and hasattr(fe.gnn_encoder, 'obs_dim'):
-                        network_input_dim = fe.gnn_encoder.obs_dim
-                    # Check MLP first layer input dimension
+                    # Check feature extractor-declared observation dimension first.
+                    if hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
+                        network_input_dim = fe.observation_space.shape[0]
+                    # Fallback: check first MLP layer input dimension.
                     elif hasattr(fe, 'mlp') and len(fe.mlp) > 0:
                         first_layer = fe.mlp[0]
                         if hasattr(first_layer, 'in_features'):
@@ -556,16 +555,20 @@ class MultiESGAgent:
                 self.logger.error(f"[OBS_SPACE_REINIT] Failed to reinitialize space for {agent}: {e}")
         
         if spaces_changed:
-            self.logger.warning("[OBS_SPACE_REINIT] Observation spaces changed - RECREATING policies with correct dimensions")
-            # ROBUST FIX: When observation spaces change, policies MUST be recreated
-            # This ensures neural networks are built with correct input dimensions
-            try:
-                # Use robust validation method to recreate policies
-                self._validate_and_fix_policy_observation_spaces_robust()
-                self.logger.info("[OBS_SPACE_REINIT] ✓ Policies recreated with correct observation spaces")
-            except Exception as e:
-                self.logger.error(f"[OBS_SPACE_REINIT] ✗ Failed to recreate policies: {e}")
-                raise RuntimeError(f"CRITICAL: Cannot continue with mismatched observation spaces. Failed to recreate policies: {e}")
+            # Paper-grade correctness: observation dimensions must be invariant within a run.
+            # If they change, we abort instead of attempting to recreate policies (which can cause churn
+            # and makes results hard to interpret).
+            msg = (
+                "[OBS_SPACE_INVARIANT_VIOLATION] Environment observation spaces changed during the run. "
+                "Aborting to prevent policy recreation churn. "
+                "Fix the config/feature toggles so observation dimensions are constant, then retrain.\n"
+                f"Old dims: {old_spaces}\n"
+                f"New dims: "
+                + str({agent: (self.observation_spaces.get(agent).shape[0] if agent in self.observation_spaces and hasattr(self.observation_spaces[agent], 'shape') else None)
+                      for agent in self.possible_agents})
+            )
+            self.logger.error(msg)
+            raise RuntimeError(msg)
         
         self._validate_observation_spaces()
 
@@ -654,112 +657,33 @@ class MultiESGAgent:
 
             algo_cls = {"PPO": PPO, "SAC": SAC, "TD3": TD3}[policy_mode]
 
-            # GNN Encoder: Check if enabled (works for both Tier 1 and Tier 2, only for PPO agents)
-            # GNN encoder is independent of forecast integration
-            # It can work on base observations (6D - Tier 1) OR forecast-enhanced observations (7D - Tier 2)
-            # This makes GNN encoder a true add-on that can be used with or without forecasts
-            use_gnn = (
-                policy_mode == "PPO" and
-                GNN_AVAILABLE and
-                getattr(config, "enable_gnn_encoder", False)
-                # REMOVED: enable_forecast_utilisation requirement
-                # GNN encoder works on any observation space (6D base or 7D with forecasts)
-            )
-
             # Anti-collapse kwargs for PPO continuous actions only.
             # IMPORTANT: Do NOT pass these to SAC/TD3 policies (different policy classes).
             clamp_kwargs = None
             if policy_mode == "PPO":
                 clamp_kwargs = {
-                    "log_std_min": float(getattr(config, "ppo_log_std_min", -1.0)),
-                    "mean_clip": float(getattr(config, "ppo_mean_clip", 5.0)),
+                    "log_std_min": float(getattr(config, "ppo_log_std_min", -2.0)),
+                    "log_std_max": float(getattr(config, "ppo_log_std_max", -0.5)),
+                    "mean_clip": float(getattr(config, "ppo_mean_clip", 0.85)),
+                    # gSDE only: keep effective sigma bounded by clamping latent_pi passed into the SDE distribution.
+                    "sde_latent_clip": float(getattr(config, "ppo_sde_latent_clip", 2.0)),
                 }
 
-            if use_gnn:
-                # Use tier-specific GNN configuration based on observation dimension
-                # Check actual observation dimension to determine which GNN configuration to use
-                obs_dim = obs_space.shape[0]
-                enable_forecast_util = getattr(config, "enable_forecast_utilisation", False)
-                
-                # Hierarchical GNN works for any agent with forecast integration (base + forecast split)
-                # - Investor: 7D (6 base + 1 forecast) -> base_feature_dim=6
-                # - Battery: 8D (4 base + 4 forecast) -> base_feature_dim=4
-                if enable_forecast_util:
-                    # Tier 2: Use hierarchical GNN for agents with forecast integration
-                    features_dim = getattr(config, "gnn_features_dim_tier2", 18)
-                    hidden_dim = getattr(config, "gnn_hidden_dim_tier2", 30)
-                    num_layers = getattr(config, "gnn_num_layers_tier2", 2)
-                    dropout = getattr(config, "gnn_dropout_tier2", 0.1)
-                    graph_type = getattr(config, "gnn_graph_type_tier2", "hierarchical")
-                    num_heads = getattr(config, "gnn_num_heads_tier2", 3)
-                    use_attention_pooling = getattr(config, "gnn_use_attention_pooling_tier2", True)
-                    net_arch = getattr(config, "gnn_net_arch_tier2", [128, 64])
-                    forecast_norm_enable = bool(getattr(config, "gnn_forecast_norm_enable_tier2", False))
-                    # OBS-ONLY forecast conditioning (FiLM) – safe/fair because it only changes the encoder
-                    forecast_conditioning_enable = bool(getattr(config, "gnn_forecast_conditioning_enable_tier2", True))
-                    forecast_conditioning_strength = float(getattr(config, "gnn_forecast_conditioning_strength_tier2", 1.0))
-                    forecast_conditioning_hidden_dim = int(getattr(config, "gnn_forecast_conditioning_hidden_dim_tier2", 64))
-                    # Determine base_feature_dim based on observation dimension
-                    if agent == "investor_0":
-                        base_feature_dim = 6  # Tier 2 Investor: 6 base + 1 forecast
-                    elif agent == "battery_operator_0":
-                        base_feature_dim = 4  # Battery: 4 base + 4 forecast
-                    else:
-                        # Other agents: Use standard GNN if dimension doesn't match known splits
-                        graph_type = getattr(config, "gnn_graph_type", "full")
-                        base_feature_dim = None
-                else:
-                    # Tier 1: Use standard settings for base observations (6D investor, 4D battery, etc.)
-                    features_dim = getattr(config, "gnn_features_dim", 18)
-                    hidden_dim = getattr(config, "gnn_hidden_dim", 30)
-                    num_layers = getattr(config, "gnn_num_layers", 2)
-                    dropout = getattr(config, "gnn_dropout", 0.1)
-                    graph_type = getattr(config, "gnn_graph_type", "full")
-                    num_heads = getattr(config, "gnn_num_heads", 3)
-                    use_attention_pooling = getattr(config, "gnn_use_attention_pooling", True)
-                    net_arch = getattr(config, "gnn_net_arch", [128, 64])
-                    base_feature_dim = None
-                    forecast_conditioning_enable = False
-                    forecast_conditioning_strength = 0.0
-                    forecast_conditioning_hidden_dim = 0
-                    forecast_norm_enable = bool(getattr(config, "gnn_forecast_norm_enable", True))
-                
-                policy_kwargs = get_gnn_policy_kwargs(
-                    features_dim=features_dim,
-                    hidden_dim=hidden_dim,
-                    num_layers=num_layers,
-                    dropout=dropout,
-                    graph_type=graph_type,
-                    num_heads=num_heads,
-                    use_attention_pooling=use_attention_pooling,
-                    net_arch=net_arch,
-                    base_feature_dim=base_feature_dim,
-                    forecast_conditioning_enable=forecast_conditioning_enable,
-                    forecast_conditioning_strength=forecast_conditioning_strength,
-                    forecast_conditioning_hidden_dim=forecast_conditioning_hidden_dim,
-                    forecast_norm_enable=forecast_norm_enable,
-                )
-                if clamp_kwargs is not None:
-                    policy_kwargs.update(clamp_kwargs)
-                policy_class = GNNActorCriticPolicy
-                logger.info(f"[GNN] Using GNN policy for {agent} (features_dim={policy_kwargs['features_extractor_kwargs']['features_dim']})")
+            # Standard MLP policy
+            policy_kwargs = {
+                "net_arch": getattr(config, "net_arch", [64, 32]),
+                "activation_fn": activation_fn,
+                "normalize_images": False,
+                "optimizer_class": torch.optim.Adam,
+                "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0},
+            }
+            if clamp_kwargs is not None:
+                policy_kwargs.update(clamp_kwargs)
+                # PPO: use clamped policy to avoid action collapse in continuous control
+                policy_class = ClampedActorCriticPolicy
             else:
-                # Standard MLP policy
-                policy_kwargs = {
-                    "net_arch": getattr(config, "net_arch", [64, 32]),
-                    "activation_fn": activation_fn,
-                    "normalize_images": False,
-                    "optimizer_class": torch.optim.Adam,
-                    "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0},
-                }
-                if clamp_kwargs is not None:
-                    policy_kwargs.update(clamp_kwargs)
-                    # PPO: use clamped policy to avoid action collapse in continuous control
-                    from gnn_encoder import ClampedActorCriticPolicy
-                    policy_class = ClampedActorCriticPolicy
-                else:
-                    # SAC/TD3: keep standard SB3 MLP policy classes
-                    policy_class = "MlpPolicy"
+                # SAC/TD3: keep standard SB3 MLP policy classes
+                policy_class = "MlpPolicy"
 
             # Optional: increase initial exploration for continuous actions
             # (helps avoid near-constant actions / premature collapse)
@@ -794,8 +718,8 @@ class MultiESGAgent:
                         "gamma": float(getattr(config, "gamma", 0.995)),
                         "n_epochs": int(min(getattr(config, "n_epochs", 10), getattr(config, "n_epochs", 10))),  # STRENGTHENED: Increased from 5 to 10
                         # Exploration knobs (optional)
-                        "use_sde": bool(getattr(config, "ppo_use_sde", False)),
-                        "sde_sample_freq": int(getattr(config, "ppo_sde_sample_freq", 4)),
+                        "use_sde": bool(getattr(config, "ppo_use_sde", True)),
+                        "sde_sample_freq": int(getattr(config, "ppo_sde_sample_freq", 1)),
                     }
                 )
             elif policy_mode in ("SAC", "TD3"):
@@ -923,10 +847,10 @@ class MultiESGAgent:
                 try:
                     if hasattr(policy, 'policy') and hasattr(policy.policy, 'features_extractor'):
                         fe = policy.policy.features_extractor
-                        # Check GNN encoder input dimension
-                        if hasattr(fe, 'gnn_encoder') and hasattr(fe.gnn_encoder, 'obs_dim'):
-                            network_input_dim = fe.gnn_encoder.obs_dim
-                        # Check MLP first layer input dimension
+                        # Check feature extractor-declared observation dimension first.
+                        if hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
+                            network_input_dim = fe.observation_space.shape[0]
+                        # Fallback: check first MLP layer input dimension.
                         elif hasattr(fe, 'mlp') and len(fe.mlp) > 0:
                             first_layer = fe.mlp[0]
                             if hasattr(first_layer, 'in_features'):
@@ -1045,7 +969,7 @@ class MultiESGAgent:
                                     if hasattr(first_layer, 'in_features'):
                                         network_input_dim = first_layer.in_features
                                 elif hasattr(policy.policy.features_extractor, 'linear'):
-                                    # For GNN or other custom extractors
+                                    # For custom extractors exposing a linear front-end
                                     first_layer = policy.policy.features_extractor.linear[0] if isinstance(policy.policy.features_extractor.linear, nn.ModuleList) else policy.policy.features_extractor.linear
                                     if hasattr(first_layer, 'in_features'):
                                         network_input_dim = first_layer.in_features
@@ -1483,15 +1407,6 @@ class MultiESGAgent:
                         self.logger.info(f"[TRAINING_PROOF] {policy.agent_name} policy updated at step {self.total_steps}: "
                                          f"policy_loss={policy_loss}, value_loss={value_loss}, entropy={entropy_loss}, "
                                          f"approx_kl={approx_kl}")
-                        # Log forecast gate stats if available (helps diagnose forecast suppression)
-                        enc = getattr(policy.features_extractor, "gnn_encoder", None)
-                        gm = getattr(enc, "last_gate_mean", None)
-                        gs = getattr(enc, "last_gate_std", None)
-                        if gm is not None and gs is not None:
-                            try:
-                                self.logger.info(f"[GATE] {policy.agent_name} gate_mean={float(gm):.4f} gate_std={float(gs):.4f}")
-                            except Exception:
-                                pass
                         if not hasattr(self, '_last_log_step'):
                             self._last_log_step = 0
                         self._last_log_step = self.total_steps
@@ -1507,18 +1422,11 @@ class MultiESGAgent:
                 self._step_count_famc += 1
                 self._train_meta_head_if_needed()
 
-                # OBS-ONLY AUX LOSS: encourage forecast usage without touching rewards
-                try:
-                    aux_coeff = float(getattr(self.config, "aux_coeff", DEFAULT_AUX_COEFF))
-                except Exception:
-                    aux_coeff = DEFAULT_AUX_COEFF
-                if aux_coeff > 0:
-                    self._apply_aux_forecast_loss(policy, aux_coeff)
-
                 policy.rollout_buffer.reset()
                 gc.collect()
             except Exception as e:
-                self.logger.warning(f"PPO training failed for {policy.agent_name}: {e}")
+                msg = f"PPO training failed for {policy.agent_name}: {e}"
+                raise RuntimeError(msg) from e
         else:
             # Only log if we're past warmup phase and buffer is unexpectedly empty
             if self.total_steps > 100 and buffer_pos == 0:
@@ -1526,88 +1434,6 @@ class MultiESGAgent:
                     f"PPO buffer for {policy.agent_name} not ready: "
                     f"pos={buffer_pos}/{buffer_size}, full={buffer_full}, n_steps={n_steps}"
                 )
-
-    def _apply_aux_forecast_loss(self, policy, aux_coeff: float):
-        """
-        Lightweight extra step: use forecast features (last obs dim = trade_signal sign) as a proxy
-        target for the auxiliary head stored on the GNN encoder. Reward stays unchanged.
-        """
-        try:
-            buffer = policy.rollout_buffer
-            obs_tensor = torch.as_tensor(buffer.observations, device=policy.device)
-            if obs_tensor.ndim == 3:  # (n_steps, n_envs, obs_dim)
-                obs_tensor = obs_tensor.reshape(-1, obs_tensor.shape[-1])
-            if obs_tensor.numel() == 0:
-                return
-
-            # Only use the filled portion of the buffer
-            buf_size = getattr(buffer, "buffer_size", len(obs_tensor))
-            filled = buf_size if getattr(buffer, "full", False) else getattr(buffer, "pos", 0)
-            if filled == 0:
-                return
-            obs_tensor = obs_tensor[:filled]
-
-            # Skip if this policy/agent has no forecast feature (Tier1 or non-forecast mode)
-            # We assume Tier2 investor obs_dim > base_feature_dim; Tier1 would not have trade_signal at the end.
-            base_feat_dim = getattr(policy, "base_feature_dim", None)
-            if base_feat_dim is None:
-                # Try to infer for investor: Tier1 obs_dim = 6, Tier2 = 8 (6 base + 2 forecast)
-                inferred_has_forecast = obs_tensor.shape[1] > 6
-            else:
-                inferred_has_forecast = obs_tensor.shape[1] > base_feat_dim
-            if not inferred_has_forecast:
-                return
-
-            # Prefer stored realized-return targets if available
-            buf = getattr(policy, "rollout_buffer", None)
-            aux_targets_arr = getattr(policy, "aux_targets", None)
-            use_aux_targets = (
-                buf is not None
-                and aux_targets_arr is not None
-                and len(aux_targets_arr) >= buf_size
-            )
-
-            # Build targets and optionally subsample a minibatch aligned with buffer fill
-            if use_aux_targets:
-                targets_np = np.asarray(aux_targets_arr[:buf_size], dtype=np.float32)[:filled]
-                target_all = torch.as_tensor(targets_np, device=policy.device).unsqueeze(1)
-            else:
-                trade_signal = obs_tensor[:, -1]
-                target_all = (trade_signal > 0).float().unsqueeze(1)
-
-            # Minibatch for stability (approx align with PPO batches)
-            batch_size = int(getattr(self.config, "aux_batch_size", 256) or 256)
-            batch_size = min(batch_size, filled)
-            if batch_size <= 0:
-                return
-            idx = np.random.choice(filled, batch_size, replace=False)
-            obs_mb = obs_tensor[idx]
-            target_mb = target_all[idx]
-
-            # Forward once to populate last_aux_logits (keep grads)
-            _ = policy.extract_features(obs_mb)
-
-            encoder = getattr(policy.features_extractor, "gnn_encoder", None)
-            aux_logits = getattr(encoder, "last_aux_logits", None)
-            if aux_logits is None or aux_logits.shape[0] != target_mb.shape[0]:
-                return
-
-            aux_loss = F.binary_cross_entropy_with_logits(aux_logits, target_mb)
-
-            policy.optimizer.zero_grad()
-            (aux_coeff * aux_loss).backward()
-            policy.optimizer.step()
-
-            # Log periodically to ensure aux is active
-            if hasattr(self, "total_steps") and self.total_steps % 1000 == 0:
-                tgt_mean = float(target_all.mean().item())
-                tgt_pos = float((target_all > 0.5).float().mean().item())
-                self.logger.info(f"[AUX] steps={self.total_steps} aux_loss={aux_loss.item():.4f} coeff={aux_coeff} "
-                                 f"filled={filled} mb={batch_size} tgt_mean={tgt_mean:.4f} tgt_pos={tgt_pos:.4f} "
-                                 f"logits_mean={float(aux_logits.mean().item()):.4f} logits_std={float(aux_logits.std().item()):.4f}")
-
-        except Exception as e:
-            self.logger.debug(f"[AUX] skipping aux loss due to error: {e}")
 
     def _rb_size(self, rb) -> int:
         try:
@@ -1641,6 +1467,53 @@ class MultiESGAgent:
                         self.logger.warning(f"Buffer trimming failed for {policy.agent_name}: {te}")
         except Exception as e:
             self.logger.warning(f"Off-policy training failed for {policy.agent_name}: {e}")
+
+    def _maybe_reset_sde_noise(self, force: bool = False) -> None:
+        """
+        Explicit gSDE noise reset (SB3 PPO).
+
+        SB3 normally calls `policy.reset_noise()` inside its rollout collector, but this repo
+        uses a custom multi-agent rollout collector, so we must manage gSDE noise ourselves.
+
+        We reset:
+        - at environment reset/episode boundary (force=True) to avoid cross-episode sign bias
+        - every `config.ppo_sde_sample_freq` environment steps (force=False)
+        """
+        try:
+            # Environment timestep is the most reliable step index within rollouts
+            # (self.total_steps is updated only after rollouts are collected).
+            env_ref = getattr(self, "env", None)
+            t = int(getattr(env_ref, "t", 0) or 0)
+
+            freq = int(getattr(self.config, "ppo_sde_sample_freq", 1) or 1)
+            if freq <= 0:
+                freq = 1
+
+            if not force:
+                if (t % freq) != 0:
+                    return
+                if self._last_sde_noise_reset_t == t:
+                    return
+
+            for algo in getattr(self, "policies", []) or []:
+                try:
+                    if getattr(algo, "mode", None) != "PPO":
+                        continue
+                    net = getattr(algo, "policy", None)
+                    if net is None:
+                        continue
+                    if not bool(getattr(net, "use_sde", False)):
+                        continue
+                    # Single-env training/eval
+                    net.reset_noise(1)
+                except Exception:
+                    # Never fail training due to noise reset issues.
+                    pass
+
+            self._last_sde_noise_reset_t = t
+        except Exception:
+            # Best-effort only.
+            return
 
     # ----------------------------- Core Loop ---------------------------------
     def _initialize_environment_enhanced(self):
@@ -1687,6 +1560,9 @@ class MultiESGAgent:
                     print("Fixing initial observations")
                 self._last_obs = self._fix_observation_dict_enhanced(self._last_obs)
                 self._training_metrics["observation_fixes"] += 1
+
+            # Reset gSDE noise at episode boundary to avoid cross-episode bias.
+            self._maybe_reset_sde_noise(force=True)
         except Exception as e:
             error_msg = f"[CRITICAL] Environment initialization failed: {e}"
             self.logger.error(error_msg)
@@ -1742,6 +1618,9 @@ class MultiESGAgent:
     def _collect_actions_enhanced(self):
         actions_dict: Dict[str, Any] = {}
         agent_data: Dict[int, Dict[str, Any]] = {}
+
+        # gSDE: resample exploration noise explicitly (SB3 rollout collector is not used here).
+        self._maybe_reset_sde_noise(force=False)
 
         for polid, policy in enumerate(self.policies):
             agent_name = self.possible_agents[polid]
@@ -1827,8 +1706,8 @@ class MultiESGAgent:
                                             except Exception:
                                                 pass
                                         # Manual clamp of log_std to configured bounds if present
-                                        log_std_min = float(getattr(self.config, "ppo_log_std_min", -10.0))
-                                        log_std_max = float(getattr(self.config, "ppo_log_std_max", 10.0))
+                                        log_std_min = float(getattr(self.config, "ppo_log_std_min", -2.0))
+                                        log_std_max = float(getattr(self.config, "ppo_log_std_max", -0.5))
                                         log_std_param = getattr(policy.policy, "log_std", None)
                                         try:
                                             if log_std_param is not None:
@@ -1943,8 +1822,9 @@ class MultiESGAgent:
                         }
                         actions_dict[agent_name] = proc
             except Exception as e:
-                self.logger.warning(f"Action collection error for {agent_name}: {e}")
-                actions_dict[agent_name], agent_data[polid] = self._create_fallback_action_data(agent_name, polid)
+                msg = f"Action collection error for {agent_name}: {e}"
+                self.logger.error(msg)
+                raise RuntimeError(msg) from e
 
         return actions_dict, agent_data
 
@@ -1952,33 +1832,9 @@ class MultiESGAgent:
         try:
             return self.env.step(actions_dict)
         except Exception as e:
-            self.logger.warning(f"Environment step error: {e}")
-            # reset to avoid cascading bad states
-            try:
-                self._initialize_environment_enhanced()
-            except Exception:
-                pass
-            next_obs = self._last_obs.copy() if isinstance(self._last_obs, dict) else {}
-            rewards = {a: 0.0 for a in self.possible_agents}
-            dones = {a: False for a in self.possible_agents}
-            truncs = {a: False for a in self.possible_agents}
-            infos = {a: {} for a in self.possible_agents}
-            return next_obs, rewards, dones, truncs, infos
-
-    def _create_fallback_action_data(self, agent_name, polid):
-        action_space = self.action_spaces[agent_name]
-        if isinstance(action_space, Box):
-            safe = ((action_space.low + action_space.high) / 2.0).astype(np.float32)
-        else:
-            safe = 0
-        safe = self._ensure_action_shape(safe, action_space)
-        data = {
-            "obs": self._last_obs[agent_name].copy(),
-            "action": safe.copy() if isinstance(safe, np.ndarray) else safe,
-            "value_t": None,
-            "log_prob_t": None,
-        }
-        return safe, data
+            msg = f"Environment step error: {e}"
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def _progress_denominator(self, interval_total: int) -> int:
         if isinstance(self._global_target_steps, int) and self._global_target_steps > 0:
@@ -2077,7 +1933,13 @@ class MultiESGAgent:
 
                 # FGB/FAMC: Add forecast signals to data dict for baseline adjustment
                 # These are computed by environment._compute_forecast_signals() each step
-                data['forecast_trust'] = getattr(self.env, '_forecast_trust', 0.0)
+                try:
+                    if hasattr(self.env, "get_fgb_trust_for_agent"):
+                        data['forecast_trust'] = float(self.env.get_fgb_trust_for_agent(agent_name))
+                    else:
+                        data['forecast_trust'] = float(getattr(self.env, '_forecast_trust', 0.0))
+                except Exception:
+                    data['forecast_trust'] = float(getattr(self.env, '_forecast_trust', 0.0))
                 data['expected_dnav'] = getattr(self.env, '_expected_dnav', 0.0)
 
                 # FAMC: Add meta-critic prediction if available
@@ -2115,25 +1977,14 @@ class MultiESGAgent:
 
                 if getattr(policy, "mode", None) == "PPO":
                     self._add_ppo_experience(policy, data, reward, polid)
-                    # Store aux target (realized 1-step return sign) aligned with rollout buffer
-                    try:
-                        info_val = infos.get(agent_name, {}) if isinstance(infos, dict) else {}
-                        price_ret_1 = float(info_val.get('price_return_1step', 0.0))
-                        aux_target = 1.0 if price_ret_1 > 0 else 0.0
-                        buf = getattr(policy, "rollout_buffer", None)
-                        if buf is not None and hasattr(buf, "buffer_size"):
-                            if not hasattr(policy, "aux_targets") or len(getattr(policy, "aux_targets", [])) != buf.buffer_size:
-                                policy.aux_targets = np.zeros(buf.buffer_size, dtype=np.float32)
-                            idx = (buf.pos - 1) % buf.buffer_size
-                            policy.aux_targets[idx] = aux_target
-                    except Exception:
-                        pass
                 else:
                     self._add_offpolicy_experience(policy, data, reward, done, truncs, next_obs, agent_name)
                 if hasattr(policy, "num_timesteps"):
                     policy.num_timesteps += 1
             except Exception as e:
-                self.logger.warning(f"Experience addition error for {agent_name}: {e}")
+                raise RuntimeError(
+                    f"[EXPERIENCE_INGESTION] Failed to add experience for {agent_name}: {e}"
+                ) from e
     
     def _validate_and_fix_buffer_shape(self, policy, polid):
         """
@@ -2193,27 +2044,19 @@ class MultiESGAgent:
                     error_msg = f"Buffer has invalid shape {obs_shape}, expected 2D or 3D"
                 
                 if shape_invalid:
-                    # CRITICAL: Buffer shape mismatch - DO NOT manually fix
-                    # Manual buffer recreation breaks SB3's internal state and causes 'clone' errors
-                    # Policies are recreated when observation spaces change, which properly recreates buffers
-                    # Just log a warning and return True (assume valid) to avoid breaking training
-                    # The policy recreation logic handles observation space mismatches
-                    if not hasattr(self, '_buffer_mismatch_warned'):
-                        self._buffer_mismatch_warned = set()
-                    if polid not in self._buffer_mismatch_warned:
-                        self.logger.warning(
-                            f"[BUFFER_SHAPE_MISMATCH] Policy {polid} ({policy.agent_name}): "
-                            f"Buffer shape mismatch detected but not fixing (would break SB3 internal state). "
-                            f"Policy should be recreated if observation space changed."
-                        )
-                        self._buffer_mismatch_warned.add(polid)
-                    return True  # Assume valid - policy recreation handles mismatches
+                    msg = (
+                        f"[BUFFER_SHAPE_MISMATCH] Policy {polid} ({policy.agent_name}): {error_msg}. "
+                        f"Failing fast to prevent silent rollout corruption."
+                    )
+                    self.logger.error(msg)
+                    raise RuntimeError(msg)
             
             # CORRECT: Buffer shape is valid (or buffer doesn't have observations array yet)
             return True
         except Exception as e:
-            self.logger.warning(f"[BUFFER_SHAPE_CHECK] Failed to validate buffer shape for policy {polid}: {e}")
-            return True  # Assume valid if check fails to avoid blocking training
+            msg = f"[BUFFER_SHAPE_CHECK] Failed to validate buffer shape for policy {polid}: {e}"
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def _add_ppo_experience(self, policy, data, reward, polid):
         """
@@ -2297,71 +2140,55 @@ class MultiESGAgent:
             action_np = np.asarray(action_fixed, dtype=np.float32).flatten()  # Flatten to 1D
 
             # --- FGB/FAMC: Forecast-guided baseline adjustment ---
-            # Mode "fixed": Apply reward-level adjustment (legacy FGB)
-            # Mode "online"/"meta": Store data for advantage-level correction (FAMC)
-            fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+            # Legacy "fixed" reward-shaping mode removed.
+            # Online/meta modes apply an *advantage-level* control variate correction (unbiased if action-independent).
+            fgb_mode = getattr(self.config, 'fgb_mode', 'online')
+            agent_name = str(getattr(policy, 'agent_name', '') or '')
 
-            if getattr(self.config, 'forecast_baseline_enable', False) and fgb_mode == 'fixed':
-                # LEGACY FGB: Reward-level adjustment with fixed λ
-                try:
-                    lam = getattr(self.config, 'forecast_baseline_lambda', 0.5)
-                    tau = data.get('forecast_trust', 0.0) if isinstance(data, dict) else 0.0
-                    exp_dnav = data.get('expected_dnav', 0.0) if isinstance(data, dict) else 0.0
-
-                    # FGB: Normalize E[ΔNAV] from DKK to return units
-                    # This keeps the baseline adjustment comparable to reward scale
-                    nav_norm = max(1.0, float(getattr(self.config, "init_budget", 0.0)) or 1.0)
-                    baseline_adj = lam * tau * (exp_dnav / nav_norm)
-
-                    # CRITICAL FIX: Increase clip range for meaningful FGB impact
-                    # Previous: ±0.01 (1 bp) was too conservative - only 1% of typical reward
-                    # New: ±0.10 (10 bp) allows 10% adjustment - meaningful variance reduction
-                    # This ensures FGB has bite while still preventing reward swamping
-                    baseline_adj = float(np.clip(baseline_adj, -0.10, 0.10))
-
-                    reward = float(reward) - baseline_adj
-
-                    # Log telemetry (metrics tracked in _famc_metrics dict)
-                    # Note: self.logger is Python logging.Logger, not SB3 logger
-                    # SB3 logger.record() is not available here
-                    if self.debug and self._step_count_famc % 1000 == 0:
-                        self.logger.debug(f"[FGB] trust={tau:.3f}, exp_dnav={exp_dnav:.2f}, baseline_adj={baseline_adj:.4f}")
-                except Exception as e:
-                    self.logger.debug(f"[FGB] Baseline adjustment failed: {e}")
-
-            # FAMC: Store control variate data for advantage-level correction (online/meta modes)
-            # This data will be used in _finalize_rollouts_enhanced after GAE computation
-            if fgb_mode in ['online', 'meta']:
-                # Store forecast signals and meta predictions for this step
-                if not hasattr(policy, '_famc_step_data'):
-                    policy._famc_step_data = []
-
-                # FAMC: Get overlay features (34D) for meta head training
-                # These are the features used for overlay inference, not agent observations
-                overlay_feats = None
-                if hasattr(self.env, '_last_overlay_features') and self.env._last_overlay_features is not None:
-                    overlay_feats = self.env._last_overlay_features.copy()
-                    # CRITICAL: Ensure overlay features are 34D (28D base + 6D deltas)
-                    if overlay_feats.ndim == 2:
-                        overlay_feats = overlay_feats[0]  # Remove batch dimension if present
-                    if overlay_feats.shape[0] != 34:
-                        # Dimension mismatch - skip storing this step's data
-                        self.logger.debug(f"[FAMC] Skipping step: overlay features have wrong dimension ({overlay_feats.shape[0]}D, expected 34D)")
-                        overlay_feats = None
+            # FAMC: Store control variate data only when forecast baseline is enabled.
+            # This data is consumed in _finalize_rollouts_enhanced after GAE computation.
+            # Keeping it disabled in Tier1 avoids unnecessary per-step memory growth.
+            if bool(getattr(self.config, 'forecast_baseline_enable', False)) and fgb_mode in ['online', 'meta']:
+                # Paper-clean mode: keep control-variate correction scoped to investor_0 only.
+                if agent_name != "investor_0":
+                    if hasattr(policy, '_famc_step_data'):
+                        policy._famc_step_data.clear()
                 else:
-                    # CRITICAL FIX: Don't use agent obs as fallback - agent semantics differ per agent
-                    # investor_0 (7D) and battery_operator_0 (8D) represent different signals
-                    overlay_feats = None
+                # Store forecast signals and meta predictions for this step
+                    if not hasattr(policy, '_famc_step_data'):
+                        policy._famc_step_data = []
 
-                # Only store FAMC data if we have valid overlay features
-                if overlay_feats is not None and overlay_feats.shape[0] == 34:
+                    # Only the investor trains the meta baseline head (avoid mixing agents, paper-clean).
+                    need_meta_obs = (
+                        fgb_mode == 'meta'
+                        and bool(getattr(self.config, 'meta_baseline_enable', False))
+                        and agent_name == "investor_0"
+                    )
+
+                    # FAMC: Get overlay features (18D) for meta head training (state-only, pre-action).
+                    overlay_feats = None
+                    from config import OVERLAY_FEATURE_DIM
+                    expected_dim = int(OVERLAY_FEATURE_DIM)
+                    if need_meta_obs and hasattr(self.env, '_last_overlay_features') and self.env._last_overlay_features is not None:
+                        overlay_feats = self.env._last_overlay_features.copy()
+                        if overlay_feats.ndim == 2:
+                            overlay_feats = overlay_feats[0]
+                        if overlay_feats.shape[0] != expected_dim:
+                            self.logger.debug(f"[FAMC] Skipping step: overlay features wrong dim ({overlay_feats.shape[0]}D, expected {expected_dim}D)")
+                            overlay_feats = None
+
                     famc_data = {
                         'tau': data.get('forecast_trust', 0.0),
                         'expected_dnav': data.get('expected_dnav', 0.0),
                         'meta_adv_pred': data.get('meta_adv_pred', 0.0),
-                        'obs': overlay_feats,  # Store overlay features (34D) for meta head training
                     }
+                    if need_meta_obs and overlay_feats is not None and overlay_feats.shape[0] == expected_dim:
+                        famc_data['obs'] = overlay_feats
                     policy._famc_step_data.append(famc_data)
+            else:
+                # Ensure stale step data cannot accumulate when baseline correction is disabled.
+                if hasattr(policy, '_famc_step_data'):
+                    policy._famc_step_data.clear()
 
             # --- reward/start flags -> numpy (CPU) ---
             reward_np = np.array([reward], dtype=np.float32)
@@ -2411,24 +2238,40 @@ class MultiESGAgent:
             policy.rollout_buffer.add(obs_np, action_np, reward_np, starts_np, value_t, log_prob_t)
 
         except Exception as e:
-            self.logger.warning(f"PPO buffer add error for policy {polid}: {e}")
-            # CRITICAL: Log detailed error information for debugging
             agent_name = getattr(policy, 'agent_name', f'policy_{polid}')
+            policy_obs_shape = None
+            buffer_obs_shape = None
+            actual_obs_shape = None
+            actual_action_shape = None
             try:
                 if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                    self.logger.warning(f"  Policy obs_space: {policy.observation_space.shape}")
-            except:
-                pass
+                    policy_obs_shape = tuple(policy.observation_space.shape)
+            except Exception:
+                policy_obs_shape = None
             try:
-                if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None:
-                    if hasattr(policy.rollout_buffer, 'obs_shape'):
-                        self.logger.warning(f"  Buffer obs_shape: {policy.rollout_buffer.obs_shape}")
-            except:
-                pass
+                if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None and hasattr(policy.rollout_buffer, 'obs_shape'):
+                    buffer_obs_shape = tuple(policy.rollout_buffer.obs_shape)
+            except Exception:
+                buffer_obs_shape = None
             try:
-                self.logger.warning(f"  Actual observation shape: {obs_np.shape if 'obs_np' in locals() else 'N/A'}")
-            except:
-                pass
+                if 'obs_np' in locals():
+                    actual_obs_shape = tuple(np.asarray(obs_np).shape)
+            except Exception:
+                actual_obs_shape = None
+            try:
+                if 'action_np' in locals():
+                    actual_action_shape = tuple(np.asarray(action_np).shape)
+            except Exception:
+                actual_action_shape = None
+
+            msg = (
+                f"[FAIL_FAST][PPO_BUFFER_ADD] policy_id={polid} agent={agent_name} "
+                f"policy_obs_shape={policy_obs_shape} buffer_obs_shape={buffer_obs_shape} "
+                f"actual_obs_shape={actual_obs_shape} actual_action_shape={actual_action_shape} "
+                f"error={e}"
+            )
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def _add_offpolicy_experience(self, policy, data, reward, done, truncs, next_obs, agent_name):
         if not hasattr(policy, "replay_buffer") or policy.replay_buffer is None:
@@ -2507,7 +2350,39 @@ class MultiESGAgent:
             else:
                 policy.replay_buffer.add(obs_b, next_obs_b, action_b, reward_b, done_b)
         except Exception as e:
-            self.logger.warning(f"Replay buffer add error: {e}")
+            policy_obs_shape = None
+            actual_obs_shape = None
+            actual_next_obs_shape = None
+            actual_action_shape = None
+            try:
+                if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
+                    policy_obs_shape = tuple(policy.observation_space.shape)
+            except Exception:
+                policy_obs_shape = None
+            try:
+                if 'obs_fixed' in locals():
+                    actual_obs_shape = tuple(np.asarray(obs_fixed).shape)
+            except Exception:
+                actual_obs_shape = None
+            try:
+                if 'next_obs_fixed' in locals():
+                    actual_next_obs_shape = tuple(np.asarray(next_obs_fixed).shape)
+            except Exception:
+                actual_next_obs_shape = None
+            try:
+                if 'action_fixed' in locals():
+                    actual_action_shape = tuple(np.asarray(action_fixed).shape)
+            except Exception:
+                actual_action_shape = None
+
+            msg = (
+                f"[FAIL_FAST][REPLAY_BUFFER_ADD] agent={agent_name} "
+                f"policy_obs_shape={policy_obs_shape} actual_obs_shape={actual_obs_shape} "
+                f"actual_next_obs_shape={actual_next_obs_shape} actual_action_shape={actual_action_shape} "
+                f"error={e}"
+            )
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def _update_state_enhanced(self, next_obs, dones, truncs):
         if not self.obs_validator.validate_observation_dict(next_obs):
@@ -2543,26 +2418,28 @@ class MultiESGAgent:
 
     def _check_buffers_full(self):
         """
-        Check if any PPO buffer has enough data for training.
+        Check if all PPO buffers have enough data for training.
 
-        ROBUST: Check buffer.pos >= n_steps instead of just buffer.full flag.
+        ROBUST: Require all PPO policies to be ready before rollout finalization.
         """
+        has_ppo_policy = False
         for policy in self.policies:
             if getattr(policy, "mode", None) != "PPO":
                 continue
+            has_ppo_policy = True
             if not hasattr(policy, "rollout_buffer") or policy.rollout_buffer is None:
-                continue
+                return False
 
             buffer = policy.rollout_buffer
             n_steps = getattr(policy, "n_steps", self.n_steps)
             buffer_pos = getattr(buffer, "pos", 0)
             buffer_full = getattr(buffer, "full", False)
 
-            # Return True if any buffer is full or has enough data
-            if buffer_full or buffer_pos >= n_steps:
-                return True
+            # Every PPO buffer must be full or have at least n_steps samples.
+            if not (buffer_full or buffer_pos >= n_steps):
+                return False
 
-        return False
+        return has_ppo_policy
 
     def _finalize_rollouts_enhanced(self):
         for polid, policy in enumerate(self.policies):
@@ -2575,9 +2452,9 @@ class MultiESGAgent:
 
                         # Check if buffer is None or empty
                         if buffer is None:
-                            if self.total_steps > 100:
-                                self.logger.warning(f"PPO rollout buffer for policy {polid} is None!")
-                            continue
+                            raise RuntimeError(
+                                f"[ROLLOUT_FINALIZE] PPO rollout buffer is None for policy {polid} ({agent_name})"
+                            )
 
                         if buffer.pos == 0:
                             # Only warn if we're past the initial warmup phase (total_steps > 100)
@@ -2586,15 +2463,10 @@ class MultiESGAgent:
                                 # Add diagnostic info to help debug why buffer is empty
                                 buffer_size = getattr(buffer, 'buffer_size', 'unknown')
                                 full = getattr(buffer, 'full', 'unknown')
-                                self.logger.warning(
-                                    f"PPO rollout buffer for policy {polid} is empty or invalid "
-                                    f"(total_steps={self.total_steps}, buffer.pos=0/{buffer_size}, "
-                                    f"full={full})"
-                                )
-                                # Check if this is due to action collection errors
-                                self.logger.warning(
-                                    f"  → This usually means experiences aren't being added to the buffer. "
-                                    f"Check for 'PPO buffer add error' or 'Action collection error' messages above."
+                                raise RuntimeError(
+                                    f"[ROLLOUT_FINALIZE] Empty PPO rollout buffer for policy {polid} ({agent_name}) "
+                                    f"(total_steps={self.total_steps}, buffer.pos=0/{buffer_size}, full={full}). "
+                                    f"This indicates experience ingestion failure."
                                 )
                             continue
 
@@ -2606,10 +2478,10 @@ class MultiESGAgent:
 
                         if buffer.pos < min_gae_len:
                             if self.total_steps > 100:
-                                self.logger.warning(
-                                    f"[PATCH B] PPO GAE skipped for {policy.agent_name}: "
+                                raise RuntimeError(
+                                    f"[ROLLOUT_FINALIZE] Under-filled PPO buffer for {policy.agent_name}: "
                                     f"pos={buffer.pos}/{buffer.buffer_size} < min_gae_len={min_gae_len} "
-                                    f"(n_steps={n_steps}). Buffer under-filled, skipping GAE to prevent crashes."
+                                    f"(n_steps={n_steps})."
                                 )
                             continue
 
@@ -2698,9 +2570,11 @@ class MultiESGAgent:
                         buffer_ready = (buffer_pos >= buffer_size) or buffer_full
                         
                         if not buffer_ready:
-                            # Skip GAE if buffer not ready (not enough data)
-                            if self.total_steps % 1000 == 0:  # Log periodically
-                                self.logger.debug(f"[GAE_SKIP] Policy {polid} ({agent_name}): Buffer not ready (pos={buffer_pos}, full={buffer_full})")
+                            if self.total_steps > 100:
+                                raise RuntimeError(
+                                    f"[GAE_SKIP_FATAL] Policy {polid} ({agent_name}): "
+                                    f"buffer not ready (pos={buffer_pos}, full={buffer_full}, size={buffer_size})."
+                                )
                             continue
                         
                         # Call GAE with tensor final_value - SB3 will handle tensor operations correctly
@@ -2720,25 +2594,30 @@ class MultiESGAgent:
                                     obs_type = type(buffer.observations).__name__
                                     obs_shape = buffer.observations.shape if hasattr(buffer.observations, 'shape') else 'N/A'
                                     self.logger.error(f"  Buffer observations: type={obs_type}, shape={obs_shape}")
-                                
-                                # This should not happen - investigate if it does
-                                # Reset buffer as fallback to allow training to continue
-                                buffer.pos = 0
-                                buffer.full = False
-                                self.logger.error(f"  Buffer reset - please report this error if it persists")
+
+                                raise RuntimeError(
+                                    f"[GAE_CLONE_ERROR] Policy {polid} ({agent_name}): {gae_error}"
+                                ) from gae_error
                             else:
                                 self.logger.error(f"[GAE_ERROR] Policy {polid} ({agent_name}): GAE computation failed: {gae_error}")
-                                # Don't re-raise - let training continue (GAE failure is non-fatal)
+                                raise RuntimeError(
+                                    f"[GAE_ERROR] Policy {polid} ({agent_name}): {gae_error}"
+                                ) from gae_error
 
                         # FAMC: Apply advantage-level correction (online/meta modes)
-                        fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+                        fgb_mode = getattr(self.config, 'fgb_mode', 'online')
                         if fgb_mode in ['online', 'meta'] and getattr(self.config, 'forecast_baseline_enable', False):
-                            self._apply_famc_correction(policy, polid)
+                            if agent_name != "investor_0":
+                                if hasattr(policy, '_famc_step_data'):
+                                    policy._famc_step_data = []
+                            else:
+                                self._apply_famc_correction(policy, polid)
 
                         # MAINTENANCE: Log buffer state for verification
                         self.logger.debug(f"GAE computed for policy {polid}: buffer_size={buffer.buffer_size}, pos={buffer.pos}")
             except Exception as e:
-                self.logger.warning(f"Rollout finalization error for policy {polid}: {e}")
+                msg = f"Rollout finalization error for policy {polid}: {e}"
+                raise RuntimeError(msg) from e
 
     def _apply_famc_correction(self, policy, polid):
         """
@@ -2761,14 +2640,26 @@ class MultiESGAgent:
                 return
 
             # Get FAMC configuration
-            fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+            fgb_mode = getattr(self.config, 'fgb_mode', 'online')
             warmup_steps = getattr(self.config, 'fgb_warmup_steps', 2000)
             lambda_max = getattr(self.config, 'fgb_lambda_max', 0.8)
-            clip_bps = getattr(self.config, 'fgb_clip_bps', 0.01)
+            clip_adv = getattr(self.config, 'fgb_clip_adv', getattr(self.config, 'fgb_clip_bps', 0.01))
             moment_beta = getattr(self.config, 'fgb_moment_beta', 0.01)
+            allow_negative_lambda = bool(getattr(self.config, 'fgb_allow_negative_lambda', False))
 
-            # Skip if still in warmup
-            if self._step_count_famc < warmup_steps:
+            agent_name = str(getattr(policy, "agent_name", f"policy_{polid}") or f"policy_{polid}")
+            if agent_name != "investor_0":
+                if hasattr(policy, '_famc_step_data'):
+                    policy._famc_step_data = []
+                return
+
+            # Warmup is measured in environment steps (not policy updates) so it doesn't depend on agent order.
+            try:
+                t_now = int(getattr(self.config, "training_global_step", getattr(self.env, "t", 0)))
+            except Exception:
+                t_now = int(getattr(self.env, "t", 0))
+
+            if t_now < warmup_steps:
                 return
 
             # Get stored FAMC data
@@ -2799,7 +2690,7 @@ class MultiESGAgent:
                     # Use expected_dnav as control variate (gated by trust)
                     C_t[i] = tau * (exp_dnav / nav_norm)
                 elif fgb_mode == 'meta':
-                    # Use meta-critic prediction as control variate (gated by trust)
+                    # Meta mode: investor_0 uses the learned meta baseline head.
                     C_t[i] = tau * meta_pred
 
             # Standardize advantages and control variates for stable moment estimation
@@ -2811,36 +2702,64 @@ class MultiESGAgent:
             C_std = np.std(C_t) + 1e-8
             C_std_norm = (C_t - C_mean) / C_std
 
-            # Update EMA moments (on standardized values)
+            # Per-policy EMA moments (avoid mixing PPO agents, order-dependence).
+            famc_state = getattr(policy, "_famc_state", None)
+            if not isinstance(famc_state, dict):
+                famc_state = {
+                    "ema_mA": 0.0,
+                    "ema_mC": 0.0,
+                    "ema_mA2": 0.0,
+                    "ema_mC2": 0.0,
+                    "ema_mAC": 0.0,
+                    "lambda_star_prev": 0.0,
+                }
+                policy._famc_state = famc_state
+
+            ema_mA = float(famc_state.get("ema_mA", 0.0))
+            ema_mC = float(famc_state.get("ema_mC", 0.0))
+            ema_mA2 = float(famc_state.get("ema_mA2", 0.0))
+            ema_mC2 = float(famc_state.get("ema_mC2", 0.0))
+            ema_mAC = float(famc_state.get("ema_mAC", 0.0))
+            lambda_star_prev = float(famc_state.get("lambda_star_prev", 0.0))
+
+            # Update EMA moments (on standardized values).
             for i in range(n_steps):
-                a = A_std_norm[i]
-                c = C_std_norm[i]
+                a = float(A_std_norm[i])
+                c = float(C_std_norm[i])
 
-                # Update first moments
-                self._ema_mA = (1 - moment_beta) * self._ema_mA + moment_beta * a
-                self._ema_mC = (1 - moment_beta) * self._ema_mC + moment_beta * c
-
-                # Update second moments
-                self._ema_mA2 = (1 - moment_beta) * self._ema_mA2 + moment_beta * (a ** 2)
-                self._ema_mC2 = (1 - moment_beta) * self._ema_mC2 + moment_beta * (c ** 2)
-                self._ema_mAC = (1 - moment_beta) * self._ema_mAC + moment_beta * (a * c)
+                ema_mA = (1 - moment_beta) * ema_mA + moment_beta * a
+                ema_mC = (1 - moment_beta) * ema_mC + moment_beta * c
+                ema_mA2 = (1 - moment_beta) * ema_mA2 + moment_beta * (a ** 2)
+                ema_mC2 = (1 - moment_beta) * ema_mC2 + moment_beta * (c ** 2)
+                ema_mAC = (1 - moment_beta) * ema_mAC + moment_beta * (a * c)
 
             # Compute variance and covariance from EMA moments
-            var_A = self._ema_mA2 - self._ema_mA ** 2
-            var_C = self._ema_mC2 - self._ema_mC ** 2
-            cov_AC = self._ema_mAC - self._ema_mA * self._ema_mC
+            var_A = ema_mA2 - ema_mA ** 2
+            var_C = ema_mC2 - ema_mC ** 2
+            cov_AC = ema_mAC - ema_mA * ema_mC
 
             # Compute optimal λ* = Cov(A,C) / Var(C)
             if var_C > 1e-6:
                 lambda_star_raw = cov_AC / var_C
-                # Clip to [0, lambda_max] (only positive correlation reduces variance)
-                lambda_star = np.clip(lambda_star_raw, 0.0, lambda_max)
+                # Clip lambda* for stability. Symmetric clipping is variance-optimal; nonnegative is a safer subset.
+                if allow_negative_lambda:
+                    lambda_star = np.clip(lambda_star_raw, -lambda_max, lambda_max)
+                else:
+                    lambda_star = np.clip(lambda_star_raw, 0.0, lambda_max)
             else:
                 lambda_star = 0.0
 
             # Smooth λ* to reduce jitter
-            self._lambda_star_prev = 0.9 * self._lambda_star_prev + 0.1 * lambda_star
-            lambda_star_smooth = self._lambda_star_prev
+            lambda_star_prev = 0.9 * lambda_star_prev + 0.1 * lambda_star
+            lambda_star_smooth = lambda_star_prev
+
+            # Persist per-policy state
+            famc_state["ema_mA"] = float(ema_mA)
+            famc_state["ema_mC"] = float(ema_mC)
+            famc_state["ema_mA2"] = float(ema_mA2)
+            famc_state["ema_mC2"] = float(ema_mC2)
+            famc_state["ema_mAC"] = float(ema_mAC)
+            famc_state["lambda_star_prev"] = float(lambda_star_prev)
 
             # Apply correction in standardized space (correct scale)
             # A'_std = A_std - λ* * C_std
@@ -2853,22 +2772,19 @@ class MultiESGAgent:
             # Clip the CHANGE (not the correction itself)
             # This preserves the advantage scale while limiting per-step adjustments
             delta = advantages_corrected - advantages
-            delta_clipped = np.clip(delta, -clip_bps, clip_bps)
+            delta_clipped = np.clip(delta, -clip_adv, clip_adv)
             advantages_corrected = advantages + delta_clipped
 
             # Compute variance for metrics
             var_before = np.var(advantages)
             var_after = np.var(advantages_corrected)
-            num_clipped = np.sum(np.abs(delta) > clip_bps)
+            num_clipped = np.sum(np.abs(delta) > clip_adv)
 
-            # CRITICAL FIX: Write back to buffer BEFORE SB3 normalization
-            # SB3's compute_returns_and_advantage already computed advantages
-            # We're modifying them here, which is fine as long as we don't trigger
-            # another normalization pass. The buffer is ready for training after this.
-            #
-            # RISK MITIGATION: This modification happens AFTER GAE computation but
-            # BEFORE the PPO update. SB3 will NOT re-normalize advantages during
-            # the update step, so our corrections are preserved.
+            # Write back to the buffer AFTER GAE computation but BEFORE the PPO update.
+            # NOTE: SB3 PPO may still normalize advantages per minibatch during training
+            # (normalize_advantage=True). Our correction changes the *relative* advantages;
+            # normalization rescales but does not remove the per-step structure.
+            # var_before/var_after here are diagnostics on raw buffer advantages (pre-normalization).
             buffer.advantages[:n_steps] = advantages_corrected.reshape(-1, 1)
 
             # Compute correlation for diagnostics
@@ -2888,24 +2804,24 @@ class MultiESGAgent:
             self._famc_metrics['var_reduction'] = float(1.0 - var_after / max(var_before, 1e-8))
 
             # Periodic detailed logging
-            if self._step_count_famc % 500 == 0:
+            if t_now % 500 == 0:
                 var_red_pct = (1.0 - var_after / max(var_before, 1e-8)) * 100
                 clip_rate_pct = (float(num_clipped) / max(1, n_steps)) * 100
                 self.logger.info(f"[FAMC] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} | VarRed={var_red_pct:.1f}% | Clip={clip_rate_pct:.1f}%")
 
             # Store features and advantages for meta head training (meta mode only)
-            if fgb_mode == 'meta' and getattr(self.config, 'meta_baseline_enable', False):
-                # CRITICAL: Only store if overlay features are valid (34D)
+            if agent_name == "investor_0" and fgb_mode == 'meta' and getattr(self.config, 'meta_baseline_enable', False):
+                from config import OVERLAY_FEATURE_DIM
+                meta_feat_dim = int(OVERLAY_FEATURE_DIM)
                 for i in range(n_steps):
-                    obs = famc_data_list[i]['obs']
-                    # Verify dimension is correct (34D overlay features)
-                    if isinstance(obs, np.ndarray) and obs.shape[0] == 34:
+                    famc_row = famc_data_list[i] if i < len(famc_data_list) else {}
+                    obs = famc_row.get('obs', None)
+                    if isinstance(obs, np.ndarray) and obs.shape[0] == meta_feat_dim:
                         self._meta_features_buffer.append(obs)
                         self._meta_adv_buffer.append(A_std_norm[i])  # Store standardized advantage
                     else:
-                        # Skip invalid observations to prevent dimension mismatches
                         if isinstance(obs, np.ndarray):
-                            self.logger.debug(f"[FAMC] Skipping invalid observation: shape={obs.shape}, expected 34D")
+                            self.logger.debug(f"[FAMC] Skipping invalid observation: shape={obs.shape}, expected {meta_feat_dim}D")
 
                 # Limit buffer size
                 max_buffer_size = 10000
@@ -2917,96 +2833,132 @@ class MultiESGAgent:
             policy._famc_step_data = []
 
         except Exception as e:
-            self.logger.warning(f"[FAMC] Correction failed for policy {polid}: {e}")
+            msg = f"[FAMC] Correction failed for policy {polid}: {e}"
+            raise RuntimeError(msg) from e
 
     def _train_meta_head_if_needed(self):
         """
         FAMC: Train meta-critic head periodically on accumulated advantages.
 
-        This trains the meta head g_φ(x_t) to predict standardized advantages
+        This trains the meta head to predict standardized advantages
         from state features only (no action leakage).
         """
+        fail_fast = bool(getattr(self.config, "fgb_fail_fast", False)) and bool(
+            getattr(self.config, "forecast_baseline_enable", False)
+        )
         try:
-            # Check if meta head training is enabled
-            fgb_mode = getattr(self.config, 'fgb_mode', 'fixed')
+            # Check if meta head training is enabled.
+            fgb_mode = getattr(self.config, 'fgb_mode', 'online')
             if fgb_mode != 'meta' or not getattr(self.config, 'meta_baseline_enable', False):
                 return
 
-            # Check if it's time to train
-            meta_train_every = getattr(self.config, 'meta_train_every', 512)
-            if self._step_count_famc % meta_train_every != 0:
-                return
-
-            # Check if we have enough data
-            if len(self._meta_features_buffer) < 128:
-                return
-
-            # Get overlay trainer from environment
-            if not hasattr(self.env, 'overlay_trainer') or self.env.overlay_trainer is None:
-                self.logger.warning("[FAMC] Overlay trainer not found, skipping meta head training")
-                return
-
-            overlay_trainer = self.env.overlay_trainer
-
-            # Sample a batch from buffer
-            batch_size = min(256, len(self._meta_features_buffer))
-            indices = np.random.choice(len(self._meta_features_buffer), batch_size, replace=False)
-
-            # Extract features and advantages
-            # CRITICAL FIX: Verify all features have the same dimension before stacking
-            valid_indices = []
-            for i in indices:
-                feat = self._meta_features_buffer[i]
-                if isinstance(feat, np.ndarray) and feat.shape[0] == 34:
-                    valid_indices.append(i)
-            
-            if len(valid_indices) < 32:  # Need at least 32 samples for a reasonable batch
-                self.logger.warning(f"[FAMC] ❌ SKIPPING meta head training: insufficient valid features ({len(valid_indices)}/{batch_size} valid)")
-                return
-            
-            # Extract only valid features and advantages
-            features_list = [self._meta_features_buffer[i] for i in valid_indices]
-            adv_list = [self._meta_adv_buffer[i] for i in valid_indices]
-            
-            # Stack into batch - all should have shape (34,) so this should work
+            # Check if it's time to train (use env-step clock, not policy-update count).
+            meta_train_every = int(getattr(self.config, 'meta_train_every', 512) or 512)
             try:
-                features_batch = np.array(features_list, dtype=np.float32)  # (batch, 34)
-                adv_batch = np.array(adv_list, dtype=np.float32)  # (batch,)
-            except ValueError as e:
-                self.logger.warning(f"[FAMC] ❌ SKIPPING meta head training: failed to stack features: {e}")
-                # Debug: Check dimensions
-                dims = [f.shape for f in features_list[:10]]
-                self.logger.warning(f"[FAMC] First 10 feature shapes: {dims}")
+                t_now = int(getattr(self.config, "training_global_step", getattr(self.env, "t", 0)))
+            except Exception:
+                t_now = int(getattr(self.env, "t", 0))
+
+            if not hasattr(self, "_last_meta_train_step"):
+                self._last_meta_train_step = -meta_train_every
+            if int(t_now) - int(self._last_meta_train_step) < meta_train_every:
                 return
 
-            # Ensure features are (batch, 34) - extract from (batch, 1, obs_dim) if needed
-            if len(features_batch.shape) == 3:
-                features_batch = features_batch.squeeze(1)
-
-            # CRITICAL CHECK: Verify feature dimension matches overlay input (34D)
-            if features_batch.shape[1] != 34:
-                self.logger.warning(f"[FAMC] ❌ SKIPPING meta head training: feature dim mismatch (got {features_batch.shape[1]}, expected 34)")
-                self.logger.warning(f"[FAMC] This means overlay features are not being cached properly!")
+            # Check if we have enough data.
+            min_samples = int(getattr(self.config, "meta_train_min_samples", 128) or 128)
+            if len(self._meta_features_buffer) < min_samples:
                 return
 
-            # SUCCESS: Features are correct dimension
-            if self._step_count_famc % (meta_train_every * 10) == 0:
-                self.logger.info(f"[FAMC] ✅ Meta head training with correct 34D features (buffer_size={len(self._meta_features_buffer)})")
+            # Get overlay trainer from environment.
+            overlay_trainer = getattr(self.env, 'overlay_trainer', None)
+            if overlay_trainer is None:
+                msg = "[FAMC] Overlay trainer not found, skipping meta head training"
+                if fail_fast:
+                    raise RuntimeError(msg)
+                self.logger.warning(msg)
+                return
 
-            # Train meta head
+            from config import OVERLAY_FEATURE_DIM
+            meta_feat_dim = int(OVERLAY_FEATURE_DIM)
+
+            # Filter valid meta-feature rows across the full buffer first.
+            valid_indices = []
+            for idx, feat in enumerate(self._meta_features_buffer):
+                if not isinstance(feat, np.ndarray):
+                    continue
+                feat_arr = np.asarray(feat, dtype=np.float32).reshape(-1)
+                if feat_arr.shape[0] != meta_feat_dim:
+                    continue
+                if not np.all(np.isfinite(feat_arr)):
+                    continue
+                valid_indices.append(idx)
+
+            valid_count = int(len(valid_indices))
+            total_count = int(len(self._meta_features_buffer))
+            self._famc_metrics['meta_valid_feature_count'] = valid_count
+            self._famc_metrics['meta_valid_feature_ratio'] = float(valid_count / max(1, total_count))
+
+            min_valid = int(getattr(self.config, "meta_train_min_valid_samples", 64) or 64)
+            if valid_count < min_valid:
+                msg = (
+                    f"[FAMC] Skipping meta head training: insufficient valid features "
+                    f"({valid_count}/{total_count}, required>={min_valid})"
+                )
+                if fail_fast:
+                    raise RuntimeError(msg)
+                self.logger.warning(msg)
+                return
+
+            batch_size = min(256, valid_count)
+            indices = np.random.choice(valid_indices, batch_size, replace=False)
+            features_batch = np.asarray([self._meta_features_buffer[i] for i in indices], dtype=np.float32)
+            adv_batch = np.asarray([self._meta_adv_buffer[i] for i in indices], dtype=np.float32).reshape(-1)
+
+            if features_batch.ndim != 2 or features_batch.shape[1] != meta_feat_dim:
+                msg = (
+                    f"[FAMC] Feature dim mismatch for meta head training: "
+                    f"got {features_batch.shape}, expected (*, {meta_feat_dim})"
+                )
+                if fail_fast:
+                    raise RuntimeError(msg)
+                self.logger.warning(msg)
+                return
+
+            if (not np.all(np.isfinite(features_batch))) or (not np.all(np.isfinite(adv_batch))):
+                msg = "[FAMC] Non-finite meta training batch detected"
+                if fail_fast:
+                    raise RuntimeError(msg)
+                self.logger.warning(msg)
+                return
+
+            if t_now % (meta_train_every * 10) == 0:
+                self.logger.info(
+                    f"[FAMC] Meta head training ({batch_size} samples, valid={valid_count}/{total_count}, "
+                    f"feature_dim={meta_feat_dim})"
+                )
+
+            # Train meta head.
             loss_type = getattr(self.config, 'meta_baseline_loss', 'mse')
             meta_loss = overlay_trainer.train_meta_baseline(features_batch, adv_batch, loss_type)
 
-            # Update metrics
+            # Mark meta head as trained at this env step (prevents per-agent re-entry).
+            self._last_meta_train_step = int(t_now)
+
+            # Update metrics.
             self._famc_metrics['meta_loss'] = float(meta_loss)
             self._famc_metrics['meta_buffer_size'] = len(self._meta_features_buffer)
 
-            # Log
             if self.verbose:
-                self.logger.info(f"[FAMC] Meta head trained: loss={meta_loss:.6f}, buffer_size={len(self._meta_features_buffer)}")
+                self.logger.info(
+                    f"[FAMC] Meta head trained: loss={meta_loss:.6f}, "
+                    f"buffer_size={len(self._meta_features_buffer)}"
+                )
 
         except Exception as e:
-            self.logger.warning(f"[FAMC] Meta head training failed: {e}")
+            msg = f"[FAMC] Meta head training failed: {e}"
+            if fail_fast:
+                raise RuntimeError(msg) from e
+            self.logger.warning(msg)
 
     def _finalize_training(self):
         for polid, policy in enumerate(self.policies):
@@ -3237,13 +3189,9 @@ class MultiESGAgent:
                             if hasattr(loaded, 'policy') and hasattr(loaded.policy, 'features_extractor'):
                                 try:
                                     # Verify network input dimension matches (if accessible)
-                                    # For GNN encoder, check the actual input dimension (obs_dim), not output dimension (features_dim)
                                     fe = loaded.policy.features_extractor
-                                    if hasattr(fe, 'gnn_encoder') and hasattr(fe.gnn_encoder, 'obs_dim'):
-                                        # GNN encoder: check input dimension
-                                        net_input_dim = fe.gnn_encoder.obs_dim
-                                    elif hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
-                                        # Standard feature extractor: check observation space
+                                    if hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
+                                        # Feature extractor: check declared observation space
                                         net_input_dim = fe.observation_space.shape[0]
                                     else:
                                         # Fallback: skip dimension check

@@ -49,8 +49,9 @@ class TradingEngine:
             risk_multiplier = 0.3 + 1.1 * normalized_val  # [0.3,2.5]
             return float(np.clip(risk_multiplier, 0.3, 2.5))
         except Exception as e:
-            logger.warning(f"Risk control application failed: {e}")
-            return 1.0
+            msg = f"[RISK_CONTROL_FATAL] Risk control application failed: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
     
     @staticmethod
     def apply_meta_control(
@@ -113,11 +114,9 @@ class TradingEngine:
             return capital_allocation_fraction, investment_freq
             
         except Exception as e:
-            logger.warning(f"Meta control application failed: {e}")
-            # Return defaults
-            default_cap = (meta_cap_min + meta_cap_max) / 2.0
-            default_freq = (meta_freq_min + meta_freq_max) // 2
-            return default_cap, default_freq
+            msg = f"[META_CONTROL_FATAL] Meta control application failed: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
     
     @staticmethod
     def calculate_battery_dispatch_policy(
@@ -186,8 +185,9 @@ class TradingEngine:
                 return ("idle", 0.0)
                 
         except Exception as e:
-            logger.warning(f"Battery dispatch policy calculation failed: {e}")
-            return ("idle", 0.0)
+            msg = f"[BATTERY_DISPATCH_FATAL] Battery dispatch policy calculation failed: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
     
     @staticmethod
     def execute_battery_operations(
@@ -242,8 +242,10 @@ class TradingEngine:
             if battery_dispatch_policy_fn:
                 try:
                     heuristic_decision, heuristic_inten = battery_dispatch_policy_fn(timestep)
-                except Exception:
-                    pass
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[BATTERY_POLICY_FATAL] battery_dispatch_policy_fn failed at timestep {timestep}: {e}"
+                    ) from e
             
             # Agent action determines decision and intensity
             agent_intensity = abs(u_raw)
@@ -324,6 +326,7 @@ class TradingEngine:
             }
             
         except Exception as e:
-            logger.error(f"Battery operations failed: {e}")
-            return 0.0, {'battery_energy': battery_energy, 'battery_discharge_power': 0.0}
+            msg = f"[BATTERY_OPS_FATAL] Battery operations failed: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
 

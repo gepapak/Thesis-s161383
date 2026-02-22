@@ -8,8 +8,23 @@ numpy==1.26.4
 cloudpickle==3.1.2
 stable_baselines3==2.7.0
 gymnasium==1.2.0
-PettingZoo==1.25.0
+PettingZoo==1.22.0
 Shimmy==0.2.1
+
+# Core runtime dependencies used by training/evaluation/forecast pipeline
+pandas==2.3.2
+torch==2.8.0
+tensorflow-intel==2.12.0
+keras==2.12.0
+h5py==3.14.0
+protobuf==4.25.8
+scikit-learn==1.7.2
+scipy==1.15.3
+optuna==4.5.0
+joblib==1.5.2
 
 # Optional utilities (safe to keep in sync)
 psutil==7.0.0
+matplotlib==3.5.3
+seaborn==0.13.2
+nvidia-ml-py==13.580.65

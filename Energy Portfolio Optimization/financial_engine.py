@@ -421,8 +421,8 @@ class FinancialEngine:
             return float(net_revenue)
             
         except Exception as e:
-            logger.warning(f"Generation revenue calculation failed: {e}")
-            return 0.0
+            logger.error(f"[FIN_GENERATION_REVENUE_FATAL] Generation revenue calculation failed: {e}")
+            raise RuntimeError("[FIN_GENERATION_REVENUE_FATAL] Generation revenue calculation failed") from e
     
     @staticmethod
     def distribute_excess_cash(
@@ -466,8 +466,8 @@ class FinancialEngine:
                 return budget, 0.0
                 
         except Exception as e:
-            logger.warning(f"Cash distribution failed: {e}")
-            return budget, 0.0
+            logger.error(f"[FIN_CASH_DISTRIBUTION_FATAL] Cash distribution failed: {e}")
+            raise RuntimeError("[FIN_CASH_DISTRIBUTION_FATAL] Cash distribution failed") from e
     
     @staticmethod
     def check_emergency_reallocation(
@@ -526,8 +526,8 @@ class FinancialEngine:
             return budget, accumulated_operational_revenue, total_reallocated
             
         except Exception as e:
-            logger.error(f"Emergency reallocation check failed: {e}")
-            return budget, accumulated_operational_revenue, total_reallocated
+            logger.error(f"[FIN_EMERGENCY_REALLOCATION_FATAL] Emergency reallocation check failed: {e}")
+            raise RuntimeError("[FIN_EMERGENCY_REALLOCATION_FATAL] Emergency reallocation check failed") from e
     
     @staticmethod
     def calculate_price_returns(
@@ -717,8 +717,8 @@ class FinancialEngine:
             return mtm_pnl, updated_positions
             
         except Exception as e:
-            logger.error(f"MTM P&L calculation failed: {e}")
-            return 0.0, financial_positions.copy()
+            logger.error(f"[FIN_MTM_FATAL] MTM P&L calculation failed: {e}")
+            raise RuntimeError("[FIN_MTM_FATAL] MTM P&L calculation failed") from e
 
     # ------------------------------------------------------------------
     # CORRECTNESS: Exposure vs MTM separation
@@ -759,9 +759,6 @@ class FinancialEngine:
             }
             return mtm_pnl, per_asset
         except Exception as e:
-            logger.error(f"MTM P&L (exposure-based) calculation failed: {e}")
-            return 0.0, {
-                'wind_instrument_value': 0.0,
-                'solar_instrument_value': 0.0,
-                'hydro_instrument_value': 0.0,
-            }
+            msg = f"[FIN_MTM_EXPOSURE_FATAL] MTM P&L (exposure-based) calculation failed: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e

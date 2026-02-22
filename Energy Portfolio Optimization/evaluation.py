@@ -49,14 +49,23 @@ from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Fix Windows console encoding issues
-if sys.platform == "win32":
+def setup_console_encoding():
+    """
+    Best-effort Windows console UTF-8 configuration.
+
+    IMPORTANT: Do NOT detach/replace sys.stdout/sys.stderr at import time.
+    Import-time I/O mutation breaks logging handlers in other modules.
+    """
+    if sys.platform != "win32":
+        return
     try:
-        import codecs
-        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
-        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
-    except:
-        pass  # Fallback if encoding fix fails
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        # Non-fatal; keep defaults.
+        pass
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -78,18 +87,11 @@ def print_section_header(title: str):
     print("="*80)
     sys.stdout.flush()
 
-# Import project modules with progress
-print_progress("🔄 Loading project modules...")
+# Import project modules (no side effects / no prints at import time).
 from main import load_energy_data
-print_progress("✅ Loaded main module")
 from environment import RenewableMultiAgentEnv
-print_progress("✅ Loaded environment module")
 from metacontroller import MultiESGAgent
-print_progress("✅ Loaded agent controller module")
 from generator import MultiHorizonForecastGenerator
-print_progress("✅ Loaded forecast generator module")
-from wrapper import MultiHorizonWrapperEnv
-print_progress("✅ All project modules loaded successfully")
 
 # Portfolio analysis imports
 try:
@@ -1017,7 +1019,7 @@ def find_latest_checkpoint(checkpoint_base_dir: str = "normal/checkpoints") -> O
     def get_checkpoint_number(path):
         try:
             return int(os.path.basename(path).split('_')[1])
-        except:
+        except (IndexError, ValueError):
             return 0
 
     latest_checkpoint = max(checkpoints, key=get_checkpoint_number)
@@ -1052,11 +1054,11 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
                 # Expose as attribute for completeness (some loaders inspect numpy._core)
                 try:
                     setattr(sys.modules["numpy"], "_core", sys.modules["numpy._core"])
-                except Exception:
-                    pass
-        except Exception:
+                except Exception as alias_error:
+                    print(f"Warning: NumPy shim attribute alias failed: {alias_error}")
+        except Exception as shim_error:
             # Never block evaluation due to a best-effort compatibility shim.
-            pass
+            print(f"Warning: NumPy compatibility shim skipped: {shim_error}")
 
         from stable_baselines3 import PPO, SAC
         print("✅ Successfully imported stable-baselines3")
@@ -1116,15 +1118,13 @@ def _load_eval_forecast_paths_episode20(forecast_base_dir: str = "forecast_model
 
 def _resolve_tier3_overlay_weights(final_models_dir: str, tier_dir: str) -> Optional[str]:
     """
-    Resolve Tier 3 DL overlay weights robustly.
-
-    Some runs save `dl_overlay_online_34d.h5` under `checkpoints/episode_X/` but don't copy it to `final_models/`.
-    Evaluation should still work in that case.
+    Resolve Tier 3 DL overlay weights (short-horizon 18D).
     """
     import re
-
+    from config import OVERLAY_FEATURE_DIM
+    dim_str = f"{OVERLAY_FEATURE_DIM}d"
     candidates = [
-        os.path.join(final_models_dir, "dl_overlay_online_34d.h5"),
+        os.path.join(final_models_dir, f"dl_overlay_online_{dim_str}.h5"),
         os.path.join(final_models_dir, "dl_overlay_online.h5"),
     ]
 
@@ -1140,7 +1140,7 @@ def _resolve_tier3_overlay_weights(final_models_dir: str, tier_dir: str) -> Opti
             ep_dirs = []
 
         for _, ep_path in sorted(ep_dirs, key=lambda x: x[0], reverse=True):
-            candidates.append(os.path.join(ep_path, "dl_overlay_online_34d.h5"))
+            candidates.append(os.path.join(ep_path, f"dl_overlay_online_{dim_str}.h5"))
             candidates.append(os.path.join(ep_path, "dl_overlay_online.h5"))
 
     for p in candidates:
@@ -1149,12 +1149,50 @@ def _resolve_tier3_overlay_weights(final_models_dir: str, tier_dir: str) -> Opti
     return None
 
 
-def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
+def _resolve_overlay_weights_from_models_dir(models_dir: str) -> Optional[str]:
     """
-    Evaluate Tier 1 / Tier 2 / Tier 3 on unseen data using:
-    - MARL weights from each tier's `final_models/`
-    - Forecast models from Episode 20 for Tier 2/3 (reserved for evaluation)
-    - No forecast training
+    Resolve overlay weights from a generic models directory.
+
+    Preferred filenames are the current Tier-2/Tier-3 naming.
+    Legacy filename is supported only as a last-resort fallback.
+    """
+    try:
+        from config import OVERLAY_FEATURE_DIM
+        dim_str = f"{int(OVERLAY_FEATURE_DIM)}d"
+    except Exception:
+        dim_str = ""
+
+    candidates = []
+    roots = [models_dir, os.path.join(models_dir, "final_models")]
+    for root in roots:
+        if not root:
+            continue
+        if dim_str:
+            candidates.append(os.path.join(root, f"dl_overlay_online_{dim_str}.h5"))
+        candidates.append(os.path.join(root, "dl_overlay_online.h5"))
+        # Legacy fallback for older runs.
+        candidates.append(os.path.join(root, "hedge_optimizer_online.h5"))
+
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
+    """Paper-style tier-suite evaluation on unseen data.
+
+    Compares three training regimes under identical Tier-1 environment dynamics and
+    observation spaces (no forecast-derived observations):
+
+      - baseline:   Tier-1 MARL (no FGB/FAMC)
+      - fgb_online: Tier-1 MARL trained with Forecast-Guided Baseline (FGB) online
+      - fgb_meta:   Tier-1 MARL trained with FGB + meta-critic (FAMC)
+
+    IMPORTANT:
+      - Forecasts are NOT enabled during this evaluation suite.
+      - FGB/FAMC are training-time variance-reduction techniques; evaluation should
+        be the pure environment with the learned policies.
     """
     from config import EnhancedConfig
 
@@ -1168,131 +1206,29 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     steps = args.eval_steps if args.eval_steps is not None else (len(eval_data) - 1)
     steps = int(max(1, steps))
 
-    # Forecast models (Episode 20) for Tier 2 and Tier 3
-    forecast_base_dir = getattr(args, "forecast_base_dir", "forecast_models")
-    forecast_paths = _load_eval_forecast_paths_episode20(forecast_base_dir)
-    model_dir = forecast_paths.get("model_dir")
-    scaler_dir = forecast_paths.get("scaler_dir")
-    metadata_dir = forecast_paths.get("metadata_dir")
-
-    # IMPORTANT: Evaluation should be "pure" evaluation: NO training side-effects.
-    # If episode_20 models are missing, train them beforehand using:
-    #   python train_evaluation_forecasts.py
-    if not (model_dir and scaler_dir and metadata_dir):
-        raise FileNotFoundError(
-            "Missing evaluation forecast model paths for episode_20.\n"
-            f"Looked under: {os.path.join(forecast_base_dir, 'episode_20')}\n"
-            "Fix: train evaluation-only forecasts first:\n"
-            "  python train_evaluation_forecasts.py\n"
-            "or point --forecast_base_dir to a directory that already contains episode_20."
-        )
-    # Shared cache across Tier 2 and Tier 3 (same models + same unseen dataset)
-    # Users may optionally point it elsewhere via --forecast_cache_dir for convenience.
-    cache_root = getattr(args, "forecast_cache_dir", None) or args.output_dir
-    # Cache root for eval (nested per dataset name)
-    eval_cache_root = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
-    eval_basename = os.path.splitext(os.path.basename(str(args.eval_data)))[0]
-    if eval_basename.lower() in ("unseendata", "unseen", "evaluation", "eval"):
-        eval_basename = "full"
-    shared_eval_cache_dir = os.path.join(
-        eval_cache_root,
-        f"forecast_cache_eval_episode20_2025-{eval_basename}",
-    )
-    # Detect cache presence for transparency (precompute_offline loads it if present).
-    cache_precomputed = False
-    try:
-        if os.path.isdir(shared_eval_cache_dir):
-            for name in os.listdir(shared_eval_cache_dir):
-                if name.startswith("precomputed_forecasts_") and name.endswith(".csv"):
-                    cache_precomputed = True
-                    break
-    except Exception:
-        cache_precomputed = False
-    print_progress(
-        f"🧊 Forecast cache: {'FOUND' if cache_precomputed else 'MISSING'} at {shared_eval_cache_dir}"
-    )
-
-    def _tier_eval(name: str, tier_dir: str, enable_forecast: bool, dl_overlay: bool) -> Dict[str, Any]:
+    def _tier_eval(name: str, run_dir: str) -> Dict[str, Any]:
         tier_out = os.path.join(args.output_dir, name)
         os.makedirs(tier_out, exist_ok=True)
         env_log_dir = os.path.join(tier_out, "env_logs")
         os.makedirs(env_log_dir, exist_ok=True)
 
         # Load SB3 policies
-        final_models_dir = os.path.join(tier_dir, "final_models")
+        final_models_dir = os.path.join(run_dir, "final_models")
         models = load_checkpoint_models(final_models_dir)
 
-        # Build config that matches the tier's observation setup
+        eval_mode = str(getattr(args, "tiers_eval_mode", "paper") or "paper").strip().lower()
+        deployed = (eval_mode == "deployed")
+
+        # Force Tier-1 eval config for all variants (fair comparison).
         cfg = EnhancedConfig()
-        cfg.enable_forecast_utilisation = bool(enable_forecast)
-        # Keep risk-management gate OFF for fair comparison (evaluation matches training tier2/3 in your run)
-        cfg.forecast_risk_management_mode = False
+        dl_weights_path = None
 
-        # Optional ablation: modify forecast-derived OBSERVATIONS during evaluation while still running the same policy.
-        if bool(enable_forecast):
-            cfg.forecast_obs_mode = str(getattr(args, "forecast_obs_mode", "normal") or "normal").lower()
-            cfg.forecast_trade_signal_disable = bool(getattr(args, "forecast_trade_signal_disable", False))
-
-        # FAIR EVALUATION:
-        # Tier 3 overlay outputs are used only for FGB/FAMC baseline signals.
-        # No overlay reward shaping or overlay risk-budget sizing exists.
-
-        # Tier 3 overlay flags (environment uses these for tier naming/logging; adapter presence enables bridge)
-        if name == "tier3":
-            # IMPORTANT:
-            # Tier-3 "meta" and Tier-3 "fixed" runs use different overlay architectures
-            # (meta has an extra meta-critic head). If we force meta head on a fixed run,
-            # the H5 weights won't match and load will fail.
-            is_fixed_run = "fixed" in os.path.basename(str(tier_dir)).lower()
-            cfg.fgb_mode = "fixed" if is_fixed_run else "meta"
-
-            cfg.overlay_enabled = True
-            cfg.forecast_baseline_enable = True
-
-            # Enable meta head ONLY for meta runs
-            cfg.meta_baseline_enable = (cfg.fgb_mode == "meta")
-            if cfg.meta_baseline_enable:
-                cfg.meta_baseline_head_dim = int(getattr(cfg, "meta_baseline_head_dim", 32))
-        else:
-            cfg.fgb_mode = "fixed"
+        if not deployed:
             cfg.overlay_enabled = False
             cfg.forecast_baseline_enable = False
             cfg.meta_baseline_enable = False
+            cfg.fgb_mode = "online"
 
-        dl_path = None
-        if dl_overlay:
-            # Tier 3 overlay weights (prefer final_models/, fallback to latest checkpoints/episode_*/)
-            dl_path = _resolve_tier3_overlay_weights(final_models_dir=final_models_dir, tier_dir=tier_dir)
-            if dl_path is None:
-                raise FileNotFoundError(
-                    "Tier 3 evaluation requires DL overlay weights but none were found.\n"
-                    f"Looked in: {final_models_dir} and {os.path.join(tier_dir, 'checkpoints', 'episode_*')}\n"
-                    "Expected one of: dl_overlay_online_34d.h5 or dl_overlay_online.h5\n"
-                    "Fix: copy the latest checkpoint overlay weight into final_models/ and re-run evaluation."
-                )
-
-        # Environment per tier
-        if enable_forecast:
-            if not (model_dir and scaler_dir) or not os.path.exists(model_dir) or not os.path.exists(scaler_dir):
-                raise FileNotFoundError(
-                    f"Episode 20 forecast paths not found. model_dir={model_dir} scaler_dir={scaler_dir}"
-                )
-            env, _ = create_evaluation_environment(
-                eval_data,
-                enable_forecasting=True,
-                model_dir=model_dir,
-                scaler_dir=scaler_dir,
-                metadata_dir=metadata_dir,
-                dl_overlay_weights_path=dl_path,
-                output_dir=tier_out,
-                investment_freq=args.investment_freq,
-                config=cfg,
-                env_log_dir=env_log_dir,
-                forecast_cache_dir=shared_eval_cache_dir,
-                precompute_forecasts=True,
-                precompute_batch_size=8192,
-            )
-        else:
             env, _ = create_evaluation_environment(
                 eval_data,
                 enable_forecasting=False,
@@ -1300,37 +1236,119 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 investment_freq=args.investment_freq,
                 config=cfg,
                 env_log_dir=env_log_dir,
+                fail_fast=True,
+            )
+        else:
+            # Deployed/system evaluation: enable forecasting (Episode 20 models) + optionally attach DL overlay weights.
+            # IMPORTANT: This is NOT paper-fair (runtime forecaster + overlay enabled).
+            try:
+                forecast_base = str(getattr(args, "forecast_base_dir", "forecast_models") or "forecast_models")
+                forecast_paths = _load_eval_forecast_paths_episode20(forecast_base_dir=forecast_base)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Deployed tier evaluation requires valid forecast paths, but loading failed: {e}"
+                ) from e
+
+            model_dir = str(forecast_paths.get("model_dir") or "forecast_models/episode_20/models")
+            scaler_dir = str(forecast_paths.get("scaler_dir") or "forecast_models/episode_20/scalers")
+            metadata_dir = forecast_paths.get("metadata_dir", None)
+
+            # Prefer using the existing evaluation cache directory if present.
+            cache_root = str(getattr(args, "forecast_cache_dir", "forecast_cache") or "forecast_cache")
+            cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025", "forecast_cache_eval_episode20_2025-full")
+            if not os.path.isdir(cache_dir):
+                cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
+
+            # Enable overlay only for the variants that are supposed to ship it.
+            wants_overlay = name in ("fgb_online", "fgb_meta")
+            if wants_overlay:
+                dl_weights_path = _resolve_tier3_overlay_weights(final_models_dir, run_dir)
+                if not dl_weights_path:
+                    raise RuntimeError(
+                        f"Deployed tier evaluation for '{name}' requires overlay weights, but none were found in "
+                        f"'{final_models_dir}' or checkpoints under '{run_dir}'."
+                    )
+
+            cfg.overlay_enabled = bool(dl_weights_path)
+            cfg.forecast_baseline_enable = bool(dl_weights_path)
+            cfg.meta_baseline_enable = bool(dl_weights_path) and (name == "fgb_meta")
+            cfg.fgb_mode = "meta" if name == "fgb_meta" else "online"
+
+            env, _ = create_evaluation_environment(
+                eval_data,
+                enable_forecasting=True,
+                model_dir=model_dir,
+                scaler_dir=scaler_dir,
+                metadata_dir=metadata_dir,
+                dl_overlay_weights_path=dl_weights_path,
+                output_dir=tier_out,
+                investment_freq=args.investment_freq,
+                config=cfg,
+                env_log_dir=env_log_dir,
+                forecast_cache_dir=cache_dir,
+                precompute_forecasts=bool(getattr(args, "tiers_precompute_forecasts", False)),
+                precompute_batch_size=int(getattr(args, "tiers_precompute_batch_size", 8192) or 8192),
+                fail_fast=True,
             )
 
         tier_metrics = run_checkpoint_evaluation(models, env, eval_data, steps)
         if tier_metrics is None:
             return {"status": "failed", "error": "evaluation_failed"}
 
+        # Post-hoc reporting: decompose NAV into operating vs trading sleeves from env logs.
+        # This does not change evaluation dynamics; it just makes the report interpretable
+        # when physical book value dominates total NAV.
+        try:
+            debug_log_path = _find_env_debug_log(env_log_dir)
+            tier_metrics["env_log_dir"] = env_log_dir
+            tier_metrics["env_debug_log"] = debug_log_path or ""
+            if debug_log_path:
+                tier_metrics["sleeve_metrics"] = _compute_sleeve_metrics_from_env_log(
+                    debug_log_path,
+                    dkk_to_usd_rate=float(getattr(cfg, "dkk_to_usd_rate", 0.145) or 0.145),
+                )
+        except Exception as e:
+            tier_metrics["sleeve_metrics"] = {"sleeve_metrics_error": str(e)}
+
         tier_metrics["status"] = "completed"
-        tier_metrics["tier_dir"] = tier_dir
+        tier_metrics["run_dir"] = run_dir
         tier_metrics["final_models_dir"] = final_models_dir
-        if enable_forecast:
-            tier_metrics["forecast_episode"] = 20
-            tier_metrics["forecast_model_dir"] = model_dir
-            tier_metrics["forecast_scaler_dir"] = scaler_dir
-        if dl_path:
-            tier_metrics["dl_overlay_weights"] = dl_path
+        tier_metrics["evaluation_mode"] = "tiers"
+        tier_metrics["variant"] = name
+        tier_metrics["tiers_eval_mode"] = eval_mode
+        tier_metrics["deployed_enable_forecasting"] = bool(deployed)
+        tier_metrics["deployed_dl_overlay_weights_path"] = dl_weights_path or ""
+        tier_metrics["deployed_overlay_enabled"] = bool(getattr(cfg, "overlay_enabled", False))
+        tier_metrics["deployed_meta_baseline_enable"] = bool(getattr(cfg, "meta_baseline_enable", False))
         return tier_metrics
 
     print_section_header("Tier Suite Evaluation (Unseen 2025 Full Year)")
-    print_progress(f"📏 Evaluating for {steps} steps")
+    print_progress(f"Evaluating for {steps} steps")
 
-    # Tier 1: no forecasts, no overlay
-    if getattr(args, "tiers_only", "all") in ("all", "tier1"):
-        results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir, enable_forecast=False, dl_overlay=False)
+    sel = str(getattr(args, "tiers_only", "all") or "all").strip().lower()
 
-    # Tier 2: forecasts enabled (Episode 20), no overlay
-    if getattr(args, "tiers_only", "all") in ("all", "tier2"):
-        results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir, enable_forecast=True, dl_overlay=False)
+    def _wants(key: str, legacy_key: str) -> bool:
+        if sel == "all":
+            return True
+        return sel in (key, legacy_key)
 
-    # Tier 3: forecasts enabled (Episode 20) + overlay weights
-    if getattr(args, "tiers_only", "all") in ("all", "tier3"):
-        results["tiers"]["tier3"] = _tier_eval("tier3", args.tier3_dir, enable_forecast=True, dl_overlay=True)
+    # Baseline (legacy: tier1)
+    if _wants("baseline", "tier1"):
+        results["tiers"]["baseline"] = _tier_eval("baseline", args.tier1_dir)
+
+    # FGB-online (legacy: tier2)
+    if _wants("fgb_online", "tier2"):
+        results["tiers"]["fgb_online"] = _tier_eval("fgb_online", args.tier2_dir)
+
+    # FGB-meta (legacy: tier3)
+    if _wants("fgb_meta", "tier3"):
+        results["tiers"]["fgb_meta"] = _tier_eval("fgb_meta", args.tier3_dir)
+
+    # Forecast-ablated variants (explicit labels for downstream aggregation).
+    if sel in ("fgb_online_no_forecast", "tier2_no_forecast"):
+        results["tiers"]["fgb_online_no_forecast"] = _tier_eval("fgb_online_no_forecast", args.tier2_dir)
+    if sel in ("fgb_meta_no_forecast", "tier3_no_forecast"):
+        results["tiers"]["fgb_meta_no_forecast"] = _tier_eval("fgb_meta_no_forecast", args.tier3_dir)
 
     return results
 
@@ -1347,19 +1365,167 @@ def _pct(x: Any) -> float:
     return v * 100.0
 
 
-def write_tier_comparison_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[str, str]:
+def _find_env_debug_log(env_log_dir: str) -> Optional[str]:
+    """Best-effort lookup of the per-episode debug CSV produced by the env logger."""
+    try:
+        # Common path in this codebase.
+        p = os.path.join(env_log_dir, "tier1_debug_ep0.csv")
+        if os.path.isfile(p):
+            return p
+
+        # Fallback: any *debug_ep0.csv in that directory.
+        candidates = glob.glob(os.path.join(env_log_dir, "*debug_ep0.csv"))
+        return candidates[0] if candidates else None
+    except Exception:
+        return None
+
+
+def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: float = 0.145) -> Dict[str, Any]:
+    """Split total NAV into (operating sleeve) and (trading sleeve) from env debug logs.
+
+    Why this exists:
+      Total NAV in this hybrid-fund simulator includes the physical book value of assets.
+      That makes total-NAV volatility/drawdown look tiny even when the financial trading
+      sleeve takes meaningful risk. For reporting/paper figures, it is often clearer to
+      decompose NAV into:
+        - operating_sleeve = physical_book_value + accumulated_operational_revenue
+        - trading_sleeve   = trading_cash + financial_mtm
     """
-    Write a single, consolidated Tier1/2/3 comparison report (CSV + Markdown).
+    metrics: Dict[str, Any] = {}
+    if not debug_csv_path or not os.path.isfile(debug_csv_path):
+        return metrics
+
+    required = {
+        "fund_nav_dkk",
+        "trading_cash_dkk",
+        "physical_book_value_dkk",
+        "accumulated_operational_revenue_dkk",
+        "financial_mtm_dkk",
+    }
+    optional = {"financial_exposure_dkk", "decision_step"}
+
+    try:
+        with open(debug_csv_path, "r", encoding="utf-8") as f:
+            header = (f.readline() or "").strip().split(",")
+        have = set(h for h in header if h)
+    except Exception:
+        have = set()
+
+    if not required.issubset(have):
+        # If the log schema changes, skip gracefully.
+        missing = sorted(list(required - have))
+        metrics["sleeve_metrics_error"] = f"missing_required_columns:{','.join(missing)}"
+        return metrics
+
+    usecols = sorted(list(required | (optional & have)))
+
+    try:
+        df = pd.read_csv(debug_csv_path, usecols=usecols)
+    except Exception as e:
+        metrics["sleeve_metrics_error"] = f"read_failed:{e}"
+        return metrics
+
+    # Convert to USD (all logs are in DKK).
+    nav_usd = df["fund_nav_dkk"].to_numpy(dtype=float) * dkk_to_usd_rate
+    trading_usd = (
+        (df["trading_cash_dkk"].to_numpy(dtype=float) + df["financial_mtm_dkk"].to_numpy(dtype=float))
+        * dkk_to_usd_rate
+    )
+    operating_usd = (
+        (df["physical_book_value_dkk"].to_numpy(dtype=float) + df["accumulated_operational_revenue_dkk"].to_numpy(dtype=float))
+        * dkk_to_usd_rate
+    )
+
+    if len(nav_usd) == 0:
+        return metrics
+
+    total_gain = float(nav_usd[-1] - nav_usd[0])
+    trading_gain = float(trading_usd[-1] - trading_usd[0])
+    operating_gain = float(operating_usd[-1] - operating_usd[0])
+
+    metrics.update({
+        "sleeve_total_initial_usd": float(nav_usd[0]),
+        "sleeve_total_final_usd": float(nav_usd[-1]),
+        "sleeve_total_gain_usd": total_gain,
+        "sleeve_trading_initial_usd": float(trading_usd[0]),
+        "sleeve_trading_final_usd": float(trading_usd[-1]),
+        "sleeve_trading_gain_usd": trading_gain,
+        "sleeve_operating_initial_usd": float(operating_usd[0]),
+        "sleeve_operating_final_usd": float(operating_usd[-1]),
+        "sleeve_operating_gain_usd": operating_gain,
+    })
+
+    if total_gain != 0.0:
+        metrics["sleeve_trading_gain_share"] = float(trading_gain / total_gain)
+    else:
+        metrics["sleeve_trading_gain_share"] = 0.0
+
+    if trading_usd[0] != 0.0:
+        metrics["sleeve_trading_return_pct"] = float((trading_usd[-1] / trading_usd[0] - 1.0) * 100.0)
+    else:
+        metrics["sleeve_trading_return_pct"] = 0.0
+
+    if operating_usd[0] != 0.0:
+        metrics["sleeve_operating_return_pct"] = float((operating_usd[-1] / operating_usd[0] - 1.0) * 100.0)
+    else:
+        metrics["sleeve_operating_return_pct"] = 0.0
+
+    # Trading sleeve "risk" metrics (computed the same way as calculate_performance_metrics()).
+    try:
+        if len(trading_usd) > 1 and float(trading_usd[0]) != 0.0:
+            tr = np.diff(trading_usd) / trading_usd[:-1]
+            vol = float(np.std(tr)) if len(tr) > 1 else 0.0
+            sharpe = float(np.mean(tr) / np.std(tr)) if vol > 0 else 0.0
+            peak = np.maximum.accumulate(trading_usd)
+            drawdowns = np.where(peak > 0.0, (peak - trading_usd) / peak, 0.0)
+            dd = float(np.max(drawdowns)) if len(drawdowns) else 0.0
+            metrics["sleeve_trading_volatility"] = vol
+            metrics["sleeve_trading_sharpe_ratio"] = sharpe
+            metrics["sleeve_trading_max_drawdown_pct"] = dd * 100.0
+    except Exception:
+        pass
+
+    # Exposure diagnostics on decision steps (more interpretable than total-NAV vol when book value dominates).
+    try:
+        if "financial_exposure_dkk" in df.columns:
+            expo = df["financial_exposure_dkk"].to_numpy(dtype=float)
+            if "decision_step" in df.columns:
+                dec = df["decision_step"].astype(bool).to_numpy()
+                expo = expo[dec] if dec.any() else expo
+            metrics["sleeve_mean_abs_exposure_dkk"] = float(np.mean(np.abs(expo))) if len(expo) else 0.0
+            metrics["sleeve_max_abs_exposure_dkk"] = float(np.max(np.abs(expo))) if len(expo) else 0.0
+    except Exception:
+        pass
+
+    return metrics
+
+
+def write_tier_comparison_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[str, str]:
+    """Write a single, consolidated comparison report (CSV + Markdown).
+
     Returns: (csv_path, md_path)
     """
     os.makedirs(output_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     rows = []
-    for tier_name in ["tier1", "tier2", "tier3"]:
-        r = tier_results.get(tier_name, {}) or {}
+    preferred_order = [
+        "baseline",
+        "fgb_online",
+        "fgb_meta",
+        "fgb_online_no_forecast",
+        "fgb_meta_no_forecast",
+    ]
+    variants = [v for v in preferred_order if v in tier_results]
+    variants.extend([v for v in tier_results.keys() if v not in variants])
+    if not variants:
+        variants = preferred_order[:3]
+
+    for variant in variants:
+        r = tier_results.get(variant, {}) or {}
+        s = r.get("sleeve_metrics", {}) or {}
         rows.append({
-            "tier": tier_name,
+            "variant": variant,
             "status": r.get("status", "unknown"),
             "final_portfolio_value_usd": float(r.get("final_portfolio_value", 0.0)),
             "initial_portfolio_value_usd": float(r.get("initial_portfolio_value", 0.0)),
@@ -1369,10 +1535,16 @@ def write_tier_comparison_report(tier_results: Dict[str, Any], output_dir: str) 
             "volatility": float(r.get("volatility", 0.0)),
             "total_rewards": float(r.get("total_rewards", 0.0)),
             "average_risk": float(r.get("average_risk", 0.0)),
-            "forecast_episode": r.get("forecast_episode", ""),
-            "forecast_model_dir": r.get("forecast_model_dir", ""),
-            "dl_overlay_weights": r.get("dl_overlay_weights", ""),
-            "tier_dir": r.get("tier_dir", ""),
+            # Sleeve decomposition (from env debug logs)
+            "trading_gain_usd": float(s.get("sleeve_trading_gain_usd", 0.0)),
+            "operating_gain_usd": float(s.get("sleeve_operating_gain_usd", 0.0)),
+            "trading_gain_share": float(s.get("sleeve_trading_gain_share", 0.0)),
+            "trading_return_pct": float(s.get("sleeve_trading_return_pct", 0.0)),
+            "operating_return_pct": float(s.get("sleeve_operating_return_pct", 0.0)),
+            "mean_abs_exposure_dkk": float(s.get("sleeve_mean_abs_exposure_dkk", 0.0)),
+            "trading_sharpe": float(s.get("sleeve_trading_sharpe_ratio", 0.0)),
+            "trading_max_dd_pct": float(s.get("sleeve_trading_max_drawdown_pct", 0.0)),
+            "run_dir": r.get("run_dir", ""),
             "final_models_dir": r.get("final_models_dir", ""),
         })
 
@@ -1380,32 +1552,40 @@ def write_tier_comparison_report(tier_results: Dict[str, Any], output_dir: str) 
     csv_path = os.path.join(output_dir, f"tier_comparison_{ts}.csv")
     df.to_csv(csv_path, index=False)
 
-    # Simple markdown report
     md_path = os.path.join(output_dir, f"tier_comparison_{ts}.md")
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write("## Tier 1 vs Tier 2 vs Tier 3 — Unseen Evaluation Report\n\n")
-        f.write(f"- **Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"- **Output CSV**: `{os.path.basename(csv_path)}`\n\n")
+        f.write("## Baseline vs FGB-online vs FGB-meta - Unseen Evaluation Report\n\n")
+        f.write(f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- Output CSV: `{os.path.basename(csv_path)}`\n\n")
 
         f.write("### Summary Table\n\n")
-        f.write("| Tier | Status | Final (USD) | Return % | Sharpe | Max DD % | Vol |\n")
+        f.write("| Variant | Status | Final (USD) | Return % | Sharpe | Max DD % | Vol |\n")
         f.write("|---|---|---:|---:|---:|---:|---:|\n")
         for _, row in df.iterrows():
             f.write(
-                f"| {row['tier']} | {row['status']} | {row['final_portfolio_value_usd']:.2f} | "
+                f"| {row['variant']} | {row['status']} | {row['final_portfolio_value_usd']:.2f} | "
                 f"{row['total_return_pct']:.3f} | {row['sharpe_ratio']:.4f} | "
                 f"{row['max_drawdown_pct']:.3f} | {row['volatility']:.6f} |\n"
             )
 
         f.write("\n### Evaluation Inputs / Artifacts\n\n")
         for _, row in df.iterrows():
-            f.write(f"- **{row['tier']}**:\n")
+            f.write(f"- {row['variant']}:\n")
             f.write(f"  - final_models: `{row['final_models_dir']}`\n")
-            if str(row.get("forecast_episode", "")).strip() != "":
-                f.write(f"  - forecast_episode: `{row['forecast_episode']}`\n")
-                f.write(f"  - forecast_model_dir: `{row['forecast_model_dir']}`\n")
-            if str(row.get("dl_overlay_weights", "")).strip() != "":
-                f.write(f"  - dl_overlay_weights: `{row['dl_overlay_weights']}`\n")
+            if str(row.get('run_dir', '')).strip() != "":
+                f.write(f"  - run_dir: `{row['run_dir']}`\n")
+
+        f.write("\n### NAV Sleeve Decomposition (Operating vs Trading)\n\n")
+        f.write("Total NAV includes physical book value, which can compress volatility/drawdown.\n")
+        f.write("This section splits gains into the operating sleeve (physical + ops revenue) and\n")
+        f.write("the trading sleeve (cash + MTM).\n\n")
+        f.write("| Variant | Trading Gain (USD) | Operating Gain (USD) | Trading Share | Trading Return % | Mean |Exposure| (DKK) |\n")
+        f.write("|---|---:|---:|---:|---:|---:|\n")
+        for _, row in df.iterrows():
+            f.write(
+                f"| {row['variant']} | {row['trading_gain_usd']:.2f} | {row['operating_gain_usd']:.2f} | "
+                f"{row['trading_gain_share']:.3f} | {row['trading_return_pct']:.2f} | {row['mean_abs_exposure_dkk']:.2f} |\n"
+            )
 
     return csv_path, md_path
 
@@ -1462,11 +1642,11 @@ def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[A
             print(f"      DL Weights: {'✅' if has_dl_weights else '❌'}")
 
             if has_dl_weights:
-                dl_weights_path = os.path.join(enhanced_models_dir, "hedge_optimizer_online.h5")
-                if os.path.exists(dl_weights_path):
+                dl_weights_path = _resolve_overlay_weights_from_models_dir(enhanced_models_dir)
+                if dl_weights_path and os.path.exists(dl_weights_path):
                     print(f"   💾 DL overlay weights found: {dl_weights_path}")
                 else:
-                    print(f"   ⚠️ DL overlay weights missing: {dl_weights_path}")
+                    print("   ⚠️ DL overlay weights missing")
 
         except Exception as e:
             print(f"   ⚠️ Could not read training config: {e}")
@@ -1474,20 +1654,17 @@ def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[A
     return load_agent_system(enhanced_models_dir, eval_env, enhanced=True)
 
 
-def create_evaluation_dl_adapter(base_env, dl_weights_path: str, config=None):
+def create_evaluation_dl_adapter(base_env, dl_weights_path: str, config=None, strict_load: bool = False):
     """
-    Create the Tier 3 DL overlay adapter for evaluation.
-
-    IMPORTANT: This must match training:
-    - Uses `dl_overlay.DLAdapter` (34D features)
-    - Loads `dl_overlay_online_34d.h5` weights
+    Create the Tier 3 DL overlay adapter for evaluation (short-horizon, matches training).
     """
     try:
         import numpy as np
         from dl_overlay import DLAdapter
         from utils import load_overlay_weights
 
-        feature_dim = 34  # training contract for Tier 3 overlay
+        from config import OVERLAY_FEATURE_DIM
+        feature_dim = int(OVERLAY_FEATURE_DIM)  # training contract for Tier 3 overlay
         meta_head_dim = int(getattr(config, "meta_baseline_head_dim", 32)) if config is not None else 32
         enable_meta_head = bool(getattr(config, "meta_baseline_enable", False)) if config is not None else False
 
@@ -1505,11 +1682,16 @@ def create_evaluation_dl_adapter(base_env, dl_weights_path: str, config=None):
         if ok:
             print_progress("✅ DL overlay weights loaded successfully (Tier 3)")
         else:
-            print_progress("⚠️ Failed to load DL overlay weights (continuing with untrained overlay)")
+            msg = "Failed to load DL overlay weights"
+            if strict_load:
+                raise RuntimeError(msg)
+            print_progress(f"⚠️ {msg} (continuing with untrained overlay)")
 
         return adapter
 
     except Exception as e:
+        if strict_load:
+            raise RuntimeError(f"Failed to create Tier 3 DL adapter: {e}") from e
         print_progress(f"⚠️ Failed to create Tier 3 DL adapter: {e}")
         return None
 
@@ -1523,12 +1705,13 @@ def create_evaluation_environment(
     log_path: Optional[str] = None,
     dl_overlay_weights_path: Optional[str] = None,
     output_dir: str = "evaluation_results",
-    investment_freq: int = 48,
+    investment_freq: int = 6,
     config=None,
     env_log_dir: Optional[str] = None,
     forecast_cache_dir: Optional[str] = None,
     precompute_forecasts: bool = False,
     precompute_batch_size: int = 8192,
+    fail_fast: bool = True,
 ) -> Tuple[Any, Optional[Any]]:
     """Create evaluation environment with optional forecasting (Tier-aligned)."""
     print_progress("🏗️ Setting up evaluation environment...")
@@ -1569,8 +1752,13 @@ def create_evaluation_environment(
                     )
                     print_progress(f"✅ Evaluation forecast cache ready: {cache_dir}")
                 except Exception as e:
-                    print_progress(f"⚠️ Forecast cache precompute failed (continuing with on-the-fly forecasts): {e}")
+                    msg = f"Forecast cache precompute failed: {e}"
+                    if fail_fast:
+                        raise RuntimeError(msg) from e
+                    print_progress(f"⚠️ {msg} (continuing with on-the-fly forecasts)")
         except Exception as e:
+            if fail_fast:
+                raise RuntimeError(f"Failed to load forecaster: {e}") from e
             print_progress(f"❌ Failed to load forecaster: {e}")
             print_progress("🚫 Continuing without forecasting...")
     else:
@@ -1612,10 +1800,17 @@ def create_evaluation_environment(
                     verbose=False,
                     init_budget=getattr(config, "init_budget", None),
                     direction_weight=getattr(config, "forecast_trust_direction_weight", 0.8),
+                    trust_boost=getattr(config, "forecast_trust_boost", 0.0),
+                    min_exposure_ratio=getattr(config, "fgb_expected_dnav_min_exposure_ratio", 0.0),
+                    pred_weight=getattr(config, "fgb_expected_dnav_pred_weight", 0.85),
+                    mwdir_weight=getattr(config, "fgb_expected_dnav_mwdir_weight", 0.15),
+                    fail_fast=bool(fail_fast),
                 )
                 print_progress("✅ CalibrationTracker initialized for evaluation (forecast trust)")
             except Exception as e:
                 base_env.calibration_tracker = None
+                if fail_fast:
+                    raise RuntimeError(f"CalibrationTracker init failed: {e}") from e
                 print_progress(f"⚠️ CalibrationTracker init failed: {e}")
 
         # Setup DL overlay if weights are provided
@@ -1624,24 +1819,36 @@ def create_evaluation_environment(
                 print_progress(f"🚀 Loading DL overlay weights: {os.path.basename(dl_overlay_weights_path)}")
 
                 # Create the real Tier 3 DL adapter and attach it
-                dl_adapter = create_evaluation_dl_adapter(base_env, dl_overlay_weights_path, config=config)
+                dl_adapter = create_evaluation_dl_adapter(
+                    base_env,
+                    dl_overlay_weights_path,
+                    config=config,
+                    strict_load=bool(fail_fast),
+                )
 
                 if dl_adapter:
                     # Attach DL adapter to base environment (use canonical dl_adapter_overlay naming)
                     base_env.dl_adapter_overlay = dl_adapter
                     print_progress("✅ DL overlay attached to evaluation environment")
                 else:
+                    if fail_fast:
+                        raise RuntimeError("Failed to create DL adapter")
                     print_progress("⚠️ Failed to create DL adapter")
 
             except Exception as e:
+                if fail_fast:
+                    raise RuntimeError(f"Failed to load DL overlay weights: {e}") from e
                 print_progress(f"⚠️ Failed to load DL overlay weights: {e}")
                 print_progress("   Continuing evaluation without DL overlay...")
+        elif dl_overlay_weights_path and fail_fast:
+            raise FileNotFoundError(f"DL overlay weights path does not exist: {dl_overlay_weights_path}")
 
         # Wrap with forecasting if enabled
         if forecaster is not None and enable_forecasting:
             print_progress("🔄 Wrapping environment with forecasting...")
             # We rely on the base env's log_dir instead.
-            eval_env = MultiHorizonWrapperEnv(base_env, forecaster)
+            # No wrapper: keep Tier-1 observation spaces fixed for a fair comparison.
+            eval_env = base_env
             print_progress("✅ Environment created with forecasting wrapper")
         else:
             eval_env = base_env
@@ -1650,6 +1857,8 @@ def create_evaluation_environment(
         return eval_env, forecaster
 
     except Exception as e:
+        if fail_fast:
+            raise
         print_progress(f"❌ Error creating environment: {e}")
         return None, None
 
@@ -1692,7 +1901,12 @@ def calculate_performance_metrics(portfolio_values: list,
             metrics['total_return'] = (pv_array[-1] / pv_array[0] - 1) if len(pv_array) > 1 else 0.0
             metrics['volatility'] = np.std(returns) if len(returns) > 1 else 0.0
             metrics['sharpe_ratio'] = (np.mean(returns) / np.std(returns)) if np.std(returns) > 0 else 0.0
-            metrics['max_drawdown'] = np.max(np.maximum.accumulate(pv_array) - pv_array) / np.max(pv_array) if len(pv_array) > 0 else 0.0
+            if len(pv_array) > 0:
+                peak = np.maximum.accumulate(pv_array)
+                drawdowns = np.where(peak > 0.0, (peak - pv_array) / peak, 0.0)
+                metrics['max_drawdown'] = float(np.max(drawdowns)) if len(drawdowns) else 0.0
+            else:
+                metrics['max_drawdown'] = 0.0
             metrics['initial_portfolio_value'] = float(pv_array[0]) if len(pv_array) > 0 else 0.0
             metrics['final_portfolio_value'] = float(pv_array[-1]) if len(pv_array) > 0 else 0.0
         
@@ -1903,8 +2117,10 @@ def run_agent_evaluation(agent_system,
             if hasattr(policy, 'policy') and hasattr(policy.policy, 'reset_noise'):
                 try:
                     policy.policy.reset_noise()
-                except:
-                    pass
+                except (AttributeError, RuntimeError, ValueError, TypeError) as e:
+                    print_progress(
+                        f"[PPO] reset_noise skipped for {getattr(policy, 'agent_name', 'unknown')}: {e}"
+                    )
     print_progress("[PPO] PPO BUFFER RESET: Preserving financial state at step 0")
 
     # Tracking metrics
@@ -2071,7 +2287,8 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                 enable_forecasting=False,  # No forecasting for normal models
                 model_dir=args.model_dir,
                 scaler_dir=args.scaler_dir,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                fail_fast=True,
             )
 
             if normal_eval_env:
@@ -2108,14 +2325,15 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
         if os.path.exists(args.full_models):
             # Create enhanced evaluation environment with DL overlay
             print_progress("🏗️ Creating enhanced environment for full models...")
-            dl_weights_path = os.path.join(args.full_models, "hedge_optimizer_online.h5")
+            dl_weights_path = _resolve_overlay_weights_from_models_dir(args.full_models)
             enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                 eval_data,
                 enable_forecasting=True,  # Enable forecasting for full models
                 model_dir=args.model_dir,
                 scaler_dir=args.scaler_dir,
-                dl_overlay_weights_path=dl_weights_path if os.path.exists(dl_weights_path) else None,
-                output_dir=args.output_dir
+                dl_overlay_weights_path=dl_weights_path,
+                output_dir=args.output_dir,
+                fail_fast=True,
             )
 
             if enhanced_eval_env:
@@ -2342,6 +2560,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
 
 def main():
     """Main evaluation function."""
+    setup_console_encoding()
     print_progress("🚀 Starting Comprehensive Evaluation System")
     parser = argparse.ArgumentParser(description="Unified Evaluation Script")
 
@@ -2357,7 +2576,7 @@ def main():
             "'baselines' for traditional methods, "
             "'compare' for comprehensive comparison, "
             "'comprehensive' for all configurations, "
-            "'tiers' to evaluate Tier1/2/3 (unseen data) using final_models + Episode19 forecasts"
+            "'tiers' to evaluate Baseline vs FGB-online vs FGB-meta (unseen data) using final_models/"
         ),
     )
 
@@ -2395,52 +2614,75 @@ def main():
                        help="Number of timesteps to evaluate (default: auto)")
     parser.add_argument("--output_dir", type=str, default="evaluation_results",
                        help="Output directory for results")
-    parser.add_argument("--investment_freq", type=int, default=48,
-                       help="Investor action frequency for evaluation (should match training; default 48)")
+    parser.add_argument("--investment_freq", type=int, default=6,
+                       help="Investor action frequency for evaluation (should match training; default 6)")
 
-    # Tier-suite evaluation (Tier 1/2/3 on unseen data)
-    parser.add_argument("--tier1_dir", type=str, default="tier1gnn_seed789",
-                       help="Tier 1 run directory containing final_models/")
-    parser.add_argument("--tier2_dir", type=str, default="tier2gnn_seed789",
-                       help="Tier 2 run directory containing final_models/")
-    parser.add_argument("--tier3_dir", type=str, default="tier3gnn_seed789",
-                       help="Tier 3 run directory containing final_models/ (and dl_overlay_online_34d.h5)")
+    # Tier-suite evaluation (paper modes on unseen data)
+    parser.add_argument("--tier1_dir", type=str, default="tier1_seed789",
+                       help="Baseline run directory containing final_models/")
+    parser.add_argument("--tier2_dir", type=str, default="tier2_seed789",
+                       help="FGB-online run directory containing final_models/")
+    parser.add_argument("--tier3_dir", type=str, default="tier3_seed789",
+                       help="FGB-meta run directory containing final_models/")
     parser.add_argument(
         "--tiers_only",
         type=str,
         default="all",
-        choices=["all", "tier1", "tier2", "tier3"],
-        help="Run only a subset of tiers in --mode tiers (useful when Tier1/2 were already evaluated).",
+        choices=[
+            "all",
+            "baseline",
+            "fgb_online",
+            "fgb_meta",
+            "tier1",
+            "tier2",
+            "tier3",
+            "fgb_online_no_forecast",
+            "fgb_meta_no_forecast",
+            "tier2_no_forecast",
+            "tier3_no_forecast",
+        ],
+        help=(
+            "Run only a subset in --mode tiers "
+            "(baseline / fgb_online / fgb_meta / fgb_online_no_forecast / fgb_meta_no_forecast). "
+            "Legacy aliases: tier1/2/3 and tier2_no_forecast/tier3_no_forecast."
+        ),
     )
-    parser.add_argument("--forecast_base_dir", type=str, default="forecast_models",
-                       help="Base directory for episode-specific forecast models (evaluation uses episode_20 by default)")
+    parser.add_argument(
+        "--tiers_eval_mode",
+        type=str,
+        default="paper",
+        choices=["paper", "deployed"],
+        help=(
+            "In --mode tiers: "
+            "'paper' evaluates the learned SB3 policies only (forecasts+DL overlay disabled; paper-fair). "
+            "'deployed' enables forecasting and loads DL overlay .h5 weights (system-level evaluation; NOT paper-fair). "
+            "In deployed mode, Tier-2/Tier-3 now fail fast on forecast/overlay setup errors. "
+            "NOTE: With the current implementation, the overlay is a training-time baseline provider and does not "
+            "directly override actions, so NAV may be unchanged; this mode is mainly for validating the deployed pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--forecast_base_dir",
+        type=str,
+        default="forecast_models",
+        help="Base directory that contains episode-specific forecast models (e.g., forecast_models/episode_20/...). Used in --tiers_eval_mode deployed.",
+    )
     parser.add_argument(
         "--forecast_cache_dir",
         type=str,
-        default=None,
-        help=(
-            "Optional directory to store evaluation-time forecast cache. "
-            "If omitted, cache is written under --output_dir."
-        ),
+        default="forecast_cache",
+        help="Base directory for forecast caches. Used in --tiers_eval_mode deployed.",
     )
     parser.add_argument(
-        "--forecast_obs_mode",
-        type=str,
-        default="normal",
-        choices=["normal", "zero", "invert"],
-        help=(
-            "Ablation for Tier2/Tier3: modify forecast-derived observation features during evaluation "
-            "while still running the same trained policies. "
-            "'zero' removes forecast info; 'invert' flips z-score directions to test sensitivity."
-        ),
-    )
-    parser.add_argument(
-        "--forecast_trade_signal_disable",
+        "--tiers_precompute_forecasts",
         action="store_true",
-        help=(
-            "Disable trade_signal in investor observations during evaluation while "
-            "keeping z_short (z_short-only test)."
-        ),
+        help="When --tiers_eval_mode deployed: precompute/load offline forecast cache for the evaluation dataset (recommended for speed/determinism).",
+    )
+    parser.add_argument(
+        "--tiers_precompute_batch_size",
+        type=int,
+        default=8192,
+        help="Batch size for offline forecast precompute when --tiers_precompute_forecasts is set.",
     )
 
     # Analysis options
@@ -2452,6 +2694,34 @@ def main():
                        help="Save plots to files instead of displaying (requires --plot)")
 
     args = parser.parse_args()
+
+    # === RUN MANIFEST (REPRODUCIBILITY) ===
+    # Write a lightweight JSON manifest capturing argv/args + a config snapshot + git hash (if available).
+    # This is research-release hygiene and does not affect evaluation results.
+    try:
+        os.makedirs(args.output_dir, exist_ok=True)
+        from run_manifest import write_run_manifest
+        try:
+            cfg_snapshot = EnhancedConfig()
+            # Reflect key CLI overrides for reproducibility.
+            if getattr(args, "investment_freq", None) is not None:
+                cfg_snapshot.investment_freq = int(args.investment_freq)
+        except Exception as snapshot_error:
+            print_progress(
+                f"⚠️  Could not build config snapshot for evaluation manifest: {snapshot_error}"
+            )
+            cfg_snapshot = None
+        manifest_path = write_run_manifest(
+            args.output_dir,
+            argv=sys.argv,
+            args=args,
+            config=cfg_snapshot,
+            extra={"entrypoint": "evaluation.py", "mode": getattr(args, "mode", None)},
+            filename_prefix="eval_manifest",
+        )
+        print_progress(f"🧾 Wrote evaluation run manifest: {manifest_path}")
+    except Exception as e:
+        print_progress(f"⚠️  Failed to write evaluation run manifest: {e}")
 
     print_progress("📋 Parsing arguments and validating paths...")
 
@@ -2489,8 +2759,8 @@ def main():
                             enhanced_features = config.get('enhanced_features', {})
                             if enhanced_features.get('forecasting_enabled') or enhanced_features.get('dl_overlay_enabled'):
                                 is_enhanced = True
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"⚠️ Could not parse training config for auto-detection ({config_file}): {e}")
 
                     if is_enhanced:
                         args.enhanced_models = candidate
@@ -2520,7 +2790,7 @@ def main():
         print_progress(f"❌ Error loading evaluation data: {e}")
         sys.exit(1)
 
-    # Tier suite mode builds a separate environment per tier (and uses Episode 19 forecasts for tier2/3)
+    # Tier suite mode evaluates baseline vs FGB-online vs FGB-meta on unseen data using final_models/
     if args.mode == "tiers":
         try:
             results = run_tier_suite_evaluation(eval_data, args)
@@ -2552,6 +2822,7 @@ def main():
         output_dir=args.output_dir,
         investment_freq=args.investment_freq,
         config=None,
+        fail_fast=True,
     )
 
     if eval_env is None:
@@ -2595,13 +2866,14 @@ def main():
             print("🚀 Loading enhanced models with forecasting and DL overlay...")
 
             # Create enhanced evaluation environment with DL overlay
-            dl_weights_path = os.path.join(args.enhanced_models, "hedge_optimizer_online.h5")
-            if os.path.exists(dl_weights_path):
+            dl_weights_path = _resolve_overlay_weights_from_models_dir(args.enhanced_models)
+            if dl_weights_path and os.path.exists(dl_weights_path):
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                     eval_data,
                     enable_forecasting=True,
                     dl_overlay_weights_path=dl_weights_path,
-                    output_dir=args.output_dir
+                    output_dir=args.output_dir,
+                    fail_fast=True,
                 )
                 eval_env = enhanced_eval_env if enhanced_eval_env else eval_env
 
@@ -2661,13 +2933,14 @@ def main():
         # Run AI evaluation first (enhanced or standard models)
         if args.enhanced_models:
             # Use enhanced models with DL overlay
-            dl_weights_path = os.path.join(args.enhanced_models, "hedge_optimizer_online.h5")
-            if os.path.exists(dl_weights_path):
+            dl_weights_path = _resolve_overlay_weights_from_models_dir(args.enhanced_models)
+            if dl_weights_path and os.path.exists(dl_weights_path):
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                     eval_data,
                     enable_forecasting=True,
                     dl_overlay_weights_path=dl_weights_path,
-                    output_dir=args.output_dir
+                    output_dir=args.output_dir,
+                    fail_fast=True,
                 )
                 eval_env = enhanced_eval_env if enhanced_eval_env else eval_env
 

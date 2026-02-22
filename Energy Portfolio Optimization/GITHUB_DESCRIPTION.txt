@@ -1,0 +1,164 @@
+Hybrid Renewable Fund MARL + Forecast-Guided Baselines (FGB/FAMC)
+
+This repository contains a research codebase for training and evaluating a
+multi-agent reinforcement learning (MARL) system that manages a hybrid
+renewable energy fund with two sleeves:
+
+  1) Physical ownership sleeve:
+     - wind / solar / hydro capacity + battery storage
+     - electricity generation + battery dispatch economics
+
+  2) Financial trading sleeve:
+     - derivatives exposure on renewable energy indices
+     - mark-to-market (MTM) PnL + execution costs + risk controls
+
+The core goal is to learn stable, risk-aware policies that improve fund-level
+outcomes (NAV dynamics) while keeping comparisons fair across algorithm
+variants.
+
+
+Key Contributions / Variants (Tiers)
+
+Tier 1: Baseline MARL
+- Standard multi-agent RL policies interacting with the same environment.
+- No forecast reward shaping.
+- This is the "classic MARL" baseline used as the reference for ablations.
+
+Tier 2: FGB (Forecast-Guided Baseline), Online Mode
+- Adds a forecast-informed control variate that is computed from PRE-ACTION
+  state and used to correct PPO advantages (variance reduction).
+- IMPORTANT: This does NOT change environment rewards or policy observations.
+  Forecasts are a backend-only signal for advantage correction.
+
+Tier 3: FAMC (Forecast-Aware Meta-Critic), Meta Mode
+- Extends FGB with a learned, state-only meta-critic head (g_phi) used as a
+  control variate for the investor agent.
+- The meta head is trained on stored standardized advantages and used purely
+  for advantage-level variance reduction.
+- Other agents fall back to the online control variate path (paper-clean and
+  avoids mixing agents in the meta head).
+
+Forecast Ablation (Signal Ablation)
+- Keeps the full FGB/FAMC plumbing but forces the forecast-derived control
+  variate signal to zero (tau/expected_dnav -> 0).
+- This isolates the contribution of the forecast signal itself.
+
+Note on "deployed" behavior:
+- FGB/FAMC are training-time variance reduction mechanisms. They do not
+  directly modify actions at evaluation time.
+- If you want an evaluation mode that changes NAV by altering actions, that is
+  a different algorithm (e.g., a forecast-guided execution/controller layer)
+  and should be reported separately.
+
+
+Repository Structure (High Level)
+
+Core simulation and training:
+- environment.py:
+  Fund simulator (physical + trading sleeves), NAV accounting, trading
+  execution, battery dispatch, and strict overlay feature construction.
+
+- metacontroller.py:
+  MARL training loop and policy management (PPO/SAC) + FGB/FAMC advantage
+  correction.
+
+Forecasts and overlay:
+- generator.py:
+  Multi-horizon forecast generator (trained separately; used at runtime for
+  forecast signals).
+
+- dl_overlay.py:
+  Minimal deep-learning overlay producing:
+    - pred_reward head (FGB)
+    - optional meta_adv head (FAMC meta mode)
+
+Wrappers and evaluation:
+- wrapper.py:
+  Environment wrappers + validation + normalization alignment checks.
+
+- evaluation.py:
+  Tier evaluation runner and report generation (writes run manifests).
+
+Backwards-compatible modules:
+- environment.py and metacontroller.py are shims that re-export the core
+  implementations to keep imports and old scripts stable.
+
+
+Reproducibility (Run Manifests)
+
+Every training/evaluation run writes a timestamped JSON manifest with:
+- command-line argv and parsed args
+- a config snapshot
+- runtime versions
+- code provenance:
+  - git commit hash if this directory is a git repo
+  - otherwise SHA256 hashes of key files
+
+Manifests are written to:
+- Training: inside the --save_dir folder
+- Evaluation: inside the --output_dir folder
+
+
+Research Hygiene (Fail-Fast Contracts)
+
+This codebase intentionally prefers "fail fast" correctness over silent
+workarounds:
+- Observation dimensions must remain invariant within a run. If dimensions
+  change, the run aborts rather than recreating policies mid-run.
+- Overlay feature vector contract is strict:
+  config.OVERLAY_FEATURE_DIM == 34 everywhere.
+- Forecast values used inside features are normalized consistently (to avoid
+  distribution shift between call paths).
+
+
+Tests
+
+A small stdlib unittest suite is included under tests/ to validate:
+- strict overlay dimension contract behavior
+- forecast precompute memory cleanup behavior
+- run manifest writing correctness
+- lightweight import smoke tests
+
+Run:
+  python -m unittest discover -s tests -v
+
+
+Typical Commands (Examples)
+
+Tier 1 (baseline MARL):
+  python main.py --episode_training --episode_data_dir training_dataset --start_episode 0 --end_episode 19 ^
+    --enable_gnn_encoder --save_dir tier1_run --seed 789 --investment_freq 24 --cooling_period 0 ^
+    --lr 0.0003 --ent_coef 0.03 --ppo_use_sde --ppo_log_std_init -0.5
+
+Tier 2 (FGB online):
+  python main.py --episode_training --episode_data_dir training_dataset --start_episode 0 --end_episode 19 ^
+    --enable_gnn_encoder --save_dir tier2_fgb_online --seed 789 --investment_freq 24 --cooling_period 0 ^
+    --fgb_mode online --forecast_training_dataset_dir forecast_training_dataset ^
+    --forecast_base_dir forecast_models --forecast_cache_dir forecast_cache ^
+    --lr 0.0003 --ent_coef 0.03 --ppo_use_sde --ppo_log_std_init -0.5
+
+Tier 3 (FAMC meta):
+  python main.py --episode_training --episode_data_dir training_dataset --start_episode 0 --end_episode 19 ^
+    --enable_gnn_encoder --save_dir tier3_famc_meta --seed 789 --investment_freq 24 --cooling_period 0 ^
+    --fgb_mode meta --forecast_training_dataset_dir forecast_training_dataset ^
+    --forecast_base_dir forecast_models --forecast_cache_dir forecast_cache ^
+    --lr 0.0003 --ent_coef 0.03 --ppo_use_sde --ppo_log_std_init -0.5
+
+Forecast signal ablation:
+  python main.py --episode_training --episode_data_dir training_dataset --start_episode 0 --end_episode 19 ^
+    --enable_gnn_encoder --save_dir tier3_famc_meta_ablate_forecasts --seed 789 --investment_freq 24 --cooling_period 0 ^
+    --fgb_mode meta --forecast_training_dataset_dir forecast_training_dataset ^
+    --forecast_base_dir forecast_models --forecast_cache_dir forecast_cache ^
+    --lr 0.0003 --ent_coef 0.03 --ppo_use_sde --ppo_log_std_init -0.5 ^
+    --fgb_ablate_forecasts
+
+Tier evaluation on unseen data:
+  python evaluation.py --mode tiers ^
+    --tier1_dir tier1_run --tier2_dir tier2_fgb_online --tier3_dir tier3_famc_meta ^
+    --eval_data evaluation_dataset/unseendata.csv --output_dir evaluation_results/tiers_seed789_2025 ^
+    --investment_freq 24
+
+
+License
+(Add your license here.)
+

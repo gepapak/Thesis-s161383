@@ -456,6 +456,7 @@ class ObservationValidatorMixin:
 
     def fix_observation_shape(self, obs: Any, expected_dim: int) -> np.ndarray:
         """Fix observation to expected shape and type."""
+        strict = bool(getattr(self, 'strict_validation', False))
         if not isinstance(obs, np.ndarray):
             if obs is None:
                 obs = np.zeros(expected_dim, dtype=np.float32)
@@ -469,10 +470,16 @@ class ObservationValidatorMixin:
         if obs.ndim != 1:
             obs = obs.flatten()
 
-        if obs.size < expected_dim:
-            obs = np.pad(obs, (0, expected_dim - obs.size))
-        elif obs.size > expected_dim:
-            obs = obs[:expected_dim]
+        if obs.size != expected_dim:
+            if strict:
+                raise ValueError(
+                    f"[OBS_DIM_MISMATCH] expected {expected_dim} dims, got {obs.size}. "
+                    f"strict_validation=True (no pad/truncate)."
+                )
+            if obs.size < expected_dim:
+                obs = np.pad(obs, (0, expected_dim - obs.size))
+            else:
+                obs = obs[:expected_dim]
 
         return obs
 
@@ -487,23 +494,28 @@ class ObservationValidatorMixin:
 
 class EnhancedObservationValidator(BaseObservationValidator, ObservationValidatorMixin):
     """
-    Validates base obs from the ENV and appends forecast features to build TOTAL obs.
+    Validates and sanitizes environment observations (Tier-1 observation space).
 
-    IMPORTANT: the ENV returns BASE-only observations. The WRAPPER is responsible for:
-      total_dim = base_dim + forecast_dim
-
-    Forecasts are normalized AND keys are prioritized to align horizons (closest to env.investment_freq first).
+    NOTE:
+        The historical Tier-2 wrapper-augmented observation vectors are retired in the
+        paper refactor. Forecasts (if present) are backend-only for FGB/FAMC and MUST
+        NOT change observation shapes.
     """
-    def __init__(self, base_env, forecaster, debug=False, postproc: Optional[ForecastPostProcessor] = None):
+    def __init__(self, base_env, forecaster, debug=False, postproc: Optional[ForecastPostProcessor] = None,
+                 strict_validation: bool = True):
         # Initialize base class
         super().__init__(base_env, debug)
 
         self.base_env = base_env
         self.forecaster = forecaster
         self.postproc = postproc or ForecastPostProcessor(base_env, normalize=True, align_horizons=True)
+        # Fail-fast correctness: never silently pad/truncate observation vectors.
+        self.strict_validation = bool(strict_validation)
 
         self.agent_observation_specs = {}
         self._initialize_observation_specs()
+        # Backward-compat alias used by metacontroller fallback paths.
+        self.observation_specs = self.agent_observation_specs
 
     def _initialize_observation_specs(self):
         for agent in self.base_env.possible_agents:
@@ -517,6 +529,9 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                     'forecast_dim': forecast_dim,
                     'total_dim': total_dim,
                     'forecast_keys': self._get_agent_forecast_keys(agent, forecast_dim),
+                    # Compatibility keys expected by metacontroller fallback logic
+                    'low': total_low,
+                    'high': total_high,
                     'bounds': (total_low, total_high)
                 }
                 if self.debug or agent == "meta_controller_0":
@@ -530,9 +545,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
         FAIL-FAST: Get base observation dimension from environment with strict validation.
         No static fallbacks allowed - any failure indicates configuration/environment issues.
         
-        CRITICAL FIX: When forecasts are enabled, the base environment ALREADY includes
-        forecast features in the "base" observation space. So we should use the FULL
-        observation space dimension from the base environment, not try to add more.
+        Forecast-derived observation augmentation is retired; always use the base
+        environment observation space dimensions.
         """
         try:
             # Method 1: Use environment's explicit dimension method
@@ -560,18 +574,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 dim = int(space.shape[0])
                 if dim <= 0:
                     raise ValueError(f"Invalid base dimension {dim} from observation_space({agent}).shape")
-                
-                # CRITICAL FIX: When forecasts are enabled, the base environment observation space
-                # already includes all forecast features. So we return the FULL dimension.
-                # The wrapper should NOT add additional forecast dimensions in this case.
-                enable_forecast_util = getattr(self.base_env.config, 'enable_forecast_utilisation', False) if hasattr(self.base_env, 'config') else False
-                if enable_forecast_util:
-                    # Base environment already includes forecasts - return full dimension
-                    logger.debug(f"[BASE_DIM] {agent}: Using full observation space dimension {dim}D (forecasts already included in base)")
-                    return dim
-                else:
-                    # Tier 1: Base environment doesn't include forecasts - return base dimension
-                    return dim
+
+                return dim
 
             # No valid method found
             raise ValueError(f"Cannot determine base observation dimension for agent '{agent}': "
@@ -585,69 +589,9 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
             )
 
     def _calculate_forecast_dimension(self, agent: str) -> int:
-        # If no forecaster, return 0 forecast dimensions (baseline mode)
-        if self.forecaster is None:
-            return 0
-
-        # CONDITIONAL: When enable_forecast_utilisation=True (Tier 2/3), the base environment already includes
-        # the forecast features in its observation space (e.g., investor_0 is 8D = 6 base + 2 forecast).
-        # So the wrapper should NOT add additional forecast dimensions.
-        enable_forecast_util = getattr(self.base_env.config, 'enable_forecast_utilisation', False) if hasattr(self.base_env, 'config') else False
-        if enable_forecast_util:
-            # Tier 2/3: Deltas already in base observations, no additional forecasts needed
-            return 0
-
-        try:
-            if hasattr(self.forecaster, 'get_agent_forecast_dims'):
-                dims = self.forecaster.get_agent_forecast_dims()
-                base_dims = int(dims.get(agent, 0))
-                # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
-                result = base_dims + (1 if agent != "risk_controller_0" else 0)
-                # FIX #7: Add 2 dims for consensus_direction and consensus_confidence
-                result += (2 if agent != "risk_controller_0" else 0)
-                if agent == "meta_controller_0":
-                    print(f"[FORECAST_DIM] {agent}: get_agent_forecast_dims={base_dims}, confidence=1, total={result}")
-                return result
-            if hasattr(self.forecaster, 'agent_horizons') and hasattr(self.forecaster, 'agent_targets'):
-                targets = self.forecaster.agent_targets.get(agent, [])
-                horizons = self.forecaster.agent_horizons.get(agent, [])
-                base_dims = int(len(targets) * len(horizons))
-                # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
-                result = base_dims + (1 if agent != "risk_controller_0" else 0)
-                # FIX #7: Add 2 dims for consensus signals
-                result += (2 if agent != "risk_controller_0" else 0)
-                if agent == "meta_controller_0":
-                    print(f"[FORECAST_DIM] {agent}: targets={len(targets)}, horizons={len(horizons)}, base_dims={base_dims}, confidence=1, total={result}")
-                return result
-            # DYNAMIC: Calculate forecast dimensions from actual forecaster configuration
-            try:
-                if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
-                    targets = self.forecaster.agent_targets.get(agent, [])
-                    horizons = self.forecaster.agent_horizons.get(agent, [])
-                    base_dims = len(targets) * len(horizons)
-                    # Add 1 for forecast confidence (except risk_controller_0 which doesn't get confidence)
-                    confidence_dim = 1 if agent != "risk_controller_0" else 0
-                    # FIX #7: Add consensus signals (2 dims) except risk_controller
-                    consensus_dim = 2 if agent != "risk_controller_0" else 0
-                    return base_dims + confidence_dim + consensus_dim
-            except Exception:
-                pass
-            # FAIL-FAST: No static fallbacks - fail fast to maintain single source of truth
-            raise ValueError(f"Cannot calculate forecast dimensions for agent '{agent}': forecaster missing agent_targets or agent_horizons metadata")
-        except Exception:
-            # DYNAMIC: Try to calculate from forecaster, fallback to hardcoded if needed
-            try:
-                if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
-                    targets = self.forecaster.agent_targets.get(agent, [])
-                    horizons = self.forecaster.agent_horizons.get(agent, [])
-                    base_dims = len(targets) * len(horizons)
-                    confidence_dim = 1 if agent != "risk_controller_0" else 0
-                    consensus_dim = 2 if agent != "risk_controller_0" else 0
-                    return base_dims + confidence_dim + consensus_dim
-            except Exception:
-                pass
-            # FAIL-FAST: No static fallbacks - fail fast to maintain single source of truth
-            raise ValueError(f"Cannot calculate forecast dimensions for agent '{agent}': forecaster missing agent_targets or agent_horizons metadata")
+        # Forecast-derived observation augmentation is retired.
+        # Forecasts (if any) are backend-only for FGB/FAMC and MUST NOT change obs dims.
+        return 0
 
     def _get_agent_forecast_keys(self, agent: str, expected_count: int) -> List[str]:
         try:
@@ -686,27 +630,18 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 f"Cannot create fallback spec for agent '{agent}': "
                 f"failed to get base dimension dynamically. {str(e)}."
             )
-        # DYNAMIC: Calculate forecast dimensions from actual forecaster configuration
-        try:
-            if hasattr(self.forecaster, 'agent_targets') and hasattr(self.forecaster, 'agent_horizons'):
-                targets = self.forecaster.agent_targets.get(agent, [])
-                horizons = self.forecaster.agent_horizons.get(agent, [])
-                base_forecast_dims = len(targets) * len(horizons)
-                confidence_dim = 1 if agent != "risk_controller_0" else 0
-                forecast_dim = base_forecast_dims + confidence_dim
-            else:
-                # ENFORCE: No static fallbacks - fail fast to maintain single source of truth
-                raise ValueError(f"Cannot create fallback spec for agent '{agent}': forecaster missing agent_targets or agent_horizons metadata")
-        except Exception as e:
-            # ENFORCE: No static fallbacks - fail fast to maintain single source of truth
-            raise ValueError(f"Cannot create fallback spec for agent '{agent}': {str(e)}")
-        total_dim = base_dim + forecast_dim
+        # Forecast-derived observation augmentation is retired (paper refactor).
+        forecast_dim = 0
+        total_dim = base_dim
+        total_low, total_high = self._get_safe_bounds(total_dim)
         self.agent_observation_specs[agent] = {
             'base_dim': base_dim,
             'forecast_dim': forecast_dim,
             'total_dim': total_dim,
-            'forecast_keys': self._get_agent_forecast_keys(agent, forecast_dim),
-            'bounds': self._get_safe_bounds(total_dim)
+            'forecast_keys': [],
+            'low': total_low,
+            'high': total_high,
+            'bounds': (total_low, total_high),
         }
 
     # ---- in-place assembly ----
@@ -731,55 +666,7 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 v = f_proc.get(key, 0.0)
                 out[bd + j] = float(v if np.isfinite(v) else 0.0)
 
-        # Optional: Append consensus signals (direction, confidence) after forecast features.
-        # IMPORTANT: Only write these if the declared spec/space already includes room for them.
-        # In Tier 2/3, the base env already includes all forecast-related features and the wrapper
-        # must NOT silently expand the observation vector.
-        try:
-            if agent != "risk_controller_0":
-                # Consensus derived from forecast engine's quality-weighted signal and trust
-                consensus_direction = 0.0
-                consensus_confidence = 0.0
-                # Attempt to read from environment's forecast engine debug/state
-                fe = getattr(self.base_env, 'forecast_engine', None)
-                if fe is not None:
-                    # Use last quality-weighted signal and trust if available
-                    qsig = None
-                    try:
-                        if hasattr(self.base_env, '_quality_signal_debug'):
-                            dbg = getattr(self.base_env, '_quality_signal_debug')
-                            qsig = float(dbg.get('quality_signal', 0.0))
-                    except Exception:
-                        pass
-                    if qsig is None:
-                        # Fallback: use combined_forecast_score from env debug if present
-                        try:
-                            if hasattr(self.base_env, '_debug_forecast_reward'):
-                                qsig = float(self.base_env._debug_forecast_reward.get('combined_forecast_score', 0.0))
-                        except Exception:
-                            qsig = 0.0
-                    consensus_direction = float(np.sign(qsig))
-                    consensus_confidence = float(np.clip(getattr(fe, 'forecast_trust', 0.5), 0.0, 1.0))
-                else:
-                    # Fallback: derive from forecasts dictionary if possible
-                    avg_signal = 0.0
-                    cnt = 0
-                    for k, v in (forecasts or {}).items():
-                        if isinstance(v, (int, float)) and np.isfinite(v):
-                            avg_signal += float(v)
-                            cnt += 1
-                    avg_signal = avg_signal / cnt if cnt > 0 else 0.0
-                    consensus_direction = float(np.sign(avg_signal))
-                    consensus_confidence = 0.5
-
-                # Append ONLY if the observation spec already includes these two dims
-                if td >= (bd + fd + 2):
-                    out[bd + fd: bd + fd + 2] = np.array(
-                        [consensus_direction, consensus_confidence], dtype=np.float32
-                    )
-        except Exception:
-            # Keep observations valid even if consensus computation fails
-            pass
+        # Forecast-augmented observation features are retired (paper refactor).
 
         low, high = spec['bounds']
         # Clip only within declared bounds length; extra consensus dims already included in td
@@ -800,10 +687,16 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
         if base_obs.ndim != 1:
             base_obs = base_obs.flatten()
         bd = spec['base_dim']
-        if base_obs.size < bd:
-            base_obs = np.pad(base_obs, (0, bd - base_obs.size))
-        elif base_obs.size > bd:
-            base_obs = base_obs[:bd]
+        if base_obs.size != bd:
+            if bool(getattr(self, 'strict_validation', False)):
+                raise ValueError(
+                    f"[BASE_OBS_DIM_MISMATCH] {agent}: expected base_dim {bd}, got {base_obs.size}. "
+                    f"strict_validation=True (no pad/truncate)."
+                )
+            if base_obs.size < bd:
+                base_obs = np.pad(base_obs, (0, bd - base_obs.size))
+            else:
+                base_obs = base_obs[:bd]
         low, high = spec['bounds']
         base_obs = np.nan_to_num(base_obs, nan=0.0, posinf=1.0, neginf=-1.0)
         base_obs = np.clip(base_obs, low[:bd], high[:bd])
@@ -818,6 +711,40 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
         # FAIL-FAST: No static fallbacks allowed for production safety
         raise ValueError(f"Cannot create safe observation for agent '{agent}': "
                         "agent not in observation specs. Build spec first using dynamic calculation.")
+
+    def fix_observation(self, agent: str, obs: Any) -> np.ndarray:
+        """
+        Fix/sanitize a single agent observation to the expected shape.
+
+        Used by metacontroller emergency/fallback paths.
+        """
+        spec = self.agent_observation_specs.get(agent)
+        if spec is None:
+            # Build a minimal safe spec on-the-fly.
+            base_dim = 1
+            try:
+                base_dim = int(self._get_validated_base_dim(agent))
+            except Exception:
+                pass
+            low, high = self._get_safe_bounds(base_dim)
+            spec = {
+                "base_dim": base_dim,
+                "forecast_dim": 0,
+                "total_dim": base_dim,
+                "forecast_keys": [],
+                "low": low,
+                "high": high,
+                "bounds": (low, high),
+            }
+            self.agent_observation_specs[agent] = spec
+
+        expected = int(spec.get("total_dim", spec.get("base_dim", 1)))
+        fixed = self.fix_observation_shape(obs, expected)
+        fixed = np.nan_to_num(fixed, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
+        low, high = spec.get("bounds", (None, None))
+        if low is not None and high is not None:
+            np.clip(fixed, low[:expected], high[:expected], out=fixed)
+        return fixed
 
     def get_validation_stats(self) -> Dict:
         return {
@@ -838,13 +765,17 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
 # =========================
 class MemoryOptimizedObservationBuilder:
     """Builds total observations (base + normalized & horizon-aligned forecasts) with validation & caching, in-place."""
-    def __init__(self, base_env, forecaster, debug=False, normalize_forecasts=True, align_horizons=True):
+    def __init__(self, base_env, forecaster, debug=False, normalize_forecasts=True, align_horizons=True,
+                 strict_validation: bool = True):
         self.base_env = base_env
         self.forecaster = forecaster
         self.debug = debug
+        self.strict_validation = bool(strict_validation)
 
         self.postproc = ForecastPostProcessor(base_env, normalize=normalize_forecasts, align_horizons=align_horizons)
-        self.validator = EnhancedObservationValidator(base_env, forecaster, debug, postproc=self.postproc)
+        self.validator = EnhancedObservationValidator(
+            base_env, forecaster, debug, postproc=self.postproc, strict_validation=self.strict_validation
+        )
 
         self._obs_out = {
             agent: np.zeros(self.validator.agent_observation_specs[agent]['total_dim'], dtype=np.float32)
@@ -950,13 +881,19 @@ class MultiHorizonWrapperEnv(ParallelEnv):
     metadata = {"name": "multi_horizon_wrapper:normalized-aligned-v1"}
 
     def __init__(self, base_env, multi_horizon_forecaster, max_memory_mb=1500,
-                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000):
+                 normalize_forecasts=True, align_horizons=True, total_timesteps=50000,
+                 strict_validation: bool = True):
         self.env = base_env
         self.base_env = base_env  # Alias for compatibility
         self.forecaster = multi_horizon_forecaster
         # CRITICAL: Forward config for code paths that expect env.config (e.g., action validation toggles).
         # The base env owns config; the wrapper should expose it transparently.
         self.config = getattr(base_env, "config", None)
+        # Default to paper-grade correctness: do not silently pad/truncate observation vectors.
+        if self.config is not None and hasattr(self.config, "strict_obs_validation"):
+            self.strict_validation = bool(getattr(self.config, "strict_obs_validation"))
+        else:
+            self.strict_validation = bool(strict_validation)
 
         # Agents
         self._possible_agents = self.env.possible_agents[:]
@@ -983,7 +920,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         # Builder / specs
         self.obs_builder = MemoryOptimizedObservationBuilder(
             self.env, self.forecaster, debug=False,
-            normalize_forecasts=normalize_forecasts, align_horizons=align_horizons
+            normalize_forecasts=normalize_forecasts, align_horizons=align_horizons,
+            strict_validation=self.strict_validation
         )
         self.memory_tracker.register_cache(self.obs_builder.forecast_cache)
         self.memory_tracker.register_cache(self.obs_builder.agent_forecast_cache)
@@ -1055,9 +993,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         
         tier = get_tier_from_config(self.env.config)
         logger.info(f"[OBS_SPACE_TIER] Detected: {tier} - {get_tier_description(tier)}")
-        
-        enable_forecast_util = getattr(self.env.config, 'enable_forecast_utilisation', False)
-        logger.info(f"[OBS_SPACE_CONFIG] tier={tier}, enable_forecast_util={enable_forecast_util}")
 
         for agent, spec in specs.items():
             low, high = spec['bounds']
@@ -1091,6 +1026,13 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         Rebuild observation spaces after environment/forecaster changes.
 
         """
+        if getattr(self, "step_count", 0) > 0:
+            # Paper-grade correctness: observation dimensions must be invariant for an entire run.
+            msg = ("[OBS_SPACE_REBUILD] Refusing to rebuild observation spaces after stepping. "
+                   "Observation dimensions must be invariant within a run. "
+                   "Create a new environment/wrapper instead.")
+            logger.error(msg)
+            raise RuntimeError(msg)
         logger.info("[OBS_SPACE_REBUILD] Rebuilding observation spaces")
         self._build_wrapper_observation_spaces()
         logger.info("[OBS_SPACE_REBUILD] Observation spaces rebuilt successfully")
@@ -1218,7 +1160,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                                f"Static space: {self._obs_spaces[agent].shape}, "
                                f"Actual observation: {validated[agent].shape}")
                     logger.error(error_msg)
-                    # Truncate or pad to match (fallback, but log the error)
+                    if getattr(self, 'strict_validation', False):
+                        raise ValueError(error_msg)
+                    # Legacy fallback: truncate/pad (kept only for non-strict mode)
                     if actual_dim > expected_dim:
                         validated[agent] = validated[agent][:expected_dim]
                     else:
@@ -1290,7 +1234,9 @@ class MultiHorizonWrapperEnv(ParallelEnv):
                                f"Static space: {self._obs_spaces[agent].shape}, "
                                f"Actual observation: {validated[agent].shape}")
                     logger.error(error_msg)
-                    # Truncate or pad to match (fallback, but log the error)
+                    if getattr(self, 'strict_validation', False):
+                        raise ValueError(error_msg)
+                    # Legacy fallback: truncate/pad (kept only for non-strict mode)
                     if actual_dim > expected_dim:
                         validated[agent] = validated[agent][:expected_dim]
                     else:

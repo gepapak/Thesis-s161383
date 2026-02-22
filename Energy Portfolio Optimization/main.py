@@ -34,10 +34,9 @@ logger = get_logger(__name__)
 # Import patched environment classes
 from environment import RenewableMultiAgentEnv
 from generator import MultiHorizonForecastGenerator
-from wrapper import MultiHorizonWrapperEnv
 from dl_overlay import DLAdapter
 from utils import load_overlay_weights, clear_tf_session, configure_tf_memory  # UNIFIED: Import from single source of truth
-from config import normalize_price  # UNIFIED: Import from single source of truth
+from config import normalize_price, OVERLAY_FEATURE_DIM  # UNIFIED: Import from single source of truth
 
 # CVXPY is optional; if unavailable we use a heuristic labeler.
 try:
@@ -552,6 +551,9 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                     logger.warning(f"[overlay/train] Training failed at step {total_trained + trained_now:,}: {e}")
                     logger.debug(f"[overlay/train] Full traceback: {traceback.format_exc()}")
                     logger.error(f"   [overlay/train] ✗ Training failed: {e}")
+                    raise RuntimeError(
+                        f"[OVERLAY_TRAIN_FATAL] Overlay training failed at step {total_trained + trained_now:,}: {e}"
+                    ) from e
 
             # Print portfolio summary at each checkpoint
             print_portfolio_summary(agent.env, end_steps)
@@ -896,12 +898,17 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
     # ------------------------------------------------------------------
     try:
         # Enable for episode training to avoid distribution shifts at episode boundaries.
-        # Compute if disabled OR if enabled but stats are missing (e.g., config toggled without populated values).
+        # Respect explicit mode selection:
+        # - use_global_normalization=False  -> rolling_past (no global precompute)
+        # - use_global_normalization=True   -> global normalization with precomputed/full-dataset stats
         need_global_norm = bool(getattr(args, "episode_training", False))
+        use_global_norm_requested = bool(getattr(config, "use_global_normalization", False))
         has_stats = all(
             hasattr(config, k) for k in ("global_price_mean", "global_price_std", "global_wind_scale", "global_solar_scale", "global_hydro_scale", "global_load_scale")
         )
-        if need_global_norm and (not getattr(config, "use_global_normalization", False) or not has_stats):
+        if need_global_norm and (not use_global_norm_requested):
+            logger.info("[GLOBAL_NORM] Using rolling_past mode (global normalization disabled).")
+        elif need_global_norm and (not has_stats):
             scenario_paths = sorted(glob.glob(os.path.join(args.episode_data_dir, "scenario_*.csv")))
             if len(scenario_paths) >= 2:
                 prices = []
@@ -950,7 +957,8 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             else:
                 logger.warning("[GLOBAL_NORM] Not enough scenario_*.csv files found to compute global normalization; leaving disabled.")
     except Exception as e:
-        logger.warning(f"[GLOBAL_NORM] Failed to compute global normalization stats: {e}")
+        logger.error(f"[GLOBAL_NORM_FATAL] Failed to compute global normalization stats: {e}")
+        raise RuntimeError("[GLOBAL_NORM_FATAL] Failed to compute global normalization stats") from e
 
     # Handle episode restart
     if args.resume_episode is not None:
@@ -1030,7 +1038,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         if not loaded:
                             logger.warning(f"   [WARN] No compatible DL overlay weights found for Episode {args.resume_episode}, starting with fresh weights")
                     elif args.dl_overlay:
-                        logger.warning(f"   [WARN] DL overlay enabled but no dl_adapter found for Episode {args.resume_episode} resume")
+                        logger.warning(
+                            f"   [WARN] DL overlay enabled but no dl_adapter_overlay found for Episode {args.resume_episode} resume"
+                        )
 
                     # Adjust start episode to resume from next episode
                     args.start_episode = args.resume_episode + 1
@@ -1213,11 +1223,12 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             episode_data = load_episode_data(args.episode_data_dir, episode_num, config=config, mw_scale_overrides=mw_scale_overrides)
 
             # 1.5. EPISODE-SPECIFIC FORECAST TRAINING AND CACHE GENERATION
-            # For Tier 2/3: Train episode-specific forecast models FROM SCRATCH if needed, then generate cache
+            # For DL overlay / FGB: Train episode-specific forecast models FROM SCRATCH if needed, then generate cache
             # CRITICAL: Each episode trains models on its OWN 6-month period ONLY (not cumulative!)
             # - Episode 0: Only 2015 H1, Episode 1: Only 2015 H2, etc.
             # This is different from RL weights which are loaded from previous episodes for continuous learning.
-            if args.enable_forecast_utilisation:
+            episode_forecasts_required = bool(args.dl_overlay or args.forecast_baseline_enable)
+            if episode_forecasts_required:
                 from episode_forecast_integration import (
                     ensure_episode_forecasts_ready,
                     check_episode_cache_exists,
@@ -1255,7 +1266,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 
                 if not success:
                     logger.error(f"   [ERROR] Failed to prepare Episode {episode_num} forecast models")
-                    logger.error(f"   [ERROR] Cannot continue - forecast models are required for Tier 2/3")
+                    logger.error(f"   [ERROR] Cannot continue - forecast models are required for DL overlay / FGB")
                     raise RuntimeError(f"Episode {episode_num} forecast model preparation failed")
                 
                 # Step 2: Reinitialize forecaster with episode-specific models
@@ -1296,9 +1307,8 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     logger.error(f"   [ERROR] {error_msg}")
                     raise RuntimeError(error_msg)
 
-            # 2. Precompute forecasts for this episode (Tier 2/3 ONLY - requires --enable_forecast_utilisation)
-            # This block only runs when forecast utilisation is enabled (Tier 2/3), not for Tier 1
-            if args.enable_forecast_utilisation and forecaster is not None:
+            # 2. Precompute forecasts for this episode (only when forecasts are required)
+            if episode_forecasts_required and forecaster is not None:
                 try:
                     # Check if cache already exists
                     cache_base_dir = getattr(args, 'forecast_cache_dir', "forecast_cache")
@@ -1328,11 +1338,11 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         logger.info(f"   [OK] Episode {episode_num} forecasts precomputed and cached")
                 except Exception as pe:
                     logger.error(f"   [ERROR] Episode {episode_num} forecast precomputation failed: {pe}")
-                    raise  # Fail fast - forecasts are mandatory for Tier 2/3
-            elif args.enable_forecast_utilisation and forecaster is None:
+                    raise  # Fail fast - forecasts are mandatory when DL overlay / FGB is enabled
+            elif episode_forecasts_required and forecaster is None:
                 # This should not happen - forecaster should have been initialized above
-                logger.error(f"   [ERROR] Forecast utilisation enabled but forecaster is None!")
-                raise RuntimeError(f"Episode {episode_num}: Forecast utilisation enabled but forecaster not initialized")
+                logger.error(f"   [ERROR] Forecasts required but forecaster is None!")
+                raise RuntimeError(f"Episode {episode_num}: Forecasts required but forecaster not initialized")
 
             # 3. Determine timesteps for this episode
             episode_timesteps = args.episode_timesteps if args.episode_timesteps else len(episode_data)
@@ -1369,9 +1379,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         episode_base_env.debug_tracker.start_episode(episode_num)
                         logger.debug(f"   [DEBUG] Set episode counter to {episode_num} for debug logging")
 
-                # CRITICAL FIX: Initialize calibration tracker for episode environment
+                # CRITICAL FIX: Initialize calibration tracker for episode environment (FGB only)
                 # For episode training, CalibrationTracker must be initialized per-episode with episode-specific forecaster
-                if args.enable_forecast_utilisation and forecaster is not None:
+                if args.forecast_baseline_enable and forecaster is not None:
                     try:
                         from dl_overlay import CalibrationTracker
                         episode_base_env.calibration_tracker = CalibrationTracker(
@@ -1379,16 +1389,27 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                             trust_metric=config.forecast_trust_metric,
                             verbose=args.debug,
                             init_budget=config.init_budget,
-                            direction_weight=config.forecast_trust_direction_weight
+                            direction_weight=config.forecast_trust_direction_weight,
+                            trust_boost=getattr(config, "forecast_trust_boost", 0.0),
+                            min_exposure_ratio=getattr(config, "fgb_expected_dnav_min_exposure_ratio", 0.0),
+                            pred_weight=getattr(config, "fgb_expected_dnav_pred_weight", 0.85),
+                            mwdir_weight=getattr(config, "fgb_expected_dnav_mwdir_weight", 0.15),
+                            fail_fast=bool(getattr(config, "fgb_fail_fast", False)),
                         )
                         logger.info(f"   [OK] Calibration tracker initialized for episode environment")
                     except Exception as e:
-                        logger.error(f"   [ERROR] Failed to initialize CalibrationTracker for episode: {e}")
+                        err_msg = f"   [ERROR] Failed to initialize CalibrationTracker for episode: {e}"
+                        if bool(getattr(config, "fgb_fail_fast", False)):
+                            raise RuntimeError(err_msg) from e
+                        logger.error(err_msg)
                         episode_base_env.calibration_tracker = None
                 else:
                     episode_base_env.calibration_tracker = None
-                    if args.enable_forecast_utilisation:
-                        logger.warning(f"   [WARN] Forecast utilisation enabled but forecaster is None - CalibrationTracker not initialized")
+                    if args.forecast_baseline_enable and forecaster is None:
+                        msg = "   [WARN] Forecast baseline enabled but forecaster is None - CalibrationTracker not initialized"
+                        if bool(getattr(config, "fgb_fail_fast", False)):
+                            raise RuntimeError(msg)
+                        logger.warning(msg)
 
                 logger.debug(f"   [DEBUG] episode_base_env.forecast_generator = {episode_base_env.forecast_generator}")
                 logger.debug(f"   [DEBUG] DL adapter feature_dim = {getattr(base_env, 'dl_adapter_overlay', None).feature_dim if hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay else 'N/A'}")
@@ -1426,21 +1447,13 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                                 episode_base_env.forecast_generator = forecaster
                             logger.info(f"   [OK] DL Overlay adapter linked from base_env to episode environment (feature_dim={episode_base_env.feature_dim})")
                         except Exception as e:
-                            logger.warning(f"Failed to link DL overlay to episode: {e}")
+                            raise RuntimeError(
+                                f"[OVERLAY_EPISODE_FATAL] Failed to link DL overlay from base_env to episode {episode_num}: {e}"
+                            ) from e
                     else:
-                        logger.warning(f"   [WARN] DL overlay enabled but base_env.dl_adapter_overlay is None - attempting per-episode initialization")
-                        # Fallback: Initialize DL overlay per-episode if base_env doesn't have it
-                        try:
-                            if forecaster is None:
-                                logger.warning(f"   [WARN] DL overlay enabled but forecaster is None for Episode {episode_num} - skipping DL overlay initialization")
-                            else:
-                                initialized = initialize_dl_overlay(episode_base_env, config, args)
-                                if initialized:
-                                    logger.info(f"   [OK] DL Overlay adapter initialized for Episode {episode_num} (feature_dim={episode_base_env.feature_dim})")
-                                else:
-                                    logger.warning(f"   [WARN] Failed to initialize DL overlay for Episode {episode_num}")
-                        except Exception as e:
-                            logger.warning(f"   [WARN] Failed to initialize DL overlay for Episode {episode_num}: {e}")
+                        raise RuntimeError(
+                            f"[OVERLAY_EPISODE_FATAL] DL overlay enabled but base_env.dl_adapter_overlay is missing for episode {episode_num}."
+                        )
                 else:
                     # NON-EPISODE TRAINING MODE: Reuse the same DLAdapter from base_env for consistency
                     if hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay is not None:
@@ -1452,30 +1465,12 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         except Exception as e:
                             logger.warning(f"Failed to link DL overlay to episode: {e}")
 
-            # Wrap with forecasting if needed
-            if forecaster is not None:
-                episode_env = MultiHorizonWrapperEnv(
-                    episode_base_env,
-                    forecaster,
-                    total_timesteps=episode_timesteps
-                )
-                
-                # With robust tier detection (config flags), wrapper builds correct dimensions from start
-                # No verification/rebuild needed - wrapper uses config flags directly like Tier 2
-                
-                # Initialize wrapper environment
-                episode_env.reset()
-                # PHASE 5.6 FIX: Set episode training mode flag to prevent environment reset
-                episode_env._episode_training_mode = True
-                # UPGRADE: Connect wrapper reference for profit-seeking expert guidance
-                # episode_base_env.set_wrapper_reference(episode_env)
-                logger.info(f"   [OK] Episode wrapper environment initialized")
-            else:
-                # Use base environment without forecasting (28D mode requires forecasts)
-                episode_env = episode_base_env
-                # PHASE 5.6 FIX: Set episode training mode flag to prevent environment reset
-                episode_env._episode_training_mode = True
-                logger.info(f"   [OK] Episode environment initialized")
+            # Forecasts are never appended to agent observations.
+            # Use the base environment as-is (Tier-1 observation spaces remain unchanged).
+            episode_env = episode_base_env
+            # PHASE 5.6 FIX: Set episode training mode flag to prevent environment reset
+            episode_env._episode_training_mode = True
+            logger.info(f"   [OK] Episode environment initialized")
 
             # 5. Update agent's environment reference to use episode data
             logger.info(f"   [CYCLE] Updating agent environment reference...")
@@ -1550,10 +1545,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             else:
                 logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh policies")
 
-            # CRITICAL FIX: Verify DL adapter's feature_dim matches environment (34D only)
             if hasattr(episode_base_env, 'dl_adapter_overlay') and episode_base_env.dl_adapter_overlay is not None:
-                # Verify feature_dim is correct (always 34D in forecast-aware mode: 28D base + 6D deltas)
-                new_feature_dim = 34  # HARD CONSTRAINT: 34D (28D base + 6D deltas)
+                from config import OVERLAY_FEATURE_DIM
+                new_feature_dim = int(OVERLAY_FEATURE_DIM)
                 episode_base_env.feature_dim = new_feature_dim
 
                 if new_feature_dim != episode_base_env.dl_adapter_overlay.feature_dim:
@@ -2013,10 +2007,11 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
         return False
 
     try:
-        logger.info("[DL] Initializing DL Overlay System (34D Forecast-Aware Mode: 28D base + 6D deltas)")
+        from config import OVERLAY_FEATURE_DIM
+        logger.info(f"[DL] Initializing DL Overlay System ({OVERLAY_FEATURE_DIM}D short-horizon only)")
         logger.debug(f"[DEBUG] env.forecast_generator = {env.forecast_generator}")
 
-        # STRICT: 34D mode only - forecasts are mandatory
+        # Forecasts are mandatory for overlay
         # BUT: In episode training mode, forecaster is initialized per-episode, not at startup
         # Allow initialization at startup for episode training (forecaster will be attached per-episode)
         if env.forecast_generator is None:
@@ -2024,7 +2019,7 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
             # For non-episode training, forecaster must exist at startup
             episode_training_mode = getattr(args, 'episode_training', False)
             if not episode_training_mode:
-                raise ValueError("DL Overlay requires forecast_generator. Forecasts are mandatory for 34D mode.")
+                raise ValueError("DL Overlay requires forecast_generator. Forecasts are mandatory.")
             else:
                 logger.info("[EPISODE_TRAINING] DL Overlay: Initializing at startup without forecaster (will be attached per-episode)")
                 # Dimensions are known from config, so we can still initialize the adapter structure
@@ -2032,13 +2027,13 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
         # CRITICAL: Enable overlay in config (only when flag is set AND not explicitly disabled)
         config.overlay_enabled = True
 
-        feature_dim = 34  # HARD CONSTRAINT: 34D (28D base + 6D deltas)
+        feature_dim = int(OVERLAY_FEATURE_DIM)
 
         # FAMC: Get meta head parameters
         meta_head_dim = getattr(config, 'meta_baseline_head_dim', 32)
         enable_meta_head = getattr(config, 'meta_baseline_enable', False)
 
-        # Initialize DLAdapter for overlay inference (34D: 28D base + 6D deltas)
+        # Initialize DLAdapter for overlay inference
         overlay_adapter = DLAdapter(
             feature_dim=feature_dim,
             verbose=False,
@@ -2052,15 +2047,8 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
         env.feature_dim = feature_dim
 
         logger.info(f"   [OK] DL Overlay adapter initialized (feature_dim={feature_dim})")
-        logger.info(f"   [OK] Mode: 34D Forecast-Aware (28D base + 6D deltas)")
-        logger.info(f"   [OK] Horizons: immediate (100%), short (95%), medium (90%), long (risk-only)")
-
-        # Display 34D feature configuration
-        logger.info("   [OK] Features: 34 (6 market + 3 positions + 16 multi-horizon forecasts + 3 portfolio + 6 deltas)")
-        logger.info("   [OK] Multi-horizon forecasts: [wind, solar, hydro, price] × [immediate, short, medium, long]")
-        logger.info("   [OK] Delta features: [Δprice_short, Δprice_med, Δprice_long, direction_consistency, mwdir, |mwdir|]")
-        logger.info("   [ROBUST] Strict shape contracts enforced at runtime")
-        logger.info("   [ROBUST] Per-horizon metrics tracked for tuning")
+        logger.info(f"   [OK] Mode: {feature_dim}D short-horizon only")
+        logger.info(f"   [OK] Features: {feature_dim} (6 market + 3 positions + 4 forecasts_medium + 3 portfolio + 2 deltas)")
 
         # Initialize OverlayTrainer for model training
         try:
@@ -2073,16 +2061,17 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
             env.overlay_trainer = overlay_trainer
             logger.info(f"   [OK] Overlay trainer initialized (learning_rate=1e-3)")
         except Exception as e:
-            logger.warning(f"Failed to initialize overlay trainer: {e}")
+            logger.error(f"[OVERLAY_INIT_FATAL] Failed to initialize overlay trainer: {e}")
             env.overlay_trainer = None
+            raise RuntimeError("[OVERLAY_INIT_FATAL] Overlay trainer initialization failed") from e
 
         return True
 
     except Exception as e:
-        logger.warning(f"Failed to initialize DL overlay adapter: {e}")
+        logger.error(f"[OVERLAY_INIT_FATAL] Failed to initialize DL overlay adapter: {e}")
         env.dl_adapter_overlay = None
         env.overlay_trainer = None
-        return False
+        raise RuntimeError("[OVERLAY_INIT_FATAL] DL overlay adapter initialization failed") from e
 
 
 def main():
@@ -2090,7 +2079,7 @@ def main():
     parser.add_argument("--data_path", type=str, default="sample.csv", help="Path to energy time series data")
     parser.add_argument("--timesteps", type=int, default=50000, help="TUNED: Increased for full synergy emergence (was 20000)")
     parser.add_argument("--device", type=str, default="cpu", help="Device for RL training (cuda/cpu)")
-    parser.add_argument("--investment_freq", type=int, default=144, help="Investor action frequency in steps")
+    parser.add_argument("--investment_freq", type=int, default=6, help="Investor action frequency in steps")
     parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models", help="Dir with trained forecast models (NEW: Updated to Forecast_ANN structure)")
     parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers", help="Dir with trained scalers (NEW: Updated to Forecast_ANN structure)")
     parser.add_argument("--forecast_training_data", type=str, default="training_dataset/trainset.csv", help="Path to training dataset for episode-specific forecast training")
@@ -2138,58 +2127,72 @@ def main():
 
     # FGB: Forecast-Guided Baseline (replaces action blending)
     parser.add_argument("--forecast_baseline_enable", action="store_true", default=False, 
-                       help="TIER 3: Enable forecast-guided value baseline (requires --enable_forecast_utilisation, auto-enables --dl_overlay)")
-    parser.add_argument("--forecast_baseline_lambda", type=float, default=0.5, help="FGB: Baseline adjustment weight λ ∈ [0,1] (used in 'fixed' mode)")
-    parser.add_argument("--forecast_trust_window", type=int, default=2016, help="FGB: Rolling window for trust calibration (~2 weeks)")
-    parser.add_argument("--forecast_trust_min", type=float, default=0.6, help="FGB: Minimum trust threshold for risk uplift")
-    parser.add_argument("--forecast_trust_metric", type=str, default="combo", choices=["combo", "hitrate", "absdir"], help="FGB: Trust computation method")
-    
-    # Forecast Risk Management Add-on: Unified flag controlling both forecast_risk_management_mode and risk_uplift_enable
-    parser.add_argument("--enable_forecast_risk_management", action="store_true", default=False, 
-                       help="ADD-ON (Tier 2 & 3): Enable forecast risk management and risk uplift (requires --enable_forecast_utilisation)")
-    
-    # Risk uplift parameters (controlled by --enable_forecast_risk_management flag above)
-    parser.add_argument("--risk_uplift_kappa", type=float, default=0.15, help="FGB: Max 15% sizing uplift (κ_uplift)")
-    parser.add_argument("--risk_uplift_cap", type=float, default=1.15, help="FGB: Maximum risk multiplier cap")
-    parser.add_argument("--risk_uplift_drawdown_gate", type=float, default=0.07, help="FGB: Disable uplift if drawdown > 7%")
-    parser.add_argument("--risk_uplift_vol_gate", type=float, default=0.02, help="FGB: Disable uplift if volatility > 2%")
+                       help="Enable forecast-guided value baseline (auto-enables --dl_overlay; does NOT change agent observations).")
+    parser.add_argument("--forecast_trust_window", type=int, default=None, help="FGB: Rolling window for trust calibration (default: config.forecast_trust_window).")
+    # Default to directional hit-rate for trust calibration. Users can still select "combo" (dir + magnitude).
+    parser.add_argument("--forecast_trust_metric", type=str, default="combo", choices=["combo", "hitrate", "absdir"], help="FGB: Trust computation method (combo=MAPE+directional)")
+    parser.add_argument("--forecast_trust_boost", type=float, default=None, help="FGB: Optional trust optimism boost (default: config.forecast_trust_boost).")
+    parser.add_argument(
+        "--fgb_ablate_forecasts",
+        action="store_true",
+        default=False,
+        help="Ablation: keep FGB/FAMC enabled but force the forecast-derived control variate to 0 (tau=0, expected_dnav=0).",
+    )
 
     # FAMC: Forecast-Aware Meta-Critic (Learned Control-Variate Baseline)
-    parser.add_argument("--fgb_mode", type=str, default="fixed", choices=["fixed", "online", "meta"], 
-                       help="TIER 3: FGB/FAMC baseline mode - fixed (constant λ), online (adaptive λ*), or meta (learned critic, requires --meta_baseline_enable)")
-    parser.add_argument("--fgb_lambda_max", type=float, default=0.8, help="FAMC: Maximum λ* for online/meta modes")
-    parser.add_argument("--fgb_clip_bps", type=float, default=0.10, help="FAMC: Per-step correction cap in return units (0.10 = 10bp, FIXED from 0.01)")
-    parser.add_argument("--fgb_warmup_steps", type=int, default=2000, help="FAMC: No correction before this many steps")
+    parser.add_argument("--fgb_mode", type=str, default="online", choices=["online", "meta"],
+                       help="TIER 3: FGB/FAMC baseline mode - online (adaptive lambda*) or meta (learned critic, requires --meta_baseline_enable)")
+    parser.add_argument("--fgb_lambda_max", type=float, default=0.8, help="FAMC: Maximum lambda* for online/meta modes")
+    parser.add_argument(
+        "--fgb_clip_adv",
+        type=float,
+        default=0.15,
+        help="FAMC: Per-step correction cap in ADVANTAGE units (clips delta advantage per-step).",
+    )
+    parser.add_argument(
+        "--fgb_clip_bps",
+        type=float,
+        default=None,
+        help="DEPRECATED: use --fgb_clip_adv (this value was never in bps/return units).",
+    )
+    parser.add_argument(
+        "--fgb_lambda_nonnegative",
+        action="store_true",
+        default=False,
+        help="FAMC: Force lambda* >= 0 (safer; may forgo variance reduction when Cov(A,C) < 0).",
+    )
+    parser.add_argument("--fgb_warmup_steps", type=int, default=1000, help="FAMC: No correction before this many steps")
     parser.add_argument("--fgb_moment_beta", type=float, default=0.01, help="FAMC: EMA rate for Cov/Var moments")
-    parser.add_argument("--meta_baseline_enable", action="store_true", default=False, help="FAMC: Enable meta-critic head g_φ(x_t)")
-    parser.add_argument("--meta_baseline_loss", type=str, default="mse", choices=["mse", "corr"], help="FAMC: Loss function for meta head")
-    parser.add_argument("--meta_baseline_head_dim", type=int, default=32, help="FAMC: Hidden dimension for meta-critic head")
-    parser.add_argument("--meta_train_every", type=int, default=512, help="FAMC: Train meta head every N steps")
-
-    # === 3-TIER SYSTEM: Forecast Utilisation ===
-    # Tier 1 (Baseline MARL): No forecasts, 6D investor observations (default - no flag needed)
-    # Tier 2 (Forecast-Enhanced Observations): --enable_forecast_utilisation, 7D investor observations (6 base + 1 forecast feature)
-    # Tier 3 (FGB/FAMC): --enable_forecast_utilisation + --forecast_baseline_enable (+ --fgb_mode), uses DL overlay for baseline adjustment
-    parser.add_argument("--enable_forecast_utilisation", action="store_true", default=False,
-                       help="TIER 2: Enable forecast model loading + forecast-enhanced observations (7D = 6 base + 1 forecast feature)")
-
-    # GNN Encoder (independent add-on - works with all tiers)
-    parser.add_argument("--enable_gnn_encoder", action="store_true", default=False,
-                       help="ADD-ON (All Tiers): Enable GNN observation encoder (works with Tier 1, Tier 2, or Tier 3)")
+    parser.add_argument(
+        "--fgb_expected_dnav_min_exposure_ratio",
+        type=float,
+        default=None,
+        help="Override expected_dnav flat-position exposure floor ratio (default from config).",
+    )
+    parser.add_argument("--meta_baseline_enable", action="store_true", default=False, help="FAMC: Enable meta-critic head g_phi(x_t)")
+    parser.add_argument("--meta_baseline_loss", type=str, default=None, choices=["mse", "corr"], help="FAMC: Loss function for meta head (default: config.meta_baseline_loss)")
+    parser.add_argument("--meta_baseline_head_dim", type=int, default=None, help="FAMC: Hidden dimension for meta-critic head (default: config.meta_baseline_head_dim)")
+    parser.add_argument("--meta_train_every", type=int, default=None, help="FAMC: Train meta head every N steps (default: config.meta_train_every)")
 
     # PPO exploration controls (helps avoid near-constant actions / saturation)
     parser.add_argument("--lr", type=float, default=None,
                         help="Override learning rate (default: config.lr).")
     parser.add_argument("--ent_coef", type=float, default=None,
                         help="Override PPO entropy coefficient (default: config.ent_coef). Useful to prevent action collapse.")
-    parser.add_argument("--ppo_use_sde", action="store_true", default=False,
+    parser.add_argument("--ppo_use_sde", dest="ppo_use_sde", action="store_true", default=None,
                         help="Enable PPO gSDE (state-dependent exploration) for continuous actions.")
-    parser.add_argument("--ppo_sde_sample_freq", type=int, default=4,
-                        help="PPO gSDE: sample a new noise matrix every n steps (default: 4).")
+    parser.add_argument("--ppo_no_sde", dest="ppo_use_sde", action="store_false",
+                        help="Disable PPO gSDE (state-dependent exploration) for continuous actions.")
+    # NOTE: This repo uses a custom multi-agent rollout collector (not SB3's).
+    # We reset gSDE noise explicitly; default to 1 to avoid long-lived sign bias across episodes.
+    parser.add_argument("--ppo_sde_sample_freq", type=int, default=None,
+                        help="PPO gSDE: sample a new noise matrix every n steps (default: config.ppo_sde_sample_freq).")
     parser.add_argument("--ppo_log_std_init", type=float, default=None,
                         help="Override PPO policy log_std_init for continuous actions (e.g., -0.3 to increase exploration).")
+    parser.add_argument("--ppo_mean_clip", type=float, default=None,
+                        help="Override PPO mean-action clip before tanh (default: config.ppo_mean_clip).")
 
-    # Forecasting Control (requires --enable_forecast_utilisation)
+    # Forecasting Control (only used when forecasts are enabled for DL overlay / FGB)
     parser.add_argument("--confidence_floor", type=float, default=0.6, help="Minimum confidence floor (0.0-1.0, default 0.6). MAPE-based confidence cannot go below this value.")
     parser.add_argument(
         "--precompute_batch_size",
@@ -2213,7 +2216,14 @@ def main():
     parser.add_argument("--episode_data_dir", type=str, default="training_dataset", help="Directory containing episode datasets")
     parser.add_argument("--start_episode", type=int, default=0, help="Starting episode number (0-19)")
     parser.add_argument("--end_episode", type=int, default=19, help="Ending episode number (0-19)")
-    parser.add_argument("--cooling_period", type=int, default=30, help="Cooling period between episodes (minutes)")
+    parser.add_argument(
+        "--global_norm_mode",
+        type=str,
+        default="rolling_past",
+        choices=["rolling_past", "global"],
+        help="Normalization mode for episode runs: rolling_past (episode rolling stats) or global (full-dataset stats).",
+    )
+    parser.add_argument("--cooling_period", type=int, default=0, help="Cooling period between episodes (minutes)")
     parser.add_argument("--episode_timesteps", type=int, default=None, help="Override timesteps per episode (auto-detect from data if None)")
     parser.add_argument("--resume_episode", type=int, default=None, help="Resume from specific episode checkpoint (loads model from episode_X directory)")
     parser.add_argument(
@@ -2252,27 +2262,31 @@ def main():
     logger.info(f"\n[LOG] Terminal output being saved to: {log_file_path}")
     logger.info(f"[LOG] All logging will be captured in this file\n")
 
-    # === AUTO-DEPENDENCY RESOLUTION (3-TIER SYSTEM) ===
+    # === AUTO-DEPENDENCY RESOLUTION (PAPER MODES) ===
     def resolve_dependencies(args):
         """
-        Automatically resolve configuration dependencies for 3-tier system:
-        Tier 1 (Baseline MARL): No forecasts
-        Tier 2 (Direct Deltas): enable_forecast_utilisation=True
-        Tier 3 (FAMC): enable_forecast_utilisation=True + fgb_mode=meta
+        Automatically resolve configuration dependencies for the paper-friendly modes:
+
+        - Baseline (Tier 1): No forecasts, no DL overlay (observations unchanged).
+        - FGB online: --forecast_baseline_enable (auto-enables --dl_overlay).
+        - FGB meta (FAMC): --fgb_mode meta (auto-enables --forecast_baseline_enable and --meta_baseline_enable).
         """
         changes_made = []
 
-        # === TIER 3: FGB requires forecast utilisation ===
-        if args.fgb_mode in ['online', 'meta'] or args.meta_baseline_enable or args.forecast_baseline_enable:
-            if not args.enable_forecast_utilisation:
-                args.enable_forecast_utilisation = True
-                changes_made.append(f"Enabled --enable_forecast_utilisation (required for FGB mode '{args.fgb_mode}')")
+        # Forecast ablation requires the baseline plumbing to be enabled (we just force tau/expected_dnav to 0).
+        if bool(getattr(args, "fgb_ablate_forecasts", False)) and not args.forecast_baseline_enable:
+            args.forecast_baseline_enable = True
+            changes_made.append("Enabled --forecast_baseline_enable (required for --fgb_ablate_forecasts)")
+
+        # Any FGB/FAMC setting implies forecast_baseline_enable.
+        if args.fgb_mode == 'meta' or args.meta_baseline_enable:
+            if not args.forecast_baseline_enable:
+                args.forecast_baseline_enable = True
+                changes_made.append("Enabled --forecast_baseline_enable (required for FGB/FAMC baseline correction)")
 
         # === FGB requires DL overlay (for expected_dnav computation) ===
         # CRITICAL: ALL FGB modes need DL overlay because expected_dnav() requires overlay_output
         # expected_dnav uses pred_reward and mwdir from DL overlay inference
-        # FIXED: Only enable DL overlay if FGB is actually enabled (forecast_baseline_enable=True)
-        # Tier 1 doesn't use FGB, so DL overlay should not be enabled
         if args.forecast_baseline_enable:
             if not args.dl_overlay:
                 args.dl_overlay = True
@@ -2284,23 +2298,6 @@ def main():
                 args.meta_baseline_enable = True
                 changes_made.append("Enabled --meta_baseline_enable (required for fgb_mode='meta')")
 
-            # CRITICAL FIX: Meta mode requires forecast_baseline_enable for FAMC correction to run
-            if not args.forecast_baseline_enable:
-                args.forecast_baseline_enable = True
-                changes_made.append("Enabled --forecast_baseline_enable (required for FAMC correction)")
-
-        # === Forecast utilisation does NOT require DL overlay ===
-        # Tier 2 uses direct deltas from ForecastGenerator (NO DL overlay needed)
-        # DL overlay is ONLY needed for Tier 3 (FGB/FAMC) when explicitly requested
-        # Do NOT auto-enable DL overlay for Tier 2 - it uses ForecastGenerator directly
-
-
-        # === Disable expert blending when using direct deltas ===
-        if args.enable_forecast_utilisation and args.expert_blend_mode != 'none':
-            logger.warning(f"\n[WARN] Direct delta observations enabled but expert_blend_mode='{args.expert_blend_mode}'")
-            logger.warning(f"[WARN] Direct deltas give PPO full control - expert blending is redundant")
-            logger.warning(f"[RECOMMEND] Use --expert_blend_mode none (PPO learns from deltas directly)")
-
         # Log auto-configuration summary
         if changes_made:
             logger.info("\n" + "="*70)
@@ -2310,16 +2307,16 @@ def main():
                 logger.info(f"  ✓ {change}")
             logger.info("="*70 + "\n")
 
-        # Log tier information
-        if args.enable_forecast_utilisation:
+        # Log mode information
+        if args.forecast_baseline_enable:
             if args.fgb_mode == 'meta':
-                logger.info("[TIER 3] FAMC Mode: Baseline MARL + Direct Deltas + Meta-Critic")
-            elif args.fgb_mode in ['online', 'fixed'] and args.forecast_baseline_enable:
-                logger.info(f"[TIER 3] FGB Mode: Baseline MARL + Direct Deltas + FGB ({args.fgb_mode})")
+                logger.info("[MODE] FGB meta (FAMC): Tier-1 observations + learned control variate (meta-critic)")
             else:
-                logger.info("[TIER 2] Direct Delta Mode: Baseline MARL + Forecast Deltas")
+                logger.info("[MODE] FGB online: Tier-1 observations + online control variate (expected_dnav)")
+        elif args.dl_overlay:
+            logger.info("[MODE] DL overlay enabled (no baseline correction): Tier-1 observations unchanged")
         else:
-            logger.info("[TIER 1] Baseline MARL: No forecasts, 6D observations")
+            logger.info("[MODE] Baseline MARL: no forecasts, no overlay (Tier-1 observations)")
 
         return args
 
@@ -2397,42 +2394,9 @@ def main():
     config.seed = args.seed
     logger.info(f"[CONFIG] Using seed: {config.seed}")
 
-    # === 3-TIER SYSTEM: Apply forecast utilisation to config ===
-    logger.info("\nApplying forecast utilisation configuration...")
-    config.enable_forecast_utilisation = args.enable_forecast_utilisation
-    logger.info(f"[FORECAST_UTIL] Enabled: {config.enable_forecast_utilisation}")
-    if config.enable_forecast_utilisation:
-        logger.info(f"[FORECAST_UTIL] Investor observations: 7D (6 base + 1 forecast) - TIER 2 (Compact Features)")
-        logger.info(f"[FORECAST_UTIL]   Base (6D): price, budget, wind_pos, solar_pos, hydro_pos, mtm_pnl")
-        logger.info(f"[FORECAST_UTIL]   Forecast (1D): trade_signal (calibrated z_short)")
-
-        # TIER 2 vs TIER 3: Different overlay usage
-        # - Tier 2 (dl_overlay=False): Direct deltas only, NO DL overlay
-        # - Tier 3 (dl_overlay=True): Direct deltas + DL overlay outputs (pred_reward + optional meta head)
-        #
-        # CRITICAL FIX: Only disable overlay outputs for Tier 2, NOT Tier 3!
-        # Tier 3's entire value proposition is using DL overlay outputs!
-        if not args.dl_overlay:
-            # TIER 2: Direct deltas from ForecastGenerator + ForecastEngine (NO DL overlay needed)
-            # Direct deltas are computed by:
-            #   1. ForecastGenerator (ANN/LSTM models) → generates forecasts
-            #   2. _compute_forecast_deltas() → computes z-scores from forecasts
-            #   3. ForecastEngine → processes z-scores into observation features (z_short, z_medium, trust)
-            # DL overlay is ONLY for Tier 3 (when --dl_overlay flag is set)
-            # Tier 2 does NOT need DL overlay - it learns directly from forecast deltas
-            logger.info(f"[FORECAST_UTIL] Tier 2 uses direct deltas from ForecastGenerator (NO DL overlay needed)")
-            logger.info(f"[FORECAST_UTIL]   PPO learns directly from calibrated trade_signal (z_short only)")
-            logger.info(f"[FORECAST_UTIL]   ForecastGenerator → _compute_forecast_deltas() → ForecastEngine → observations")
-        else:
-            # TIER 3: Direct deltas + DL overlay outputs (pred_reward + optional meta head)
-            # IMPORTANT (fairness): Tier 3 does NOT inject overlay signals into env reward
-            # and does NOT change observation shapes versus Tier 2.
-            #
-            logger.info(f"[TIER3] DL overlay enabled - overlay outputs will be used:")
-            logger.info(f"[TIER3]   - Meta-critic (FAMC): {'enabled' if config.meta_baseline_enable else 'disabled'}")
-            logger.info(f"[FORECAST_UTIL]   PPO learns directly from calibrated trade_signal (z_short only)")
-    else:
-        logger.info(f"[FORECAST_UTIL] Investor observations: 6D (baseline MARL)")
+    # === OBSERVATION POLICY (TIER-1 OBSERVATION SPACE) ===
+    logger.info("\nObservation configuration...")
+    logger.info("[OBS] Investor observations: 6D (Tier-1 base)")
 
     # PPO exploration overrides (optional)
     if args.lr is not None:
@@ -2441,83 +2405,73 @@ def main():
     if args.ent_coef is not None:
         config.ent_coef = float(args.ent_coef)
         logger.info(f"[PPO] Overriding ent_coef -> {config.ent_coef}")
-    config.ppo_use_sde = bool(getattr(args, "ppo_use_sde", False))
-    config.ppo_sde_sample_freq = int(getattr(args, "ppo_sde_sample_freq", 4))
-    config.ppo_log_std_init = getattr(args, "ppo_log_std_init", None)
+    if getattr(args, "ppo_use_sde", None) is not None:
+        config.ppo_use_sde = bool(args.ppo_use_sde)
+        logger.info(f"[PPO] Overriding use_sde -> {config.ppo_use_sde}")
+    if getattr(args, "ppo_sde_sample_freq", None) is not None:
+        config.ppo_sde_sample_freq = int(args.ppo_sde_sample_freq)
+        logger.info(f"[PPO] Overriding sde_sample_freq -> {config.ppo_sde_sample_freq}")
+    if getattr(args, "ppo_log_std_init", None) is not None:
+        config.ppo_log_std_init = float(args.ppo_log_std_init)
+        logger.info(f"[PPO] Overriding log_std_init -> {config.ppo_log_std_init}")
+    if getattr(args, "ppo_mean_clip", None) is not None:
+        config.ppo_mean_clip = float(args.ppo_mean_clip)
+        logger.info(f"[PPO] Overriding ppo_mean_clip -> {config.ppo_mean_clip}")
     if bool(getattr(config, "force_disable_sde", False)):
         if config.ppo_use_sde:
             logger.info("[PPO] force_disable_sde=True: overriding use_sde -> False")
         config.ppo_use_sde = False
-    logger.info(f"[PPO] use_sde={config.ppo_use_sde} sde_sample_freq={config.ppo_sde_sample_freq} log_std_init={config.ppo_log_std_init}")
-
-    # === GNN Encoder: Apply GNN configuration (works for both Tier 1 and Tier 2) ===
-    logger.info("\nApplying GNN encoder configuration...")
-    config.enable_gnn_encoder = args.enable_gnn_encoder
-    if config.enable_gnn_encoder:
-        # GNN encoder is independent of forecast integration
-        # It can work on base observations (6D) OR forecast-enhanced observations (7D = 6 base + 1 forecast)
-        # This makes GNN encoder a true add-on that can be used with or without forecasts
-        obs_type = "7D (with forecasts)" if config.enable_forecast_utilisation else "6D (base)"
-        tier_label = "Tier 2 (forecast-enhanced)" if config.enable_forecast_utilisation else "Tier 1 (base observations)"
-        logger.info(f"[GNN] Enabled: Graph Attention Network encoder ({tier_label})")
-        logger.info(f"[GNN]   Observation type: {obs_type}")
-        if config.enable_forecast_utilisation:
-            # Tier 2 optimized settings with hierarchical architecture
-            logger.info(f"[GNN]   Features dim: {config.gnn_features_dim_tier2} (Tier 2 optimized)")
-            logger.info(f"[GNN]   Hidden dim: {config.gnn_hidden_dim_tier2} (Tier 2 optimized)")
-            logger.info(f"[GNN]   Layers: {config.gnn_num_layers_tier2} (Tier 2 optimized)")
-            logger.info(f"[GNN]   Graph type: {config.gnn_graph_type_tier2} (Tier 2: hierarchical - separate base/forecast encoders + cross-attention)")
-            logger.info(f"[GNN]   Architecture: 6D base features -> GNN -> 12D | 1D forecast features -> GNN -> 12D | Cross-attention -> 24D")
-            logger.info(f"[GNN]   Dropout: {config.gnn_dropout_tier2} (Tier 2 optimized)")
-            logger.info(f"[GNN]   MLP arch: {config.gnn_net_arch_tier2} (Tier 2 optimized)")
-        else:
-            # Tier 1 standard settings
-            logger.info(f"[GNN]   Features dim: {config.gnn_features_dim}")
-            logger.info(f"[GNN]   Hidden dim: {config.gnn_hidden_dim}")
-            logger.info(f"[GNN]   Layers: {config.gnn_num_layers}")
-            logger.info(f"[GNN]   Graph type: {config.gnn_graph_type}")
-    else:
-        if config.enable_forecast_utilisation:
-            logger.info(f"[GNN] Disabled (Tier 2 - direct forecast features)")
-        else:
-            logger.info(f"[GNN] Disabled (Tier 1 - baseline MARL)")
+    logger.info(
+        f"[PPO] use_sde={config.ppo_use_sde} "
+        f"sde_sample_freq={config.ppo_sde_sample_freq} "
+        f"log_std_init={config.ppo_log_std_init} "
+        f"mean_clip={getattr(config, 'ppo_mean_clip', None)}"
+    )
 
     # FGB: Apply forecast-guided baseline CLI args to config
     logger.info("\nApplying forecast-guided baseline configuration...")
     config.forecast_baseline_enable = args.forecast_baseline_enable
-    config.forecast_baseline_lambda = args.forecast_baseline_lambda
-    config.forecast_trust_window = args.forecast_trust_window
-    config.forecast_trust_min = args.forecast_trust_min
+    if args.forecast_trust_window is not None:
+        config.forecast_trust_window = args.forecast_trust_window
     config.forecast_trust_metric = args.forecast_trust_metric
-    config.risk_uplift_kappa = args.risk_uplift_kappa
-    config.risk_uplift_cap = args.risk_uplift_cap
-    config.risk_uplift_drawdown_gate = args.risk_uplift_drawdown_gate
-    config.risk_uplift_vol_gate = args.risk_uplift_vol_gate
-    
-    # Forecast Risk Management Add-on: Unified flag controlling both forecast_risk_management_mode and risk_uplift_enable
-    if hasattr(args, 'enable_forecast_risk_management'):
-        config.forecast_risk_management_mode = args.enable_forecast_risk_management
-        config.risk_uplift_enable = args.enable_forecast_risk_management
-        if args.enable_forecast_risk_management:
-            logger.info(f"[FORECAST_RISK_MGMT] Enabled: forecast_risk_management_mode=True, risk_uplift_enable=True")
-    else:
-        # Default: both disabled if flag not provided
-        config.forecast_risk_management_mode = False
-        config.risk_uplift_enable = False
+    if args.forecast_trust_boost is not None:
+        config.forecast_trust_boost = float(args.forecast_trust_boost)
+    config.fgb_ablate_forecasts = bool(getattr(args, "fgb_ablate_forecasts", False))
+    if args.global_norm_mode is not None:
+        config.use_global_normalization = bool(args.global_norm_mode == "global")
+        logger.info(f"[GLOBAL_NORM] global_norm_mode={args.global_norm_mode} -> use_global_normalization={config.use_global_normalization}")
 
     # FAMC: Apply FAMC/meta-critic CLI args to config (CRITICAL FIX)
     logger.info("\nApplying FAMC configuration...")
     config.fgb_mode = args.fgb_mode
     config.fgb_lambda_max = args.fgb_lambda_max
-    config.fgb_clip_bps = args.fgb_clip_bps
+    config.fgb_clip_adv = args.fgb_clip_adv
+    if args.fgb_clip_bps is not None:
+        logger.warning("[FAMC] --fgb_clip_bps is deprecated; use --fgb_clip_adv. Interpreting provided value as advantage-unit clip.")
+        config.fgb_clip_adv = args.fgb_clip_bps
+    # Backward-compatible alias (deprecated)
+    config.fgb_clip_bps = config.fgb_clip_adv
     config.fgb_warmup_steps = args.fgb_warmup_steps
     config.fgb_moment_beta = args.fgb_moment_beta
+    config.fgb_allow_negative_lambda = (not args.fgb_lambda_nonnegative)
+    # Always fail fast for Tier-2/Tier-3 baseline paths.
+    config.fgb_fail_fast = True
+    if args.fgb_expected_dnav_min_exposure_ratio is not None:
+        config.fgb_expected_dnav_min_exposure_ratio = float(args.fgb_expected_dnav_min_exposure_ratio)
     config.meta_baseline_enable = args.meta_baseline_enable
-    config.meta_baseline_loss = args.meta_baseline_loss
-    config.meta_baseline_head_dim = args.meta_baseline_head_dim
-    config.meta_train_every = args.meta_train_every
+    if args.meta_baseline_loss is not None:
+        config.meta_baseline_loss = args.meta_baseline_loss
+    if args.meta_baseline_head_dim is not None:
+        config.meta_baseline_head_dim = args.meta_baseline_head_dim
+    if args.meta_train_every is not None:
+        config.meta_train_every = args.meta_train_every
     logger.info(f"[FAMC] Mode: {config.fgb_mode}")
     logger.info(f"[FAMC] Meta-critic: {'enabled' if config.meta_baseline_enable else 'disabled'}")
+    logger.info("[FAMC] Correction scope: investor-only")
+    logger.info(
+        f"[FGB] trust_window={config.forecast_trust_window} metric={config.forecast_trust_metric} "
+        f"trust_boost={getattr(config, 'forecast_trust_boost', 0.0)}"
+    )
     if config.meta_baseline_enable:
         logger.info(f"[FAMC] Meta head dim: {config.meta_baseline_head_dim}")
         logger.info(f"[FAMC] Meta train every: {config.meta_train_every} steps")
@@ -2536,23 +2490,23 @@ def main():
         logger.warning("       Set --forecast_baseline_enable to use the new approach.")
 
     logger.info(f"\n[FGB] Forecast baseline: {'enabled' if config.forecast_baseline_enable else 'disabled'}")
-    logger.info(f"[FGB] Risk uplift: {'enabled' if config.risk_uplift_enable else 'disabled'}")
 
     # DEBUG: Verify all FAMC and expert blending config values are applied correctly
     logger.info("\n" + "="*70)
     logger.info("FAMC & EXPERT BLENDING CONFIGURATION VERIFICATION")
     logger.info("="*70)
     logger.info(f"forecast_baseline_enable:  {config.forecast_baseline_enable}")
+    logger.info(f"fgb_ablate_forecasts:      {getattr(config, 'fgb_ablate_forecasts', False)}")
     logger.info(f"fgb_mode:                  {config.fgb_mode}")
     logger.info(f"fgb_lambda_max:            {config.fgb_lambda_max}")
-    logger.info(f"fgb_clip_bps:              {config.fgb_clip_bps}")
+    logger.info(f"fgb_clip_adv:              {getattr(config, 'fgb_clip_adv', getattr(config, 'fgb_clip_bps', None))}")
+    logger.info(f"fgb_allow_negative_lambda: {getattr(config, 'fgb_allow_negative_lambda', False)}")
+    logger.info(f"fgb_fail_fast:             {getattr(config, 'fgb_fail_fast', False)}")
     logger.info(f"meta_baseline_enable:      {config.meta_baseline_enable}")
     logger.info(f"meta_baseline_head_dim:    {config.meta_baseline_head_dim}")
     logger.info(f"meta_train_every:          {config.meta_train_every}")
     logger.info(f"expert_blend_mode:         {getattr(config, 'expert_blend_mode', 'NOT SET')}")
     logger.info(f"expert_blend_weight:       {getattr(config, 'expert_blend_weight', 'NOT SET')}")
-    logger.info(f"risk_uplift_enable:        {config.risk_uplift_enable}")
-    logger.info(f"risk_uplift_kappa:         {config.risk_uplift_kappa}")
     logger.info("="*70)
 
     # VALIDATE CONFIGURATION (NEW)
@@ -2565,12 +2519,12 @@ def main():
         logger.error(f"  {e}")
         return
 
-    # FIX: Validate forecast configuration - forecasts needed for EITHER dl_overlay OR forecast_baseline_enable OR enable_forecast_utilisation
+    # Validate forecast configuration - forecasts are needed for DL overlay and/or FGB/FAMC baseline correction.
     logger.info("\nValidating forecast configuration...")
-    forecast_required = args.dl_overlay or args.forecast_baseline_enable or args.enable_forecast_utilisation
+    forecast_required = bool(args.dl_overlay or args.forecast_baseline_enable)
 
     if forecast_required:
-        logger.info(f"Forecast models required (enable_forecast_utilisation={args.enable_forecast_utilisation})")
+        logger.info(f"Forecast models required (dl_overlay={bool(args.dl_overlay)}, forecast_baseline_enable={bool(args.forecast_baseline_enable)})")
         
         # CRITICAL: For episode-based training, models are created per-episode on-the-fly
         # Don't fail if models don't exist at startup - they'll be trained during episode training
@@ -2583,22 +2537,48 @@ def main():
             if not args.model_dir or not os.path.exists(args.model_dir):
                 error_msg = (
                     f"[ERROR] Forecast models required but model_dir not found: {args.model_dir}\n"
-                    f"  Reason: --enable_forecast_utilisation is enabled (Tier 2/3)\n"
-                    f"  Action: Train forecast models and save to '{args.model_dir}/' or use Tier 1 (baseline MARL)"
+                    f"  Reason: Forecasts enabled (dl_overlay and/or forecast_baseline_enable)\n"
+                    f"  Action: Train forecast models and save to '{args.model_dir}/' or disable DL overlay / FGB."
                 )
                 logger.error(error_msg)
                 raise FileNotFoundError(error_msg)
             if not args.scaler_dir or not os.path.exists(args.scaler_dir):
                 error_msg = (
                     f"[ERROR] Forecast scalers required but scaler_dir not found: {args.scaler_dir}\n"
-                    f"  Reason: --enable_forecast_utilisation is enabled (Tier 2/3)\n"
-                    f"  Action: Train forecast models and save scalers to '{args.scaler_dir}/' or use Tier 1 (baseline MARL)"
+                    f"  Reason: Forecasts enabled (dl_overlay and/or forecast_baseline_enable)\n"
+                    f"  Action: Train forecast models and save scalers to '{args.scaler_dir}/' or disable DL overlay / FGB."
                 )
                 logger.error(error_msg)
                 raise FileNotFoundError(error_msg)
             logger.info(f"[OK] Forecast directories validated: model_dir={args.model_dir}, scaler_dir={args.scaler_dir}")
     else:
         logger.info("[TIER 1] Baseline MARL mode - no forecasts required")
+
+    # === RUN MANIFEST (REPRODUCIBILITY) ===
+    # Write a lightweight JSON manifest capturing argv/args/final config + git hash (if available).
+    # This is research-release hygiene and does not affect algorithm behavior.
+    try:
+        from run_manifest import write_run_manifest
+        manifest_path = write_run_manifest(
+            args.save_dir,
+            argv=sys.argv,
+            args=args,
+            config=config,
+            extra={
+                "entrypoint": "main.py",
+                "episode_training": bool(getattr(args, "episode_training", False)),
+                "forecast_required": bool(forecast_required),
+                "dl_overlay": bool(getattr(args, "dl_overlay", False)),
+                "forecast_baseline_enable": bool(getattr(args, "forecast_baseline_enable", False)),
+                "fgb_mode": getattr(args, "fgb_mode", None),
+                "meta_baseline_enable": bool(getattr(args, "meta_baseline_enable", False)),
+                "fgb_ablate_forecasts": bool(getattr(args, "fgb_ablate_forecasts", False)),
+            },
+            filename_prefix="train_manifest",
+        )
+        logger.info(f"[MANIFEST] Wrote run manifest: {manifest_path}")
+    except Exception as e:
+        logger.warning(f"[MANIFEST] Failed to write run manifest: {e}")
 
     # Apply MW scale overrides from CLI arguments
     mw_scale_overrides = {
@@ -2645,23 +2625,24 @@ def main():
             logger.error(f"Error loading data: {e}")
             return
 
-    # 2) Forecaster - Required when forecast utilisation is enabled (Tier 2/3)
+    # 2) Forecaster
     # Tier 1 (Baseline MARL): No forecasts needed
-    # Tier 2/3 (Direct Deltas / FAMC): Forecasts required for delta computation
+    # Paper modes with forecasts:
+    # - DL overlay: forecasts needed for overlay features/training (not injected into obs/reward)
+    # - FGB/FAMC: forecasts needed for control-variate baseline signals (not injected into obs/reward)
     forecaster = None
-    forecast_required = args.enable_forecast_utilisation  # Master flag controls forecast loading
+    forecast_required = bool(args.dl_overlay or args.forecast_baseline_enable)
 
     if forecast_required:
         feature_description = []
-        if args.fgb_mode == 'meta':
-            feature_description.append("FAMC meta-critic")
-        elif args.fgb_mode in ['online', 'fixed'] and args.forecast_baseline_enable:
-            feature_description.append(f"FGB ({args.fgb_mode} mode)")
-        else:
-            feature_description.append("direct delta observations")
+        if args.forecast_baseline_enable:
+            if args.fgb_mode == 'meta':
+                feature_description.append("FGB meta (FAMC) baseline correction")
+            else:
+                feature_description.append("FGB online baseline correction")
 
         if args.dl_overlay:
-            feature_description.append("DL overlay (34D: 28D base + 6D deltas)")
+            feature_description.append(f"DL overlay ({OVERLAY_FEATURE_DIM}D short-horizon)")
 
         # CRITICAL: For episode-based training, skip forecaster initialization at startup
         # Forecaster will be initialized per-episode with episode-specific models
@@ -2751,7 +2732,7 @@ def main():
     else:
         logger.info("\n[TIER 1] Baseline MARL mode: Skipping forecaster initialization")
         logger.info("[TIER 1] Investor observations: 6D (wind, solar, hydro, price, load, budget)")
-        logger.info("[TIER 1] To enable forecast deltas, use: --enable_forecast_utilisation")
+        logger.info("[TIER 1] To enable forecasts for DL overlay / FGB, use: --forecast_baseline_enable (auto-enables --dl_overlay)")
 
     # Re-seed using config.seed to ensure consistency with agent init
     # (config.seed was already set from args.seed above)
@@ -2795,20 +2776,17 @@ def main():
         )
 
 
-        # Step 2: Initialize DLAdapter for overlay inference (28D Forecast-Aware mode)
+        # Step 2: Initialize DLAdapter for overlay inference
         # This provides shared intelligence, adaptive risk budgeting, and predictive reward shaping
         # Use the single source of truth for initialization
         initialize_dl_overlay(base_env, config, args)
 
-        # FGB: Initialize CalibrationTracker for forecast trust computation
-        # TIER 2: Uses trust for observations only (no FGB baseline adjustment)
-        # TIER 3: Uses trust for observations AND FGB baseline adjustment
-        # Initialize when EITHER enable_forecast_utilisation OR forecast_baseline_enable is True
-        # CRITICAL: For episode training, CalibrationTracker is initialized per-episode with episode-specific forecaster
+        # FGB: Initialize CalibrationTracker for forecast trust computation (baseline correction only).
+        # CRITICAL: For episode training, CalibrationTracker is initialized per-episode with episode-specific forecaster.
         if args.episode_training:
             logger.info("[EPISODE_TRAINING] Skipping CalibrationTracker initialization at startup (will be initialized per-episode)")
             base_env.calibration_tracker = None
-        elif (config.enable_forecast_utilisation or config.forecast_baseline_enable) and forecaster is not None:
+        elif config.forecast_baseline_enable and forecaster is not None:
             try:
                 from dl_overlay import CalibrationTracker
                 base_env.calibration_tracker = CalibrationTracker(
@@ -2816,12 +2794,14 @@ def main():
                     trust_metric=config.forecast_trust_metric,
                     verbose=args.debug,
                     init_budget=config.init_budget,  # FGB: Pass fund NAV for exposure scaling
-                    direction_weight=config.forecast_trust_direction_weight  # Weight for directional accuracy (default: 0.7)
+                    direction_weight=config.forecast_trust_direction_weight,  # Weight for directional accuracy (default: 0.7)
+                    trust_boost=getattr(config, "forecast_trust_boost", 0.0),
+                    min_exposure_ratio=getattr(config, "fgb_expected_dnav_min_exposure_ratio", 0.0),
+                    pred_weight=getattr(config, "fgb_expected_dnav_pred_weight", 0.85),
+                    mwdir_weight=getattr(config, "fgb_expected_dnav_mwdir_weight", 0.15),
+                    fail_fast=bool(getattr(config, "fgb_fail_fast", False)),
                 )
-                if config.forecast_baseline_enable:
-                    logger.info(f"[TIER 3] CalibrationTracker initialized for FGB (window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, dir_weight={config.forecast_trust_direction_weight})")
-                else:
-                    logger.info(f"[TIER 2] CalibrationTracker initialized for trust computation (window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, dir_weight={config.forecast_trust_direction_weight})")
+                logger.info(f"[FGB] CalibrationTracker initialized (window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, dir_weight={config.forecast_trust_direction_weight})")
             except Exception as e:
                 # FAIL-FAST: CalibrationTracker is required for forecast utilisation
                 error_msg = f"[ERROR] CalibrationTracker initialization failed but is required for forecast utilisation: {e}"
@@ -2829,54 +2809,21 @@ def main():
                 raise RuntimeError(error_msg)
         else:
             base_env.calibration_tracker = None
-            if config.enable_forecast_utilisation or config.forecast_baseline_enable:
-                logger.warning("[WARN] Forecast utilisation enabled but forecaster not available - CalibrationTracker not initialized")
+            if config.forecast_baseline_enable and forecaster is None:
+                logger.warning("[WARN] Forecast baseline enabled but forecaster not available - CalibrationTracker not initialized")
 
-        # Environment wrapper selection based on mode
-        # CRITICAL FIX: For Tier 2/3 (--enable_forecast_utilisation), always create wrapper
-        # In episode training, forecaster is None at startup (episode-specific), but wrapper is still needed
-        # The wrapper will receive the episode-specific forecaster per-episode
-        if forecaster is not None or args.enable_forecast_utilisation:
-            # Use forecasting wrapper
-            # For episode training, forecaster is None at startup but will be provided per-episode
-            # The wrapper can handle forecaster=None initially (it just won't provide forecast features until forecaster is attached)
-            if forecaster is None and args.episode_training:
-                logger.info("[EPISODE_TRAINING] Creating wrapper without forecaster (will be provided per-episode)")
-            env = MultiHorizonWrapperEnv(
-                base_env,
-                forecaster,  # None for episode training at startup, actual forecaster for non-episode training
-                total_timesteps=args.timesteps if hasattr(args, 'timesteps') and args.timesteps else 50000
-            )
-            
-            # ROOT CAUSE FIX: Ensure observation spaces are correct from the start
-            # If Tier 3 (forecast_baseline_enable), DL overlay should already be initialized (line 2727)
-            # The wrapper should detect it during initialization and build correct spaces
-            # If DL adapter exists but wrapper didn't detect it (shouldn't happen), rebuild once
-            if hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay is not None:
-                # Verify wrapper has correct dimensions (should be 18D for investor in Tier 3)
-                inv_space = env.observation_space('investor_0')
-                if inv_space.shape[0] != 18:
-                    logger.info("[OBS_SPACE_FIX] Wrapper didn't detect DL adapter correctly - rebuilding observation spaces")
-                    env.rebuild_observation_spaces()
-                else:
-                    logger.debug("[OBS_SPACE_FIX] Wrapper has correct dimensions (18D) - no rebuild needed")
-            
-            logger.info("[OK] Using multi-horizon wrapper with forecasting")
-            # UPGRADE: Connect wrapper reference for profit-seeking expert guidance
-            # base_env.set_wrapper_reference(env)
-        else:
-            # Use base environment without forecasting (Tier 1 only - no forecast features)
-            env = base_env
-            logger.info("[OK] Using environment without forecasting")
+        # Forecasts are never appended to agent observations in the paper setup.
+        # Use the base environment as-is (Tier-1 observation spaces remain unchanged).
+        env = base_env
+        logger.info("[OK] Using base environment (Tier-1 observations; no wrapper)")
 
-        # DL overlay adapter (34D: 28D base + 6D deltas)
+        # DL overlay adapter
         if args.dl_overlay and hasattr(base_env, 'dl_adapter_overlay') and base_env.dl_adapter_overlay is not None:
             try:
-                # DL overlay is 34D forecast-aware mode only (28D base + 6D deltas)
                 feature_dim = base_env.dl_adapter_overlay.feature_dim
-                if feature_dim != 34:
-                    raise ValueError(f"DL overlay must be 34D (28D base + 6D deltas), got {feature_dim}D")
-                logger.info(f"   DL overlay: 34D Forecast-Aware (28D base + 6D deltas with directional signals)")
+                if feature_dim != OVERLAY_FEATURE_DIM:
+                    raise ValueError(f"DL overlay must be {OVERLAY_FEATURE_DIM}D (short-horizon), got {feature_dim}D")
+                logger.info(f"   DL overlay: {feature_dim}D short-horizon only")
             except Exception as e:
                 logger.error(f"   Error: DL overlay dimension validation failed: {e}")
                 raise
@@ -2892,23 +2839,21 @@ def main():
         logger.info("Enhanced environment created successfully!")
         logger.info("   Multi-objective rewards: enabled")
         if forecaster is not None:
-            logger.info(f"   Enhanced risk management: enabled. Confidence floor: {args.confidence_floor}")
-            logger.info("   Forecast-augmented observations via wrapper: enabled")
+            logger.info(f"   Forecast backend: enabled (confidence_floor={args.confidence_floor})")
+            logger.info("   Observations: Tier-1 base (no forecast features)")
         else:
             # In episode-training mode, the forecaster is intentionally initialized per-episode.
-            # So at startup it's normal to have forecaster=None even for Tier 2/3.
-            if args.enable_forecast_utilisation and getattr(args, "episode_training", False):
-                logger.info("   Enhanced risk management: enabled (forecasts will be attached per-episode)")
-                logger.info("   Forecast-augmented observations: pending (forecaster initialized per-episode)")
+            if getattr(args, "episode_training", False) and forecast_required:
+                logger.info("   Forecast backend: pending (initialized per-episode)")
             else:
-                logger.info("   Enhanced risk management: enabled (no forecasts)")
-                logger.info("   Forecast-augmented observations: disabled")
+                logger.info("   Forecast backend: disabled")
+            logger.info("   Observations: Tier-1 base (no forecast features)")
         logger.info("   Checkpoint summaries: enabled (saved after each checkpoint)")
 
         # FORECAST OPTIMIZATION: Add diagnostic logging after environment creation
-        if args.enable_forecast_utilisation and forecaster is not None:
+        if forecast_required and forecaster is not None:
             logger.info("\n" + "="*70)
-            logger.info("FORECAST INTEGRATION DIAGNOSTICS")
+            logger.info("FORECAST BACKEND DIAGNOSTICS")
             logger.info("="*70)
             logger.info(f"Max position size:              {config.max_position_size * 100:.1f}% of capital")
             logger.info(f"Capital allocation:             {config.capital_allocation_fraction * 100:.1f}% of fund")
@@ -2922,41 +2867,36 @@ def main():
         logger.info("FORECAST FEATURE VALIDATION SUMMARY")
         logger.info("="*70)
         
-        # Determine active tier
-        if args.enable_forecast_utilisation and args.forecast_baseline_enable:
-            active_tier = "TIER 3 (FGB/FAMC)"
-        elif args.enable_forecast_utilisation:
-            active_tier = "TIER 2 (Forecast-Enhanced Observations)"
+        # Determine active evaluation/training variant (paper modes)
+        if args.forecast_baseline_enable:
+            active_variant = "FGB-meta (FAMC)" if args.fgb_mode == "meta" else "FGB-online"
         else:
-            active_tier = "TIER 1 (Baseline MARL)"
-        logger.info(f"Active Tier:                    {active_tier}")
+            active_variant = "Baseline (Tier-1 MARL)"
+        logger.info(f"Active Variant:                 {active_variant}")
         
         if forecaster is not None:
             forecaster_status = "YES"
         else:
             # Avoid confusion: in episode-training, this is expected at startup.
-            if getattr(args, "episode_training", False) and args.enable_forecast_utilisation:
+            if getattr(args, "episode_training", False) and forecast_required:
                 forecaster_status = "NO (expected: initialized per-episode)"
             else:
                 forecaster_status = "NO"
         logger.info(f"Forecaster loaded:              {forecaster_status}")
-        logger.info(f"DL Overlay enabled:             {'YES (34D: 28D base + 6D deltas)' if args.dl_overlay else 'NO'}")
-        logger.info(f"Forecast utilisation:           {'YES (Tier 2/3)' if args.enable_forecast_utilisation else 'NO (Tier 1)'}")
-        
-        # Only show FGB details if Tier 3 is actually active
-        if args.enable_forecast_utilisation and args.forecast_baseline_enable:
+        logger.info(f"DL Overlay enabled:             {'YES (' + str(OVERLAY_FEATURE_DIM) + 'D short-horizon)' if args.dl_overlay else 'NO'}")
+
+        # Only show FGB details if enabled
+        if args.forecast_baseline_enable:
             logger.info(f"FGB mode:                       {args.fgb_mode}")
             if args.fgb_mode == 'meta':
                 logger.info(f"  └─ FAMC meta-critic:          {'YES' if args.meta_baseline_enable else 'NO'}")
                 logger.info(f"  └─ Meta head dim:             {config.meta_baseline_head_dim}")
                 logger.info(f"  └─ Meta train every:          {config.meta_train_every} steps")
-            elif args.fgb_mode in ['online', 'fixed']:
+            elif args.fgb_mode == 'online':
                 logger.info(f"  └─ Traditional FGB:           {'YES' if args.forecast_baseline_enable else 'NO'}")
                 logger.info(f"  └─ CalibrationTracker:        {'YES' if hasattr(base_env, 'calibration_tracker') and base_env.calibration_tracker is not None else 'NO'}")
         else:
-            logger.info(f"FGB mode:                       DISABLED (Tier 3 not active)")
-        logger.info(f"Forecast risk management:       {'YES' if config.forecast_risk_management_mode else 'NO'}")
-        logger.info(f"Risk uplift:                    {'YES' if config.risk_uplift_enable else 'NO'}")
+            logger.info("FGB mode:                       DISABLED")
 
         # CRITICAL VALIDATION: Ensure consistency
         validation_errors = []
@@ -2968,14 +2908,11 @@ def main():
             if args.forecast_baseline_enable and forecaster is None:
                 validation_errors.append("Forecast-guided baseline enabled but forecaster not loaded!")
         # Skip this validation for episode training mode
-        if not args.episode_training and (args.enable_forecast_utilisation or args.forecast_baseline_enable) and (not hasattr(base_env, 'calibration_tracker') or base_env.calibration_tracker is None):
-            validation_errors.append("Forecast utilisation enabled but CalibrationTracker not initialized!")
-        # FIXED: Only validate DLAdapter if overlay_enabled is True (not just dl_overlay flag)
-        # Tier 2 sets dl_overlay=True (for auto-config) but overlay_enabled=False (to prevent inference)
-        # CRITICAL: Skip DLAdapter validation for episode training (initialized per-episode)
-        if not args.episode_training:
-            if args.dl_overlay and config.overlay_enabled and (not hasattr(base_env, 'dl_adapter_overlay') or base_env.dl_adapter_overlay is None):
-                validation_errors.append("DL overlay enabled but DLAdapter not initialized!")
+        if not args.episode_training and args.forecast_baseline_enable and (not hasattr(base_env, 'calibration_tracker') or base_env.calibration_tracker is None):
+            validation_errors.append("FGB enabled but CalibrationTracker not initialized!")
+        # FIXED: Always validate DLAdapter if overlay is enabled (episode + non-episode training).
+        if args.dl_overlay and config.overlay_enabled and (not hasattr(base_env, 'dl_adapter_overlay') or base_env.dl_adapter_overlay is None):
+            validation_errors.append("DL overlay enabled but DLAdapter not initialized!")
 
         if validation_errors:
             logger.error("\n" + "!"*70)
@@ -2986,8 +2923,8 @@ def main():
             raise RuntimeError("Forecast feature validation failed. See errors above.")
         else:
             # In episode-training startup, forecaster may be None by design; don't claim forecasts are validated.
-            if getattr(args, "episode_training", False) and args.enable_forecast_utilisation and forecaster is None:
-                logger.info("\n✓ Forecast feature schema validated (forecaster will be initialized per-episode)")
+            if getattr(args, "episode_training", False) and forecast_required and forecaster is None:
+                logger.info("\n✓ Forecast backend schema validated (forecaster will be initialized per-episode)")
             else:
                 logger.info("\n✓ All forecast features validated successfully")
         logger.info("="*70 + "\n")
@@ -3014,8 +2951,8 @@ def main():
         logger.info("\nRunning hyperparameter optimization...")
         opt_data = data.head(min(5000, len(data)))
         opt_base_env = RenewableMultiAgentEnv(opt_data, forecast_generator=forecaster, dl_adapter=None, config=config)
-        opt_env = opt_base_env if forecaster is None \
-                  else MultiHorizonWrapperEnv(opt_base_env, forecaster)
+        # No wrapper: keep Tier-1 observation spaces fixed for a fair comparison.
+        opt_env = opt_base_env
 
         best_params, best_perf = run_hyperparameter_optimization(
             opt_env,
@@ -3037,15 +2974,14 @@ def main():
     # 5) Agents (config already created above)
     logger.info("\nInitializing enhanced multi-agent RL system...")
     try:
-        # CRITICAL FIX: Reset environment BEFORE initializing agent
-        # This ensures the wrapper has updated observation spaces to match actual observations
-        # (especially important for 28D mode where forecast dimensions are added at runtime)
+        # Reset environment BEFORE initializing agents so observation spaces and any optional
+        # forecast backend state are fully initialized.
         logger.info("   [PREP] Resetting environment to finalize observation spaces...")
         try:
             obs = env.reset()
-            
+
             # FORECAST OPTIMIZATION: Verify forecasts are working after first reset
-            if args.enable_forecast_utilisation and forecaster is not None:
+            if forecast_required and forecaster is not None:
                 logger.info("\n" + "="*70)
                 logger.info("FORECAST VERIFICATION (After First Reset)")
                 logger.info("="*70)
@@ -3242,17 +3178,15 @@ def main():
                 'agent_total_steps': int(getattr(agent, 'total_steps', 0)),
                 'device': args.device,
                 'flags': {
-                    'enable_forecast_utilisation': bool(getattr(config, 'enable_forecast_utilisation', False)),
                     'dl_overlay': bool(getattr(args, 'dl_overlay', False)),
-                    'enable_gnn_encoder': bool(getattr(config, 'enable_gnn_encoder', False)),
+                    'forecast_baseline_enable': bool(getattr(config, 'forecast_baseline_enable', False)),
+                    'meta_baseline_enable': bool(getattr(config, 'meta_baseline_enable', False)),
+                    'fgb_mode': str(getattr(config, 'fgb_mode', 'online')),
                 },
                 'optimized_params': best_params,
                 'enhanced_features': {
-                    # Backward-compatible flags used by older evaluation code.
-                    # Prefer using the explicit 'flags.enable_forecast_utilisation' above.
-                    'forecasting_enabled': bool(getattr(config, 'enable_forecast_utilisation', False)),
                     'dl_overlay_enabled': args.dl_overlay,
-                    'has_dl_weights': args.dl_overlay and getattr(base_env, "dl_adapter", None) is not None
+                    'has_dl_weights': args.dl_overlay and getattr(base_env, "dl_adapter_overlay", None) is not None
                 },
                 'final_config': {
                     'lr': config.lr,
@@ -3312,61 +3246,61 @@ def smoke_test():
     # Test imports to catch syntax errors and duplicate names
     try:
         import environment
-        logger.info("✓ environment.py imported successfully")
+        logger.info("[OK] environment.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ environment.py import failed: {e}")
+        logger.error(f"[FAIL] environment.py import failed: {e}")
         return False
 
     try:
         import wrapper
-        logger.info("✓ wrapper.py imported successfully")
+        logger.info("[OK] wrapper.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ wrapper.py import failed: {e}")
+        logger.error(f"[FAIL] wrapper.py import failed: {e}")
         return False
 
     try:
         import config
-        logger.info("✓ config.py imported successfully")
+        logger.info("[OK] config.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ config.py import failed: {e}")
+        logger.error(f"[FAIL] config.py import failed: {e}")
         return False
 
     try:
         import risk
-        logger.info("✓ risk.py imported successfully")
+        logger.info("[OK] risk.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ risk.py import failed: {e}")
+        logger.error(f"[FAIL] risk.py import failed: {e}")
         return False
 
     try:
         import generator
-        logger.info("✓ generator.py imported successfully")
+        logger.info("[OK] generator.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ generator.py import failed: {e}")
+        logger.error(f"[FAIL] generator.py import failed: {e}")
         return False
 
     try:
         import dl_overlay
-        logger.info("✓ dl_overlay.py imported successfully")
+        logger.info("[OK] dl_overlay.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ dl_overlay.py import failed: {e}")
+        logger.error(f"[FAIL] dl_overlay.py import failed: {e}")
         return False
 
     try:
         import evaluation
-        logger.info("✓ evaluation.py imported successfully")
+        logger.info("[OK] evaluation.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ evaluation.py import failed: {e}")
+        logger.error(f"[FAIL] evaluation.py import failed: {e}")
         return False
 
     try:
         import metacontroller
-        logger.info("✓ metacontroller.py imported successfully")
+        logger.info("[OK] metacontroller.py imported successfully")
     except Exception as e:
-        logger.error(f"✗ metacontroller.py import failed: {e}")
+        logger.error(f"[FAIL] metacontroller.py import failed: {e}")
         return False
 
-    logger.info("✓ All modules imported successfully - no duplicate names or syntax errors detected")
+    logger.info("[OK] All modules imported successfully - no duplicate names or syntax errors detected")
     return True
 
 

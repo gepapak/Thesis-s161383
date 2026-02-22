@@ -269,8 +269,12 @@ def load_overlay_weights(adapter, weights_path: str, feature_dim: int) -> bool:
 
 
 def get_overlay_feature_dim(env) -> int:
-    """Get the feature dimension for DL overlay (34D: 28D base + 6D deltas)."""
-    return 34
+    """Get the feature dimension for DL overlay (strict contract; single source of truth)."""
+    try:
+        from config import OVERLAY_FEATURE_DIM
+        return int(OVERLAY_FEATURE_DIM)
+    except Exception:
+        return 18  # Fallback for medium-horizon overlay
 
 
 def clear_tf_session():
@@ -1362,15 +1366,23 @@ TIER_2 = "TIER_2"
 TIER_3 = "TIER_3"
 
 
-def determine_tier(enable_forecast_utilisation: bool,
-                   forecast_baseline_enable: bool,
-                   dl_overlay_enabled: bool) -> str:
-    if forecast_baseline_enable or dl_overlay_enabled:
+def determine_tier(
+    forecast_baseline_enable: bool,
+    meta_baseline_enable: bool,
+    dl_overlay_enabled: bool,
+) -> str:
+    """Return the paper-tier label for a run configuration.
+
+    Tier meanings in the paper refactor:
+    - TIER_1: MARL baseline (no forecast baseline/meta; no extra observations)
+    - TIER_2: FGB online (forecast-guided baseline; no extra observations)
+    - TIER_3: FGB meta (FAMC meta-critic enabled; no extra observations)
+    """
+    if meta_baseline_enable:
         return TIER_3
-    elif enable_forecast_utilisation:
+    if forecast_baseline_enable or dl_overlay_enabled:
         return TIER_2
-    else:
-        return TIER_1
+    return TIER_1
 
 
 def get_expected_observation_dims(tier: str, agent_name: str) -> int:
@@ -1380,40 +1392,34 @@ def get_expected_observation_dims(tier: str, agent_name: str) -> int:
         'risk_controller_0': 9,
         'meta_controller_0': 11,
     }
-    if tier == TIER_1:
-        return base_dims.get(agent_name, 6)
-    forecast_dims = {
-        'investor_0': 2,
-        'battery_operator_0': 4,
-        'risk_controller_0': 3,
-        'meta_controller_0': 2,
-    }
-    return base_dims.get(agent_name, 6) + forecast_dims.get(agent_name, 0)
+    # Observation shapes are fixed (Tier-1) across baseline and FGB/FAMC variants.
+    # Tier-2 forecast-augmented observations are deprecated.
+    return base_dims.get(agent_name, 6)
 
 
 def get_tier_from_config(config) -> str:
-    enable_forecast_util = getattr(config, 'enable_forecast_utilisation', False)
     forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
+    meta_baseline_enable = getattr(config, 'meta_baseline_enable', False)
     overlay_enabled = getattr(config, 'overlay_enabled', False)
-    return determine_tier(enable_forecast_util, forecast_baseline_enable, overlay_enabled)
+    return determine_tier(forecast_baseline_enable, meta_baseline_enable, overlay_enabled)
 
 
 def get_tier_from_env(env) -> str:
     if not hasattr(env, 'config'):
         return TIER_1
     config = env.config
-    enable_forecast_util = getattr(config, 'enable_forecast_utilisation', False)
     forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
+    meta_baseline_enable = getattr(config, 'meta_baseline_enable', False)
     overlay_enabled = getattr(config, 'overlay_enabled', False)
     has_dl_adapter = hasattr(env, 'dl_adapter_overlay') and env.dl_adapter_overlay is not None
-    return determine_tier(enable_forecast_util, forecast_baseline_enable, overlay_enabled or has_dl_adapter)
+    return determine_tier(forecast_baseline_enable, meta_baseline_enable, overlay_enabled or has_dl_adapter)
 
 
 def get_tier_description(tier: str) -> str:
     descriptions = {
-        TIER_1: "MARL Baseline - No forecasts, no DL overlay",
-        TIER_2: "MARL + Forecast Integration - Forecasts enabled, no DL overlay",
-        TIER_3: "MARL + Forecast + FAMC - Tier 2 observations + FGB/FAMC (DL-assisted baseline only)",
+        TIER_1: "MARL baseline (no forecast baseline/meta; no extra observations)",
+        TIER_2: "MARL + FGB online (forecast-guided baseline; no extra observations)",
+        TIER_3: "MARL + FGB meta (FAMC meta-critic; no extra observations)",
     }
     return descriptions.get(tier, f"Unknown tier: {tier}")
 

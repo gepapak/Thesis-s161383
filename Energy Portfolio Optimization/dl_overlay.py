@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 """
-DL Overlay System - Tier 3 ONLY (FGB/FAMC support)
+DL Overlay System - FGB/FAMC support (optional)
 
-IMPORTANT: This module is ONLY for Tier 3 (when --dl_overlay flag is set).
-Tier 2 (forecast integration) does NOT need this - it uses direct deltas from ForecastGenerator.
+Used only when --dl_overlay is set.
 
-TIER 2 (Forecast Integration - NO DL overlay needed):
-- ForecastGenerator (ANN/LSTM models) → generates forecasts
-- _compute_forecast_deltas() → computes z-scores from forecasts  
-- ForecastEngine → processes z-scores into observation features
-- PPO learns directly from forecast deltas (z_short, z_medium, trust)
+The overlay is a forecaster, not a controller:
+- It does NOT change policy observation spaces (no forecast-augmented observations).
+- It does NOT inject rewards or directly resize trades.
+- It provides internal signals for variance reduction:
+  - FGB online: expected dNAV baseline correction
+  - FGB meta (FAMC): optional meta-critic head
 
-TIER 3 COMPONENTS (FGB/FAMC - requires --dl_overlay flag):
-- OverlaySharedModel: shared encoder with the minimal heads needed for FGB/FAMC:
-  1. pred_reward: predictive reward proxy used to estimate expected ΔNAV (NOT injected into env reward)
-  2. meta_adv: meta-critic head for FAMC (Forecast-Aware Meta-Critic) (optional)
-- DLAdapter: Thin API for environment integration with strict shape contracts
-- OverlayExperienceBuffer: Circular buffer for training (TIER 3 ONLY)
-- OverlayTrainer: pred_reward-only training (TIER 3 ONLY)
-- CalibrationTracker: FGB forecast trust (τₜ) and expected ΔNAV (TIER 3 ONLY)
+Components (when enabled):
+- OverlaySharedModel: shared encoder with minimal heads for FGB/FAMC
+  1) pred_reward: proxy used to estimate expected dNAV (never injected into env reward)
+  2) meta_adv: meta-critic head for FAMC (optional; enabled via --meta_baseline_enable)
+- DLAdapter: thin API for environment integration with strict shape contracts
+- OverlayExperienceBuffer: circular buffer for training (overlay-only)
+- OverlayTrainer: pred_reward-only training (overlay-only)
+- CalibrationTracker: forecast trust and expected dNAV (overlay-only)
 
-DL OVERLAY OUTPUTS (Tier 3):
-1. Predicted Reward (1D): auxiliary predictive signal [-1, 1] (used for expected ΔNAV; never injected)
-2. Meta-Critic (optional): FAMC advantage prediction (Tier 3 with --meta_baseline_enable)
-
-Features:
-- 34D mode: 28D base + 6D forecast deltas (short/medium/long for price/total_gen)
+Overlay features (internal, NOT policy observations):
+- 18D mode: Market(6) + Positions(3) + Forecasts_short(4) + Portfolio(3) + Deltas(2)
 - Minimal outputs: pred_reward (+ optional meta_adv head for FAMC)
 - Strict shape/name invariants enforced at runtime
 - Memory efficient (< 1 MB)
@@ -56,6 +52,7 @@ from config import (
     DL_OVERLAY_WINDOW_SIZE_DEFAULT,
     DL_OVERLAY_INIT_BUDGET_DEFAULT,
     DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT,
+    OVERLAY_FEATURE_DIM,
 )  # UNIFIED: Import constants from config
 
 # Apply thread settings after import as well (best-effort; harmless if already set).
@@ -66,22 +63,18 @@ except Exception:
     pass
 
 # ============================================================================
-# DL OVERLAY: SHARED ENCODER + HEADS (28D FORECAST-AWARE MODE ONLY)
+# DL OVERLAY: SHARED ENCODER + HEADS (18D SHORT-HORIZON)
 # ============================================================================
 
 class OverlaySharedModel(tf.keras.Model):
     """
-    Shared encoder for 28D forecast-aware mode only.
+    Shared encoder for 18D short-horizon overlay.
 
     Outputs (strict shape contract):
     - pred_reward: (batch, 1) in [-1, +1] → predictive signal for expected ΔNAV (never injected)
     - meta_adv (optional): (batch, 1) → FAMC meta-critic control-variate
 
-    DESIGN: 4 strategy heads for 4 forecast horizons
-    - Immediate: Reactive trading (respond to NOW signals) - full forecast
-    - Short: Tactical adjustments (1h ahead) - 95% confidence
-    - Medium: Strategic shifts (4h ahead) - 90% confidence
-    - Long: Positioning (24h ahead) - risk-only (no directional signal)
+    Features: Market(6) + Positions(3) + Forecasts_short(4) + Portfolio(3) + Deltas(2)
     """
 
     def __init__(self, feature_dim: int, meta_head_dim: int = 32, enable_meta_head: bool = False):
@@ -144,22 +137,24 @@ class DLAdapter:
     Thin adapter API for env/wrapper to call overlay inference.
     Manages OverlaySharedModel and exposes shared_inference method.
 
-    STRICT 34D MODE: feature_dim must be 34 (28D base + 6D deltas). Fails fast if not.
+    STRICT MODE: feature_dim must match config.OVERLAY_FEATURE_DIM.
+    Medium-horizon only: 18D (Market + Positions + Forecasts + Portfolio + Deltas).
+    single source of truth across env/config/weights and avoid silent semantic drift.
     """
 
     def __init__(self, feature_dim: int, verbose: bool = False, meta_head_dim: int = 32, enable_meta_head: bool = False):
-        # CRITICAL FIX: Remove hard 34D constraint - accept dynamic feature dimensions
-        # This makes the system robust to feature additions (e.g., temperature, volatility)
-        # The model will adapt to whatever feature_dim is provided by the environment
-        if feature_dim < 10:
+        # NOTE: We intentionally do NOT support dynamic overlay feature dimensions right now.
+        # The environment constructs a strict OVERLAY_FEATURE_DIM feature vector and the saved
+        # TF weights are trained on that exact schema. If you want truly dynamic dims later,
+        # you must make env feature construction + weight naming/versioning fully dimension-aware.
+        if int(feature_dim) != int(OVERLAY_FEATURE_DIM):
             error_msg = (
-                f"[CRITICAL] DLAdapter requires at least 10 features, got {feature_dim}\n"
-                f"REASON: The DL overlay needs minimum market context to function:\n"
-                f"  - Market features (wind, solar, hydro, price, etc.)\n"
-                f"  - Position features (wind_pos, solar_pos, hydro_pos)\n"
-                f"  - Portfolio metrics (nav, cash, efficiency)\n"
-                f"SOLUTION: Ensure environment provides sufficient observation features.\n"
-                f"If forecasting is disabled, use baseline mode (--dl_overlay not set)."
+                f"[CRITICAL] DLAdapter feature_dim mismatch: expected {OVERLAY_FEATURE_DIM}D, got {feature_dim}D\n"
+                f"REASON: The overlay feature contract is strict ({OVERLAY_FEATURE_DIM}D).\n"
+                f"SOLUTION:\n"
+                f"  - Ensure environment._build_overlay_features() produces {OVERLAY_FEATURE_DIM}D.\n"
+                f"  - Ensure DLAdapter is initialized with feature_dim={OVERLAY_FEATURE_DIM}.\n"
+                f"  - Ensure you are loading overlay weights trained for {OVERLAY_FEATURE_DIM}D.\n"
             )
             logging.error(error_msg)
             raise ValueError(error_msg)
@@ -171,13 +166,13 @@ class DLAdapter:
         self._shape_check_done = False  # Track if we've validated shapes
 
         if enable_meta_head:
-            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic), meta_head_dim={meta_head_dim} (FAMC enabled)")
+            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (STRICT), meta_head_dim={meta_head_dim} (FAMC enabled)")
         else:
-            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (dynamic)")
+            logging.info(f"DLAdapter initialized: feature_dim={feature_dim} (STRICT)")
 
     def shared_inference(self, feats_np: np.ndarray, training: bool = False) -> Dict[str, Any]:
         """
-        Run shared inference on features (dynamic dimension).
+        Run shared inference on features (STRICT dimension).
 
         Args:
             feats_np: numpy array of shape (1, feature_dim) or (batch, feature_dim)
@@ -193,7 +188,7 @@ class DLAdapter:
             if len(feats_np.shape) == 1:
                 feats_np = feats_np.reshape(1, -1)
 
-            # CRITICAL FIX: Verify input shape matches feature_dim (dynamic)
+            # Verify input shape matches the strict feature_dim contract.
             if feats_np.shape[1] != self.feature_dim:
                 error_msg = (
                     f"[CRITICAL] DLAdapter.shared_inference: Expected {self.feature_dim}D features, got {feats_np.shape[1]}D\n"
@@ -424,7 +419,7 @@ class OverlayTrainer:
         The predictions are used as control variates to reduce advantage variance.
 
         Args:
-            features_batch: State features (batch, 34) - overlay input features
+            features_batch: State features (batch, 18) - overlay input features
             adv_targets: Standardized advantages (batch, 1) - mean=0, std=1
             loss_type: {"mse", "corr"} - loss function
 
@@ -435,8 +430,7 @@ class OverlayTrainer:
         """
         try:
             if not hasattr(self.model, 'meta_head') or self.model.meta_head is None:
-                logging.warning("[FAMC] Meta head not initialized, skipping training")
-                return 0.0
+                raise RuntimeError("[FAMC_META_TRAIN_FATAL] Meta head not initialized")
 
             # Convert to tensors
             features = tf.convert_to_tensor(features_batch, dtype=tf.float32)
@@ -480,7 +474,7 @@ class OverlayTrainer:
 
         except Exception as e:
             logging.error(f"[FAMC] Meta baseline training failed: {e}")
-            return 0.0
+            raise RuntimeError("[FAMC_META_TRAIN_FATAL] Meta baseline training failed") from e
 
     def validate(self) -> float:
         """Compute validation loss (FGB/FAMC pred_reward only)."""
@@ -528,7 +522,19 @@ class CalibrationTracker:
     TIER 2: This is NOT used (forecast trust is computed differently)
     """
 
-    def __init__(self, window_size: int = None, trust_metric: str = "combo", verbose: bool = False, init_budget: Optional[float] = None, direction_weight: float = None):
+    def __init__(
+        self,
+        window_size: int = None,
+        trust_metric: str = "combo",
+        verbose: bool = False,
+        init_budget: Optional[float] = None,
+        direction_weight: float = None,
+        trust_boost: float = 0.0,
+        min_exposure_ratio: float = 0.0,
+        pred_weight: float = 0.85,
+        mwdir_weight: float = 0.15,
+        fail_fast: bool = False,
+    ):
         """
         Args:
             window_size: Rolling window size for calibration (default from config: 2016 ≈ 2 weeks @ 10-min steps)
@@ -536,12 +542,22 @@ class CalibrationTracker:
             verbose: Enable debug logging
             init_budget: Initial fund NAV (used to scale expected_dnav when positions are flat, default from config)
             direction_weight: Weight for directional accuracy in combo metric (default from config: 0.8 = 80% direction, 20% magnitude)
+            trust_boost: Optional multiplicative optimism boost on trust (0.0 disables boosting)
+            min_exposure_ratio: Optional flat-position exposure floor ratio for expected_dnav (0.0 disables synthetic floor)
+            pred_weight: Blend weight for pred_reward in expected_dnav
+            mwdir_weight: Blend weight for mwdir in expected_dnav
+            fail_fast: If True, raise on expected_dnav failures instead of silently returning 0.0
         """
         self.window_size = window_size if window_size is not None else DL_OVERLAY_WINDOW_SIZE_DEFAULT
         self.trust_metric = trust_metric
         self.verbose = verbose
         self.init_budget = float(init_budget) if init_budget is not None else DL_OVERLAY_INIT_BUDGET_DEFAULT
         self.direction_weight = float(direction_weight) if direction_weight is not None else DL_OVERLAY_DIRECTION_WEIGHT_DEFAULT
+        self.trust_boost = max(0.0, float(trust_boost or 0.0))
+        self.min_exposure_ratio = max(0.0, float(min_exposure_ratio or 0.0))
+        self.pred_weight = float(pred_weight)
+        self.mwdir_weight = float(mwdir_weight)
+        self.fail_fast = bool(fail_fast)
 
         # Rolling history for calibration
         self.forecast_history = deque(maxlen=window_size)  # (forecast, realized) pairs
@@ -554,8 +570,8 @@ class CalibrationTracker:
             'long': {'hits': 0, 'total': 0, 'mae': deque(maxlen=window_size)},
         }
 
-        # Cache for efficiency
-        self._trust_cache = None
+        # Cache for efficiency (per horizon). Cleared on every update().
+        self._trust_cache: Dict[str, float] = {}
         self._cache_step = -1
 
         if self.verbose:
@@ -588,7 +604,7 @@ class CalibrationTracker:
             stats['mae'].append(abs(forecast - realized))
 
         # Invalidate cache
-        self._trust_cache = None
+        self._trust_cache.clear()
 
     def get_trust(self, horizon: str = "short", recent_mape: Optional[float] = None) -> float:
         """
@@ -608,68 +624,61 @@ class CalibrationTracker:
         Returns:
             τₜ ∈ [0,1]: Trust score (0 = no trust, 1 = full trust)
         """
-        # Return cached value if available (same step)
-        if self._trust_cache is not None:
-            return self._trust_cache
+        # Normalize horizon and return cached value if available (per-horizon).
+        h = str(horizon or "short").strip().lower()
+        if h not in self.horizon_stats:
+            h = "short"
+        if recent_mape is None and h in self._trust_cache:
+            return float(self._trust_cache[h])
 
-        # Not enough data yet - buffer is warming up
-        buffer_size = len(self.forecast_history)
+        # Not enough data yet - horizon buffer is warming up
+        stats = self.horizon_stats.get(h, {})
+        buffer_size = int(stats.get('total', 0))
         if buffer_size < 10:
-            # FIX #3: Return neutral trust (0.5) instead of 0.0 during warm-up
-            # This prevents forecast rewards from being cut in half during early training
-            # With trust=0.5, trust_scale = 0.5 + (1.5-0.5)*0.5 = 1.0 (no penalty)
-            # Log warning every 10 samples to inform user about warm-up
+            # Return neutral trust (0.5) during warm-up so we don't suppress corrections early.
             if buffer_size > 0 and buffer_size % 10 == 0:
                 logging.warning(
-                    f"[CalibrationTracker] Buffer warm-up: {buffer_size}/10 samples collected. "
-                    f"Trust will remain 0.5 (neutral) until 10 samples are available. "
-                    f"Forecast rewards will use neutral scaling (1.0x) during warm-up."
+                    f"[CalibrationTracker] Horizon warm-up ({h}): {buffer_size}/10 samples collected. "
+                    f"Trust will remain 0.5 (neutral) until 10 samples are available."
                 )
-            return 0.5  # FIX #3: Changed from 0.0 to 0.5 (neutral trust)
+            return 0.5
 
         # Compute trust based on selected metric
         if self.trust_metric == "hitrate":
             # Direction hit-rate: 2 * hit_rate - 1 ∈ [-1, 1], then clip to [0, 1]
-            if len(self.direction_history) > 0:
-                hit_rate = np.mean(list(self.direction_history))
-                trust = max(0.0, 2.0 * hit_rate - 1.0)
-            else:
-                trust = 0.0
+            hits = float(stats.get('hits', 0.0))
+            hit_rate = hits / max(1.0, float(buffer_size)) if buffer_size > 0 else 0.5
+            trust = max(0.0, 2.0 * float(hit_rate) - 1.0)
 
         elif self.trust_metric == "absdir":
-            # Use absolute value of recent forecasts (proxy for confidence)
-            recent_forecasts = [f for f, _ in list(self.forecast_history)[-100:]]
-            if len(recent_forecasts) > 0:
-                trust = min(1.0, np.mean(np.abs(recent_forecasts)))
-            else:
-                trust = 0.0
+            # absdir requires forecast magnitude; we don't store per-horizon magnitudes here.
+            # Fall back to horizon hit-rate as a robust proxy.
+            hits = float(stats.get('hits', 0.0))
+            hit_rate = hits / max(1.0, float(buffer_size)) if buffer_size > 0 else 0.5
+            trust = float(np.clip(hit_rate, 0.0, 1.0))
 
         elif self.trust_metric == "combo":
             # Combo: direction_weight * (2·hit_rate - 1) + (1 - direction_weight) * (1 - norm_mae)
             # Default: 0.8 * direction + 0.2 * magnitude (was 0.5/0.5)
             # This gives more weight to directional accuracy, which is more robust to tanh compression
             # RATIONALE: With 75% directional accuracy, 80/20 weighting yields trust ≈ 0.6 (threshold)
-            if len(self.direction_history) > 0:
-                hit_rate = np.mean(list(self.direction_history))
-                hit_component = max(0.0, 2.0 * hit_rate - 1.0)
-            else:
-                hit_component = 0.0
+            hits = float(stats.get('hits', 0.0))
+            hit_rate = hits / max(1.0, float(buffer_size)) if buffer_size > 0 else 0.5
+            hit_component = max(0.0, 2.0 * float(hit_rate) - 1.0)
 
-            # MAE component (normalized by typical forecast magnitude)
-            if len(self.forecast_history) > 0:
-                forecasts = [f for f, _ in list(self.forecast_history)]
-                realized = [r for _, r in list(self.forecast_history)]
-                mae = np.mean(np.abs(np.array(forecasts) - np.array(realized)))
-                typical_mag = np.mean(np.abs(realized)) + 1e-6
-                norm_mae = min(1.0, mae / typical_mag)
+            # MAE component (horizon-specific). Signals are tanh-compressed in [-1, 1], so MAE is naturally bounded.
+            mae_hist = stats.get('mae', None)
+            if mae_hist is not None and len(mae_hist) > 0:
+                mae = float(np.mean(list(mae_hist)))
+                norm_mae = float(np.clip(mae, 0.0, 1.0))
                 mae_component = max(0.0, 1.0 - norm_mae)
             else:
                 mae_component = 0.0
 
             # Use configurable weights (default: 80% direction, 20% magnitude)
-            dir_weight = getattr(self, 'direction_weight', 0.8)
+            dir_weight = float(getattr(self, 'direction_weight', 0.8))
             mag_weight = 1.0 - dir_weight
-            trust = dir_weight * hit_component + mag_weight * mae_component
+            trust = float(dir_weight * hit_component + mag_weight * mae_component)
 
         else:
             logging.warning(f"[CalibrationTracker] Unknown trust_metric: {self.trust_metric}, defaulting to 0.0")
@@ -690,22 +699,21 @@ class CalibrationTracker:
             # This makes trust responsive to actual forecast quality
             trust = 0.6 * trust + 0.4 * mape_factor
 
-        # FIX: Apply moderate optimistic boost to trust calculation
-        # Current trust (0.438 avg) is too low - moderate boost to encourage forecast usage
-        # Boost trust by 10% (cap at 1.0) - balanced approach, not too aggressive
-        # This helps agent learn to use forecasts without over-trusting bad forecasts
-        trust_boost = 0.1
-        trust = min(1.0, trust * (1.0 + trust_boost))
+        # Optional multiplicative trust boost for controlled optimism.
+        # Keep at 0.0 for unbiased trust calibration.
+        if self.trust_boost > 0.0:
+            trust = min(1.0, trust * (1.0 + self.trust_boost))
 
         # Clip to [0, 1]
         trust = float(np.clip(trust, 0.0, 1.0))
 
-        # Cache result
-        self._trust_cache = trust
+        # Cache result (per horizon) only when not conditioned on recent_mape
+        if recent_mape is None:
+            self._trust_cache[h] = float(trust)
 
-        if self.verbose and len(self.forecast_history) % 500 == 0:
+        if self.verbose and buffer_size % 500 == 0:
             mape_info = f", MAPE={recent_mape:.4f}" if recent_mape is not None else ""
-            logging.info(f"[CalibrationTracker] Trust τₜ={trust:.3f} (metric={self.trust_metric}, n={len(self.forecast_history)}{mape_info})")
+            logging.info(f"[CalibrationTracker] Trust={trust:.3f} (metric={self.trust_metric}, horizon={h}, n={buffer_size}{mape_info})")
 
         return trust
 
@@ -714,11 +722,11 @@ class CalibrationTracker:
         """
         FGB: Compute expected ΔNAV for the next step given current state.
 
-        Maps forecast to expected ΔNAV using a linear proxy:
-            E[ΔNAV] = exposure * pred_reward * mwdir - est_costs
+        Maps state-only overlay output to expected ΔNAV using a linear proxy:
+            E[ΔNAV] = exposure * pred_reward - est_costs
 
         Args:
-            overlay_output: Dict with keys {"pred_reward", "mwdir", ...}
+            overlay_output: Dict with keys {"pred_reward", ...}
             positions: Dict with current positions (e.g., {"wind": 1000, "solar": 500, ...})
             costs: Dict with transaction cost params (e.g., {"bps": 5, "fixed": 100})
 
@@ -730,37 +738,80 @@ class CalibrationTracker:
             pred_reward = float(overlay_output.get("pred_reward", 0.0))
             if isinstance(pred_reward, np.ndarray):
                 pred_reward = float(pred_reward.flatten()[0])
+            if not np.isfinite(pred_reward):
+                pred_reward = 0.0
+            pred_reward = float(np.clip(pred_reward, -1.0, 1.0))
 
-            mwdir = float(overlay_output.get("mwdir", 0.0))
 
             # Compute exposure (total notional of current positions)
             # FGB: Use sum of absolute position values as exposure proxy
             exposure = sum(abs(float(v)) for v in positions.values() if isinstance(v, (int, float)))
 
-            # If no positions, use a small fraction of fund NAV as proxy
-            # This ensures FGB has bite early when policy is still flat
-            if exposure < 1e-6:
-                exposure = 0.01 * self.init_budget  # 1% of initial NAV
+            # Optional flat-position exposure floor. Default is 0 to avoid synthetic early-step signal noise.
+            if exposure < 1e-6 and self.min_exposure_ratio > 0.0:
+                exposure = self.min_exposure_ratio * self.init_budget
 
             # Expected ΔNAV (linear proxy)
-            # pred_reward is in [-1, 1], mwdir is in [-1, 1]
-            # Scale by exposure to get DKK units
-            exp_dnav_gross = exposure * pred_reward * mwdir
+            # pred_reward is in [-1, 1] and should encode direction/magnitude from state-only inputs.
+            # Optionally blend with mwdir (forecast-weighted direction) if available for robustness.
+            mwdir = float(overlay_output.get("mwdir", 0.0))
+            if isinstance(mwdir, np.ndarray):
+                mwdir = float(mwdir.flatten()[0]) if mwdir.size > 0 else 0.0
+            if not np.isfinite(mwdir):
+                mwdir = 0.0
+            mwdir = float(np.clip(mwdir, -1.0, 1.0))
+            # pred_reward is primary (trained on realized MTM); mwdir adds forecast-return signal.
+            w_pred = max(0.0, self.pred_weight)
+            w_mw = max(0.0, self.mwdir_weight)
+            w_sum = w_pred + w_mw
+            if w_sum <= 1e-12:
+                w_pred, w_mw = 1.0, 0.0
+            else:
+                w_pred, w_mw = w_pred / w_sum, w_mw / w_sum
+            pred_blend = w_pred * pred_reward + w_mw * mwdir
+            if not np.isfinite(pred_blend):
+                msg = (
+                    f"[CalibrationTracker] expected_dnav non-finite pred_blend: "
+                    f"pred_reward={pred_reward}, mwdir={mwdir}, "
+                    f"weights=({w_pred:.4f},{w_mw:.4f}), blend={pred_blend}"
+                )
+                if bool(getattr(self, "fail_fast", False)):
+                    raise RuntimeError(msg)
+                logging.warning(msg)
+                return 0.0
+            exp_dnav_gross = exposure * pred_blend
 
-            # Estimate transaction costs (if positions change)
-            # FGB: Assume typical trade size is 10% of exposure
-            typical_trade_notional = 0.1 * exposure
-            bps = costs.get("bps", 5.0)
-            fixed = costs.get("fixed", 100.0)
-            est_costs = (typical_trade_notional * bps / 10000.0) + fixed
+            # Estimate transaction costs - use config values passed from env (match _execute_investor_trades)
+            # Conservative: assume 5% of exposure trades per step (was 10%) to avoid over-penalizing
+            if exposure <= 1e-6:
+                est_costs = 0.0
+            else:
+                typical_trade_notional = 0.05 * max(exposure, 1.0)
+                bps = costs.get("bps", 0.5)  # Config default 0.5 bps (institutional)
+                fixed = costs.get("fixed", 172.0)  # Config: ~$25/trade in DKK
+                est_costs = (typical_trade_notional * bps / 10000.0) + fixed
 
             # Net expected ΔNAV
             exp_dnav = exp_dnav_gross - est_costs
 
+            # Guard against NaN (e.g., from missing forecasts or corrupted overlay output)
+            if not np.isfinite(float(exp_dnav)):
+                msg = (
+                    f"[CalibrationTracker] expected_dnav non-finite output: "
+                    f"exp_dnav_gross={exp_dnav_gross}, est_costs={est_costs}, exp_dnav={exp_dnav}"
+                )
+                if bool(getattr(self, "fail_fast", False)):
+                    raise RuntimeError(msg)
+                logging.warning(msg)
+                return 0.0
+
             return float(exp_dnav)
 
         except Exception as e:
-            logging.warning(f"[CalibrationTracker] expected_dnav failed: {e}")
+            msg = f"[CalibrationTracker] expected_dnav failed: {e}"
+            if bool(getattr(self, "fail_fast", False)):
+                raise RuntimeError(msg) from e
+            logging.warning(msg)
             return 0.0
 
     def reset(self):
@@ -771,7 +822,8 @@ class CalibrationTracker:
             stats['hits'] = 0
             stats['total'] = 0
             stats['mae'].clear()
-        self._trust_cache = None
+        # _trust_cache is a per-horizon dict; keep the type stable across resets.
+        self._trust_cache.clear()
 
         if self.verbose:
             logging.info("[CalibrationTracker] Reset calibration history")
