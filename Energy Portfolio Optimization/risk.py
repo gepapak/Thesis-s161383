@@ -125,6 +125,13 @@ class EnhancedRiskController:
                 'liquidity': 0.15,
                 'regulatory': 0.15
             }
+        self.forecast_uncertainty_risk_weight = float(
+            np.clip(
+                getattr(config, 'forecast_uncertainty_risk_weight', 0.10) if config else 0.10,
+                0.0,
+                1.0,
+            )
+        )
 
         # Adaptive thresholds from config
         if config and hasattr(config, 'risk_thresholds'):
@@ -359,8 +366,9 @@ class EnhancedRiskController:
 
             return float(np.clip(risk, 0.0, 1.0))
         except Exception as e:
-            self.logger.warning(f"Forecast uncertainty risk calculation failed: {e}")
-            return 0.15
+            msg = f"[RISK_FORECAST_UNCERTAINTY_FATAL] Forecast uncertainty risk calculation failed: {e}"
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
 
     # ----------------------------- Aggregation & API -----------------------------
 
@@ -375,11 +383,18 @@ class EnhancedRiskController:
             initial_budget = float(env_state.get('initial_budget', 1e7))
             timestep = int(env_state.get('timestep', 0))
 
+            def _cap(primary_key: str, legacy_key: str) -> float:
+                raw = env_state.get(primary_key, env_state.get(legacy_key, 0.0))
+                try:
+                    return float(raw)
+                except Exception:
+                    return 0.0
+
             capacities = {
-                'wind': float(env_state.get('wind_capacity_mw', 0.0)),
-                'solar': float(env_state.get('solar_capacity_mw', 0.0)),
-                'hydro': float(env_state.get('hydro_capacity_mw', 0.0)),
-                'battery': float(env_state.get('battery_capacity_mwh', 0.0)),
+                'wind': _cap('wind_capacity_mw', 'wind_capacity'),
+                'solar': _cap('solar_capacity_mw', 'solar_capacity'),
+                'hydro': _cap('hydro_capacity_mw', 'hydro_capacity'),
+                'battery': _cap('battery_capacity_mwh', 'battery_capacity'),
             }
 
             # ENHANCEMENT: Add forecast uncertainty risk
@@ -394,13 +409,27 @@ class EnhancedRiskController:
                 'forecast_uncertainty_risk': forecast_uncertainty_risk,
             }
 
+            w_market = max(0.0, float(self.risk_weights.get('market', 0.0)))
+            w_oper = max(0.0, float(self.risk_weights.get('operational', 0.0)))
+            w_port = max(0.0, float(self.risk_weights.get('portfolio', 0.0)))
+            w_liq = max(0.0, float(self.risk_weights.get('liquidity', 0.0)))
+            w_reg = max(0.0, float(self.risk_weights.get('regulatory', 0.0)))
+            base_sum = w_market + w_oper + w_port + w_liq + w_reg
+            if base_sum <= 1e-12:
+                w_market, w_oper, w_port, w_liq, w_reg = 0.25, 0.20, 0.25, 0.15, 0.15
+                base_sum = 1.0
+
+            forecast_w = float(np.clip(self.forecast_uncertainty_risk_weight, 0.0, 1.0))
+            base_scale = (1.0 - forecast_w) / base_sum
             overall = (
-                self.risk_weights['market']      * comp['market_risk'] +
-                self.risk_weights['operational'] * comp['operational_risk'] +
-                self.risk_weights['portfolio']   * comp['portfolio_risk'] +
-                self.risk_weights['liquidity']   * comp['liquidity_risk'] +
-                self.risk_weights['regulatory']  * comp['regulatory_risk'] +
-                0.10 * comp['forecast_uncertainty_risk']  # 10% weight for forecast uncertainty
+                base_scale * (
+                    w_market * comp['market_risk'] +
+                    w_oper * comp['operational_risk'] +
+                    w_port * comp['portfolio_risk'] +
+                    w_liq * comp['liquidity_risk'] +
+                    w_reg * comp['regulatory_risk']
+                )
+                + forecast_w * comp['forecast_uncertainty_risk']
             )
 
             # Apply adaptive scaling to prevent saturation
@@ -420,15 +449,9 @@ class EnhancedRiskController:
             return comp
 
         except Exception as e:
-            self.logger.warning(f"Comprehensive risk calculation failed: {e}")
-            return {
-                'market_risk': RISK_FALLBACK_MARKET,
-                'operational_risk': RISK_FALLBACK_OPERATIONAL,
-                'portfolio_risk': RISK_FALLBACK_PORTFOLIO,
-                'liquidity_risk': RISK_FALLBACK_LIQUIDITY,
-                'regulatory_risk': RISK_FALLBACK_REGULATORY,
-                'overall_risk': RISK_FALLBACK_OVERALL
-            }
+            msg = f"[RISK_COMPREHENSIVE_FATAL] Comprehensive risk calculation failed: {e}"
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
 
     def get_risk_adjusted_actions(self, risk_assessment: Dict[str, float]) -> Dict[str, float]:
         """

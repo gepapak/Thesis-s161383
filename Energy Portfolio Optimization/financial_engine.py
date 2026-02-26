@@ -660,16 +660,9 @@ class FinancialEngine:
             }
             
         except Exception as e:
-            logger.error(f"Price return calculation failed: {e}")
-            price_return = float((current_price - prev_price) / max(abs(prev_price), 1e-6))
-            return {
-                'price_return': price_return,
-                'price_return_short': price_return,
-                'price_return_medium': price_return,
-                'price_return_long': price_return,
-                'price_return_forecast': price_return,
-                'correlation_debug': {}
-            }
+            msg = f"[FIN_PRICE_RETURN_FATAL] Price return calculation failed: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
     
     @staticmethod
     def calculate_mtm_pnl(

@@ -379,6 +379,7 @@ class ProfitFocusedRewardCalculator:
                     'ops_returns': deque(maxlen=200),
                     'trading_returns': deque(maxlen=200),
                     'effectiveness_multiplier': 1.0,
+                    'last_score': 0.0,
                 }
 
             tracker = self.hedge_effectiveness_tracker
@@ -415,10 +416,17 @@ class ProfitFocusedRewardCalculator:
                 hedging_score *= float(np.clip(1.0 + 0.1 * (risk_mult - 1.0), 0.5, 1.5))
 
             tracker['effectiveness_multiplier'] = float(np.clip(tracker['effectiveness_multiplier'] * 0.99 + hedging_score * 0.01, 0.5, 1.2))
-            return float(np.clip(hedging_score * tracker['effectiveness_multiplier'], -3.0, 3.0))
+            score = float(np.clip(hedging_score * tracker['effectiveness_multiplier'], -3.0, 3.0))
+            tracker['last_score'] = score
+            return score
         except Exception as e:
             logger.warning(f"Hedging effectiveness calculation failed: {e}")
-            return 0.0
+            tracker = getattr(self, 'hedge_effectiveness_tracker', {})
+            try:
+                fallback = float(np.clip(float(tracker.get('last_score', 0.0)), -3.0, 3.0))
+            except Exception:
+                fallback = 0.0
+            return fallback
 
 # =============================================================================
 # HYBRID MODEL Environment with Complete Original Functionality
@@ -916,7 +924,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_mtm_pnl = 0.0
         self.last_realized_dnav = 0.0
         self.last_realized_dnav_return = 0.0
+        # Investor-sleeve realized dNAV (used by Tier-3 dNAV-driven lambda objective).
+        self.last_realized_investor_dnav = 0.0
+        self.last_realized_investor_dnav_return = 0.0
+        self.last_realized_investor_return_denom = 1.0
         self._overlay_prev_nav = None
+        self._last_investor_transaction_cost = 0.0
+        self._last_investor_exposure_pretrade = 0.0
         self.cumulative_mtm_pnl = 0.0  # ENHANCED: Track cumulative trading performance
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
@@ -937,6 +951,23 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self._last_overlay_features = None  # FAMC: Cache overlay features for meta head training
         self._forecast_trust = 0.0  # τₜ: forecast trust score
         self._expected_dnav = 0.0  # E[ΔNAV]: expected NAV change
+        # Transition-aligned control-variate snapshots consumed by learner.
+        # These are intentionally lagged one env step to align with MTM attribution timing.
+        self._forecast_trust_cv = 0.0
+        self._expected_dnav_cv = 0.0
+        self._meta_adv_pred_cv = 0.0
+        # Adaptive turnover ratio used by expected_dnav transaction-cost proxy.
+        self._expected_dnav_turnover_ratio = float(
+            np.clip(getattr(self.config, "fgb_expected_dnav_turnover_ratio_init", 0.05), 0.0, 1.0)
+        )
+        self._expected_dnav_turnover_ratio_by_asset = {
+            "wind": float(self._expected_dnav_turnover_ratio),
+            "solar": float(self._expected_dnav_turnover_ratio),
+            "hydro": float(self._expected_dnav_turnover_ratio),
+        }
+        self._expected_dnav_turnover_alpha = float(
+            np.clip(getattr(self.config, "fgb_expected_dnav_turnover_alpha", 0.1), 0.0, 1.0)
+        )
 
         # =====================================================================
         # PAPER MODES: Baseline vs FGB-online vs FGB-meta (no forecast-augmented obs)
@@ -955,36 +986,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
             logger.info("BASELINE MARL: Tier-1 observations (no forecasts, no overlay)")
         logger.info("=" * 70)
 
-        # =====================================================================
-        # KELLY POSITION SIZING & REGIME DETECTION (Portfolio Optimization)
-        # =====================================================================
-        from utils import MultiAssetKellySizer, MarketRegimeDetector
-
-        self.kelly_sizer = MultiAssetKellySizer(
-            assets=['wind', 'solar', 'hydro'],
-            correlation_lookback=100,
-            lookback=100,
-            max_kelly_fraction=0.25,
-            min_trades_required=20
-        )
-
-        self.regime_detector = MarketRegimeDetector(
-            lookback_short=20,
-            lookback_long=50,
-            vol_lookback=100,
-            vol_regime_threshold=1.5,
-            hurst_mr_threshold=0.4,
-            trend_strength_threshold=0.6,
-            ma_signal_threshold=0.02
-        )
-
         # NOTE (Model B accounting):
         # Financial instruments are treated as a margin-style overlay:
         # - `financial_positions` are exposures (not equity / not "position value")
         # - NAV impact comes from MTM PnL, tracked separately in `financial_mtm_positions`
         # Therefore we do NOT maintain "open position cost basis" bookkeeping.
-        # Kelly is updated from per-step MTM PnL in `_update_finance()`.
-        self._current_regime = {'regime': 'neutral', 'position_multiplier': 1.0, 'metrics': {}}
 
         # OPTIMIZED: Track forecast accuracy for adaptive confidence
         self._forecast_accuracy_tracker = {
@@ -1012,6 +1018,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         # OVERLAY TRAINING STATE (Experience collection for trainer)
         # =====================================================================
         self._overlay_feature_history = deque(maxlen=20)  # Recent features for target computation
+        self._overlay_pending_features = None  # One-step lag to align state features with realized targets
         self._overlay_reward_history = deque(maxlen=20)   # Recent rewards for pred_reward target
         self._overlay_pnl_history = deque(maxlen=20)      # Recent P&L for pred_reward target
 
@@ -1602,7 +1609,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
                         logger.info(f"[FORECAST_ARRAYS] All 20 forecast arrays pre-allocated ✓")
 
                     # DIAGNOSTIC: Show actual forecast values vs current
-                    current_price = float(self.price[0]) if len(self.price) > 0 else 0.0
+                    # Use canonical internal price arrays (self.price does not exist in this env).
+                    if hasattr(self, "_price_raw") and len(self._price_raw) > 0:
+                        current_price = float(self._price_raw[0])
+                    elif hasattr(self, "_price") and len(self._price) > 0:
+                        current_price = float(self._price[0])
+                    else:
+                        current_price = 0.0
                     logger.info(f"[FORECAST_VALUES] t=0 current_price={current_price:.2f}")
                     for horizon in ["short", "medium", "long"]:
                         key = f"price_forecast_{horizon}"
@@ -1828,6 +1841,23 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_mtm_pnl = 0.0
         self.last_realized_dnav = 0.0
         self.last_realized_dnav_return = 0.0
+        self.last_realized_investor_dnav = 0.0
+        self.last_realized_investor_dnav_return = 0.0
+        self.last_realized_investor_return_denom = 1.0
+        self._last_investor_transaction_cost = 0.0
+        self._last_investor_exposure_pretrade = 0.0
+        self._forecast_trust_cv = 0.0
+        self._expected_dnav_cv = 0.0
+        self._meta_adv_pred_cv = 0.0
+        self._expected_dnav_turnover_ratio = float(
+            np.clip(getattr(self.config, "fgb_expected_dnav_turnover_ratio_init", 0.05), 0.0, 1.0)
+        )
+        self._expected_dnav_turnover_ratio_by_asset = {
+            "wind": float(self._expected_dnav_turnover_ratio),
+            "solar": float(self._expected_dnav_turnover_ratio),
+            "hydro": float(self._expected_dnav_turnover_ratio),
+        }
+        self._overlay_pending_features = None
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
         
@@ -1896,6 +1926,23 @@ class RenewableMultiAgentEnv(ParallelEnv):
         self.last_mtm_pnl = 0.0
         self.last_realized_dnav = 0.0
         self.last_realized_dnav_return = 0.0
+        self.last_realized_investor_dnav = 0.0
+        self.last_realized_investor_dnav_return = 0.0
+        self.last_realized_investor_return_denom = 1.0
+        self._last_investor_transaction_cost = 0.0
+        self._last_investor_exposure_pretrade = 0.0
+        self._forecast_trust_cv = 0.0
+        self._expected_dnav_cv = 0.0
+        self._meta_adv_pred_cv = 0.0
+        self._expected_dnav_turnover_ratio = float(
+            np.clip(getattr(self.config, "fgb_expected_dnav_turnover_ratio_init", 0.05), 0.0, 1.0)
+        )
+        self._expected_dnav_turnover_ratio_by_asset = {
+            "wind": float(self._expected_dnav_turnover_ratio),
+            "solar": float(self._expected_dnav_turnover_ratio),
+            "hydro": float(self._expected_dnav_turnover_ratio),
+        }
+        self._overlay_pending_features = None
         self.cumulative_mtm_pnl = 0.0
         self.last_reward_breakdown = {}
         self.last_reward_weights = {}
@@ -2133,6 +2180,35 @@ class RenewableMultiAgentEnv(ParallelEnv):
             )
 
             overlay_features_pre = None
+            # Snapshot previous-step control-variate signals for this transition.
+            # This aligns C_t with the realized MTM attribution timing used in finance update.
+            if forecast_backend_enabled:
+                try:
+                    tau_prev = float(getattr(self, "_forecast_trust", 0.0))
+                except Exception:
+                    tau_prev = 0.0
+                try:
+                    exp_prev = float(getattr(self, "_expected_dnav", 0.0))
+                except Exception:
+                    exp_prev = 0.0
+                meta_prev = 0.0
+                try:
+                    overlay_prev = getattr(self, "_last_overlay_output", None)
+                    if isinstance(overlay_prev, dict) and "meta_adv" in overlay_prev:
+                        meta_raw = overlay_prev.get("meta_adv", 0.0)
+                        if isinstance(meta_raw, np.ndarray):
+                            meta_prev = float(meta_raw.flatten()[0]) if meta_raw.size > 0 else 0.0
+                        else:
+                            meta_prev = float(meta_raw)
+                except Exception:
+                    meta_prev = 0.0
+                self._forecast_trust_cv = float(tau_prev if np.isfinite(tau_prev) else 0.0)
+                self._expected_dnav_cv = float(exp_prev if np.isfinite(exp_prev) else 0.0)
+                self._meta_adv_pred_cv = float(meta_prev if np.isfinite(meta_prev) else 0.0)
+            else:
+                self._forecast_trust_cv = 0.0
+                self._expected_dnav_cv = 0.0
+                self._meta_adv_pred_cv = 0.0
             # Avoid stale baseline/meta predictions if overlay inference fails on this step.
             # (We want control-variate signals to be state-only for *this* timestep.)
             if forecast_backend_enabled:
@@ -2140,12 +2216,22 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 self._last_overlay_features = None
 
             # Compute z-scores/deltas for CURRENT timestep i (used for calibration/trust, logging, etc.).
-            if forecast_backend_enabled and self.forecast_generator is not None:
+            if forecast_backend_enabled:
                 self._compute_forecast_deltas(i, update_calibration=True)
 
             # Run overlay inference once per step, PRE-ACTION.
             overlay_adapter = getattr(self, 'dl_adapter_overlay', None)
-            if overlay_adapter is not None and getattr(self.config, 'overlay_enabled', False):
+            overlay_enabled = bool(getattr(self.config, 'overlay_enabled', False))
+            baseline_overlay_required = bool(getattr(self.config, 'forecast_baseline_enable', False)) and overlay_enabled
+            strict_overlay = bool(getattr(self.config, "fgb_fail_fast", False)) or baseline_overlay_required
+            if overlay_enabled and overlay_adapter is None:
+                msg = (
+                    f"[OVERLAY_INFERENCE] overlay_enabled=True but dl_adapter_overlay is None at step {self.t}"
+                )
+                if strict_overlay:
+                    raise RuntimeError(msg)
+                logger.warning(msg)
+            elif overlay_adapter is not None and overlay_enabled:
                 try:
                     base_features = self._build_overlay_features(i)
                     if base_features is not None:
@@ -2156,13 +2242,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
                         if overlay_outs:
                             self._last_overlay_output = overlay_outs
                             self._last_overlay_features = base_features.copy()
-                        elif bool(getattr(self.config, "fgb_fail_fast", False)):
+                        elif strict_overlay:
                             raise RuntimeError("[OVERLAY_INFERENCE] shared_inference returned empty output")
-                    elif bool(getattr(self.config, "fgb_fail_fast", False)):
+                    elif strict_overlay:
                         raise RuntimeError("[OVERLAY_INFERENCE] _build_overlay_features returned None")
                 except Exception as e:
                     msg = f"[OVERLAY_INFERENCE] CRITICAL FAILURE (pre-action) at step {self.t}: {e}"
-                    if bool(getattr(self.config, "fgb_fail_fast", False)):
+                    if strict_overlay:
                         raise RuntimeError(msg) from e
                     logger.warning(msg)
                     logger.debug(f"[OVERLAY_INFERENCE] Full traceback: {traceback.format_exc()}")
@@ -2203,29 +2289,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     current_forecasts = self.forecast_generator.predict_all_horizons(timestep=i)
                     if isinstance(current_forecasts, dict):
                         self._track_forecast_accuracy(current_forecasts)
-                except Exception:
-                    pass
-
-            # ===== REGIME DETECTION UPDATE =====
-            # Update regime detector with current price
-            # CRITICAL FIX: Use i (captured timestep) instead of self.t for consistency
-            if hasattr(self, 'regime_detector') and hasattr(self, '_price') and i < len(self._price):
-                current_price = float(self._price[i])
-                self.regime_detector.update(current_price)
-
-                # Detect regime every 6 steps (hourly)
-                # CRITICAL FIX: Use i (captured timestep) instead of self.t for consistency
-                if i % 6 == 0:
-                    regime_info = self.regime_detector.detect_regime()
-                    self._current_regime = regime_info
-
-                    # Log regime changes daily
-                    if i % 144 == 0:
-                        logger.info(f"[REGIME] Step {i}: {regime_info['regime']} "
-                                   f"(confidence={regime_info['confidence']:.2f}, "
-                                   f"mult={regime_info['position_multiplier']:.2f}, "
-                                   f"hurst={regime_info['metrics'].get('hurst_exponent', 0.5):.3f})")
-
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[FORECAST_ACCURACY_FATAL] Forecast accuracy tracking failed at step {self.t}: {e}"
+                    ) from e
 
             # === ENHANCEMENT 6: DIAGNOSTIC LOGGING ===
             # Log overlay state for monitoring
@@ -2257,25 +2324,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self.step_in_episode = self.t
 
             index = max(0, self.t - 1)
-            # ------------------------------------------------------------------
-            # Keep forecast backend state aligned to the next timestep (no double-counting).
-            # ------------------------------------------------------------------
-            # After incrementing self.t, the next observation is for timestep `self.t`.
-            # Recompute forecast deltas for that timestep WITHOUT updating calibration/trust.
-            if forecast_backend_enabled and self.forecast_generator is not None and self.t < self.max_steps:
-                try:
-                    self._compute_forecast_deltas(self.t, update_calibration=False)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"[FORECAST_DELTAS_FATAL] Next-step update failed at step {self.t}: {e}"
-                    ) from e
-            self._fill_obs()
-
-            # CRITICAL FIX: Update forecast generator with current observations
-            # The forecast generator needs to see actual values to make predictions for next timestep
+            # Update forecast generator with the just-realized observation first.
+            # This keeps next-step forecast deltas synchronized with latest state.
             if self.forecast_generator is not None and hasattr(self.forecast_generator, 'update'):
                 try:
-                    # Build observation dict with current values
                     current_obs = {
                         'price': float(self._price_raw[i]) if i < len(self._price_raw) else 250.0,
                         'wind': float(self._wind[i]) if i < len(self._wind) else 0.0,
@@ -2288,6 +2340,20 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     raise RuntimeError(
                         f"[FORECAST_UPDATE_FATAL] Failed to update forecast generator at t={i}: {e}"
                     ) from e
+
+            # ------------------------------------------------------------------
+            # Keep forecast backend state aligned to the next timestep (no double-counting).
+            # ------------------------------------------------------------------
+            # After incrementing self.t, the next observation is for timestep `self.t`.
+            # Recompute forecast deltas for that timestep WITHOUT updating calibration/trust.
+            if forecast_backend_enabled and self.t < self.max_steps:
+                try:
+                    self._compute_forecast_deltas(self.t, update_calibration=False)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[FORECAST_DELTAS_FATAL] Next-step update failed at step {self.t}: {e}"
+                    ) from e
+            self._fill_obs()
 
             self._populate_info(index, financial, acts)
 
@@ -2468,7 +2534,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
             return float(np.clip(portfolio_intensity, 0.3, 2.5))
 
         except Exception as e:
-            return 1.0  # Default intensity
+            raise RuntimeError(
+                f"[PORTFOLIO_HEDGE_INTENSITY_FATAL] Failed at step {getattr(self, 't', 'N/A')}: {e}"
+            ) from e
 
     # def set_wrapper_reference(self, wrapper_env):
     #     """CRITICAL: Set reference to wrapper for profit-seeking expert"""
@@ -2812,6 +2880,48 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
             # === STEP 4: Calculate and deduct transaction costs ===
             total_traded_notional = abs(trade_wind) + abs(trade_solar) + abs(trade_hydro)
+            # Update expected_dnav turnover proxy (EWMA) for next-step cost estimation.
+            try:
+                denom_turnover = max(
+                    float(getattr(self, "_last_investor_exposure_pretrade", 0.0)),
+                    float(getattr(self, "_last_tradeable_capital", 0.0)),
+                    1.0,
+                )
+                realized_turnover = float(np.clip(total_traded_notional / denom_turnover, 0.0, 1.0))
+                alpha_turnover = float(np.clip(getattr(self, "_expected_dnav_turnover_alpha", 0.1), 0.0, 1.0))
+                prev_turnover = float(np.clip(getattr(self, "_expected_dnav_turnover_ratio", 0.05), 0.0, 1.0))
+                self._expected_dnav_turnover_ratio = float(
+                    np.clip((1.0 - alpha_turnover) * prev_turnover + alpha_turnover * realized_turnover, 0.0, 1.0)
+                )
+                # Per-asset turnover EWMA (wind/solar/hydro) for finer expected_dnav cost scaling.
+                cur_wind_abs = abs(float(current_wind))
+                cur_solar_abs = abs(float(current_solar))
+                cur_hydro_abs = abs(float(current_hydro))
+                # Fallback denominator: split tradeable capital across sleeves when book is near flat.
+                sleeve_floor = max(float(getattr(self, "_last_tradeable_capital", 0.0)) / 3.0, 1.0)
+                denom_wind = max(cur_wind_abs, sleeve_floor)
+                denom_solar = max(cur_solar_abs, sleeve_floor)
+                denom_hydro = max(cur_hydro_abs, sleeve_floor)
+                realized_turnover_by_asset = {
+                    "wind": float(np.clip(abs(trade_wind) / denom_wind, 0.0, 1.0)),
+                    "solar": float(np.clip(abs(trade_solar) / denom_solar, 0.0, 1.0)),
+                    "hydro": float(np.clip(abs(trade_hydro) / denom_hydro, 0.0, 1.0)),
+                }
+                prev_by_asset = getattr(self, "_expected_dnav_turnover_ratio_by_asset", {}) or {}
+                self._expected_dnav_turnover_ratio_by_asset = {
+                    asset: float(
+                        np.clip(
+                            (1.0 - alpha_turnover) * float(np.clip(prev_by_asset.get(asset, prev_turnover), 0.0, 1.0))
+                            + alpha_turnover * realized_turnover_by_asset[asset],
+                            0.0,
+                            1.0,
+                        )
+                    )
+                    for asset in ("wind", "solar", "hydro")
+                }
+            except Exception:
+                # Keep previous estimate on numerical issues; don't break execution path here.
+                pass
 
             if total_traded_notional > self.config.no_trade_threshold:
                 transaction_cost_bps = self.config.transaction_cost_bps
@@ -2819,6 +2929,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 transaction_costs = (total_traded_notional * transaction_cost_bps / 10000.0) + fixed_cost
 
                 self.budget -= transaction_costs
+                self._last_investor_transaction_cost = float(transaction_costs)
                 
                 # Log trade execution proof (periodically to show agents are making decisions)
                 if t % 5000 == 0 and t > 0:
@@ -2858,6 +2969,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
                 return total_traded_notional
             else:
+                self._last_investor_transaction_cost = 0.0
                 return 0.0  # Ignore very small trades and incur no costs
 
         except Exception as e:
@@ -2910,9 +3022,17 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 logger.info(f"[FORECAST_DELTAS] _compute_forecast_deltas called at t={i}")
                 logger.info(f"  forecast_generator: {self.forecast_generator}")
 
+            fail_fast = bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                bool(getattr(self.config, "forecast_baseline_enable", False))
+                or bool(getattr(self.config, "overlay_enabled", False))
+            )
+
             if self.forecast_generator is None:
+                msg = f"[FORECAST_DELTAS] forecast_generator is None at step {i}"
+                if fail_fast:
+                    raise RuntimeError(msg)
                 if i == 0:
-                    logger.warning(f"[FORECAST_DELTAS] forecast_generator is None!")
+                    logger.warning(msg)
                 return
 
             # CRITICAL FIX: Predict for CURRENT timestep (i), not next (i+1)
@@ -2922,8 +3042,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if i == 0:
                 logger.info(f"[FORECAST_DELTAS] Got forecasts: {list(forecasts.keys()) if forecasts else 'None'}")
             if not forecasts:
+                msg = f"[FORECAST_DELTAS] No forecasts returned at step {i}"
+                if fail_fast:
+                    raise RuntimeError(msg)
                 if i == 0:
-                    logger.warning(f"[FORECAST_DELTAS] No forecasts returned!")
+                    logger.warning(msg)
                 return
 
             # Populate per-target forecast arrays so the overlay feature builder can access them via _get_forecast_safe().
@@ -3488,7 +3611,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 logger.info(f"  Forecast trust: {self._forecast_trust:.4f}")
 
         except Exception as e:
-            if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+            if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                bool(getattr(self.config, "forecast_baseline_enable", False))
+                or bool(getattr(self.config, "overlay_enabled", False))
+            ):
                 raise RuntimeError(f"[FORECAST_DELTAS] Failed to compute forecast deltas at step {i}: {e}") from e
             # FIX Issue #5: On forecast failure, use previous z-scores with decay instead of zero
             logger.warning(f"[FORECAST_DELTAS] Failed to compute forecast deltas at step {i}: {e}")
@@ -3815,13 +3941,19 @@ class RenewableMultiAgentEnv(ParallelEnv):
                                 horizon=str(horizon_name),
                             )
                     except Exception as e:
-                        if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+                        if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                            bool(getattr(self.config, "forecast_baseline_enable", False))
+                            or bool(getattr(self.config, "overlay_enabled", False))
+                        ):
                             raise RuntimeError(f"[CALIBRATION] Medium/long horizon update failed at t={i}: {e}") from e
                         # Calibration is best-effort unless fail-fast is enabled.
                         pass
 
             except Exception as e:
-                if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+                if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                    bool(getattr(self.config, "forecast_baseline_enable", False))
+                    or bool(getattr(self.config, "overlay_enabled", False))
+                ):
                     raise RuntimeError(f"[CALIBRATION] Update failed at t={i}: {e}") from e
                 if i % 1000 == 0:
                     logger.warning(f"[CALIBRATION] Update failed at t={i}: {e}")
@@ -3913,7 +4045,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             return features
 
         except Exception as e:
-            if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+            if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                bool(getattr(self.config, "forecast_baseline_enable", False))
+                or bool(getattr(self.config, "overlay_enabled", False))
+            ):
                 raise RuntimeError(f"[OVERLAY_FEATURES] Error building overlay features at step {i}: {e}") from e
             logger.debug(f"[OVERLAY_FEATURES] Error building overlay features at step {i}: {e}")
             return None
@@ -3924,6 +4059,8 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         IMPORTANT (paper-clean): `features` should be the PRE-ACTION state features for step i.
         The outcome/targets are realized post-action, but the model itself is state-only.
+        To keep temporal alignment with MTM attribution, we pair realized target at step i
+        with PRE-ACTION features from step i-1.
         """
         try:
             # Get features (prefer pre-action features from step()).
@@ -3937,6 +4074,13 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # Store in history for target computation
             self._overlay_feature_history.append(features[0])  # Remove batch dimension
 
+            # One-step lag pairing: realized target at step i corresponds to previous transition.
+            current_features = features[0].astype(np.float32)
+            pending_features = getattr(self, "_overlay_pending_features", None)
+            self._overlay_pending_features = current_features.copy()
+            if pending_features is None:
+                return
+
             # Compute targets based on recent history
             if len(self._overlay_feature_history) < 5:
                 return  # Need some history to compute meaningful targets
@@ -3946,10 +4090,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
             pred_reward_target = self._compute_pred_reward_target()
 
             experience = {
-                'features': features[0].astype(np.float32),
+                'features': pending_features.astype(np.float32),
                 'pred_reward_target': float(pred_reward_target),
-                'outcome': float(getattr(self, 'last_realized_dnav', 0.0)),
-                'timestamp': self.t
+                'outcome': float(getattr(self, 'last_realized_investor_dnav', getattr(self, 'last_realized_dnav', 0.0))),
+                'timestamp': max(0, int(self.t) - 1),
             }
 
             # Add to trainer buffer
@@ -3961,7 +4105,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 logger.info(f"[OVERLAY_EXPERIENCE] t={self.t} | buffer_size={buffer_size} | pred_reward_target={pred_reward_target:.3f}")
 
         except Exception as e:
-            if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+            if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                bool(getattr(self.config, "forecast_baseline_enable", False))
+                or bool(getattr(self.config, "overlay_enabled", False))
+            ):
                 raise RuntimeError(f"[OVERLAY_EXPERIENCE] Failed to collect experience at t={self.t}: {e}") from e
             logger.debug(f"Experience collection failed: {e}")
             logger.debug(f"Full traceback: {traceback.format_exc()}")
@@ -3970,34 +4117,50 @@ class RenewableMultiAgentEnv(ParallelEnv):
         """
         Overlay supervision target for pred_reward (FGB/FAMC overlay only).
 
-        Paper-clean: outcome-aligned.
-        We supervise pred_reward using realized step dNAV for the current step
-        (computed after execution), normalized by an exposure proxy consistent with
-        CalibrationTracker.expected_dnav().
+        Paper-clean: investor-sleeve outcome aligned.
+        We supervise pred_reward using realized investor dNAV for the current step
+        (computed after execution), normalized by the same investor exposure-denominator
+        family used in Tier-3 dNAV-driven correction.
 
         Returns:
             float in [-1, 1]
         """
         try:
-            # Realized incremental NAV change (DKK) from this step (set in _update_finance).
-            realized_dnav = float(getattr(self, 'last_realized_dnav', 0.0))
+            # Realized investor-sleeve dNAV (DKK) from this step (set in _update_finance).
+            realized_dnav = float(
+                getattr(
+                    self,
+                    'last_realized_investor_dnav',
+                    getattr(self, 'last_realized_dnav', 0.0),
+                )
+            )
             if not np.isfinite(realized_dnav):
                 realized_dnav = 0.0
 
-            # Exposure proxy: sum absolute notional across financial instruments (DKK).
-            positions = getattr(self, 'financial_positions', {}) or {}
-            exposure = 0.0
-            for v in positions.values():
-                try:
-                    fv = float(v)
-                except Exception:
-                    continue
-                if np.isfinite(fv):
-                    exposure += abs(fv)
+            # Investor exposure-denominator: keep consistent with Tier-3 target construction.
+            exposure = float(getattr(self, 'last_realized_investor_return_denom', 0.0))
+            if (not np.isfinite(exposure)) or exposure <= 0.0:
+                exposure = float(getattr(self, '_last_investor_exposure_pretrade', 0.0))
 
+            # Fallback to absolute investor book exposure if needed.
+            if (not np.isfinite(exposure)) or exposure <= 0.0:
+                positions = getattr(self, 'financial_positions', {}) or {}
+                exposure = 0.0
+                for v in positions.values():
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    if np.isfinite(fv):
+                        exposure += abs(fv)
+
+            # Optional flat-exposure floor is config-driven (shared with expected_dnav path).
             init_budget = float(getattr(self, 'init_budget', 0.0) or 0.0)
-            if exposure < 1e-6:
-                exposure = 0.01 * max(init_budget, 1.0)
+            min_ratio = 0.0
+            if self.config is not None:
+                min_ratio = float(getattr(self.config, 'fgb_expected_dnav_min_exposure_ratio', 0.0) or 0.0)
+            if exposure < 1e-6 and min_ratio > 0.0:
+                exposure = float(min_ratio * max(init_budget, 1.0))
 
             # dNAV return proxy (unitless) for stable training.
             realized_return = float(realized_dnav / max(exposure, 1.0))
@@ -4030,7 +4193,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             if self.t % 500 == 0 and self.t > 0:
                 try:
                     logger.debug(
-                        f"[PRED_REWARD_TARGET] t={self.t} dnav={realized_dnav:,.0f} "
+                        f"[PRED_REWARD_TARGET] t={self.t} investor_dnav={realized_dnav:,.0f} "
                         f"exposure={exposure:,.0f} ret={realized_return:+.5f} target={pred_target:+.3f}"
                     )
                 except Exception:
@@ -4039,42 +4202,25 @@ class RenewableMultiAgentEnv(ParallelEnv):
             return float(np.clip(pred_target, -1.0, 1.0))
 
         except Exception as e:
-            if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+            if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                bool(getattr(self.config, "forecast_baseline_enable", False))
+                or bool(getattr(self.config, "overlay_enabled", False))
+            ):
                 raise RuntimeError(f"[PRED_REWARD_TARGET] computation failed at t={self.t}: {e}") from e
             logger.debug(f'Pred reward target computation failed: {e}')
             return 0.0
 
     def _compute_strategy_targets(self) -> Dict[str, np.ndarray]:
         """
-        ROBUST: Compute strategy targets with multiple fallback strategies.
+        Legacy compatibility hook.
 
-        Priority order:
-        1. P&L-based targets (best - actual outcomes)
-        2. Realized price movement targets (good - actual market movements)
-        3. Forecast-based targets (fallback - predicted movements)
-        4. Neutral targets (last resort)
+        Strategy-target blending is retired in this codebase. Overlay supervision
+        now uses realized investor dNAV targets via `_compute_pred_reward_target()`.
         """
-        try:
-            # PRIORITY 1: P&L-based targets (if enough history)
-            if len(self._action_history) >= 10 and len(self._pnl_history) >= 10:
-                return self._compute_pnl_based_targets()
-
-            # PRIORITY 2: Realized price movement targets (use actual future prices for training)
-            # This is NOT data leakage because we're training the overlay, not the RL policy
-            # The overlay learns to predict profitable actions based on current state
-            if self.t >= 144:  # Need enough history for all horizons
-                return self._compute_realized_movement_targets()
-
-            # PRIORITY 3: Forecast-based targets (if forecasts are available)
-            if self._are_forecasts_available():
-                return self._compute_forecast_based_targets()
-
-            # PRIORITY 4: Neutral targets (cold start)
-            return self._compute_neutral_targets()
-
-        except Exception as e:
-            logger.warning(f"Strategy target computation failed: {e}")
-            return self._compute_neutral_targets()
+        raise RuntimeError(
+            "[LEGACY_STRATEGY_TARGETS] _compute_strategy_targets() is retired. "
+            "Use _compute_pred_reward_target() for overlay supervision."
+        )
 
     def _compute_pnl_based_targets(self) -> Dict[str, np.ndarray]:
         """
@@ -4469,8 +4615,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 return ("discharge", inten)
             else:
                 return ("idle", 0.0)
-        except Exception:
-            return ("idle", 0.0)
+        except Exception as e:
+            raise RuntimeError(
+                f"[BATTERY_DISPATCH_POLICY_FATAL] Failed at step {i}: {e}"
+            ) from e
 
     def _execute_battery_ops(self, bat_action: np.ndarray, i: int) -> float:
         """
@@ -4632,11 +4780,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
         Accumulates to financial_mtm_positions. Call BEFORE _execute_investor_trades.
         """
         from financial_engine import FinancialEngine
-        enable_forecast_util = False
         horizon_correlations = getattr(self, '_horizon_correlations', None)
         price_returns = FinancialEngine.calculate_price_returns(
             timestep=i, current_price=current_price, price_history=self._price_raw,
-            enable_forecast_util=enable_forecast_util, horizon_correlations=horizon_correlations
+            enable_forecast_util=False, horizon_correlations=horizon_correlations
         )
         price_return = price_returns['price_return']
         self._correlation_debug = price_returns['correlation_debug']
@@ -4655,6 +4802,16 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 'solar_instrument_value': 0.0,
                 'hydro_instrument_value': 0.0,
             }
+        # Pre-trade exposure denominator for investor-sleeve realized return.
+        try:
+            pretrade_exposure = 0.0
+            for v in (getattr(self, "financial_positions", {}) or {}).values():
+                fv = float(v)
+                if np.isfinite(fv):
+                    pretrade_exposure += abs(fv)
+            self._last_investor_exposure_pretrade = float(pretrade_exposure)
+        except Exception:
+            self._last_investor_exposure_pretrade = 0.0
         mtm_pnl, per_asset_mtm = FinancialEngine.calculate_mtm_pnl_from_exposure(
             financial_exposures=self.financial_positions,
             price_return=price_return,
@@ -4754,6 +4911,29 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self.performance_history['generation_revenue_history'].append(generation_revenue)
             self.performance_history['nav_history'].append(fund_nav)
 
+            # Realized investor-sleeve dNAV/return for FAMC/Tier-3 lambda objective.
+            # Use pure MTM on pre-trade exposure for this step's price move.
+            # This avoids contaminating the target with current-step action-dependent transaction costs.
+            realized_investor_dnav = float(mtm_pnl)
+            investor_return_denom = float(getattr(self, "_last_investor_exposure_pretrade", 0.0))
+            if (not np.isfinite(investor_return_denom)) or investor_return_denom <= 0.0:
+                investor_return_denom = 0.0
+                for v in (getattr(self, "financial_positions", {}) or {}).values():
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    if np.isfinite(fv):
+                        investor_return_denom += abs(fv)
+            if (not np.isfinite(investor_return_denom)) or investor_return_denom <= 0.0:
+                investor_return_denom = float(max(getattr(self, "_last_tradeable_capital", 0.0), 1.0))
+            realized_investor_return = float(realized_investor_dnav / max(investor_return_denom, 1.0))
+            if not np.isfinite(realized_investor_return):
+                realized_investor_return = 0.0
+            self.last_realized_investor_dnav = float(realized_investor_dnav)
+            self.last_realized_investor_dnav_return = float(realized_investor_return)
+            self.last_realized_investor_return_denom = float(max(investor_return_denom, 1.0))
+
             # Realized step dNAV for overlay supervision (pred_reward target).
             prev_nav_for_overlay = getattr(self, '_overlay_prev_nav', None)
             if prev_nav_for_overlay is None:
@@ -4790,37 +4970,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
             self.cumulative_battery_revenue += battery_cash_delta
             self.cumulative_mtm_pnl += mtm_pnl  # ENHANCED: Track cumulative trading performance
 
-            # ===== KELLY SIZER UPDATE (Model B): per-step MTM PnL samples =====
-            # Under Model B, exposures are not "position values". We compute per-step MTM PnL from exposure
-            # (`per_asset_mtm`) and feed those PnL samples directly into Kelly sizing.
-            if hasattr(self, 'kelly_sizer'):
-                try:
-                    # Avoid feeding long runs of exact zeros (Kelly treats zeros as losses and will spam warnings).
-                    eps = 1e-9
-                    w = float(per_asset_mtm.get('wind_instrument_value', 0.0))
-                    s = float(per_asset_mtm.get('solar_instrument_value', 0.0))
-                    h = float(per_asset_mtm.get('hydro_instrument_value', 0.0))
-                    if abs(w) > eps:
-                        self.kelly_sizer.update('wind', w)
-                    if abs(s) > eps:
-                        self.kelly_sizer.update('solar', s)
-                    if abs(h) > eps:
-                        self.kelly_sizer.update('hydro', h)
-                except Exception as e:
-                    logger.warning(f"[KELLY] Update failed at t={i}: {e}")
-
-                # Log Kelly metrics periodically
-                if i % 1000 == 0 and i > 0:
-                    try:
-                        kelly_metrics = self.kelly_sizer.get_all_metrics()
-                        wind_metrics = kelly_metrics.get('wind', {})
-                        logger.info(f"[KELLY] Step {i}: "
-                                   f"wind_kelly={wind_metrics.get('kelly_fraction', 0.5):.3f}, "
-                                   f"win_rate={wind_metrics.get('win_rate', 0.5):.2f}, "
-                                   f"num_trades={wind_metrics.get('num_trades', 0)}")
-                    except Exception:
-                        pass
-
             # CRITICAL FIX: Update cumulative returns (total fund return)
             current_nav = fund_nav
             if hasattr(self, '_previous_nav') and self._previous_nav > 0:
@@ -4844,23 +4993,35 @@ class RenewableMultiAgentEnv(ParallelEnv):
             #
             # This aligns reward with observations (agents rewarded for z-scores they actually saw)
             forecast_signal_score = 0.0
-            forecast_gate_passed = False
-            forecast_used_flag = False
-            forecast_usage_reason = "disabled"
-            self._debug_forecast_reward = {
-                "forecast_used": False,
+            forecast_backend_enabled = bool(getattr(self.config, "forecast_baseline_enable", False))
+            tau_now = float(getattr(self, "_forecast_trust", 0.0))
+            exp_dnav_now = float(getattr(self, "_expected_dnav", 0.0))
+            trust_ok = bool(np.isfinite(tau_now) and tau_now > 0.0)
+            expected_ok = bool(np.isfinite(exp_dnav_now))
+
+            forecast_gate_passed = bool(forecast_backend_enabled and trust_ok)
+            forecast_used_flag = bool(forecast_gate_passed and expected_ok and abs(exp_dnav_now) > 1e-12)
+            if not forecast_backend_enabled:
+                forecast_usage_reason = "fgb_disabled"
+            elif not trust_ok:
+                forecast_usage_reason = "trust_zero_or_invalid"
+            elif not expected_ok:
+                forecast_usage_reason = "expected_dnav_invalid"
+            elif abs(exp_dnav_now) <= 1e-12:
+                forecast_usage_reason = "expected_dnav_zero"
+            else:
+                forecast_usage_reason = "active"
+            self._debug_fgb_backend = {
+                "forecast_used": bool(forecast_used_flag),
                 "forecast_not_used_reason": forecast_usage_reason,
-                "forecast_gate_passed": False,
+                "forecast_gate_passed": bool(forecast_gate_passed),
+                "forecast_trust": float(tau_now if np.isfinite(tau_now) else 0.0),
+                "expected_dnav": float(exp_dnav_now if np.isfinite(exp_dnav_now) else 0.0),
+                "forecast_usage_bonus": 0.0,
             }
 
-            # Tier-2 forecast engine deleted (paper refactor).
-            # Keep default "disabled" payload so downstream debug logging is stable.
-
-            # NOTE: Do NOT force forecast_used_flag to True here.
-            # We keep the engine's decision (or the default False) so usage stats
-            # reflect actual gate/usage, not observation availability.
-            # If you want the old behavior, wrap the block below in a config flag.
-            # (No action needed; just rely on the values already set above.)
+            # Forecast reward shaping remains disabled in the paper setup.
+            # These debug flags represent control-variate backend activity only.
 
             # =====================================================================
             # AGENT-SPECIFIC REWARDS
@@ -5221,7 +5382,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
             # This is ESSENTIAL for forecast integration to work (signal/noise improves)
             
             agent_rewards = {}
-            debug_forecast = getattr(self, '_debug_forecast_reward', {})
+            debug_forecast = getattr(self, '_debug_fgb_backend', {})
             
             # Allocate base_reward among agents: investor(40%), battery(30%), risk(20%), meta(10%)
             # These ratios reflect each agent's contribution to overall portfolio management
@@ -5632,8 +5793,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 exposure_exec = 0.0
 
             action_sign = float(np.sign(exposure_exec)) if abs(exposure_exec) > 1e-9 else float(np.sign(exposure_val))
-            trade_signal_active = 0.0
-            trade_signal_sign = 0.0
+            try:
+                obs_trade_signal_val = float(getattr(self, "_last_obs_trade_signal", 0.0))
+            except Exception:
+                obs_trade_signal_val = 0.0
+            trade_signal_active = 1.0 if abs(obs_trade_signal_val) > 1e-9 else 0.0
+            trade_signal_sign = float(np.sign(obs_trade_signal_val)) if trade_signal_active > 0.0 else 0.0
 
             # Ensure all values are floats (not arrays) to avoid "ambiguous truth value" error
             self.debug_tracker.log_step(
@@ -5704,14 +5869,6 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     # Price returns (ensure floats)
                     price_return_1step=float(debug_forecast.get('price_return_1step', 0.0)),
                     price_return_forecast=float(debug_forecast.get('price_return_forecast', 0.0)),
-                    # Forecast reward components (ensure floats)
-                    alignment_reward=float(debug_forecast.get('alignment_reward', 0.0)),
-                    pnl_reward=float(debug_forecast.get('pnl_reward', 0.0)),
-                    forecast_signal_score=float(debug_forecast.get('forecast_signal_score', 0.0)),
-                    generation_forecast_score=float(debug_forecast.get('generation_forecast_score', 0.0)),
-                    combined_forecast_score=float(debug_forecast.get('combined_forecast_score', 0.0)),
-                    trust_scale=float(debug_forecast.get('trust_scale', 1.0)),
-                    warmup_factor=float(debug_forecast.get('warmup_factor', 1.0)),
                     # Main reward components (already floats from above)
                     operational_score=operational_score,
                     risk_score=risk_score,
@@ -5949,6 +6106,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     'budget': self.budget,
                     'initial_budget': self.init_budget,
                     'timestep': self.t,
+                    # Canonical keys expected by EnhancedRiskController:
+                    'wind_capacity_mw': self.physical_assets['wind_capacity_mw'],
+                    'solar_capacity_mw': self.physical_assets['solar_capacity_mw'],
+                    'hydro_capacity_mw': self.physical_assets['hydro_capacity_mw'],
+                    'battery_capacity_mwh': self.physical_assets['battery_capacity_mwh'],
+                    # Backward-compatible aliases:
                     'wind_capacity': self.physical_assets['wind_capacity_mw'],
                     'solar_capacity': self.physical_assets['solar_capacity_mw'],
                     'hydro_capacity': self.physical_assets['hydro_capacity_mw'],
@@ -5969,11 +6132,9 @@ class RenewableMultiAgentEnv(ParallelEnv):
                 return
 
         except Exception as e:
-            logger.warning(f"Risk snapshot update failed: {e}")
-            self.overall_risk_snapshot = 0.5
-            self.market_risk_snapshot = 0.3
-            self.portfolio_risk_snapshot = 0.25
-            self.liquidity_risk_snapshot = 0.15
+            msg = f"[RISK_SNAPSHOT_FATAL] Risk snapshot update failed at step {self.t}: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
 
     # ------------------------------------------------------------------
     # Observations (Tier1-only; no forecast-augmented obs)
@@ -6116,7 +6277,7 @@ class RenewableMultiAgentEnv(ParallelEnv):
         if name in self._fgb_trust_cache:
             return float(self._fgb_trust_cache[name])
 
-        # Horizon preference per agent (default: auto; investor fixed to medium via config).
+        # Horizon preference per agent (default: auto; investor fixed to short via config).
         pref = "auto"
         try:
             pref_map = getattr(self.config, "fgb_trust_horizon_by_agent", {})
@@ -6251,8 +6412,12 @@ class RenewableMultiAgentEnv(ParallelEnv):
             except Exception:
                 pass
 
-            # Only compute if calibration tracker is available
+            # CalibrationTracker is required for forecast-baseline control variates.
             if self.calibration_tracker is None:
+                if bool(getattr(self.config, "forecast_baseline_enable", False)):
+                    raise RuntimeError(
+                        "[FGB] calibration_tracker is None while forecast_baseline_enable=True"
+                    )
                 return
 
             # Trust (tau_t) is updated in _compute_forecast_deltas(update_calibration=True).
@@ -6290,7 +6455,11 @@ class RenewableMultiAgentEnv(ParallelEnv):
                     positions=positions_snapshot,
                     costs={
                         'bps': self.config.transaction_cost_bps,
-                        'fixed': self.config.transaction_fixed_cost
+                        'fixed': self.config.transaction_fixed_cost,
+                        'turnover_ratio': float(getattr(self, "_expected_dnav_turnover_ratio", 0.05)),
+                        'turnover_ratio_by_asset': dict(
+                            getattr(self, "_expected_dnav_turnover_ratio_by_asset", {}) or {}
+                        ),
                     }
                 ))
             # NOTE: Risk uplift removed. Forecasts are used for FGB/FAMC variance reduction only,
@@ -6298,7 +6467,10 @@ class RenewableMultiAgentEnv(ParallelEnv):
 
         except Exception as e:
             msg = f"[FGB] Forecast signal computation failed: {e}"
-            if bool(getattr(self.config, "fgb_fail_fast", False)) and bool(getattr(self.config, "forecast_baseline_enable", False)):
+            if bool(getattr(self.config, "fgb_fail_fast", False)) and (
+                bool(getattr(self.config, "forecast_baseline_enable", False))
+                or bool(getattr(self.config, "overlay_enabled", False))
+            ):
                 raise RuntimeError(msg) from e
             logger.warning(msg)
 

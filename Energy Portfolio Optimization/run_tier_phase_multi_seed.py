@@ -325,6 +325,14 @@ def main():
                         help="Pinned PPO log_std_init for canonical seed-suite runs.")
     parser.add_argument("--ppo_mean_clip", type=float, default=0.85,
                         help="Pinned PPO mean-action clip for canonical seed-suite runs.")
+    parser.add_argument("--fgb_cv_calib_beta", type=float, default=0.10,
+                        help="Pinned EMA beta for rolling control-variate scale calibration.")
+    parser.add_argument("--fgb_cv_gain_min", type=float, default=0.50,
+                        help="Pinned minimum correction gain from CV scale calibration.")
+    parser.add_argument("--fgb_cv_gain_max", type=float, default=1.50,
+                        help="Pinned maximum correction gain from CV scale calibration.")
+    parser.add_argument("--fgb_cv_neg_gain", type=float, default=0.50,
+                        help="Pinned correction gain used when calibration implies negative scale.")
     parser.add_argument("--disable_ppo_use_sde", action="store_true",
                         help="Disable PPO gSDE. By default this runner enables --ppo_use_sde.")
     parser.add_argument("--eval_data", type=str, default="evaluation_dataset/unseendata.csv")
@@ -365,7 +373,7 @@ def main():
         "--investment_freq", str(args.investment_freq),
         "--cooling_period", str(args.cooling_period),
         "--fgb_warmup_steps", "1000",
-        "--fgb_lambda_max", "0.9",
+        "--fgb_lambda_max", "0.6",
         "--lr", str(args.lr),
         "--ent_coef", str(args.ent_coef),
         "--ppo_log_std_init", str(args.ppo_log_std_init),
@@ -379,11 +387,15 @@ def main():
         "--forecast_cache_dir", args.forecast_cache_dir,
     ]
     fgb_shared_args = [
-        "--fgb_lambda_nonnegative",
-        "--fgb_clip_adv", "0.15",
+        "--fgb_clip_adv", "0.10",
         "--forecast_trust_window", "500",
         "--forecast_trust_metric", "hitrate",
         "--forecast_trust_boost", "0.0",
+        "--fgb_cv_calib_beta", str(args.fgb_cv_calib_beta),
+        "--fgb_cv_gain_min", str(args.fgb_cv_gain_min),
+        "--fgb_cv_gain_max", str(args.fgb_cv_gain_max),
+        "--fgb_cv_neg_gain", str(args.fgb_cv_neg_gain),
+        "--fgb_allow_negative_lambda",
     ]
     protocol_path = os.path.join(suite_dir, "phase_protocol.json")
     write_phase_protocol_json(
@@ -397,7 +409,8 @@ def main():
             "fgb_shared_args_for_forecast_enabled_variants": fgb_shared_args,
             "documentation": (
                 "All forecast-enabled variants share the same FGB/FAMC stabilization settings "
-                "(fgb_shared_args). This keeps protocol-level settings explicit and reproducible."
+                "(fgb_shared_args), including explicit lambda-sign behavior "
+                "(--fgb_allow_negative_lambda). This keeps protocol-level settings explicit and reproducible."
             ),
         },
     )

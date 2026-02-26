@@ -1104,17 +1104,39 @@ def _load_eval_forecast_paths_episode20(forecast_base_dir: str = "forecast_model
     Evaluation on unseen data uses the evaluation-reserved forecast models (Episode 20).
     No training should happen in evaluation.
     """
+    def _validate_forecast_paths(paths: Dict[str, str], source: str) -> Dict[str, str]:
+        required = ("model_dir", "scaler_dir", "metadata_dir")
+        missing = []
+        for key in required:
+            p = paths.get(key)
+            if not isinstance(p, str) or not os.path.isdir(p):
+                missing.append(f"{key}={p}")
+        if missing:
+            raise FileNotFoundError(
+                f"[EVAL_FORECAST_PATHS_FATAL] Invalid forecast paths from {source}: "
+                + ", ".join(missing)
+            )
+        return paths
+
     try:
         from episode_forecast_integration import get_evaluation_forecast_paths
-        return get_evaluation_forecast_paths(forecast_base_dir=forecast_base_dir)
-    except Exception:
-        # Fallback to the conventional folder layout
+        resolved = get_evaluation_forecast_paths(forecast_base_dir=forecast_base_dir)
+        return _validate_forecast_paths(resolved, "episode_forecast_integration")
+    except Exception as e:
+        # Fallback to the conventional folder layout (validated, else fatal).
         ep_dir = os.path.join(forecast_base_dir, "episode_20")
-        return {
+        fallback = {
             "model_dir": os.path.join(ep_dir, "models"),
             "scaler_dir": os.path.join(ep_dir, "scalers"),
             "metadata_dir": os.path.join(ep_dir, "metadata"),
         }
+        try:
+            return _validate_forecast_paths(fallback, "conventional episode_20 layout")
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "[EVAL_FORECAST_PATHS_FATAL] Failed to resolve evaluation forecast paths "
+                f"(primary error: {e}; fallback error: {fallback_exc})"
+            ) from fallback_exc
 
 def _resolve_tier3_overlay_weights(final_models_dir: str, tier_dir: str) -> Optional[str]:
     """
@@ -1136,8 +1158,10 @@ def _resolve_tier3_overlay_weights(final_models_dir: str, tier_dir: str) -> Opti
                 m = re.match(r"episode_(\d+)$", name)
                 if m:
                     ep_dirs.append((int(m.group(1)), os.path.join(ckpt_root, name)))
-        except Exception:
-            ep_dirs = []
+        except Exception as e:
+            raise RuntimeError(
+                f"[EVAL_OVERLAY_WEIGHTS_FATAL] Failed to list checkpoint directory {ckpt_root}: {e}"
+            ) from e
 
         for _, ep_path in sorted(ep_dirs, key=lambda x: x[0], reverse=True):
             candidates.append(os.path.join(ep_path, f"dl_overlay_online_{dim_str}.h5"))
@@ -1159,8 +1183,10 @@ def _resolve_overlay_weights_from_models_dir(models_dir: str) -> Optional[str]:
     try:
         from config import OVERLAY_FEATURE_DIM
         dim_str = f"{int(OVERLAY_FEATURE_DIM)}d"
-    except Exception:
-        dim_str = ""
+    except Exception as e:
+        raise RuntimeError(
+            f"[EVAL_OVERLAY_WEIGHTS_FATAL] Could not resolve OVERLAY_FEATURE_DIM from config: {e}"
+        ) from e
 
     candidates = []
     roots = [models_dir, os.path.join(models_dir, "final_models")]
@@ -1482,8 +1508,8 @@ def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: f
             metrics["sleeve_trading_volatility"] = vol
             metrics["sleeve_trading_sharpe_ratio"] = sharpe
             metrics["sleeve_trading_max_drawdown_pct"] = dd * 100.0
-    except Exception:
-        pass
+    except Exception as e:
+        metrics["sleeve_trading_risk_metrics_error"] = str(e)
 
     # Exposure diagnostics on decision steps (more interpretable than total-NAV vol when book value dominates).
     try:
@@ -1494,8 +1520,8 @@ def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: f
                 expo = expo[dec] if dec.any() else expo
             metrics["sleeve_mean_abs_exposure_dkk"] = float(np.mean(np.abs(expo))) if len(expo) else 0.0
             metrics["sleeve_max_abs_exposure_dkk"] = float(np.max(np.abs(expo))) if len(expo) else 0.0
-    except Exception:
-        pass
+    except Exception as e:
+        metrics["sleeve_exposure_metrics_error"] = str(e)
 
     return metrics
 

@@ -109,8 +109,8 @@ class OverlaySharedModel(tf.keras.Model):
             self.meta_head = None
             logging.info(f"OverlaySharedModel initialized: {feature_dim} features (no meta-critic)")
 
-    def call(self, x, training=None):
-        """Forward pass through shared encoder and heads"""
+    def encode(self, x, training=None):
+        """Shared trunk encoder used by both heads."""
         z = self.d1(x)
         z = self.do1(z, training=training)
         z = self.d2(z)
@@ -118,6 +118,11 @@ class OverlaySharedModel(tf.keras.Model):
         z = self.d3(z)
         z = self.do3(z, training=training)
         z = self.d4(z)
+        return z
+
+    def call(self, x, training=None):
+        """Forward pass through shared encoder and heads"""
+        z = self.encode(x, training=training)
 
         pred_reward = self.pred_reward_head(z)  # [-1,1]
         out = {
@@ -311,7 +316,7 @@ class OverlayTrainer:
     def __init__(self, model: OverlaySharedModel, learning_rate: float = 3e-3, verbose: bool = False):
         self.model = model
         self.verbose = verbose
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        self.learning_rate = float(learning_rate)
         self.buffer = OverlayExperienceBuffer(max_size=10_000)
 
         # Loss functions for each head (FGB/FAMC: pred_reward only)
@@ -331,7 +336,65 @@ class OverlayTrainer:
         self.patience_counter = 0
         self.max_patience = 10
 
+        # IMPORTANT:
+        # Keep separate optimizers for disjoint variable groups.
+        # Keras optimizers track known variables and can fail if the same optimizer
+        # is later asked to update a different set.
+        self.overlay_train_vars = []
+        self.meta_train_vars = []
+        self.overlay_optimizer = None
+        self.meta_optimizer = None
+        self._initialize_optimizers()
+
         logging.info(f"OverlayTrainer initialized with learning_rate={learning_rate}")
+
+    def _initialize_optimizers(self):
+        """Initialize dedicated optimizers and pre-register their variable sets."""
+        # Ensure model variables exist before building optimizer slots.
+        if not self.model.built:
+            feat_dim = int(getattr(self.model, "feature_dim", 0))
+            if feat_dim <= 0:
+                raise RuntimeError("[OVERLAY_INIT_FATAL] Invalid model feature_dim for optimizer initialization")
+            dummy = tf.zeros((1, feat_dim), dtype=tf.float32)
+            _ = self.model(dummy, training=False)
+
+        meta_vars = []
+        if hasattr(self.model, "meta_head") and self.model.meta_head is not None:
+            meta_vars = list(self.model.meta_head.trainable_variables)
+        meta_var_ids = {id(v) for v in meta_vars}
+
+        # Overlay trainer updates shared encoder + pred_reward head only.
+        self.overlay_train_vars = [v for v in self.model.trainable_variables if id(v) not in meta_var_ids]
+        self.meta_train_vars = meta_vars
+
+        if not self.overlay_train_vars:
+            raise RuntimeError("[OVERLAY_INIT_FATAL] No overlay trainable variables found")
+
+        self.overlay_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
+        self._build_optimizer(self.overlay_optimizer, self.overlay_train_vars, "overlay")
+
+        if self.meta_train_vars:
+            self.meta_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
+            self._build_optimizer(self.meta_optimizer, self.meta_train_vars, "meta")
+
+    @staticmethod
+    def _build_optimizer(optimizer, variables, label: str):
+        """Best-effort optimizer slot pre-build for strict variable registration."""
+        try:
+            build_fn = getattr(optimizer, "build", None)
+            if callable(build_fn):
+                build_fn(variables)
+        except Exception as e:
+            logging.warning(f"[OVERLAY] Optimizer build skipped for {label}: {e}")
+
+    @staticmethod
+    def _apply_gradients_safe(optimizer, gradients, variables) -> int:
+        """Apply only valid gradients and return number of updated variables."""
+        grads_and_vars = [(g, v) for g, v in zip(gradients, variables) if g is not None]
+        if not grads_and_vars:
+            return 0
+        optimizer.apply_gradients(grads_and_vars)
+        return len(grads_and_vars)
 
     def add_experience(self, experience: Dict[str, Any]):
         """Add experience to training buffer"""
@@ -366,8 +429,10 @@ class OverlayTrainer:
                 losses['total'] = float(total_loss.numpy())
 
             # Backward pass
-            gradients = tape.gradient(total_loss, self.model.trainable_variables)
-            self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+            gradients = tape.gradient(total_loss, self.overlay_train_vars)
+            applied = self._apply_gradients_safe(self.overlay_optimizer, gradients, self.overlay_train_vars)
+            if applied == 0:
+                raise RuntimeError("[OVERLAY_TRAIN_FATAL] No valid gradients for overlay update")
 
             return losses
 
@@ -441,14 +506,11 @@ class OverlayTrainer:
                 targets = tf.reshape(targets, (-1, 1))
 
             with tf.GradientTape() as tape:
-                # Forward pass through meta head only
-                pred = self.model.meta_head(self.model.d4(
-                    self.model.do3(self.model.d3(
-                        self.model.do2(self.model.d2(
-                            self.model.do1(self.model.d1(features), training=True)
-                        ), training=True)
-                    ), training=True)
-                ), training=True)
+                # Forward pass through meta head only.
+                # Use deterministic trunk features (training=False) because the trunk is
+                # frozen for this update; stochastic dropout noise here degrades signal quality.
+                z_det = tf.stop_gradient(self.model.encode(features, training=False))
+                pred = self.model.meta_head(z_det, training=True)
 
                 if loss_type == "mse":
                     # MSE loss (targets should be standardized outside)
@@ -466,9 +528,12 @@ class OverlayTrainer:
                     loss = tf.reduce_mean(tf.square(pred - targets))
 
             # Backward pass (only update meta head parameters)
-            vars = self.model.meta_head.trainable_variables
-            grads = tape.gradient(loss, vars)
-            self.optimizer.apply_gradients(zip(grads, vars))
+            if not self.meta_train_vars or self.meta_optimizer is None:
+                raise RuntimeError("[FAMC_META_TRAIN_FATAL] Meta optimizer not initialized")
+            grads = tape.gradient(loss, self.meta_train_vars)
+            applied = self._apply_gradients_safe(self.meta_optimizer, grads, self.meta_train_vars)
+            if applied == 0:
+                raise RuntimeError("[FAMC_META_TRAIN_FATAL] No valid gradients for meta head update")
 
             return float(loss.numpy())
 
@@ -505,12 +570,12 @@ class OverlayTrainer:
 
 
 # ============================================================================
-# TIER 3 ONLY: FGB CALIBRATION TRACKER (Forecast-Guided Baseline)
+# TIER 2/3: FGB CALIBRATION TRACKER (Forecast-Guided Baseline)
 # ============================================================================
 
 class CalibrationTracker:
     """
-    TIER 3 ONLY: FGB - Rolling online calibration for forecast trust (τₜ) and expected ΔNAV.
+    TIER 2/3: FGB - Rolling online calibration for forecast trust (τₜ) and expected ΔNAV.
 
     This class tracks forecast accuracy over a rolling window and computes:
     1. Trust τₜ ∈ [0,1]: How much to trust the forecast (based on hit-rate, MAE, etc.)
@@ -519,7 +584,7 @@ class CalibrationTracker:
     The DL overlay remains a forecaster, not a controller.
     PPO remains the action decision-maker; we reduce advantage variance via baseline adjustment.
 
-    TIER 2: This is NOT used (forecast trust is computed differently)
+    Used by forecast-baseline variants in this codebase (Tier 2 and Tier 3).
     """
 
     def __init__(
@@ -782,14 +847,50 @@ class CalibrationTracker:
             exp_dnav_gross = exposure * pred_blend
 
             # Estimate transaction costs - use config values passed from env (match _execute_investor_trades)
-            # Conservative: assume 5% of exposure trades per step (was 10%) to avoid over-penalizing
+            # Use adaptive turnover ratio (EWMA from realized trading), fallback to conservative default.
             if exposure <= 1e-6:
                 est_costs = 0.0
             else:
-                typical_trade_notional = 0.05 * max(exposure, 1.0)
+                turnover_ratio = float(costs.get("turnover_ratio", 0.05))
+                if not np.isfinite(turnover_ratio):
+                    turnover_ratio = 0.05
+                turnover_ratio = float(np.clip(turnover_ratio, 0.0, 1.0))
+                effective_turnover_ratio = turnover_ratio
+                # Optional per-asset turnover override (more stable when sleeve turnover
+                # differs across wind/solar/hydro).
+                turnover_ratio_by_asset = costs.get("turnover_ratio_by_asset", None)
+                if isinstance(turnover_ratio_by_asset, dict):
+                    asset_pos = {}
+                    for asset in ("wind", "solar", "hydro"):
+                        pos_val = positions.get(f"{asset}_instrument_value", positions.get(asset, 0.0))
+                        try:
+                            pos_val = float(pos_val)
+                        except Exception:
+                            pos_val = 0.0
+                        asset_pos[asset] = abs(pos_val) if np.isfinite(pos_val) else 0.0
+                    total_asset_pos = float(sum(asset_pos.values()))
+                    if total_asset_pos > 1e-9:
+                        weighted_turnover = 0.0
+                        valid_asset_weight = 0.0
+                        for asset, pos_abs in asset_pos.items():
+                            raw_asset_turn = turnover_ratio_by_asset.get(asset, turnover_ratio)
+                            try:
+                                asset_turn = float(raw_asset_turn)
+                            except Exception:
+                                continue
+                            if not np.isfinite(asset_turn):
+                                continue
+                            asset_turn = float(np.clip(asset_turn, 0.0, 1.0))
+                            w = float(pos_abs / total_asset_pos)
+                            weighted_turnover += w * asset_turn
+                            valid_asset_weight += w
+                        if valid_asset_weight > 1e-9:
+                            effective_turnover_ratio = float(np.clip(weighted_turnover, 0.0, 1.0))
+                typical_trade_notional = effective_turnover_ratio * max(exposure, 1.0)
                 bps = costs.get("bps", 0.5)  # Config default 0.5 bps (institutional)
                 fixed = costs.get("fixed", 172.0)  # Config: ~$25/trade in DKK
-                est_costs = (typical_trade_notional * bps / 10000.0) + fixed
+                fixed_cost_component = fixed if typical_trade_notional > 1e-9 else 0.0
+                est_costs = (typical_trade_notional * bps / 10000.0) + fixed_cost_component
 
             # Net expected ΔNAV
             exp_dnav = exp_dnav_gross - est_costs

@@ -14,6 +14,28 @@ import traceback
 import gc
 from typing import Optional, Tuple, Dict, Any, List
 
+# Determinism-critical environment variables must be set before any TensorFlow import.
+# Parse CLI seed early (best effort) so child libs see a stable value at import time.
+def _early_determinism_env_bootstrap() -> None:
+    seed_str = "42"
+    try:
+        if "--seed" in sys.argv:
+            idx = sys.argv.index("--seed")
+            if idx + 1 < len(sys.argv):
+                seed_str = str(int(sys.argv[idx + 1]))
+    except Exception:
+        seed_str = "42"
+    os.environ.setdefault("PYTHONHASHSEED", seed_str)
+    os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    # Pin BLAS/math threadpools for reproducibility.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+_early_determinism_env_bootstrap()
+
 import numpy as np
 import pandas as pd
 import torch  # for device availability check
@@ -34,7 +56,6 @@ logger = get_logger(__name__)
 # Import patched environment classes
 from environment import RenewableMultiAgentEnv
 from generator import MultiHorizonForecastGenerator
-from dl_overlay import DLAdapter
 from utils import load_overlay_weights, clear_tf_session, configure_tf_memory  # UNIFIED: Import from single source of truth
 from config import normalize_price, OVERLAY_FEATURE_DIM  # UNIFIED: Import from single source of truth
 
@@ -1965,17 +1986,11 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             except Exception as save_error:
                 logger.warning(f"   [WARN] Emergency checkpoint save failed: {save_error}")
 
-            # Ask user if they want to continue with next episode
-            logger.warning(f"\n[WARN] Episode {episode_num} failed. Options:")
-            logger.info(f"   1. Continue with Episode {episode_num + 1}")
-            logger.info(f"   2. Stop training")
-
             if is_oom_error:
                 logger.info(f"   [SUGGESTION] OOM: Consider reducing batch size, episode timesteps, or enabling more aggressive memory cleanup")
-
-            # For now, continue to next episode (can be made interactive later)
-            logger.info(f"   -> Continuing with next episode...")
-            continue
+            raise RuntimeError(
+                f"[EPISODE_TRAINING_FATAL] Episode {episode_num} failed; aborting run under fail-fast policy."
+            ) from e
 
     logger.info(f"\n[SUCCESS] EPISODE TRAINING COMPLETED!")
     logger.info(f"   Successful episodes: {successful_episodes}/{args.end_episode - args.start_episode + 1}")
@@ -2008,6 +2023,7 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
 
     try:
         from config import OVERLAY_FEATURE_DIM
+        from dl_overlay import DLAdapter, OverlayTrainer
         logger.info(f"[DL] Initializing DL Overlay System ({OVERLAY_FEATURE_DIM}D short-horizon only)")
         logger.debug(f"[DEBUG] env.forecast_generator = {env.forecast_generator}")
 
@@ -2052,7 +2068,6 @@ def initialize_dl_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
 
         # Initialize OverlayTrainer for model training
         try:
-            from dl_overlay import OverlayTrainer
             overlay_trainer = OverlayTrainer(
                 model=overlay_adapter.model,
                 learning_rate=1e-3,
@@ -2130,7 +2145,7 @@ def main():
                        help="Enable forecast-guided value baseline (auto-enables --dl_overlay; does NOT change agent observations).")
     parser.add_argument("--forecast_trust_window", type=int, default=None, help="FGB: Rolling window for trust calibration (default: config.forecast_trust_window).")
     # Default to directional hit-rate for trust calibration. Users can still select "combo" (dir + magnitude).
-    parser.add_argument("--forecast_trust_metric", type=str, default="combo", choices=["combo", "hitrate", "absdir"], help="FGB: Trust computation method (combo=MAPE+directional)")
+    parser.add_argument("--forecast_trust_metric", type=str, default="hitrate", choices=["combo", "hitrate", "absdir"], help="FGB: Trust computation method (default: hitrate for canonical parity)")
     parser.add_argument("--forecast_trust_boost", type=float, default=None, help="FGB: Optional trust optimism boost (default: config.forecast_trust_boost).")
     parser.add_argument(
         "--fgb_ablate_forecasts",
@@ -2146,8 +2161,8 @@ def main():
     parser.add_argument(
         "--fgb_clip_adv",
         type=float,
-        default=0.15,
-        help="FAMC: Per-step correction cap in ADVANTAGE units (clips delta advantage per-step).",
+        default=None,
+        help="FAMC: Per-step correction cap in ADVANTAGE units (default: config.fgb_clip_adv).",
     )
     parser.add_argument(
         "--fgb_clip_bps",
@@ -2161,8 +2176,38 @@ def main():
         default=False,
         help="FAMC: Force lambda* >= 0 (safer; may forgo variance reduction when Cov(A,C) < 0).",
     )
+    parser.add_argument(
+        "--fgb_allow_negative_lambda",
+        action="store_true",
+        default=False,
+        help="FAMC: Explicitly allow lambda* < 0 when Cov(A,C) < 0 (variance-optimal setting).",
+    )
     parser.add_argument("--fgb_warmup_steps", type=int, default=1000, help="FAMC: No correction before this many steps")
     parser.add_argument("--fgb_moment_beta", type=float, default=0.01, help="FAMC: EMA rate for Cov/Var moments")
+    parser.add_argument(
+        "--fgb_cv_calib_beta",
+        type=float,
+        default=None,
+        help="FAMC: EMA beta for rolling control-variate scale calibration (default: config).",
+    )
+    parser.add_argument(
+        "--fgb_cv_gain_min",
+        type=float,
+        default=None,
+        help="FAMC: Minimum gain for calibrated control-variate amplitude (default: config).",
+    )
+    parser.add_argument(
+        "--fgb_cv_gain_max",
+        type=float,
+        default=None,
+        help="FAMC: Maximum gain for calibrated control-variate amplitude (default: config).",
+    )
+    parser.add_argument(
+        "--fgb_cv_neg_gain",
+        type=float,
+        default=None,
+        help="FAMC: Gain used when calibration implies negative control-variate scale (default: config).",
+    )
     parser.add_argument(
         "--fgb_expected_dnav_min_exposure_ratio",
         type=float,
@@ -2323,26 +2368,43 @@ def main():
     # Apply dependency resolution
     args = resolve_dependencies(args)
 
+    # Seed value first (single source of truth for this run).
+    seed_value = int(args.seed)
+
+    # CRITICAL: Set deterministic env vars BEFORE TensorFlow/CUDA initialization.
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+    # Recommended by PyTorch/CUDA for deterministic GEMM behavior.
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    # Pin math threadpools to 1 for stronger determinism.
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
     # Safer device selection
     if args.device.lower() == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available. Falling back to CPU.")
         args.device = "cpu"
 
-    # Initialize TensorFlow based on device setting
+    # Initialize TensorFlow based on device setting (after deterministic env setup).
     from generator import initialize_tensorflow
     tf = initialize_tensorflow(args.device)
 
-    # Seed everything for repeatability (uses args.seed from command line)
-    seed_value = args.seed
-    
-    # CRITICAL: Set deterministic operations BEFORE seeding
-    # This must be done before any PyTorch operations
-    import torch
-    torch.use_deterministic_algorithms(True, warn_only=True)  # Enable deterministic algorithms
-    torch.backends.cudnn.deterministic = True  # Make CuDNN deterministic
-    torch.backends.cudnn.benchmark = False  # Disable benchmark for reproducibility
-    
-    # Seed all random number generators
+    # CRITICAL: enforce deterministic algorithms (hard fail on non-deterministic ops).
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    # Seed all random number generators.
     random.seed(seed_value)
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
@@ -2350,20 +2412,19 @@ def main():
         torch.cuda.manual_seed_all(seed_value)
         torch.cuda.manual_seed(seed_value)
 
-    # CRITICAL: Seed TensorFlow for deterministic DL overlay training
+    # Seed TensorFlow after initialization.
     if tf is not None:
         tf.random.set_seed(seed_value)
-        os.environ['TF_DETERMINISTIC_OPS'] = '1'  # Force deterministic ops
-        os.environ['TF_CUDNN_DETERMINISTIC'] = '1'  # Make CuDNN deterministic
-        os.environ['PYTHONHASHSEED'] = str(seed_value)  # Python hash seed
-    
-    # CRITICAL: Seed environment's RNG at initialization
-    # This ensures environment randomness is also deterministic
-    os.environ['PYTHONHASHSEED'] = str(seed_value)
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(1)
+            tf.config.threading.set_inter_op_parallelism_threads(1)
+        except Exception:
+            pass
 
     logger.info(f"[SEED] All RNGs seeded with {seed_value} for deterministic training")
     logger.info(f"[SEED] PyTorch deterministic algorithms: ENABLED")
     logger.info(f"[SEED] CuDNN deterministic: ENABLED")
+    logger.info("[SEED] Threading pinned: OMP=1 MKL=1 NUMEXPR=1 TORCH=1 TF=1")
 
     logger.info("Enhanced Multi-Horizon Energy Investment RL System")
     logger.info("=" * 60)
@@ -2393,6 +2454,9 @@ def main():
     # Override config.seed with command-line argument
     config.seed = args.seed
     logger.info(f"[CONFIG] Using seed: {config.seed}")
+    # Determinism policy: always use single-threaded policy training.
+    config.multithreading = False
+    logger.info("[CONFIG] Forced multithreading=False for deterministic training")
 
     # === OBSERVATION POLICY (TIER-1 OBSERVATION SPACE) ===
     logger.info("\nObservation configuration...")
@@ -2431,6 +2495,9 @@ def main():
     # FGB: Apply forecast-guided baseline CLI args to config
     logger.info("\nApplying forecast-guided baseline configuration...")
     config.forecast_baseline_enable = args.forecast_baseline_enable
+    # Mirror intended runtime overlay state into config before manifest emission.
+    # initialize_dl_overlay() will still perform concrete adapter construction later.
+    config.overlay_enabled = bool(args.dl_overlay)
     if args.forecast_trust_window is not None:
         config.forecast_trust_window = args.forecast_trust_window
     config.forecast_trust_metric = args.forecast_trust_metric
@@ -2445,7 +2512,8 @@ def main():
     logger.info("\nApplying FAMC configuration...")
     config.fgb_mode = args.fgb_mode
     config.fgb_lambda_max = args.fgb_lambda_max
-    config.fgb_clip_adv = args.fgb_clip_adv
+    if args.fgb_clip_adv is not None:
+        config.fgb_clip_adv = args.fgb_clip_adv
     if args.fgb_clip_bps is not None:
         logger.warning("[FAMC] --fgb_clip_bps is deprecated; use --fgb_clip_adv. Interpreting provided value as advantage-unit clip.")
         config.fgb_clip_adv = args.fgb_clip_bps
@@ -2453,7 +2521,20 @@ def main():
     config.fgb_clip_bps = config.fgb_clip_adv
     config.fgb_warmup_steps = args.fgb_warmup_steps
     config.fgb_moment_beta = args.fgb_moment_beta
-    config.fgb_allow_negative_lambda = (not args.fgb_lambda_nonnegative)
+    if args.fgb_cv_calib_beta is not None:
+        config.fgb_cv_calib_beta = float(args.fgb_cv_calib_beta)
+    if args.fgb_cv_gain_min is not None:
+        config.fgb_cv_gain_min = float(args.fgb_cv_gain_min)
+    if args.fgb_cv_gain_max is not None:
+        config.fgb_cv_gain_max = float(args.fgb_cv_gain_max)
+    if args.fgb_cv_neg_gain is not None:
+        config.fgb_cv_neg_gain = float(args.fgb_cv_neg_gain)
+    if bool(args.fgb_lambda_nonnegative) and bool(args.fgb_allow_negative_lambda):
+        raise ValueError("Cannot set both --fgb_lambda_nonnegative and --fgb_allow_negative_lambda.")
+    if bool(args.fgb_lambda_nonnegative):
+        config.fgb_allow_negative_lambda = False
+    elif bool(args.fgb_allow_negative_lambda):
+        config.fgb_allow_negative_lambda = True
     # Always fail fast for Tier-2/Tier-3 baseline paths.
     config.fgb_fail_fast = True
     if args.fgb_expected_dnav_min_exposure_ratio is not None:
@@ -2501,6 +2582,10 @@ def main():
     logger.info(f"fgb_lambda_max:            {config.fgb_lambda_max}")
     logger.info(f"fgb_clip_adv:              {getattr(config, 'fgb_clip_adv', getattr(config, 'fgb_clip_bps', None))}")
     logger.info(f"fgb_allow_negative_lambda: {getattr(config, 'fgb_allow_negative_lambda', False)}")
+    logger.info(f"fgb_cv_calib_beta:        {getattr(config, 'fgb_cv_calib_beta', None)}")
+    logger.info(f"fgb_cv_gain_min:          {getattr(config, 'fgb_cv_gain_min', None)}")
+    logger.info(f"fgb_cv_gain_max:          {getattr(config, 'fgb_cv_gain_max', None)}")
+    logger.info(f"fgb_cv_neg_gain:          {getattr(config, 'fgb_cv_neg_gain', None)}")
     logger.info(f"fgb_fail_fast:             {getattr(config, 'fgb_fail_fast', False)}")
     logger.info(f"meta_baseline_enable:      {config.meta_baseline_enable}")
     logger.info(f"meta_baseline_head_dim:    {config.meta_baseline_head_dim}")
@@ -3136,6 +3221,7 @@ def main():
         logger.error(f"Training failed: {e}")
         import traceback
         traceback.print_exc()
+        raise RuntimeError(f"[TRAINING_FATAL] {e}") from e
     finally:
         # Close envs if they expose close()
         try:

@@ -84,14 +84,7 @@ class ObservationBuilder:
                 'hydro_n': hydro_n
             }
         except Exception as e:
-            logger.warning(f"Market feature normalization failed: {e}")
-            return {
-                'price_n': 0.0,
-                'load_n': 0.0,
-                'wind_n': 0.0,
-                'solar_n': 0.0,
-                'hydro_n': 0.0
-            }
+            raise RuntimeError(f"[OBS_NORMALIZE_FATAL] Market feature normalization failed: {e}") from e
     
     @staticmethod
     def build_investor_observations(
@@ -139,7 +132,7 @@ class ObservationBuilder:
             obs_array[5] = mtm_pnl_norm
                 
         except Exception as e:
-            logger.warning(f"Investor observation building failed: {e}")
+            raise RuntimeError(f"[OBS_INVESTOR_FATAL] Investor observation building failed: {e}") from e
     
     @staticmethod
     def build_battery_observations(
@@ -180,5 +173,5 @@ class ObservationBuilder:
             # soc_distance_to_max = float(np.clip((soc_max - soc_normalized) / max(soc_max - soc_min, 0.01), 0.0, 1.0))
             
         except Exception as e:
-            logger.warning(f"Battery observation building failed: {e}")
+            raise RuntimeError(f"[OBS_BATTERY_FATAL] Battery observation building failed: {e}") from e
 

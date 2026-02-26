@@ -1,4 +1,4 @@
-# metacontroller.py
+﻿# metacontroller.py
 # -----------------------------------------------------------------------------
 from copy import deepcopy
 from gymnasium import Env, spaces
@@ -113,12 +113,19 @@ class DummyGymEnv(Env):
 # ================================ Utilities =================================
 def safe_multithreaded_processing(function, policies, multithreading=True, max_workers=None):
     """Safe multithreaded processing with error handling."""
+    errors = []
     if not multithreading or len(policies) <= 1:
         for polid, policy in enumerate(policies):
             try:
                 function(polid, policy)
             except Exception as exc:
-                logger.error(f"Policy {polid} error: {exc}")
+                msg = f"[TRAINING_POLICY_FATAL] Policy {polid} ({getattr(policy, 'agent_name', polid)}) error: {exc}"
+                logger.error(msg)
+                errors.append(msg)
+        if errors:
+            raise RuntimeError(
+                "[TRAINING_POLICY_FATAL] One or more policy updates failed:\n" + "\n".join(errors)
+            )
         return
 
     max_workers = max_workers or min(4, len(policies))
@@ -127,10 +134,18 @@ def safe_multithreaded_processing(function, policies, multithreading=True, max_w
         for future, polid in futures:
             try:
                 future.result(timeout=90)
-            except concurrent.futures.TimeoutError:
-                logger.warning(f"Policy {polid} training timeout")
+            except concurrent.futures.TimeoutError as exc:
+                msg = f"[TRAINING_POLICY_FATAL] Policy {polid} training timeout: {exc}"
+                logger.error(msg)
+                errors.append(msg)
             except Exception as exc:
-                print(f"Policy {polid} generated an exception: {exc}")
+                msg = f"[TRAINING_POLICY_FATAL] Policy {polid} generated an exception: {exc}"
+                logger.error(msg)
+                errors.append(msg)
+    if errors:
+        raise RuntimeError(
+            "[TRAINING_POLICY_FATAL] One or more policy updates failed:\n" + "\n".join(errors)
+        )
 
 
 # ======================== Observation Validator =============================
@@ -206,13 +221,13 @@ class MultiESGAgent:
         }
 
         # FAMC: Forecast-Aware Meta-Critic state tracking
-        # EMA moments for online λ* computation
+        # EMA moments for online Î»* computation
         self._ema_mA = 0.0   # E[A]
         self._ema_mC = 0.0   # E[C]
-        self._ema_mA2 = 0.0  # E[A²]
-        self._ema_mC2 = 0.0  # E[C²]
-        self._ema_mAC = 0.0  # E[A·C]
-        self._lambda_star_prev = 0.0  # Smoothed λ*
+        self._ema_mA2 = 0.0  # E[AÂ²]
+        self._ema_mC2 = 0.0  # E[CÂ²]
+        self._ema_mAC = 0.0  # E[AÂ·C]
+        self._lambda_star_prev = 0.0  # Smoothed Î»*
         self._step_count_famc = 0  # Step counter for FAMC
 
         # FAMC: Buffers for meta-critic training
@@ -256,7 +271,7 @@ class MultiESGAgent:
         try:
             # CRITICAL FIX: DO NOT reset total_steps - it must accumulate across episodes
             # for proper learning rate schedules and optimizer state
-            # self.total_steps = 0  # ← REMOVED! This was breaking learning continuity
+            # self.total_steps = 0  # â† REMOVED! This was breaking learning continuity
 
             # Reset observation tracking
             self._last_obs = None
@@ -282,7 +297,7 @@ class MultiESGAgent:
                     self.logger.info(f"[FAMC] Cleared meta buffers: {buffer_size_before} entries freed")
 
             # FAMC: Reset EMA moments for new episode
-            # This ensures λ* computation starts fresh
+            # This ensures Î»* computation starts fresh
             self._ema_mA = 0.0
             self._ema_mC = 0.0
             self._ema_mA2 = 0.0
@@ -415,7 +430,7 @@ class MultiESGAgent:
                         f"This is a CRITICAL initialization error."
                     )
                 else:
-                    self.logger.debug(f"[ROBUST_INIT] ✓ {agent}: Observation space matches ({declared_dim}D)")
+                    self.logger.debug(f"[ROBUST_INIT] âœ“ {agent}: Observation space matches ({declared_dim}D)")
             
             if mismatches:
                 error_msg = (
@@ -428,7 +443,7 @@ class MultiESGAgent:
                 self.logger.error(error_msg)
                 raise RuntimeError(error_msg)
             
-            self.logger.info("[ROBUST_INIT] ✓ All observation spaces match actual environment output")
+            self.logger.info("[ROBUST_INIT] âœ“ All observation spaces match actual environment output")
             
         except RuntimeError:
             # Re-raise RuntimeError (our fail-fast errors)
@@ -506,7 +521,7 @@ class MultiESGAgent:
                 )
             else:
                 self.logger.debug(
-                    f"[ROBUST_VERIFY] ✓ {agent_name}: Policy matches observation space "
+                    f"[ROBUST_VERIFY] âœ“ {agent_name}: Policy matches observation space "
                     f"(env={env_obs_dim}D, policy_attr={policy_obs_dim}D, network={network_input_dim}D)"
                 )
         
@@ -520,7 +535,7 @@ class MultiESGAgent:
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
         
-        self.logger.info("[ROBUST_VERIFY] ✓ All policies match observation spaces")
+        self.logger.info("[ROBUST_VERIFY] âœ“ All policies match observation spaces")
     
     def reinitialize_observation_spaces(self):
         """
@@ -905,11 +920,11 @@ class MultiESGAgent:
                                 self.memory_tracker.register_buffer(new_policy.replay_buffer)
                             
                             policies_recreated += 1
-                            self.logger.info(f"[ROBUST_CHECK] ✓ {agent_name}: Policy RECREATED with {env_obs_dim}D observation space")
+                            self.logger.info(f"[ROBUST_CHECK] âœ“ {agent_name}: Policy RECREATED with {env_obs_dim}D observation space")
                         else:
-                            self.logger.error(f"[ROBUST_CHECK] ✗ {agent_name}: Failed to recreate policy")
+                            self.logger.error(f"[ROBUST_CHECK] âœ— {agent_name}: Failed to recreate policy")
                     except Exception as recreate_error:
-                        self.logger.error(f"[ROBUST_CHECK] ✗ {agent_name}: Error recreating policy: {recreate_error}")
+                        self.logger.error(f"[ROBUST_CHECK] âœ— {agent_name}: Error recreating policy: {recreate_error}")
                 else:
                     # Policy is correct - verify observation space attribute matches
                     if policy_obs_dim != env_obs_dim:
@@ -917,16 +932,16 @@ class MultiESGAgent:
                         policy.observation_space = env_obs_space
                         if hasattr(policy, 'policy') and hasattr(policy.policy, 'observation_space'):
                             policy.policy.observation_space = env_obs_space
-                        self.logger.debug(f"[ROBUST_CHECK] ✓ {agent_name}: Updated observation_space attribute to {env_obs_dim}D")
+                        self.logger.debug(f"[ROBUST_CHECK] âœ“ {agent_name}: Updated observation_space attribute to {env_obs_dim}D")
                     else:
-                        self.logger.debug(f"[ROBUST_CHECK] ✓ {agent_name}: Policy observation space correct ({env_obs_dim}D)")
+                        self.logger.debug(f"[ROBUST_CHECK] âœ“ {agent_name}: Policy observation space correct ({env_obs_dim}D)")
             except Exception as e:
-                self.logger.error(f"[ROBUST_CHECK] ✗ {agent_name}: Error during validation: {e}")
+                self.logger.error(f"[ROBUST_CHECK] âœ— {agent_name}: Error during validation: {e}")
         
         if policies_recreated > 0:
             self.logger.info(f"[ROBUST_CHECK] Recreated {policies_recreated} policies with correct observation spaces")
         else:
-            self.logger.info(f"[ROBUST_CHECK] All policies have correct observation spaces ✓")
+            self.logger.info(f"[ROBUST_CHECK] All policies have correct observation spaces âœ“")
     
     def _fix_policy_observation_spaces(self):
         """
@@ -1333,6 +1348,9 @@ class MultiESGAgent:
             except Exception as e:
                 self.logger.error(f"Training error for {getattr(policy, 'agent_name', polid)}: {e}")
                 self._training_metrics["policy_errors"] += 1
+                raise RuntimeError(
+                    f"[TRAINING_POLICY_FATAL] Training failed for {getattr(policy, 'agent_name', polid)}: {e}"
+                ) from e
 
         pbar = tqdm(total=int(total_timesteps), desc="Training..", unit="steps")
 
@@ -1461,7 +1479,7 @@ class MultiESGAgent:
                             policy.replay_buffer.full = trim >= getattr(policy.replay_buffer, "buffer_size", trim)
                             if self.debug:
                                 self.logger.info(
-                                    f"Trimmed {policy.agent_name} buffer: {buffer_size} → {trim}"
+                                    f"Trimmed {policy.agent_name} buffer: {buffer_size} â†’ {trim}"
                                 )
                     except Exception as te:
                         self.logger.warning(f"Buffer trimming failed for {policy.agent_name}: {te}")
@@ -1861,7 +1879,7 @@ class MultiESGAgent:
 
     def _handle_rollout_failure_enhanced(self):
         if self.debug:
-            print("Rollout failure recovery…")
+            print("Rollout failure recoveryâ€¦")
         self.memory_tracker.cleanup("heavy")
         self._initialize_environment_enhanced()
 
@@ -1934,20 +1952,49 @@ class MultiESGAgent:
                 # FGB/FAMC: Add forecast signals to data dict for baseline adjustment
                 # These are computed by environment._compute_forecast_signals() each step
                 try:
-                    if hasattr(self.env, "get_fgb_trust_for_agent"):
-                        data['forecast_trust'] = float(self.env.get_fgb_trust_for_agent(agent_name))
-                    else:
-                        data['forecast_trust'] = float(getattr(self.env, '_forecast_trust', 0.0))
+                    tau_cv = float(getattr(self.env, '_forecast_trust_cv', np.nan))
                 except Exception:
-                    data['forecast_trust'] = float(getattr(self.env, '_forecast_trust', 0.0))
-                data['expected_dnav'] = getattr(self.env, '_expected_dnav', 0.0)
+                    tau_cv = np.nan
+                if not np.isfinite(tau_cv):
+                    try:
+                        if hasattr(self.env, "get_fgb_trust_for_agent"):
+                            tau_cv = float(self.env.get_fgb_trust_for_agent(agent_name))
+                        else:
+                            tau_cv = float(getattr(self.env, '_forecast_trust', 0.0))
+                    except Exception:
+                        tau_cv = float(getattr(self.env, '_forecast_trust', 0.0))
+                data['forecast_trust'] = float(tau_cv if np.isfinite(tau_cv) else 0.0)
+                try:
+                    exp_cv = float(getattr(self.env, '_expected_dnav_cv', np.nan))
+                except Exception:
+                    exp_cv = np.nan
+                if not np.isfinite(exp_cv):
+                    exp_cv = float(getattr(self.env, '_expected_dnav', 0.0))
+                data['expected_dnav'] = float(exp_cv if np.isfinite(exp_cv) else 0.0)
+                data['realized_dnav_return'] = float(getattr(self.env, 'last_realized_dnav_return', 0.0))
+                data['realized_dnav'] = float(getattr(self.env, 'last_realized_dnav', 0.0))
+                # Investor-sleeve realized target for Tier-3 dNAV-driven lambda objective.
+                data['realized_investor_dnav_return'] = float(
+                    getattr(self.env, 'last_realized_investor_dnav_return', data['realized_dnav_return'])
+                )
+                data['realized_investor_dnav'] = float(
+                    getattr(self.env, 'last_realized_investor_dnav', data['realized_dnav'])
+                )
+                data['realized_investor_return_denom'] = float(
+                    getattr(self.env, 'last_realized_investor_return_denom', max(1.0, float(getattr(self.config, "init_budget", 1.0))))
+                )
 
-                # FAMC: Add meta-critic prediction if available
-                # This comes from the DL overlay's meta_adv head (state-only)
-                if hasattr(self.env, '_last_overlay_output') and self.env._last_overlay_output:
+                # FAMC: Add transition-aligned meta baseline prediction.
+                # Prefer lagged snapshot from env (aligned with realized target timing), fallback to current output.
+                try:
+                    meta_cv = float(getattr(self.env, '_meta_adv_pred_cv', np.nan))
+                except Exception:
+                    meta_cv = np.nan
+                if np.isfinite(meta_cv):
+                    data['meta_adv_pred'] = float(meta_cv)
+                elif hasattr(self.env, '_last_overlay_output') and self.env._last_overlay_output:
                     overlay_out = self.env._last_overlay_output
                     if isinstance(overlay_out, dict) and 'meta_adv' in overlay_out:
-                        # Extract scalar from (1, 1) tensor
                         meta_adv_raw = overlay_out['meta_adv']
                         if hasattr(meta_adv_raw, 'shape') and len(meta_adv_raw.shape) > 0:
                             data['meta_adv_pred'] = float(meta_adv_raw.flatten()[0])
@@ -2181,6 +2228,11 @@ class MultiESGAgent:
                         'tau': data.get('forecast_trust', 0.0),
                         'expected_dnav': data.get('expected_dnav', 0.0),
                         'meta_adv_pred': data.get('meta_adv_pred', 0.0),
+                        'realized_dnav_return': data.get('realized_dnav_return', 0.0),
+                        'realized_dnav': data.get('realized_dnav', 0.0),
+                        'realized_investor_dnav_return': data.get('realized_investor_dnav_return', data.get('realized_dnav_return', 0.0)),
+                        'realized_investor_dnav': data.get('realized_investor_dnav', data.get('realized_dnav', 0.0)),
+                        'realized_investor_return_denom': data.get('realized_investor_return_denom', max(1.0, float(getattr(self.config, "init_budget", 1.0)))),
                     }
                     if need_meta_obs and overlay_feats is not None and overlay_feats.shape[0] == expected_dim:
                         famc_data['obs'] = overlay_feats
@@ -2224,16 +2276,13 @@ class MultiESGAgent:
             buffer_size = getattr(buffer, 'buffer_size', 128)
             current_pos = getattr(buffer, 'pos', 0)
             
-            # If buffer is at capacity (pos >= buffer_size), reset to 0 before adding
-            # This prevents "index 128 is out of bounds" error
+            # Fail fast on overflow instead of silently wrapping.
+            # Wrapping here can hide rollout-finalization bugs and corrupt PPO updates.
             if current_pos >= buffer_size:
-                buffer.pos = 0
-                buffer.full = False
-                if not hasattr(self, '_buffer_wrap_warned'):
-                    self._buffer_wrap_warned = set()
-                if polid not in self._buffer_wrap_warned:
-                    self.logger.warning(f"[BUFFER_WRAP] Policy {polid} ({policy.agent_name}): Buffer at capacity (pos={current_pos}/{buffer_size}), wrapping to 0")
-                    self._buffer_wrap_warned.add(polid)
+                raise RuntimeError(
+                    f"[BUFFER_OVERFLOW] Policy {polid} ({policy.agent_name}): "
+                    f"rollout buffer pos={current_pos} reached/exceeded size={buffer_size} before add()."
+                )
             
             policy.rollout_buffer.add(obs_np, action_np, reward_np, starts_np, value_t, log_prob_t)
 
@@ -2499,15 +2548,11 @@ class MultiESGAgent:
                             actual_obs_dim = final_obs.shape[1]
                             
                             if actual_obs_dim != expected_obs_dim:
-                                # Fix dimension mismatch
-                                if actual_obs_dim > expected_obs_dim:
-                                    # Observation is larger - truncate to match policy
-                                    final_obs = final_obs[:, :expected_obs_dim]
-                                else:
-                                    # Observation is smaller - pad with zeros
-                                    pad_size = expected_obs_dim - actual_obs_dim
-                                    padding = np.zeros((final_obs.shape[0], pad_size), dtype=np.float32)
-                                    final_obs = np.concatenate([final_obs, padding], axis=1)
+                                raise RuntimeError(
+                                    f"[ROLLOUT_FINALIZE_FATAL] Final observation dimension mismatch for "
+                                    f"policy {polid} ({agent_name}): expected {expected_obs_dim}D, "
+                                    f"got {actual_obs_dim}D. Failing fast to avoid silent GAE corruption."
+                                )
                         
                         with torch.no_grad():
                             obs_tensor = obs_as_tensor(final_obs, policy.device)
@@ -2623,12 +2668,13 @@ class MultiESGAgent:
         """
         FAMC: Apply learned control-variate baseline correction to advantages.
 
-        This implements variance-optimal advantage correction:
-        A'_t = A_t - λ* * C_t
+        This applies mode-specific advantage correction:
+        A'_t = A_t - Î»* * C_t
 
         where:
         - C_t is the control variate (meta-critic prediction or expected_dnav)
-        - λ* = Cov(A,C) / Var(C) is computed online via EMA
+        - online mode: Î»* = Cov(A,C) / Var(C) from online EMA moments
+        - meta mode: Î»* is updated by a dNAV-driven meta-gradient objective
 
         Args:
             policy: PPO policy with rollout_buffer containing computed advantages
@@ -2675,8 +2721,9 @@ class MultiESGAgent:
             # Extract advantages from buffer (shape: (buffer_size, 1))
             advantages = buffer.advantages[:n_steps].flatten()  # (n_steps,)
 
-            # Build control variate C_t based on mode
+            # Build control variate C_t based on mode and realized dNAV return target.
             C_t = np.zeros(n_steps, dtype=np.float32)
+            realized_dnav_ret = np.zeros(n_steps, dtype=np.float32)
             nav_norm = max(1.0, float(getattr(self.config, "init_budget", 0.0)) or 1.0)
 
             for i in range(n_steps):
@@ -2685,6 +2732,26 @@ class MultiESGAgent:
                 tau = float(famc_data.get('tau', 0.0))
                 exp_dnav = float(famc_data.get('expected_dnav', 0.0))
                 meta_pred = float(famc_data.get('meta_adv_pred', 0.0))
+                realized_ret = float(
+                    famc_data.get(
+                        'realized_investor_dnav_return',
+                        famc_data.get('realized_dnav_return', 0.0),
+                    )
+                )
+                if not np.isfinite(realized_ret):
+                    realized_dnav = float(
+                        famc_data.get(
+                            'realized_investor_dnav',
+                            famc_data.get('realized_dnav', 0.0),
+                        )
+                    )
+                    realized_denom = float(famc_data.get('realized_investor_return_denom', nav_norm))
+                    if (not np.isfinite(realized_denom)) or realized_denom <= 0.0:
+                        realized_denom = nav_norm
+                    realized_ret = float(realized_dnav / max(realized_denom, 1.0))
+                if not np.isfinite(realized_ret):
+                    realized_ret = 0.0
+                realized_dnav_ret[i] = realized_ret
 
                 if fgb_mode == 'online':
                     # Use expected_dnav as control variate (gated by trust)
@@ -2701,6 +2768,9 @@ class MultiESGAgent:
             C_mean = np.mean(C_t)
             C_std = np.std(C_t) + 1e-8
             C_std_norm = (C_t - C_mean) / C_std
+            R_mean = np.mean(realized_dnav_ret)
+            R_std = np.std(realized_dnav_ret) + 1e-8
+            R_std_norm = (realized_dnav_ret - R_mean) / R_std
 
             # Per-policy EMA moments (avoid mixing PPO agents, order-dependence).
             famc_state = getattr(policy, "_famc_state", None)
@@ -2712,73 +2782,156 @@ class MultiESGAgent:
                     "ema_mC2": 0.0,
                     "ema_mAC": 0.0,
                     "lambda_star_prev": 0.0,
+                    "lambda_meta": 0.0,
+                    "lambda_meta_m": 0.0,
+                    "lambda_meta_prev": 0.0,
+                    "cv_alpha_ema": 1.0,
+                    "cv_alpha_batch": 1.0,
+                    "cv_gain": 1.0,
                 }
                 policy._famc_state = famc_state
 
-            ema_mA = float(famc_state.get("ema_mA", 0.0))
-            ema_mC = float(famc_state.get("ema_mC", 0.0))
-            ema_mA2 = float(famc_state.get("ema_mA2", 0.0))
-            ema_mC2 = float(famc_state.get("ema_mC2", 0.0))
-            ema_mAC = float(famc_state.get("ema_mAC", 0.0))
-            lambda_star_prev = float(famc_state.get("lambda_star_prev", 0.0))
-
-            # Update EMA moments (on standardized values).
-            for i in range(n_steps):
-                a = float(A_std_norm[i])
-                c = float(C_std_norm[i])
-
-                ema_mA = (1 - moment_beta) * ema_mA + moment_beta * a
-                ema_mC = (1 - moment_beta) * ema_mC + moment_beta * c
-                ema_mA2 = (1 - moment_beta) * ema_mA2 + moment_beta * (a ** 2)
-                ema_mC2 = (1 - moment_beta) * ema_mC2 + moment_beta * (c ** 2)
-                ema_mAC = (1 - moment_beta) * ema_mAC + moment_beta * (a * c)
-
-            # Compute variance and covariance from EMA moments
-            var_A = ema_mA2 - ema_mA ** 2
-            var_C = ema_mC2 - ema_mC ** 2
-            cov_AC = ema_mAC - ema_mA * ema_mC
-
-            # Compute optimal λ* = Cov(A,C) / Var(C)
-            if var_C > 1e-6:
-                lambda_star_raw = cov_AC / var_C
-                # Clip lambda* for stability. Symmetric clipping is variance-optimal; nonnegative is a safer subset.
-                if allow_negative_lambda:
-                    lambda_star = np.clip(lambda_star_raw, -lambda_max, lambda_max)
-                else:
-                    lambda_star = np.clip(lambda_star_raw, 0.0, lambda_max)
+            # Rolling control-variate scale calibration against realized investor dNAV returns.
+            # This adjusts correction amplitude (not policy reward) to better align baseline scale
+            # with realized sleeve outcomes and reduce over-dampening.
+            cv_alpha_ema = float(famc_state.get("cv_alpha_ema", 1.0))
+            cv_alpha_batch = float(famc_state.get("cv_alpha_batch", 1.0))
+            cv_gain = float(famc_state.get("cv_gain", 1.0))
+            cv_beta = float(np.clip(getattr(self.config, "fgb_cv_calib_beta", 0.10), 0.0, 1.0))
+            cv_gain_min = float(max(0.0, getattr(self.config, "fgb_cv_gain_min", 0.50)))
+            cv_gain_max = float(max(cv_gain_min, getattr(self.config, "fgb_cv_gain_max", 1.50)))
+            cv_neg_gain = float(np.clip(getattr(self.config, "fgb_cv_neg_gain", 0.50), 0.0, cv_gain_max))
+            if n_steps >= 2:
+                c_centered = C_t.astype(np.float64) - float(np.mean(C_t))
+                r_centered = realized_dnav_ret.astype(np.float64) - float(np.mean(realized_dnav_ret))
+                var_c_raw = float(np.mean(c_centered * c_centered))
+                if np.isfinite(var_c_raw) and var_c_raw > 1e-12:
+                    cov_cr_raw = float(np.mean(c_centered * r_centered))
+                    alpha_now = cov_cr_raw / var_c_raw
+                    if np.isfinite(alpha_now):
+                        cv_alpha_batch = float(alpha_now)
+                        cv_alpha_ema = (1.0 - cv_beta) * cv_alpha_ema + cv_beta * cv_alpha_batch
+            if not np.isfinite(cv_alpha_ema):
+                cv_alpha_ema = 1.0
+            if cv_alpha_ema < 0.0:
+                cv_gain = cv_neg_gain
             else:
-                lambda_star = 0.0
+                cv_gain = float(np.clip(cv_alpha_ema, cv_gain_min, cv_gain_max))
+            famc_state["cv_alpha_ema"] = float(cv_alpha_ema)
+            famc_state["cv_alpha_batch"] = float(cv_alpha_batch)
+            famc_state["cv_gain"] = float(cv_gain)
 
-            # Smooth λ* to reduce jitter
-            lambda_star_prev = 0.9 * lambda_star_prev + 0.1 * lambda_star
-            lambda_star_smooth = lambda_star_prev
+            lambda_star_prev = float(famc_state.get("lambda_star_prev", 0.0))
+            lambda_star_smooth = float(lambda_star_prev)
+            if fgb_mode == 'online':
+                # Tier 2: variance-optimal lambda via online EMA moments.
+                ema_mA = float(famc_state.get("ema_mA", 0.0))
+                ema_mC = float(famc_state.get("ema_mC", 0.0))
+                ema_mA2 = float(famc_state.get("ema_mA2", 0.0))
+                ema_mC2 = float(famc_state.get("ema_mC2", 0.0))
+                ema_mAC = float(famc_state.get("ema_mAC", 0.0))
 
-            # Persist per-policy state
-            famc_state["ema_mA"] = float(ema_mA)
-            famc_state["ema_mC"] = float(ema_mC)
-            famc_state["ema_mA2"] = float(ema_mA2)
-            famc_state["ema_mC2"] = float(ema_mC2)
-            famc_state["ema_mAC"] = float(ema_mAC)
-            famc_state["lambda_star_prev"] = float(lambda_star_prev)
+                for i in range(n_steps):
+                    a = float(A_std_norm[i])
+                    c = float(C_std_norm[i])
 
-            # Apply correction in standardized space (correct scale)
-            # A'_std = A_std - λ* * C_std
-            A_corrected_std = A_std_norm - lambda_star_smooth * C_std_norm
+                    ema_mA = (1 - moment_beta) * ema_mA + moment_beta * a
+                    ema_mC = (1 - moment_beta) * ema_mC + moment_beta * c
+                    ema_mA2 = (1 - moment_beta) * ema_mA2 + moment_beta * (a ** 2)
+                    ema_mC2 = (1 - moment_beta) * ema_mC2 + moment_beta * (c ** 2)
+                    ema_mAC = (1 - moment_beta) * ema_mAC + moment_beta * (a * c)
 
-            # De-standardize back to original scale
-            # A' = A'_std * σ_A + μ_A
+                var_C = ema_mC2 - ema_mC ** 2
+                cov_AC = ema_mAC - ema_mA * ema_mC
+                if var_C > 1e-6:
+                    lambda_star_raw = cov_AC / var_C
+                    if allow_negative_lambda:
+                        lambda_star = np.clip(lambda_star_raw, -lambda_max, lambda_max)
+                    else:
+                        lambda_star = np.clip(lambda_star_raw, 0.0, lambda_max)
+                else:
+                    lambda_star = 0.0
+
+                lambda_star_prev = 0.9 * lambda_star_prev + 0.1 * lambda_star
+                lambda_star_smooth = float(lambda_star_prev)
+
+                famc_state["ema_mA"] = float(ema_mA)
+                famc_state["ema_mC"] = float(ema_mC)
+                famc_state["ema_mA2"] = float(ema_mA2)
+                famc_state["ema_mC2"] = float(ema_mC2)
+                famc_state["ema_mAC"] = float(ema_mAC)
+                famc_state["lambda_star_prev"] = float(lambda_star_prev)
+
+            if fgb_mode == 'meta':
+                # Tier 3 objective override: dNAV-driven meta-gradient lambda.
+                # Minimize L(lambda) = E[(A_std - lambda*C_std - R_std)^2] + l2*lambda^2
+                meta_lr = float(getattr(self.config, "fgb_meta_lambda_lr", 0.05))
+                meta_l2 = float(getattr(self.config, "fgb_meta_lambda_l2", 0.01))
+                meta_momentum = float(getattr(self.config, "fgb_meta_lambda_momentum", 0.9))
+                meta_grad_clip = float(getattr(self.config, "fgb_meta_lambda_grad_clip", 5.0))
+                lambda_meta = float(famc_state.get("lambda_meta", 0.0))
+                lambda_meta_m = float(famc_state.get("lambda_meta_m", 0.0))
+                lambda_star_prev = float(famc_state.get("lambda_meta_prev", lambda_meta))
+
+                pred_adv_std = A_std_norm - (lambda_meta * C_std_norm)
+                residual = pred_adv_std - R_std_norm
+                grad = float(-2.0 * np.mean(residual * C_std_norm) + 2.0 * meta_l2 * lambda_meta)
+                if not np.isfinite(grad):
+                    grad = 0.0
+                grad = float(np.clip(grad, -meta_grad_clip, meta_grad_clip))
+
+                lambda_meta_m = (meta_momentum * lambda_meta_m) + ((1.0 - meta_momentum) * grad)
+                lambda_meta_next = lambda_meta - (meta_lr * lambda_meta_m)
+                # Tier-3 stabilization:
+                # keep λ* non-negative and capped tighter than generic FGB bounds
+                # to avoid over-correction that collapses investor exposure.
+                meta_lambda_cap = float(min(lambda_max, 0.35))
+                if not np.isfinite(meta_lambda_cap) or meta_lambda_cap <= 0.0:
+                    meta_lambda_cap = float(max(lambda_max, 1e-6))
+                lambda_meta_next = float(np.clip(lambda_meta_next, 0.0, meta_lambda_cap))
+
+                lambda_star_prev = (0.9 * lambda_star_prev) + (0.1 * lambda_meta_next)
+                lambda_star_smooth = float(lambda_star_prev)
+                famc_state["lambda_star_prev"] = float(lambda_star_prev)
+                famc_state["lambda_meta_prev"] = float(lambda_star_prev)
+                famc_state["lambda_meta"] = float(lambda_meta_next)
+                famc_state["lambda_meta_m"] = float(lambda_meta_m)
+                famc_state["meta_lambda_grad"] = float(grad)
+                if np.std(R_std_norm) > 1e-6 and np.std(A_std_norm) > 1e-6:
+                    famc_state["meta_target_corr"] = float(np.corrcoef(A_std_norm, R_std_norm)[0, 1])
+                else:
+                    famc_state["meta_target_corr"] = 0.0
+                famc_state["meta_lambda_cap"] = float(meta_lambda_cap)
+
+            # Apply correction in standardized space with smooth saturation.
+            # This avoids abrupt hard-clipping artifacts and reduces meta-mode over-dampening
+            # when lambda updates spike temporarily.
+            meta_corr_scale = 1.0
+            delta_std_raw = -lambda_star_smooth * cv_gain * C_std_norm
+            if fgb_mode == 'meta':
+                meta_target_corr = float(famc_state.get("meta_target_corr", 0.0))
+                if not np.isfinite(meta_target_corr):
+                    meta_target_corr = 0.0
+                # Use correction only when Corr(A,R) is positive.
+                # Negative/zero correlation means no reliable meta signal.
+                meta_corr_scale = float(np.clip(meta_target_corr, 0.0, 1.0))
+                delta_std_raw = delta_std_raw * meta_corr_scale
+
+            # Convert configured raw-advantage clip to standardized domain and
+            # apply smooth tanh saturation to correction deltas.
+            clip_std = float(max(clip_adv / max(A_std, 1e-8), 1e-6))
+            delta_std = clip_std * np.tanh(delta_std_raw / clip_std)
+            A_corrected_std = A_std_norm + delta_std
+
+            # De-standardize back to original scale: A' = A'_std * σ_A + μ_A
             advantages_corrected = A_corrected_std * A_std + A_mean
-
-            # Clip the CHANGE (not the correction itself)
-            # This preserves the advantage scale while limiting per-step adjustments
             delta = advantages_corrected - advantages
-            delta_clipped = np.clip(delta, -clip_adv, clip_adv)
-            advantages_corrected = advantages + delta_clipped
 
             # Compute variance for metrics
             var_before = np.var(advantages)
             var_after = np.var(advantages_corrected)
-            num_clipped = np.sum(np.abs(delta) > clip_adv)
+            # "Clipped" diagnostics now represent smooth-saturation activation.
+            num_clipped = np.sum(np.abs(delta_std_raw) > clip_std)
 
             # Write back to the buffer AFTER GAE computation but BEFORE the PPO update.
             # NOTE: SB3 PPO may still normalize advantages per minibatch during training
@@ -2802,12 +2955,32 @@ class MultiESGAgent:
             self._famc_metrics['num_clipped'] = int(num_clipped)
             self._famc_metrics['num_total'] = int(n_steps)
             self._famc_metrics['var_reduction'] = float(1.0 - var_after / max(var_before, 1e-8))
+            self._famc_metrics['cv_alpha_batch'] = float(cv_alpha_batch)
+            self._famc_metrics['cv_alpha_ema'] = float(cv_alpha_ema)
+            self._famc_metrics['cv_gain'] = float(cv_gain)
+            if fgb_mode == 'meta':
+                self._famc_metrics['meta_lambda_grad'] = float(famc_state.get("meta_lambda_grad", 0.0))
+                self._famc_metrics['meta_target_corr'] = float(famc_state.get("meta_target_corr", 0.0))
+                self._famc_metrics['meta_corr_scale'] = float(meta_corr_scale)
+                self._famc_metrics['meta_lambda_cap'] = float(famc_state.get("meta_lambda_cap", 0.0))
 
             # Periodic detailed logging
             if t_now % 500 == 0:
                 var_red_pct = (1.0 - var_after / max(var_before, 1e-8)) * 100
                 clip_rate_pct = (float(num_clipped) / max(1, n_steps)) * 100
-                self.logger.info(f"[FAMC] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} | VarRed={var_red_pct:.1f}% | Clip={clip_rate_pct:.1f}%")
+                if fgb_mode == 'meta':
+                    meta_grad = float(famc_state.get("meta_lambda_grad", 0.0))
+                    target_corr = float(famc_state.get("meta_target_corr", 0.0))
+                    self.logger.info(
+                        f"[FAMC_META_DNAV] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} "
+                        f"| Corr(A,R)={target_corr:.3f} | VarRed={var_red_pct:.1f}% "
+                        f"| Clip={clip_rate_pct:.1f}% | cv_gain={cv_gain:.3f} | corr_scale={meta_corr_scale:.3f} | grad={meta_grad:.4f}"
+                    )
+                else:
+                    self.logger.info(
+                        f"[FAMC] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} "
+                        f"| VarRed={var_red_pct:.1f}% | Clip={clip_rate_pct:.1f}% | cv_gain={cv_gain:.3f}"
+                    )
 
             # Store features and advantages for meta head training (meta mode only)
             if agent_name == "investor_0" and fgb_mode == 'meta' and getattr(self.config, 'meta_baseline_enable', False):
@@ -2829,12 +3002,14 @@ class MultiESGAgent:
                     self._meta_features_buffer = self._meta_features_buffer[-max_buffer_size:]
                     self._meta_adv_buffer = self._meta_adv_buffer[-max_buffer_size:]
 
-            # Clear FAMC step data for next rollout
-            policy._famc_step_data = []
-
         except Exception as e:
             msg = f"[FAMC] Correction failed for policy {polid}: {e}"
             raise RuntimeError(msg) from e
+        finally:
+            # Always clear per-rollout FAMC data, including warmup/early-return paths,
+            # to prevent stale alignment against a future rollout buffer.
+            if hasattr(policy, '_famc_step_data'):
+                policy._famc_step_data = []
 
     def _train_meta_head_if_needed(self):
         """
@@ -3036,7 +3211,7 @@ class MultiESGAgent:
                     saved_count += 1
                     if self.debug:
                         used = after - before
-                        print(f"Saved {agent_name} policy (Δmem {used:.1f}MB)")
+                        print(f"Saved {agent_name} policy (Î”mem {used:.1f}MB)")
                     if after > self.memory_tracker.max_memory_mb * 0.8:
                         self.memory_tracker.cleanup("light")
                 finally:
@@ -3180,7 +3355,7 @@ class MultiESGAgent:
                                 # Validate buffer shape matches observation space
                                 if loaded_obs_dim != current_obs_dim:
                                     # Observation space changed - buffer needs to be recreated
-                                    self.logger.warning(f"[BUFFER_VALIDATION] {agent_name}: Observation space changed ({loaded_obs_dim}D → {current_obs_dim}D). Recreating buffer.")
+                                    self.logger.warning(f"[BUFFER_VALIDATION] {agent_name}: Observation space changed ({loaded_obs_dim}D â†’ {current_obs_dim}D). Recreating buffer.")
                                     self._validate_and_fix_buffer_shape(loaded, idx)
                                 else:
                                     # Even if dimensions match, validate buffer shape is correct
@@ -3231,7 +3406,7 @@ class MultiESGAgent:
                 after = self.memory_tracker.get_memory_usage()
                 loaded_count += 1
                 if self.debug:
-                    print(f"Loaded {agent_name} policy (Δmem {after - before:.1f}MB)")
+                    print(f"Loaded {agent_name} policy (Î”mem {after - before:.1f}MB)")
                 if after > self.memory_tracker.max_memory_mb * 0.8:
                     self.memory_tracker.cleanup("light")
             except Exception as e:
@@ -3452,7 +3627,7 @@ class OptunaHyperparameterOptimizer:
         )
 
         try:
-            print(f"🚀 Starting Optuna HPO for {self.n_trials} trials (timeout: {self.timeout}s)...")
+            print(f"ðŸš€ Starting Optuna HPO for {self.n_trials} trials (timeout: {self.timeout}s)...")
             study.optimize(
                 self._objective,
                 n_trials=self.n_trials,
@@ -3460,10 +3635,10 @@ class OptunaHyperparameterOptimizer:
                 show_progress_bar=True
             )
         except KeyboardInterrupt:
-            print("\n🛑 HPO interrupted by user.")
+            print("\nðŸ›‘ HPO interrupted by user.")
         
         if not study.best_trial:
-             print("⚠️ HPO finished with no completed trials. Returning default parameters.")
+             print("âš ï¸ HPO finished with no completed trials. Returning default parameters.")
              return {}, {"best_sharpe_ratio": -10.0}
 
         best_params = study.best_params
@@ -3474,9 +3649,9 @@ class OptunaHyperparameterOptimizer:
 
         performance_summary = {"best_sharpe_ratio": best_value}
         
-        print("\n🎉 HPO Finished!")
-        print(f"🏆 Best Sharpe Ratio: {best_value:.4f}")
-        print("📋 Best Hyperparameters:")
+        print("\nðŸŽ‰ HPO Finished!")
+        print(f"ðŸ† Best Sharpe Ratio: {best_value:.4f}")
+        print("ðŸ“‹ Best Hyperparameters:")
         for key, value in best_params.items():
             print(f"  - {key}: {value}")
 

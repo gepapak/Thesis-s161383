@@ -324,6 +324,9 @@ class EnhancedConfig:
         self.portfolio_risk_capital_weight = 0.4
         self.liquidity_risk_buffer_weight = 0.6
         self.liquidity_risk_cashflow_weight = 0.4
+        # Weight for forecast-uncertainty risk inside overall risk aggregation.
+        # Overall risk code renormalizes base weights to keep total contribution at 1.0.
+        self.forecast_uncertainty_risk_weight = 0.10
 
 
         # NEW: Infrastructure fund performance targets
@@ -516,7 +519,7 @@ class EnhancedConfig:
         # Rolling window for online calibration of forecast trust (τₜ)
         # CRITICAL FIX: Reduced from 2016 to 500 for faster adaptation (Issue #4)
         self.forecast_trust_window = 500      # ~3.5 days @ 10-min steps (was 2016 = ~2 weeks)
-        self.forecast_trust_metric = "combo"  # {"combo", "hitrate", "absdir"}: MAPE + directional for robustness
+        self.forecast_trust_metric = "hitrate"  # {"combo", "hitrate", "absdir"}: default hit-rate for runner/manual parity
         self.forecast_trust_direction_weight = 0.8  # Weight for directional accuracy in combo metric (only used if metric="combo")
         # CRITICAL FIX: Increased trust scale min from 0.5 to 0.8 to reduce penalty for low trust (Issue #4)
         self.forecast_trust_scale_min = 0.8    # Minimum trust scale (was 0.5) - less penalty for low trust
@@ -554,14 +557,6 @@ class EnhancedConfig:
         # Preferred names for the same controls (kept alongside legacy keys for compatibility).
         self.overlay_dnav_return_clip = 0.20
         self.overlay_dnav_return_tanh_scale = 20.0
-
-        # === Forecast Reward Warmup ===
-        # Gradually turn on forecast-based rewards so early training behaves like Tier 1
-        # and forecasts can only start to influence behavior once statistics (EMA, MAPE, trust)
-        # have had time to stabilize.
-        #
-        # Typical episode has ~26,000 timesteps, so 5,000 steps is a gentle warmup.
-        self.forecast_reward_warmup_steps = 5000
 
         # --------------------------------------------------------------
         # Forecast quality thresholds (price-relative MAPE)
@@ -602,6 +597,11 @@ class EnhancedConfig:
         self.fgb_moment_beta = 0.01           # EMA rate for Cov/Var moments (0.01 = ~100-step window)
         # If True, allow negative lambda* when Cov(A,C) < 0 (variance-optimal); otherwise clamp to [0, lambda_max].
         self.fgb_allow_negative_lambda = True
+        # Rolling calibration of control-variate scale against realized investor dNAV return.
+        self.fgb_cv_calib_beta = 0.10
+        self.fgb_cv_gain_min = 0.50
+        self.fgb_cv_gain_max = 1.50
+        self.fgb_cv_neg_gain = 0.50
         # Fail-fast guard for Tier-2/Tier-3 baseline paths (recommended for research runs).
         # When enabled, forecast/meta failures raise immediately instead of silently degrading.
         self.fgb_fail_fast = True
@@ -610,6 +610,11 @@ class EnhancedConfig:
         # expected_dnav blend weights (pred_reward + mwdir). Kept explicit for reproducible tuning.
         self.fgb_expected_dnav_pred_weight = 0.85
         self.fgb_expected_dnav_mwdir_weight = 0.15
+        # Tier 3 meta-gradient lambda objective (dNAV-driven). Used only when fgb_mode="meta".
+        self.fgb_meta_lambda_lr = 0.05
+        self.fgb_meta_lambda_l2 = 0.01
+        self.fgb_meta_lambda_momentum = 0.9
+        self.fgb_meta_lambda_grad_clip = 5.0
 
         # === FAMC: Meta-Critic Head Training ===
         # FIXED: Default to False (must be explicitly enabled via command-line flag)
@@ -620,24 +625,18 @@ class EnhancedConfig:
         self.meta_train_min_samples = 128     # Minimum meta buffer size before any head update
         self.meta_train_min_valid_samples = 64  # Minimum valid feature rows per meta update
 
-        # === Forecast Reward Parameters (Tier 2/3) ===
-        # FIX: Moderate increase from 5.0 to 10.0 (2x instead of 4x) for balanced learning
-        # Analysis showed agent alignment is random (49%) - need stronger incentive but not too aggressive
-        # Profitability gating prevents over-rewarding bad trades
-        # Moderate multiplier encourages learning without destabilizing reward signal
-        self.forecast_alignment_multiplier = 14.0  # Stronger reward for aligning with forecasts
-        self.forecast_alignment_multiplier_battery = 15.0  # Keep enabled for battery (arbitrage benefits from forecasts)
-
-        # FIX: Make generation forecast weight configurable (Issue #8)
-        self.generation_forecast_weight = 0.3  # Weight for generation forecasts in combined score (default: 0.3 = 30%)
+        # === Legacy Forecast-Reward Compatibility (unused in paper setup) ===
+        # Reward shaping by forecast quality is disabled (forecast reward weight = 0).
+        # These fields are retained for backward compatibility with old checkpoints/scripts.
+        self.forecast_alignment_multiplier = 14.0
+        self.forecast_alignment_multiplier_battery = 15.0
+        self.generation_forecast_weight = 0.3
         # FIX: EMA std initialization parameters (Issue #1)
         self.ema_std_init_samples = 20  # Number of samples to use for adaptive EMA std initialization
         self.ema_std_init_alpha = 0.2   # Higher alpha for first 100 steps (faster convergence)
         
-        # CRITICAL FIX: Reduce warmup to make forecast integration more aggressive
-        # Original: 5000 steps = ~20% of episode, too conservative
-        # New: 1000 steps = ~4% of episode, forecasts kick in quickly
-        self.forecast_reward_warmup_steps = 1000  # Reduced from 5000 to make forecasts impactful sooner
+        # Legacy no-op in paper mode (forecast reward weight is zero); kept for compatibility.
+        self.forecast_reward_warmup_steps = 1000
         self.ema_std_min = 10.0         # Minimum EMA std value (DKK) - prevents division by tiny values
         # CRITICAL FIX: Increased from 500.0 to 2000.0 to prevent saturation (Issue #1)
         self.ema_std_max = 2000.0       # Maximum EMA std value (DKK) - prevents extreme values (was 500.0)
@@ -648,7 +647,7 @@ class EnhancedConfig:
         # FIX: Generation EMA std clamping range (Issue #5)
         self.gen_ema_std_min = 0.01  # Minimum EMA std for generation (normalized, not DKK)
         self.gen_ema_std_max = 1.0   # Maximum EMA std for generation (normalized, not DKK)
-        self.forecast_pnl_reward_scale = 500.0  # Scale realized MTM contribution in reward shaping
+        self.forecast_pnl_reward_scale = 500.0
 
         # === Expert Blending Mode (CRITICAL FIX: Added missing config attributes) ===
         self.expert_blend_mode = "none"       # {"none", "fixed", "adaptive", "residual"}: expert blending mode
@@ -664,7 +663,8 @@ class EnhancedConfig:
         self.ent_coef = 0.030  # Increased to encourage exploration/position-taking (investor especially)
         self.verbose = 1
         self.seed = 42
-        self.multithreading = True
+        # Determinism-first default: disable policy-level multithreaded updates.
+        self.multithreading = False
 
         # PPO-specific parameters - STRENGTHENED FOR BETTER LEARNING
         self.batch_size = 256  # STRENGTHENED: Increased from 128 for more stable gradients
@@ -947,6 +947,18 @@ class EnhancedConfig:
                 errors.append(f"forecast_horizons[{horizon_name}]={horizon_steps} not a positive integer")
 
         # 11. Overlay parameters should be valid
+        if not (0.0 <= float(self.fgb_cv_calib_beta) <= 1.0):
+            errors.append(f"fgb_cv_calib_beta ({self.fgb_cv_calib_beta}) not in [0, 1]")
+        if float(self.fgb_cv_gain_min) < 0.0:
+            errors.append(f"fgb_cv_gain_min ({self.fgb_cv_gain_min}) must be >= 0")
+        if float(self.fgb_cv_gain_max) < float(self.fgb_cv_gain_min):
+            errors.append(
+                f"fgb_cv_gain_max ({self.fgb_cv_gain_max}) < fgb_cv_gain_min ({self.fgb_cv_gain_min})"
+            )
+        if not (0.0 <= float(self.fgb_cv_neg_gain) <= float(self.fgb_cv_gain_max)):
+            errors.append(
+                f"fgb_cv_neg_gain ({self.fgb_cv_neg_gain}) not in [0, fgb_cv_gain_max ({self.fgb_cv_gain_max})]"
+            )
 
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)

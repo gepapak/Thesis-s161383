@@ -269,8 +269,7 @@ class RewardLogger:
                           'mape_short', 'mape_medium', 'mape_long',
                           'obs_trade_signal', 'obs_trade_action_corr', 'obs_trade_exposure_corr', 'obs_trade_delta_exposure_corr'],
             'rewards': ['episode', 'timestep', 'base_reward', 'investor_reward', 'battery_reward',
-                        'alignment_reward', 'pnl_reward', 'forecast_signal_score', 'risk_score',
-                        'operational_score']
+                        'risk_score', 'operational_score']
         }
         
         # Track episode-level aggregates
@@ -386,14 +385,6 @@ class RewardLogger:
                  # Price returns
                  price_return_1step: float = 0.0,
                  price_return_forecast: float = 0.0,
-                 # Forecast reward components
-                 alignment_reward: float = 0.0,
-                 pnl_reward: float = 0.0,
-                 forecast_signal_score: float = 0.0,
-                 generation_forecast_score: float = 0.0,
-                 combined_forecast_score: float = 0.0,
-                 trust_scale: float = 1.0,
-                 warmup_factor: float = 1.0,
                  # Main reward components
                  operational_score: float = 0.0,
                  risk_score: float = 0.0,
@@ -680,14 +671,6 @@ class RewardLogger:
             'obs_trade_exposure_corr': obs_trade_exposure_corr,
             'obs_trade_delta_exposure_corr': obs_trade_delta_exposure_corr,
             'signal_gate_multiplier': signal_gate_multiplier,
-            # Forecast reward components
-            'alignment_reward': alignment_reward,
-            'pnl_reward': pnl_reward,
-            'forecast_signal_score': forecast_signal_score,
-            'generation_forecast_score': generation_forecast_score,
-            'combined_forecast_score': combined_forecast_score,
-            'trust_scale': trust_scale,
-            'warmup_factor': warmup_factor,
             # Forecast score
             'forecast_score': forecast_score,
             # Forecast weight
@@ -1065,9 +1048,6 @@ class RewardLogger:
             'obs_forecast_trust', 'obs_normalized_error', 'obs_trade_signal', 'obs_trade_action_corr',
             'obs_trade_exposure_corr', 'obs_trade_delta_exposure_corr',
             'signal_gate_multiplier',
-            # Forecast reward components (0.0 for Tier 1, populated for Tier 2)
-            'alignment_reward', 'pnl_reward', 'forecast_signal_score', 'generation_forecast_score',
-            'combined_forecast_score', 'trust_scale', 'warmup_factor',
             # Forecast score from reward components (0.0 for Tier 1)
             'forecast_score',
             # Forecast weight from reward weights (0.0 for Tier 1)
@@ -1145,4 +1125,3 @@ class RewardLogger:
             self.csv_file_handle.close()
             self.csv_file_handle = None
             self.csv_writer = None
-
