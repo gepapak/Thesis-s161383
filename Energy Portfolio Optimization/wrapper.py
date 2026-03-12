@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Enhanced Multi-Horizon Wrapper (fully patched w/ forecast normalization + horizon alignment)
+Enhanced Multi-Horizon Wrapper (paper-refactor compatible)
 
 Provides:
-- TOTAL-dimension observation construction (base + normalized & horizon-aligned forecasts)
-- Strict shape checking and validation
-- Memory-optimized observation building with caching
+- Base-dimension observation passthrough and strict validation
+- No forecast-derived observation augmentation (forecasts are backend-only)
+- Memory-optimized observation handling with caching
 - Enhanced monitoring (optional)
 
 """
@@ -158,14 +158,14 @@ class ForecastPostProcessor:
         """
         Normalize feature values using CONSISTENT approach with environment.py.
 
-        CRITICAL: Ensures overlay model receives normalized features matching
-        what environment.py produces in _build_overlay_features().
+        CRITICAL: Ensures the enhancer-base feature path receives normalized
+        features matching what environment.py produces in _build_enhancer_base_features().
 
         Normalization strategy:
         - PRICE: Z-score with dynamic mean/std (time-varying statistics)
         - RENEWABLES (wind, solar, hydro, load): Fixed scale (95th percentile)
 
-        This consistency is ESSENTIAL for overlay model training and inference.
+        This consistency is ESSENTIAL for enhancer-base feature construction.
         """
         if not self.normalize:
             return float(val) if np.isfinite(val) else 0.0
@@ -192,7 +192,7 @@ class ForecastPostProcessor:
                 logger.warning(f"[NORMALIZATION] Price normalization failed: {e}, returning 0.0")
                 return 0.0
 
-        # RENEWABLES: Fixed scale normalization (MATCHES environment.py _build_overlay_features)
+        # RENEWABLES: Fixed scale normalization (MATCHES environment.py _build_enhancer_base_features)
         # Uses 95th percentile scales computed at initialization
         try:
             config = getattr(self.env, 'config', None)
@@ -314,7 +314,7 @@ class ForecastPostProcessor:
         """
         CRITICAL VALIDATION: Ensure wrapper normalization matches environment.py.
 
-        This prevents silent degradation where overlay model receives inconsistently
+        This prevents silent degradation where the enhancer path receives inconsistently
         normalized features, causing poor performance without obvious errors.
 
         Returns:
@@ -339,7 +339,7 @@ class ForecastPostProcessor:
                         f"  Wrapper: {wrapper_norm:.4f}\n"
                         f"  Environment: {env_norm:.4f}\n"
                         f"  Difference: {abs(wrapper_norm - env_norm):.4f}\n"
-                        f"  This will confuse the overlay model!"
+                        f"  This will confuse the enhancer path!"
                     )
                     return False
 
@@ -557,8 +557,8 @@ class EnhancedObservationValidator(BaseObservationValidator, ObservationValidato
                 return dim
 
             # Method 2: Use observation space shape
-            # CRITICAL FIX: When forecasts are enabled, base_env.observation_space already includes forecasts
-            # So we should use the FULL dimension, not try to add more forecast dimensions
+            # Forecast-derived observation augmentation is retired.
+            # Always use the base environment observation-space dimension directly.
             if hasattr(self.base_env, 'observation_space'):
                 if callable(self.base_env.observation_space):
                     space = self.base_env.observation_space(agent)
@@ -927,7 +927,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self.memory_tracker.register_cache(self.obs_builder.agent_forecast_cache)
 
         # FIX: Validate normalization consistency between wrapper and environment
-        # This prevents silent degradation where overlay receives inconsistent features
+        # This prevents silent degradation where the enhancer path receives inconsistent features
         if normalize_forecasts:
             self.obs_builder.postproc.validate_normalization_consistency()
 
@@ -953,7 +953,7 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_price_forecast_norm = 0.0
         self._last_price_forecast_aligned = 0.0
 
-        print("[OK] Enhanced multi-horizon wrapper initialized (TOTAL-dim observations, normalized + aligned forecasts)")
+        print("[OK] Enhanced multi-horizon wrapper initialized (base-dim observations; no forecast augmentation)")
 
     def _get_currency_rate(self) -> float:
         """Get currency conversion rate from single source of truth."""
@@ -1048,11 +1048,6 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 
     @property
     def max_steps(self): return getattr(self.env, "max_steps", 1000)
-
-    @property
-    def overlay_trainer(self):
-        """Forward overlay_trainer access to base environment."""
-        return getattr(self.env, "overlay_trainer", None)
 
     # ---- unified augmentation ----
         # No observation augmentation beyond the environment-provided observation space.
@@ -1179,8 +1174,8 @@ class MultiHorizonWrapperEnv(ParallelEnv):
         self._last_clip_counts = clip_counts
         self._last_clip_totals = clip_totals
 
-        # CRITICAL FIX #6: Populate forecast arrays BEFORE env.step() so DL labeler has access
-        # The DL overlay labeler needs forecasts during step execution for label generation
+        # CRITICAL FIX #6: Populate forecast arrays BEFORE env.step() so the enhancer feature path has access
+        # The Tier-2 enhancer feature builder needs forecasts during step execution for label generation
         try:
             if hasattr(self.env, 'populate_forecast_arrays'):
                 current_forecasts = self._get_forecasts_for_logging()
@@ -1756,116 +1751,3 @@ class MultiHorizonWrapperEnv(ParallelEnv):
 # =========================
 # FGB Forecast Validation
 # =========================
-def verify_fgb_forecasts(wrapper, num_steps: int = 10) -> bool:
-    """
-    Verify that forecast features are present and non-degenerate in observations.
-
-    This function checks:
-    1. Forecast features are present in observations
-    2. Forecast features have non-zero values (not just padding)
-    3. Forecast features have reasonable variance
-
-    Args:
-        wrapper: The wrapped environment
-        num_steps: Number of steps to verify (default: 10)
-
-    Returns:
-        True if forecasts are valid, raises ValueError otherwise
-
-    Raises:
-        ValueError: If forecasts are missing, all-zero, or have near-zero variance
-    """
-    try:
-        logger.info("[FGB_VALIDATION] Starting forecast verification...")
-
-        # Reset environment
-        obs, info = wrapper.reset()
-
-        if 'investor_0' not in obs:
-            raise ValueError("FGB validation: investor_0 not in observations")
-
-        investor_obs = obs['investor_0']
-        total_dim = len(investor_obs)
-
-        # Current expected layouts:
-        # - Tier 2 / Tier 3 (fair, obs-identical): investor_0 is 8D = 6 base + 2 forecast features
-        #   Forecast slice: indices [6:8]
-        # - Legacy/experimental layouts may have more dims; we only require that there is a non-empty
-        #   forecast slice immediately after the 6 base dims.
-        base_dim = 6
-        if total_dim <= base_dim:
-            raise ValueError(
-                f"FGB validation: Observation too small ({total_dim} dims). "
-                f"Expected > {base_dim} dims so forecast features can exist."
-            )
-
-        forecast_start = base_dim
-        # Prefer the canonical 8D slice when available; otherwise take all remaining dims after base.
-        forecast_end = 8 if total_dim >= 8 else total_dim
-        forecast_features = investor_obs[forecast_start:forecast_end]
-        if forecast_features.size == 0:
-            raise ValueError(
-                f"FGB validation: Empty forecast feature slice. total_dim={total_dim}, "
-                f"slice=[{forecast_start}:{forecast_end}]"
-            )
-
-        # Check 1: Forecast magnitude (should not be all zeros)
-        forecast_magnitude = float(np.abs(forecast_features).sum())
-        if forecast_magnitude < 0.01:
-            raise ValueError(
-                f"FGB validation: Forecast features are all near-zero! "
-                f"Forecasts may not be generated or appended. "
-                f"forecast_magnitude={forecast_magnitude:.6f} (expected > 0.01)"
-            )
-
-        # Check 2: Forecast variance (should have some variation)
-        forecast_std = float(np.std(forecast_features))
-        if forecast_std < 0.001:
-            raise ValueError(
-                f"FGB validation: Forecast features have near-zero variance! "
-                f"May be using flat/constant forecasts. "
-                f"forecast_std={forecast_std:.6f} (expected > 0.001)"
-            )
-
-        # Check 3: Run a few steps and verify forecasts change
-        forecast_history = [forecast_features.copy()]
-        for step in range(num_steps):
-            actions = {agent: wrapper.action_space(agent).sample() for agent in wrapper.possible_agents}
-            obs, rewards, dones, truncs, infos = wrapper.step(actions)
-
-            if 'investor_0' in obs:
-                investor_obs = obs['investor_0']
-                forecast_features = investor_obs[forecast_start:forecast_end]
-                forecast_history.append(forecast_features.copy())
-
-        # Check that forecasts change over time (not static)
-        forecast_changes = []
-        for i in range(1, len(forecast_history)):
-            change = float(np.abs(forecast_history[i] - forecast_history[i-1]).sum())
-            forecast_changes.append(change)
-
-        avg_change = float(np.mean(forecast_changes))
-        if avg_change < 0.001:
-            logger.warning(
-                f"FGB validation: Forecasts are not changing over time! "
-                f"avg_change={avg_change:.6f} (expected > 0.001). "
-                f"This may indicate forecasts are static or not being updated."
-            )
-
-        # All checks passed
-        logger.info(
-            f"[FGB_VALIDATION] ✓ Forecasts validated successfully:\n"
-            f"  - Magnitude: {forecast_magnitude:.4f}\n"
-            f"  - Std dev: {forecast_std:.4f}\n"
-            f"  - Avg change/step: {avg_change:.6f}\n"
-            f"  - Observation dims: {total_dim} (forecast slice: [{forecast_start}:{forecast_end}] "
-            f"= {forecast_end - forecast_start} dims)"
-        )
-        return True
-
-    except ValueError as e:
-        logger.error(f"[FGB_VALIDATION] ✗ FAILED: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"[FGB_VALIDATION] ✗ Unexpected error: {str(e)}")
-        raise ValueError(f"FGB forecast validation failed: {str(e)}")

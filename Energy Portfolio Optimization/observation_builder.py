@@ -89,7 +89,7 @@ class ObservationBuilder:
     @staticmethod
     def build_investor_observations(
         obs_array: np.ndarray,
-        price_n: float,
+        price_momentum: float,
         budget: float,
         init_budget: float,
         financial_positions: Dict[str, float],
@@ -100,9 +100,12 @@ class ObservationBuilder:
         """
         REFACTORED: Build investor agent observations.
         
+        Uses price_momentum (directional signal) instead of price level for trading decisions.
+        Momentum = normalized return over investment horizon; positive = price rising, negative = falling.
+        
         Args:
             obs_array: Observation array to fill (modified in-place)
-            price_n: Normalized price
+            price_momentum: Normalized price return/momentum in [-1, 1] (replaces price level)
             budget: Current budget
             init_budget: Initial budget
             financial_positions: Dict with wind/solar/hydro instrument values
@@ -123,8 +126,8 @@ class ObservationBuilder:
             # Calculate MTM P&L normalization
             mtm_pnl_norm = float(np.clip(cumulative_mtm_pnl / max(init_budget, 1.0), -1.0, 1.0))
             
-            # Base observations (6D)
-            obs_array[0] = price_n
+            # Base observations (6D): price_momentum (not level) for directional trading signal
+            obs_array[0] = float(np.clip(price_momentum, -1.0, 1.0))
             obs_array[1] = budget_n
             obs_array[2] = wind_pos_norm
             obs_array[3] = solar_pos_norm

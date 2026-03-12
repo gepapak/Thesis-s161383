@@ -3,25 +3,16 @@
 Run canonical tier phases across multiple seeds.
 
 Phase ordering per seed:
-- tier1_tier3: 1) Tier 1 basic MARL, 2) Tier 3 FAMC meta
-- tier1_tier2_tier3:
+- tier1_tier2:
   1) Tier 1 basic MARL
-  2) Tier 2 FGB online
-  3) Tier 3 FAMC meta
-- all_tiers_per_seed:
+  2) Tier 2 DL Enhancer
+- tier1_enhancer:
   1) Tier 1 basic MARL
-  2) Tier 2 FGB online
-  3) Tier 3 FAMC meta
-  4) Tier 2 forecast ablated
-  5) Tier 3 forecast ablated
+  2) Tier 2 DL Enhancer
 
 For each run: train via main.py, evaluate via evaluation.py --mode tiers.
-
-Methodology note:
-- Shared FGB/FAMC stability arguments (`fgb_shared_args`) are applied uniformly to all
-  forecast-enabled variants (Tier 2, Tier 3, and forecast-ablated variants).
-- This is the canonical protocol used by this runner and is documented to avoid
-  ambiguity between strict shared-core settings and method-specific behavior.
+The runner forwards an explicit tier evaluation mode so suites can validate the
+deployed DL enhancer path or stay in paper-only policy evaluation.
 """
 
 import argparse
@@ -40,78 +31,52 @@ VARIANT_TRAIN_SPECS = {
         "slug": "tier1_basic_marl",
         "extra": [],
     },
-    "tier2_fgb_online": {
-        "name": "Tier 2 FGB online",
-        "slug": "tier2_fgb_online",
+    "tier2_forecast_enhancer": {
+        "name": "Tier 2 DL Enhancer (full)",
+        "slug": "tier2_forecast_enhancer",
         "extra": [
             "--forecast_baseline_enable",
-            "--fgb_mode", "online",
         ],
     },
-    "tier3_famc_meta": {
-        "name": "Tier 3 FAMC meta",
-        "slug": "tier3_famc_meta",
+    "tier2_forecast_enhancer_ablated": {
+        "name": "Tier 2 DL Enhancer (5D no forecast features)",
+        "slug": "tier2_forecast_enhancer_ablated",
         "extra": [
             "--forecast_baseline_enable",
-            "--fgb_mode", "meta",
-            "--meta_baseline_enable",
-        ],
-    },
-    "tier2_fgb_online_forecast_ablated": {
-        "name": "Tier 2 forecast ablated",
-        "slug": "tier2_fgb_online_forecast_ablated",
-        "extra": [
-            "--forecast_baseline_enable",
-            "--fgb_mode", "online",
-            "--fgb_ablate_forecasts",
-        ],
-    },
-    "tier3_famc_meta_forecast_ablated": {
-        "name": "Tier 3 forecast ablated",
-        "slug": "tier3_famc_meta_forecast_ablated",
-        "extra": [
-            "--forecast_baseline_enable",
-            "--fgb_mode", "meta",
-            "--meta_baseline_enable",
-            "--fgb_ablate_forecasts",
+            "--tier2_enhancer_ablate_forecast_features",
         ],
     },
 }
 
 PHASE_VARIANTS = {
-    "tier1_tier3": ["tier1_basic_marl", "tier3_famc_meta"],
-    "tier1_tier2_tier3": [
+    "tier1_tier2": [
         "tier1_basic_marl",
-        "tier2_fgb_online",
-        "tier3_famc_meta",
+        "tier2_forecast_enhancer",
     ],
-    "tier3_only": ["tier3_famc_meta"],
-    "all_tiers_per_seed": [
+    "tier1_enhancer": [
         "tier1_basic_marl",
-        "tier2_fgb_online",
-        "tier3_famc_meta",
-        "tier2_fgb_online_forecast_ablated",
-        "tier3_famc_meta_forecast_ablated",
+        "tier2_forecast_enhancer",
+    ],
+    "tier2_only": ["tier2_forecast_enhancer"],
+    "tier1_tier2_full_ablated": [
+        "tier1_basic_marl",
+        "tier2_forecast_enhancer",
+        "tier2_forecast_enhancer_ablated",
     ],
 }
 
 EVAL_DIR_ARG_BY_VARIANT = {
     "tier1_basic_marl": "--tier1_dir",
-    "tier2_fgb_online": "--tier2_dir",
-    "tier3_famc_meta": "--tier3_dir",
-    "tier2_fgb_online_forecast_ablated": "--tier2_dir",
-    "tier3_famc_meta_forecast_ablated": "--tier3_dir",
+    "tier2_forecast_enhancer": "--tier2_dir",
+    "tier2_forecast_enhancer_ablated": "--tier2_ablated_dir",
 }
 
 # evaluation.py --tiers_only accepts:
-# all, baseline, fgb_online, fgb_meta, tier1, tier2, tier3,
-# fgb_online_no_forecast/tier2_no_forecast, fgb_meta_no_forecast/tier3_no_forecast
+# all, baseline, tier2, tier1, tier2_ablated
 EVAL_TIERS_ONLY_BY_VARIANT = {
     "tier1_basic_marl": "tier1",
-    "tier2_fgb_online": "tier2",
-    "tier3_famc_meta": "tier3",
-    "tier2_fgb_online_forecast_ablated": "tier2_no_forecast",
-    "tier3_famc_meta_forecast_ablated": "tier3_no_forecast",
+    "tier2_forecast_enhancer": "tier2",
+    "tier2_forecast_enhancer_ablated": "tier2_ablated",
 }
 
 
@@ -306,13 +271,19 @@ def write_phase_protocol_json(path: str, payload: dict) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Run multi-seed tier phases with evaluation.")
     parser.add_argument("--seeds", nargs="+", required=True, help="Seeds, e.g. --seeds 7 42 123 789 2025")
-    parser.add_argument("--phase", type=str, required=True, choices=list(PHASE_VARIANTS.keys()))
+    parser.add_argument("--phase", type=str, default="tier1_tier2_full_ablated",
+                        choices=list(PHASE_VARIANTS.keys()),
+                        help="Phase: tier1_tier2_full_ablated (3 runs/seed) or tier1_tier2, tier1_enhancer, tier2_only")
     parser.add_argument("--episode_data_dir", type=str, default="training_dataset")
     parser.add_argument("--start_episode", type=int, default=0)
     parser.add_argument("--end_episode", type=int, default=19)
-    parser.add_argument("--global_norm_mode", type=str, default="rolling_past", choices=["rolling_past", "global"],
+    parser.add_argument("--global_norm_mode", type=str, default="global", choices=["rolling_past", "global"],
                         help="Normalization mode forwarded to main.py.")
     parser.add_argument("--investment_freq", type=int, default=6)
+    parser.add_argument("--meta_freq_min", type=int, default=6,
+                        help="Default live investor cadence minimum forwarded to train/eval. Default pins short horizon.")
+    parser.add_argument("--meta_freq_max", type=int, default=6,
+                        help="Default live investor cadence maximum forwarded to train/eval. Default pins short horizon.")
     parser.add_argument("--cooling_period", type=int, default=0)
     parser.add_argument("--forecast_training_dataset_dir", type=str, default="forecast_training_dataset")
     parser.add_argument("--forecast_base_dir", type=str, default="forecast_models")
@@ -321,22 +292,22 @@ def main():
                         help="Pinned PPO learning rate for canonical seed-suite runs.")
     parser.add_argument("--ent_coef", type=float, default=0.03,
                         help="Pinned PPO entropy coefficient for canonical seed-suite runs.")
-    parser.add_argument("--ppo_log_std_init", type=float, default=-0.5,
+    parser.add_argument("--ppo_log_std_init", type=float, default=-1.0,
                         help="Pinned PPO log_std_init for canonical seed-suite runs.")
-    parser.add_argument("--ppo_mean_clip", type=float, default=0.85,
+    parser.add_argument("--ppo_mean_clip", type=float, default=0.70,
                         help="Pinned PPO mean-action clip for canonical seed-suite runs.")
-    parser.add_argument("--fgb_cv_calib_beta", type=float, default=0.10,
-                        help="Pinned EMA beta for rolling control-variate scale calibration.")
-    parser.add_argument("--fgb_cv_gain_min", type=float, default=0.50,
-                        help="Pinned minimum correction gain from CV scale calibration.")
-    parser.add_argument("--fgb_cv_gain_max", type=float, default=1.50,
-                        help="Pinned maximum correction gain from CV scale calibration.")
-    parser.add_argument("--fgb_cv_neg_gain", type=float, default=0.50,
-                        help="Pinned correction gain used when calibration implies negative scale.")
+    parser.add_argument("--forecast_tier_ppo_mean_clip", type=float, default=0.70,
+                        help="Pinned PPO mean-action clip applied to forecast-enabled Tier-2 variants.")
     parser.add_argument("--disable_ppo_use_sde", action="store_true",
                         help="Disable PPO gSDE. By default this runner enables --ppo_use_sde.")
     parser.add_argument("--eval_data", type=str, default="evaluation_dataset/unseendata.csv")
     parser.add_argument("--eval_steps", type=int, default=None)
+    parser.add_argument("--tiers_eval_mode", type=str, default="deployed", choices=["paper", "deployed"],
+                        help="Evaluation mode forwarded to evaluation.py. Default is deployed so Tier-2 runs are checked with enhancer weights attached.")
+    parser.add_argument("--tiers_precompute_forecasts", action="store_true",
+                        help="When tiers_eval_mode=deployed, precompute/load the evaluation forecast cache for speed and determinism.")
+    parser.add_argument("--tiers_precompute_batch_size", type=int, default=8192,
+                        help="Batch size forwarded to evaluation.py when --tiers_precompute_forecasts is enabled.")
     parser.add_argument("--output_root", type=str, default="batch_tier_phase_runs")
     parser.add_argument("--suite_dir", type=str, default="",
                         help="Optional existing suite directory to resume into. If empty, a new suite dir is created.")
@@ -371,31 +342,25 @@ def main():
         "--end_episode", str(args.end_episode),
         "--global_norm_mode", str(args.global_norm_mode),
         "--investment_freq", str(args.investment_freq),
+        "--meta_freq_min", str(args.meta_freq_min),
+        "--meta_freq_max", str(args.meta_freq_max),
         "--cooling_period", str(args.cooling_period),
-        "--fgb_warmup_steps", "1000",
-        "--fgb_lambda_max", "0.6",
         "--lr", str(args.lr),
         "--ent_coef", str(args.ent_coef),
         "--ppo_log_std_init", str(args.ppo_log_std_init),
-        "--ppo_mean_clip", str(args.ppo_mean_clip),
     ]
     if not bool(args.disable_ppo_use_sde):
         common_args.append("--ppo_use_sde")
+    baseline_policy_args = [
+        "--ppo_mean_clip", str(args.ppo_mean_clip),
+    ]
     forecast_args = [
         "--forecast_training_dataset_dir", args.forecast_training_dataset_dir,
         "--forecast_base_dir", args.forecast_base_dir,
         "--forecast_cache_dir", args.forecast_cache_dir,
     ]
-    fgb_shared_args = [
-        "--fgb_clip_adv", "0.10",
-        "--forecast_trust_window", "500",
-        "--forecast_trust_metric", "hitrate",
-        "--forecast_trust_boost", "0.0",
-        "--fgb_cv_calib_beta", str(args.fgb_cv_calib_beta),
-        "--fgb_cv_gain_min", str(args.fgb_cv_gain_min),
-        "--fgb_cv_gain_max", str(args.fgb_cv_gain_max),
-        "--fgb_cv_neg_gain", str(args.fgb_cv_neg_gain),
-        "--fgb_allow_negative_lambda",
+    enhancer_policy_args = [
+        "--ppo_mean_clip", str(args.forecast_tier_ppo_mean_clip),
     ]
     protocol_path = os.path.join(suite_dir, "phase_protocol.json")
     write_phase_protocol_json(
@@ -404,14 +369,21 @@ def main():
             "phase": args.phase,
             "global_norm_mode": str(args.global_norm_mode),
             "investment_freq": int(args.investment_freq),
+            "meta_freq_min": int(args.meta_freq_min),
+            "meta_freq_max": int(args.meta_freq_max),
+            "tiers_eval_mode": str(args.tiers_eval_mode),
+            "tiers_precompute_forecasts": bool(args.tiers_precompute_forecasts),
+            "tiers_precompute_batch_size": int(args.tiers_precompute_batch_size),
             "shared_training_args": common_args,
-            "forecast_args_for_forecast_enabled_variants": forecast_args,
-            "fgb_shared_args_for_forecast_enabled_variants": fgb_shared_args,
+            "tier1_policy_args": baseline_policy_args,
+            "forecast_args_for_tier2": forecast_args,
+            "tier2_policy_args": enhancer_policy_args,
             "documentation": (
-                "All forecast-enabled variants share the same FGB/FAMC stabilization settings "
-                "(fgb_shared_args), including explicit lambda-sign behavior "
-                "(--fgb_allow_negative_lambda). This keeps protocol-level settings explicit and reproducible."
+                "Tier 1 uses the baseline MARL policy stack. Tier 2 variants train from scratch with the same MARL "
+                "architecture while the forecast-backed short-memory residual enhancer is applied live during "
+                "training and validated in deployed evaluation."
             ),
+            "tier2_training_contract": "live_short_memory_residual_overlay",
         },
     )
     # Build full run plan with deterministic global numbering.
@@ -478,10 +450,13 @@ def main():
         eval_out = str(plan["eval_output_dir"])
 
         extra = list(spec["extra"])
+        train_extra_args = []
         if canonical != "tier1_basic_marl":
-            extra = forecast_args + fgb_shared_args + extra
+            train_extra_args = forecast_args + enhancer_policy_args
+        else:
+            train_extra_args = list(baseline_policy_args)
         label = f"[Run {run_no}/{total_runs}] {spec['name']} (seed={seed}, order={idx})"
-        train_cmd = [py, "main.py"] + common_args + ["--seed", str(seed), "--save_dir", save_dir] + extra
+        train_cmd = [py, "main.py"] + common_args + ["--seed", str(seed), "--save_dir", save_dir] + train_extra_args + extra
         train_result = run_command(train_cmd, label)
 
         row = {
@@ -511,7 +486,15 @@ def main():
                 "--eval_steps", str(eval_steps),
                 "--output_dir", eval_out,
                 "--investment_freq", str(args.investment_freq),
+                "--meta_freq_min", str(args.meta_freq_min),
+                "--meta_freq_max", str(args.meta_freq_max),
+                "--tiers_eval_mode", str(args.tiers_eval_mode),
+                "--forecast_base_dir", args.forecast_base_dir,
+                "--forecast_cache_dir", args.forecast_cache_dir,
+                "--tiers_precompute_batch_size", str(args.tiers_precompute_batch_size),
             ]
+            if bool(args.tiers_precompute_forecasts):
+                eval_cmd.append("--tiers_precompute_forecasts")
             eval_label = f"[Run {run_no}/{total_runs}] Eval {canonical} (seed={seed})"
             eval_result = run_command(eval_cmd, eval_label)
             row["evaluation_success"] = eval_result.get("success", False)

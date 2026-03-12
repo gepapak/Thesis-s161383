@@ -56,21 +56,21 @@ Repository Structure (High Level)
 Core simulation and training:
 - environment.py:
   Fund simulator (physical + trading sleeves), NAV accounting, trading
-  execution, battery dispatch, and strict overlay feature construction.
+  execution, battery dispatch, and strict enhancer-base feature construction.
 
 - metacontroller.py:
   MARL training loop and policy management (PPO/SAC) + FGB/FAMC advantage
   correction.
 
-Forecasts and overlay:
+Forecasts and the enhancer base:
 - generator.py:
   Multi-horizon forecast generator (trained separately; used at runtime for
   forecast signals).
 
-- dl_overlay.py:
-  Minimal deep-learning overlay producing:
-    - pred_reward head (FGB)
-    - optional meta_adv head (FAMC meta mode)
+- dl_enhancer.py:
+  Tier-2 DL enhancer runtime and forecast calibration:
+    - CalibrationTracker for forecast trust / expected dNAV
+    - EnhancerAdapter + EnhancerTrainer for learned investor exposure scaling
 
 Wrappers and evaluation:
 - wrapper.py:
@@ -114,7 +114,7 @@ workarounds:
 Tests
 
 A small stdlib unittest suite is included under tests/ to validate:
-- strict overlay dimension contract behavior
+- strict enhancer-base dimension contract behavior
 - forecast precompute memory cleanup behavior
 - run manifest writing correctness
 - lightweight import smoke tests
@@ -144,21 +144,20 @@ Tier 3 (FAMC meta):
     --forecast_base_dir forecast_models --forecast_cache_dir forecast_cache ^
     --lr 0.0003 --ent_coef 0.03 --ppo_use_sde --ppo_log_std_init -0.5
 
-Forecast signal ablation:
+Tier 2 forecast-feature ablation:
   python main.py --episode_training --episode_data_dir training_dataset --start_episode 0 --end_episode 19 ^
-    --enable_gnn_encoder --save_dir tier3_famc_meta_ablate_forecasts --seed 789 --investment_freq 24 --cooling_period 0 ^
-    --fgb_mode meta --forecast_training_dataset_dir forecast_training_dataset ^
+    --enable_gnn_encoder --save_dir tier2_ablated_run --seed 789 --investment_freq 24 --cooling_period 0 ^
+    --forecast_baseline_enable --forecast_training_dataset_dir forecast_training_dataset ^
     --forecast_base_dir forecast_models --forecast_cache_dir forecast_cache ^
     --lr 0.0003 --ent_coef 0.03 --ppo_use_sde --ppo_log_std_init -0.5 ^
-    --fgb_ablate_forecasts
+    --tier2_enhancer_ablate_forecast_features
 
 Tier evaluation on unseen data:
   python evaluation.py --mode tiers ^
-    --tier1_dir tier1_run --tier2_dir tier2_fgb_online --tier3_dir tier3_famc_meta ^
+    --tier1_dir tier1_run --tier2_dir tier2_run --tier2_ablated_dir tier2_ablated_run ^
     --eval_data evaluation_dataset/unseendata.csv --output_dir evaluation_results/tiers_seed789_2025 ^
     --investment_freq 24
 
 
 License
 (Add your license here.)
-

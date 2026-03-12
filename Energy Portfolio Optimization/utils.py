@@ -1,14 +1,14 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 UNIFIED UTILITIES MODULE (COMPREHENSIVE)
 
 Consolidates all utility functions and classes into a single, organized module:
 - safe_utils.py (SafeDivision, safe_clip, safe_mean, safe_std, sanitize_array, ensure_finite)
-- utils_overlay.py (load_overlay_weights, get_overlay_feature_dim, clear_tf_session, configure_tf_memory)
+- enhancer-base utilities (clear_tf_session, configure_tf_memory)
 - error_handling.py (ErrorHandler, safe_operation, validation functions, ContextualLogger)
 - memory_manager.py (UnifiedMemoryManager)
 - observation_validator.py (UnifiedObservationValidator)
-- dl_overlay.py (OverlaySharedModel, DLAdapter, OverlayExperienceBuffer, OverlayTrainer, CalibrationTracker)
+- dl_enhancer.py (CalibrationTracker, EnhancerAdapter, EnhancerTrainer)
 
 Single source of truth for all utility operations across the entire codebase.
 """
@@ -224,57 +224,6 @@ def exposure_with_cap(total_position: float, max_position: float, cap: float = 0
 
 
 # ============================================================================
-# DL OVERLAY UTILITIES (from utils_overlay.py)
-# ============================================================================
-
-def load_overlay_weights(adapter, weights_path: str, feature_dim: int) -> bool:
-    """
-    Load DL overlay weights with proper Keras model building.
-
-    CRITICAL: Keras models must be "built" (variables initialized) before
-    load_weights() can be called. This function handles that requirement.
-    """
-    if not os.path.exists(weights_path):
-        logging.warning(f"Weights file not found: {weights_path}")
-        return False
-
-    try:
-        # CRITICAL: Get TensorFlow lazily
-        tf = _get_tf()
-        if tf is None:
-            logging.warning(f"TensorFlow not available, cannot load weights from {weights_path}")
-            return False
-
-        # CRITICAL: Build model before loading weights
-        dummy_input = tf.random.normal((1, feature_dim), dtype=tf.float32)
-        _ = adapter.model(dummy_input, training=False)
-
-        # Now load weights
-        if hasattr(adapter.model, "load_weights"):
-            adapter.model.load_weights(weights_path)
-            logging.info(f"[OK] Loaded DL overlay weights ({feature_dim}D) from {weights_path}")
-            return True
-        else:
-            logging.warning(f"DL overlay model does not have load_weights method")
-            return False
-
-    except Exception as e:
-        if "incompatible" in str(e).lower() or "shape" in str(e).lower():
-            logging.warning(f"Feature dimension mismatch when loading {weights_path}")
-        else:
-            logging.warning(f"Could not load DL overlay weights from {weights_path}: {e}")
-        return False
-
-
-def get_overlay_feature_dim(env) -> int:
-    """Get the feature dimension for DL overlay (strict contract; single source of truth)."""
-    try:
-        from config import OVERLAY_FEATURE_DIM
-        return int(OVERLAY_FEATURE_DIM)
-    except Exception:
-        return 18  # Fallback for medium-horizon overlay
-
-
 def clear_tf_session():
     """Clear TensorFlow session to prevent memory/graph conflicts."""
     try:
@@ -796,11 +745,9 @@ class UnifiedObservationValidator:
 
 
 # ============================================================================
-# DL OVERLAY SYSTEM (from dl_overlay.py)
+# TIER-2 DL ENHANCER SYSTEM
 # ============================================================================
-# NOTE: DL overlay classes (OverlaySharedModel, DLAdapter, etc.) remain in dl_overlay.py
-# due to complex TensorFlow keras.Model inheritance requirements.
-# Import them from dl_overlay module when needed.
+# NOTE: Tier-2 DL logic (CalibrationTracker, EnhancerAdapter, etc.) is in dl_enhancer.py.
 
 
 # ============================================================================
@@ -813,24 +760,18 @@ class UnifiedObservationValidator:
 
 TIER_1 = "TIER_1"
 TIER_2 = "TIER_2"
-TIER_3 = "TIER_3"
 
 
 def determine_tier(
     forecast_baseline_enable: bool,
-    meta_baseline_enable: bool,
-    dl_overlay_enabled: bool,
 ) -> str:
     """Return the paper-tier label for a run configuration.
 
     Tier meanings in the paper refactor:
-    - TIER_1: MARL baseline (no forecast baseline/meta; no extra observations)
-    - TIER_2: FGB online (forecast-guided baseline; no extra observations)
-    - TIER_3: FGB meta (FAMC meta-critic enabled; no extra observations)
+    - TIER_1: MARL baseline (no forecast backend)
+    - TIER_2: MARL + Tier-2 DL enhancer backend
     """
-    if meta_baseline_enable:
-        return TIER_3
-    if forecast_baseline_enable or dl_overlay_enabled:
+    if forecast_baseline_enable:
         return TIER_2
     return TIER_1
 
@@ -842,16 +783,13 @@ def get_expected_observation_dims(tier: str, agent_name: str) -> int:
         'risk_controller_0': 9,
         'meta_controller_0': 11,
     }
-    # Observation shapes are fixed (Tier-1) across baseline and FGB/FAMC variants.
-    # Tier-2 forecast-augmented observations are deprecated.
+    # Observation shapes are fixed (Tier-1) across baseline and Tier-2 variants.
     return base_dims.get(agent_name, 6)
 
 
 def get_tier_from_config(config) -> str:
     forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
-    meta_baseline_enable = getattr(config, 'meta_baseline_enable', False)
-    overlay_enabled = getattr(config, 'overlay_enabled', False)
-    return determine_tier(forecast_baseline_enable, meta_baseline_enable, overlay_enabled)
+    return determine_tier(forecast_baseline_enable)
 
 
 def get_tier_from_env(env) -> str:
@@ -859,17 +797,14 @@ def get_tier_from_env(env) -> str:
         return TIER_1
     config = env.config
     forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
-    meta_baseline_enable = getattr(config, 'meta_baseline_enable', False)
-    overlay_enabled = getattr(config, 'overlay_enabled', False)
-    has_dl_adapter = hasattr(env, 'dl_adapter_overlay') and env.dl_adapter_overlay is not None
-    return determine_tier(forecast_baseline_enable, meta_baseline_enable, overlay_enabled or has_dl_adapter)
+    has_enhancer = hasattr(env, 'enhancer_adapter') and env.enhancer_adapter is not None
+    return determine_tier(forecast_baseline_enable or has_enhancer)
 
 
 def get_tier_description(tier: str) -> str:
     descriptions = {
-        TIER_1: "MARL baseline (no forecast baseline/meta; no extra observations)",
-        TIER_2: "MARL + FGB online (forecast-guided baseline; no extra observations)",
-        TIER_3: "MARL + FGB meta (FAMC meta-critic; no extra observations)",
+        TIER_1: "MARL baseline (no forecast backend; no extra observations)",
+        TIER_2: "MARL + Tier-2 DL enhancer backend (no extra observations)",
     }
     return descriptions.get(tier, f"Unknown tier: {tier}")
 
@@ -878,8 +813,8 @@ __all__ = [
     'SafeDivision', 'safe_clip', 'safe_mean', 'safe_std', 'safe_percentile',
     'sanitize_array', 'ensure_finite',
 
-    # DL overlay utilities
-    'load_overlay_weights', 'get_overlay_feature_dim', 'clear_tf_session', 'configure_tf_memory',
+    # Tier-2 enhancer utilities
+    'clear_tf_session', 'configure_tf_memory',
 
     # Error handling
     'ErrorHandler', 'safe_operation', 'validate_input', 'validate_type', 'validate_range',
@@ -892,8 +827,7 @@ __all__ = [
     'UnifiedObservationValidator',
 
     # Tier utilities
-    'TIER_1', 'TIER_2', 'TIER_3',
+    'TIER_1', 'TIER_2',
     'determine_tier', 'get_expected_observation_dims',
     'get_tier_from_config', 'get_tier_from_env', 'get_tier_description',
 ]
-

@@ -78,10 +78,17 @@ def check_episode_cache_exists(episode_num: int, cache_base_dir: str = "forecast
     if not os.path.exists(episode_cache_dir):
         return False
     
-    # Check for cache files (generator.py saves cache in this directory)
-    cache_files = [f for f in os.listdir(episode_cache_dir) if f.endswith('.npy') or f.endswith('.pkl')]
-    
-    return len(cache_files) > 0
+    # generator.py persists episode forecast caches as CSV plus metadata JSON.
+    cache_files = [
+        f for f in os.listdir(episode_cache_dir)
+        if f.startswith("precomputed_forecasts_")
+        and (f.endswith(".csv") or f.endswith("_metadata.json"))
+    ]
+
+    has_csv_cache = any(f.endswith(".csv") for f in cache_files)
+    has_metadata = any(f.endswith("_metadata.json") for f in cache_files)
+
+    return has_csv_cache and has_metadata
 
 
 def train_episode_forecast_models(
@@ -161,7 +168,7 @@ def ensure_episode_forecasts_ready(
     cache_base_dir: str = "forecast_cache"
 ) -> tuple[bool, dict]:
     """
-    Ensure episode-specific forecast models are trained and ready.
+    Ensure episode-specific forecast models already exist and are ready.
     
     CRITICAL (NO-LEAKAGE):
     Each forecast episode trains models FROM SCRATCH on a 1-year rolling window:
@@ -171,7 +178,7 @@ def ensure_episode_forecasts_ready(
     
     This function:
     1. Checks if models exist for THIS episode
-    2. If not, trains them FROM SCRATCH using episode-specific scenario file
+    2. Fails fast if they do not exist
     3. Returns paths for forecaster initialization
     
     Args:
@@ -187,21 +194,15 @@ def ensure_episode_forecasts_ready(
     models_exist = check_episode_models_exist(episode_num, forecast_base_dir)
     
     if not models_exist:
-        logger.info(f"   [FORECAST] Episode {episode_num} models not found - training now...")
-        success = train_episode_forecast_models(
-            episode_num=episode_num,
-            episode_data_path=episode_data_path,
-            forecast_base_dir=forecast_base_dir
+        logger.error(
+            f"   [FORECAST] Episode {episode_num} models not found in "
+            f"{os.path.join(forecast_base_dir, f'episode_{episode_num}')}."
         )
-        
-        if not success:
-            logger.error(f"   [ERROR] Failed to train Episode {episode_num} forecast models")
-            return False, {}
-        
-        # Verify models were created
-        if not check_episode_models_exist(episode_num, forecast_base_dir):
-            logger.error(f"   [ERROR] Episode {episode_num} models still not found after training")
-            return False, {}
+        logger.error(
+            f"   [FORECAST] Prebuild them before RL training using the forecast scenario "
+            f"file for this episode: {episode_data_path}"
+        )
+        return False, {}
     else:
         logger.info(f"   [FORECAST] Episode {episode_num} models already exist - skipping training")
     
@@ -225,4 +226,3 @@ def get_evaluation_forecast_paths(forecast_base_dir: str = "forecast_models"):
         dict with 'model_dir', 'scaler_dir', 'metadata_dir' keys for Episode 20
     """
     return get_episode_forecast_paths(20, forecast_base_dir)
-

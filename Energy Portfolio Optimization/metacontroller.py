@@ -1,4 +1,4 @@
-﻿# metacontroller.py
+# metacontroller.py
 # -----------------------------------------------------------------------------
 from copy import deepcopy
 from gymnasium import Env, spaces
@@ -162,9 +162,13 @@ class MultiESGAgent:
 
     def __init__(self, config, env, device, training=True, with_expert=None, debug=False):
         self.env = env
+        self.config = config
         self.possible_agents = list(env.possible_agents)
         self.num_agents = len(self.possible_agents)
         self.num_envs = 1
+        # Keep Tier-1 PPO rollout cadence aligned with the older stable collector behavior.
+        # Short-horizon trading already increases decision density; doubling PPO rollout size on
+        # top of that made the investor updates too aggressive in practice.
         self.n_steps = int(getattr(config, "update_every", 128))
         self.verbose = int(getattr(config, "verbose", 0))
         self.debug = bool(debug)
@@ -196,7 +200,6 @@ class MultiESGAgent:
         self._verify_policies_match_observation_spaces()
 
         # Training state
-        self.config = config
         self.device = device
         self.training = bool(training)
         self.total_steps = 0
@@ -211,6 +214,7 @@ class MultiESGAgent:
         # Runtime buffers
         self._last_obs: Optional[Dict[str, np.ndarray]] = None
         self._episode_starts: List[bool] = [True] * self.num_agents
+        self._last_step_dones: List[bool] = [False] * self.num_agents
         self._consecutive_errors = 0
         self._max_consecutive_errors = 20
         self._training_metrics = {
@@ -218,32 +222,6 @@ class MultiESGAgent:
             "observation_fixes": 0,
             "policy_errors": 0,
             "successful_steps": 0,
-        }
-
-        # FAMC: Forecast-Aware Meta-Critic state tracking
-        # EMA moments for online Î»* computation
-        self._ema_mA = 0.0   # E[A]
-        self._ema_mC = 0.0   # E[C]
-        self._ema_mA2 = 0.0  # E[AÂ²]
-        self._ema_mC2 = 0.0  # E[CÂ²]
-        self._ema_mAC = 0.0  # E[AÂ·C]
-        self._lambda_star_prev = 0.0  # Smoothed Î»*
-        self._step_count_famc = 0  # Step counter for FAMC
-
-        # FAMC: Buffers for meta-critic training
-        self._meta_features_buffer = []  # State features for meta head training
-        self._meta_adv_buffer = []       # Advantages for meta head training
-
-        # FAMC: Metrics tracking
-        self._famc_metrics = {
-            'lambda_star': 0.0,
-            'corr_AC': 0.0,
-            'clip_rate': 0.0,
-            'meta_loss': 0.0,
-            'var_adv_before': 0.0,
-            'var_adv_after': 0.0,
-            'num_clipped': 0,
-            'num_total': 0,
         }
 
         print(f"Enhanced MultiESGAgent initialized with {len(self.policies)} agents")
@@ -264,7 +242,7 @@ class MultiESGAgent:
         - Learning rate schedules
         - Buffer states
         - Episode tracking variables
-        - FAMC meta buffers (CRITICAL for OOM prevention)
+        - Legacy control-variate buffers (CRITICAL for OOM prevention)
 
         CRITICAL: Does NOT reset total_steps - this must be preserved for learning continuity!
         """
@@ -276,6 +254,7 @@ class MultiESGAgent:
             # Reset observation tracking
             self._last_obs = None
             self._episode_starts = [True] * self.num_agents
+            self._last_step_dones = [False] * self.num_agents
             self._consecutive_errors = 0
 
             # Reset training metrics
@@ -286,26 +265,6 @@ class MultiESGAgent:
                 "successful_steps": 0,
             }
 
-            # FAMC: Clear meta buffers to prevent OOM across episodes
-            # CRITICAL: These buffers accumulate observations and advantages
-            # Without clearing, they grow unbounded across 20 episodes
-            if hasattr(self, '_meta_features_buffer'):
-                buffer_size_before = len(self._meta_features_buffer)
-                self._meta_features_buffer.clear()
-                self._meta_adv_buffer.clear()
-                if buffer_size_before > 0:
-                    self.logger.info(f"[FAMC] Cleared meta buffers: {buffer_size_before} entries freed")
-
-            # FAMC: Reset EMA moments for new episode
-            # This ensures Î»* computation starts fresh
-            self._ema_mA = 0.0
-            self._ema_mC = 0.0
-            self._ema_mA2 = 0.0
-            self._ema_mC2 = 0.0
-            self._ema_mAC = 0.0
-            self._lambda_star_prev = 0.0
-            # Note: Keep _step_count_famc to maintain warmup across episodes
-
             # Reset each policy's internal state
             for i, policy in enumerate(self.policies):
                 try:
@@ -314,21 +273,6 @@ class MultiESGAgent:
                         policy.replay_buffer.reset()
                     if hasattr(policy, 'rollout_buffer') and policy.rollout_buffer is not None:
                         policy.rollout_buffer.reset()
-
-                    # FAMC: Clear policy-specific FAMC step data
-                    if hasattr(policy, '_famc_step_data'):
-                        policy._famc_step_data.clear()
-
-                    # FAMC: Reset per-policy EMA state (keeps moments isolated per agent).
-                    if hasattr(policy, "_famc_state") and isinstance(getattr(policy, "_famc_state", None), dict):
-                        policy._famc_state = {
-                            "ema_mA": 0.0,
-                            "ema_mC": 0.0,
-                            "ema_mA2": 0.0,
-                            "ema_mC2": 0.0,
-                            "ema_mAC": 0.0,
-                            "lambda_star_prev": 0.0,
-                        }
 
                     # CRITICAL FIX: DO NOT reset optimizer state
                     # Resetting optimizer wipes out Adam's momentum/variance estimates
@@ -656,6 +600,20 @@ class MultiESGAgent:
                 self.logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
+    def _get_agent_ppo_setting(self, agent_name: str, base_attr: str, default=None):
+        """
+        Resolve optional investor-specific PPO overrides while preserving global defaults
+        for the other agents.
+        """
+        try:
+            if agent_name == "investor_0":
+                investor_attr = f"investor_{base_attr}"
+                if hasattr(self.config, investor_attr):
+                    return getattr(self.config, investor_attr)
+            return getattr(self.config, base_attr, default)
+        except Exception:
+            return default
+
     def _create_single_policy(self, config, device, agent, agent_idx, activation_fn):
         try:
             policy_cfg = getattr(config, "agent_policies", None)
@@ -671,17 +629,19 @@ class MultiESGAgent:
             self.memory_tracker.register_env(dummy_env)
 
             algo_cls = {"PPO": PPO, "SAC": SAC, "TD3": TD3}[policy_mode]
+            ppo_n_steps = int(min(self.n_steps, getattr(config, "n_steps", 1024)))
+            ppo_batch_size = int(min(getattr(config, "batch_size", 256), ppo_n_steps))
 
             # Anti-collapse kwargs for PPO continuous actions only.
             # IMPORTANT: Do NOT pass these to SAC/TD3 policies (different policy classes).
             clamp_kwargs = None
             if policy_mode == "PPO":
                 clamp_kwargs = {
-                    "log_std_min": float(getattr(config, "ppo_log_std_min", -2.0)),
-                    "log_std_max": float(getattr(config, "ppo_log_std_max", -0.5)),
-                    "mean_clip": float(getattr(config, "ppo_mean_clip", 0.85)),
+                    "log_std_min": float(self._get_agent_ppo_setting(agent, "ppo_log_std_min", -2.0)),
+                    "log_std_max": float(self._get_agent_ppo_setting(agent, "ppo_log_std_max", -0.5)),
+                    "mean_clip": float(self._get_agent_ppo_setting(agent, "ppo_mean_clip", 0.85)),
                     # gSDE only: keep effective sigma bounded by clamping latent_pi passed into the SDE distribution.
-                    "sde_latent_clip": float(getattr(config, "ppo_sde_latent_clip", 2.0)),
+                    "sde_latent_clip": float(self._get_agent_ppo_setting(agent, "ppo_sde_latent_clip", 2.0)),
                 }
 
             # Standard MLP policy
@@ -702,7 +662,7 @@ class MultiESGAgent:
 
             # Optional: increase initial exploration for continuous actions
             # (helps avoid near-constant actions / premature collapse)
-            log_std_init = getattr(config, "ppo_log_std_init", None)
+            log_std_init = self._get_agent_ppo_setting(agent, "ppo_log_std_init", None)
             if log_std_init is not None:
                 try:
                     policy_kwargs["log_std_init"] = float(log_std_init)
@@ -723,8 +683,8 @@ class MultiESGAgent:
                 algo_kwargs.update(
                     {
                         "ent_coef": getattr(config, "ent_coef", 0.005),
-                        "n_steps": int(min(self.n_steps, getattr(config, "n_steps", 1024))),  # STRENGTHENED: Increased from 512
-                        "batch_size": getattr(config, "batch_size", 256),  # STRENGTHENED: Use config batch_size (256)
+                        "n_steps": ppo_n_steps,
+                        "batch_size": ppo_batch_size,
                         "gae_lambda": float(getattr(config, "gae_lambda", 0.98)),
                         "clip_range": float(getattr(config, "clip_range", 0.15)),
                         "normalize_advantage": True,
@@ -733,8 +693,8 @@ class MultiESGAgent:
                         "gamma": float(getattr(config, "gamma", 0.995)),
                         "n_epochs": int(min(getattr(config, "n_epochs", 10), getattr(config, "n_epochs", 10))),  # STRENGTHENED: Increased from 5 to 10
                         # Exploration knobs (optional)
-                        "use_sde": bool(getattr(config, "ppo_use_sde", True)),
-                        "sde_sample_freq": int(getattr(config, "ppo_sde_sample_freq", 1)),
+                        "use_sde": bool(self._get_agent_ppo_setting(agent, "ppo_use_sde", True)),
+                        "sde_sample_freq": int(self._get_agent_ppo_setting(agent, "ppo_sde_sample_freq", 1)),
                     }
                 )
             elif policy_mode in ("SAC", "TD3"):
@@ -1105,6 +1065,36 @@ class MultiESGAgent:
         except Exception:
             return self._ensure_action_shape(raw_action, action_space)
 
+    def _project_action_to_space(self, action, action_space):
+        """
+        Project a sanitized action into the declared action space.
+
+        This keeps execution-time actions and rollout-buffer actions aligned,
+        which is important for PPO action/log-prob consistency.
+        """
+        try:
+            if isinstance(action_space, Discrete):
+                if isinstance(action, (list, tuple, np.ndarray)) and np.size(action) > 0:
+                    a = int(np.round(np.atleast_1d(action)[0]))
+                else:
+                    a = int(np.round(float(action)))
+                return int(np.clip(a, 0, action_space.n - 1))
+
+            a = self._ensure_action_shape(action, action_space)
+            a = np.asarray(a, dtype=np.float32).reshape(-1)
+            if hasattr(action_space, "low") and hasattr(action_space, "high"):
+                low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+                high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
+                if low.size == 1 and a.size > 1:
+                    low = np.repeat(low[0], a.size)
+                if high.size == 1 and a.size > 1:
+                    high = np.repeat(high[0], a.size)
+                if low.size >= a.size and high.size >= a.size:
+                    a = np.clip(a, low[:a.size], high[:a.size])
+            return a.astype(np.float32)
+        except Exception:
+            return self._ensure_action_shape(action, action_space)
+
     def _coerce_action_for_buffer(self, policy, agent_name: str, action):
         try:
             # Get the action space from policy or fallback to class-level spaces
@@ -1353,6 +1343,7 @@ class MultiESGAgent:
                 ) from e
 
         pbar = tqdm(total=int(total_timesteps), desc="Training..", unit="steps")
+        trainable_policies = list(self.policies)
 
         self._initialize_environment_enhanced()
         target = self.total_steps + int(total_timesteps)
@@ -1371,7 +1362,13 @@ class MultiESGAgent:
                 if self.total_steps % 1000 == 0:
                     self._update_progress_display(pbar, total_timesteps)
 
-                safe_multithreaded_processing(train_with_memory, self.policies, self.multithreading, max_workers=2)
+                if trainable_policies:
+                    safe_multithreaded_processing(
+                        train_with_memory,
+                        trainable_policies,
+                        self.multithreading,
+                        max_workers=2,
+                    )
                 self._consecutive_errors = 0
 
                 if self.total_steps % 5000 == 0:
@@ -1435,10 +1432,6 @@ class MultiESGAgent:
                         if not hasattr(self, '_last_log_step'):
                             self._last_log_step = 0
                         self._last_log_step = self.total_steps
-
-                # FAMC: Train meta-critic head periodically (meta mode only)
-                self._step_count_famc += 1
-                self._train_meta_head_if_needed()
 
                 policy.rollout_buffer.reset()
                 gc.collect()
@@ -1629,9 +1622,8 @@ class MultiESGAgent:
         self._finalize_rollouts_enhanced()
         return steps_collected
 
-    # REMOVED: _blend_with_expert_suggestions() - Legacy action blending removed
-    # Action blending is deprecated and replaced by FGB (Tier 3)
-    # Tier 2 does NOT blend actions - PPO learns directly from observations
+    # REMOVED: _blend_with_expert_suggestions() - Legacy action blending removed.
+    # Tier-2 enhancer does NOT blend actions; PPO learns directly from observations.
 
     def _collect_actions_enhanced(self):
         actions_dict: Dict[str, Any] = {}
@@ -1687,15 +1679,38 @@ class MultiESGAgent:
                 with torch.no_grad():
                     obs_tensor = obs_as_tensor(obs, policy.device)
                     if getattr(policy, "mode", None) == "PPO":
+                        log_std_min = float(self._get_agent_ppo_setting(agent_name, "ppo_log_std_min", -2.0))
+                        log_std_max = float(self._get_agent_ppo_setting(agent_name, "ppo_log_std_max", -0.5))
+                        if bool(self._get_agent_ppo_setting(agent_name, "ppo_log_std_anneal", False)):
+                            anneal_steps = max(1, int(self._get_agent_ppo_setting(agent_name, "ppo_log_std_anneal_steps", 400000)))
+                            final_log_std_max = float(self._get_agent_ppo_setting(agent_name, "ppo_log_std_final_max", log_std_max))
+                            global_step = int(getattr(self.config, "training_global_step", 0))
+                            anneal_progress = float(np.clip(global_step / float(anneal_steps), 0.0, 1.0))
+                            log_std_max = float(
+                                log_std_max + (final_log_std_max - log_std_max) * anneal_progress
+                            )
+                        try:
+                            if hasattr(policy.policy, "_log_std_min"):
+                                policy.policy._log_std_min = float(log_std_min)
+                            if hasattr(policy.policy, "_log_std_max"):
+                                policy.policy._log_std_max = float(log_std_max)
+                        except Exception:
+                            pass
+
                         # Stable SB3 API: distribution sampling + log_prob + value
                         distribution = policy.policy.get_distribution(obs_tensor)
                         action_t = distribution.get_actions(deterministic=False)
-                        log_prob_t = distribution.log_prob(action_t)
                         value_t = policy.policy.predict_values(obs_tensor)
 
                         raw = action_t.detach().cpu().numpy().flatten()
+                        # Keep PPO execution on the same smooth path as the rest of the controller:
+                        # sanitize, apply optional tanh squash for out-of-range samples, then
+                        # project into the declared action space for buffer/env consistency.
                         proc = self._process_action_enhanced(raw, self.action_spaces[agent_name])
                         proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
+                        proc = self._project_action_to_space(proc, self.action_spaces[agent_name])
+                        proc_t = torch.as_tensor(proc, dtype=action_t.dtype, device=policy.device).reshape(action_t.shape)
+                        log_prob_t = distribution.log_prob(proc_t)
                         # Debug: log investor action scale stats (raw/proc + dist params) at decision steps
                         if agent_name == "investor_0":
                             try:
@@ -1708,7 +1723,7 @@ class MultiESGAgent:
                                     proc_np = np.asarray(proc, dtype=np.float32).flatten()
                                     raw_abs_max = float(np.max(np.abs(raw_np))) if raw_np.size else 0.0
                                     proc_abs_max = float(np.max(np.abs(proc_np))) if proc_np.size else 0.0
-                                    tanh_applied = bool(getattr(self.config, "enable_action_tanh_squash", True)) and raw_abs_max > 1.0 + 1e-6
+                                    tanh_applied = bool(proc_abs_max + 1e-6 < raw_abs_max)
 
                                     # Safely extract mean/std from distribution; fallback to zeros
                                     mean_val = None
@@ -1723,15 +1738,6 @@ class MultiESGAgent:
                                                 dist_std = getattr(dist_full.distribution, "stddev", None)
                                             except Exception:
                                                 pass
-                                        # Manual clamp of log_std to configured bounds if present
-                                        log_std_min = float(getattr(self.config, "ppo_log_std_min", -2.0))
-                                        log_std_max = float(getattr(self.config, "ppo_log_std_max", -0.5))
-                                        log_std_param = getattr(policy.policy, "log_std", None)
-                                        try:
-                                            if log_std_param is not None:
-                                                log_std_param.data.clamp_(log_std_min, log_std_max)
-                                        except Exception:
-                                            pass
                                         if dist_mean is not None:
                                             mean_val = dist_mean.detach().cpu().numpy().flatten()
                                         if dist_std is not None:
@@ -1762,6 +1768,7 @@ class MultiESGAgent:
                                             target_env._inv_a_raw = a0
                                             target_env._inv_tanh_mu = tanh_mu0
                                             target_env._inv_tanh_a = tanh_a0
+                                            target_env._inv_log_std_cap = float(log_std_max)
                                             target_env._inv_sat_mean = float(mean_sat)
                                             target_env._inv_sat_sample = float(samp_sat)
                                             target_env._inv_sat_noise_only = float(noise_only_sat)
@@ -1814,8 +1821,8 @@ class MultiESGAgent:
                             self.logger.info(f"[DECISION_PROOF] {agent_name} sampled action {action_str} at step {self.total_steps} "
                                            f"(value={value_mean}, log_prob={log_prob_mean})")
 
-                        # EXPERT BLENDING: Blend PPO action with DL overlay expert suggestions
-                        # This gives DL overlay more direct control over actions
+                        # Legacy expert-action blending removed.
+                        # The Tier-2 enhancer never overrides PPO actions directly.
                         # if agent_name == "investor_0":
                         #     proc = self._blend_with_expert_suggestions(proc, agent_name)
 
@@ -1949,78 +1956,7 @@ class MultiESGAgent:
                 except Exception:
                     pass
 
-                # FGB/FAMC: Add forecast signals to data dict for baseline adjustment
-                # These are computed by environment._compute_forecast_signals() each step
-                try:
-                    tau_cv = float(getattr(self.env, '_forecast_trust_cv', np.nan))
-                except Exception:
-                    tau_cv = np.nan
-                if not np.isfinite(tau_cv):
-                    try:
-                        if hasattr(self.env, "get_fgb_trust_for_agent"):
-                            tau_cv = float(self.env.get_fgb_trust_for_agent(agent_name))
-                        else:
-                            tau_cv = float(getattr(self.env, '_forecast_trust', 0.0))
-                    except Exception:
-                        tau_cv = float(getattr(self.env, '_forecast_trust', 0.0))
-                data['forecast_trust'] = float(tau_cv if np.isfinite(tau_cv) else 0.0)
-                try:
-                    exp_cv = float(getattr(self.env, '_expected_dnav_cv', np.nan))
-                except Exception:
-                    exp_cv = np.nan
-                if not np.isfinite(exp_cv):
-                    exp_cv = float(getattr(self.env, '_expected_dnav', 0.0))
-                data['expected_dnav'] = float(exp_cv if np.isfinite(exp_cv) else 0.0)
-                data['realized_dnav_return'] = float(getattr(self.env, 'last_realized_dnav_return', 0.0))
-                data['realized_dnav'] = float(getattr(self.env, 'last_realized_dnav', 0.0))
-                # Investor-sleeve realized target for Tier-3 dNAV-driven lambda objective.
-                data['realized_investor_dnav_return'] = float(
-                    getattr(self.env, 'last_realized_investor_dnav_return', data['realized_dnav_return'])
-                )
-                data['realized_investor_dnav'] = float(
-                    getattr(self.env, 'last_realized_investor_dnav', data['realized_dnav'])
-                )
-                data['realized_investor_return_denom'] = float(
-                    getattr(self.env, 'last_realized_investor_return_denom', max(1.0, float(getattr(self.config, "init_budget", 1.0))))
-                )
-
-                # FAMC: Add transition-aligned meta baseline prediction.
-                # Prefer lagged snapshot from env (aligned with realized target timing), fallback to current output.
-                try:
-                    meta_cv = float(getattr(self.env, '_meta_adv_pred_cv', np.nan))
-                except Exception:
-                    meta_cv = np.nan
-                if np.isfinite(meta_cv):
-                    data['meta_adv_pred'] = float(meta_cv)
-                elif hasattr(self.env, '_last_overlay_output') and self.env._last_overlay_output:
-                    overlay_out = self.env._last_overlay_output
-                    if isinstance(overlay_out, dict) and 'meta_adv' in overlay_out:
-                        meta_adv_raw = overlay_out['meta_adv']
-                        if hasattr(meta_adv_raw, 'shape') and len(meta_adv_raw.shape) > 0:
-                            data['meta_adv_pred'] = float(meta_adv_raw.flatten()[0])
-                        else:
-                            data['meta_adv_pred'] = float(meta_adv_raw)
-                    else:
-                        data['meta_adv_pred'] = 0.0
-                else:
-                    data['meta_adv_pred'] = 0.0
-
-                # Auxiliary alignment for meta exposure (training-only shaping)
-                if agent_name == "meta_controller_0":
-                    align_w = float(getattr(self.config, "meta_exposure_align_weight", 0.0))
-                    if align_w != 0.0:
-                        try:
-                            trade_signal = float(getattr(self.env, "_last_obs_trade_signal", 0.0))
-                            exposure = float(getattr(self.env, "meta_exposure", 0.0))
-                            align = float(np.clip(trade_signal * exposure, -1.0, 1.0))
-                            if bool(getattr(self.config, "meta_exposure_align_only_action_steps", True)):
-                                freq = int(getattr(self.env, "investment_freq", 1) or 1)
-                                t = int(getattr(self.env, "t", 0))
-                                if freq > 1 and (t % freq != 0):
-                                    align = 0.0
-                            reward = float(reward) + float(align_w * align)
-                        except Exception:
-                            pass
+                # Legacy online/meta baseline payload removed (enhancer-only backend).
 
                 if getattr(policy, "mode", None) == "PPO":
                     self._add_ppo_experience(policy, data, reward, polid)
@@ -2185,62 +2121,6 @@ class MultiESGAgent:
             if "torch" in str(type(action_fixed)):
                 action_fixed = action_fixed.detach().cpu().numpy()
             action_np = np.asarray(action_fixed, dtype=np.float32).flatten()  # Flatten to 1D
-
-            # --- FGB/FAMC: Forecast-guided baseline adjustment ---
-            # Legacy "fixed" reward-shaping mode removed.
-            # Online/meta modes apply an *advantage-level* control variate correction (unbiased if action-independent).
-            fgb_mode = getattr(self.config, 'fgb_mode', 'online')
-            agent_name = str(getattr(policy, 'agent_name', '') or '')
-
-            # FAMC: Store control variate data only when forecast baseline is enabled.
-            # This data is consumed in _finalize_rollouts_enhanced after GAE computation.
-            # Keeping it disabled in Tier1 avoids unnecessary per-step memory growth.
-            if bool(getattr(self.config, 'forecast_baseline_enable', False)) and fgb_mode in ['online', 'meta']:
-                # Paper-clean mode: keep control-variate correction scoped to investor_0 only.
-                if agent_name != "investor_0":
-                    if hasattr(policy, '_famc_step_data'):
-                        policy._famc_step_data.clear()
-                else:
-                # Store forecast signals and meta predictions for this step
-                    if not hasattr(policy, '_famc_step_data'):
-                        policy._famc_step_data = []
-
-                    # Only the investor trains the meta baseline head (avoid mixing agents, paper-clean).
-                    need_meta_obs = (
-                        fgb_mode == 'meta'
-                        and bool(getattr(self.config, 'meta_baseline_enable', False))
-                        and agent_name == "investor_0"
-                    )
-
-                    # FAMC: Get overlay features (18D) for meta head training (state-only, pre-action).
-                    overlay_feats = None
-                    from config import OVERLAY_FEATURE_DIM
-                    expected_dim = int(OVERLAY_FEATURE_DIM)
-                    if need_meta_obs and hasattr(self.env, '_last_overlay_features') and self.env._last_overlay_features is not None:
-                        overlay_feats = self.env._last_overlay_features.copy()
-                        if overlay_feats.ndim == 2:
-                            overlay_feats = overlay_feats[0]
-                        if overlay_feats.shape[0] != expected_dim:
-                            self.logger.debug(f"[FAMC] Skipping step: overlay features wrong dim ({overlay_feats.shape[0]}D, expected {expected_dim}D)")
-                            overlay_feats = None
-
-                    famc_data = {
-                        'tau': data.get('forecast_trust', 0.0),
-                        'expected_dnav': data.get('expected_dnav', 0.0),
-                        'meta_adv_pred': data.get('meta_adv_pred', 0.0),
-                        'realized_dnav_return': data.get('realized_dnav_return', 0.0),
-                        'realized_dnav': data.get('realized_dnav', 0.0),
-                        'realized_investor_dnav_return': data.get('realized_investor_dnav_return', data.get('realized_dnav_return', 0.0)),
-                        'realized_investor_dnav': data.get('realized_investor_dnav', data.get('realized_dnav', 0.0)),
-                        'realized_investor_return_denom': data.get('realized_investor_return_denom', max(1.0, float(getattr(self.config, "init_budget", 1.0)))),
-                    }
-                    if need_meta_obs and overlay_feats is not None and overlay_feats.shape[0] == expected_dim:
-                        famc_data['obs'] = overlay_feats
-                    policy._famc_step_data.append(famc_data)
-            else:
-                # Ensure stale step data cannot accumulate when baseline correction is disabled.
-                if hasattr(policy, '_famc_step_data'):
-                    policy._famc_step_data.clear()
 
             # --- reward/start flags -> numpy (CPU) ---
             reward_np = np.array([reward], dtype=np.float32)
@@ -2456,7 +2336,9 @@ class MultiESGAgent:
 
         self._last_obs = next_obs
         for polid, agent in enumerate(self.possible_agents):
-            self._episode_starts[polid] = bool(dones.get(agent, False) or truncs.get(agent, False))
+            done_flag = bool(dones.get(agent, False) or truncs.get(agent, False))
+            self._episode_starts[polid] = done_flag
+            self._last_step_dones[polid] = done_flag
 
         # PHASE 5.6 FIX: Don't reset environment during episode training
         # During episode training, the environment should continue until episode_timesteps is reached
@@ -2585,12 +2467,15 @@ class MultiESGAgent:
                                 # Scalar value - convert to tensor
                                 final_value = torch.tensor([[float(final_value)]], dtype=torch.float32, device=policy.device)
 
-                        # CRITICAL FIX: GAE Terminal Flag
-                        # Because the environment immediately resets on done=True, the final_obs
-                        # collected in the buffer is the post-reset state, which is non-terminal.
-                        # Therefore, dones_b must be explicitly set to np.array([False], dtype=bool)
-                        # to align with custom loop logic and prevent GAE corruption.
-                        dones_b = np.array([False], dtype=bool)
+                        # Use the terminal flag from the last collected transition.
+                        # If the env auto-reset, final_obs is already the reset observation, but
+                        # SB3 still needs dones=True here to prevent bootstrap across the boundary.
+                        last_done_flag = False
+                        try:
+                            last_done_flag = bool(self._last_step_dones[polid])
+                        except Exception:
+                            last_done_flag = False
+                        dones_b = np.array([last_done_flag], dtype=bool)
 
                         # ROOT CAUSE FIX: SB3's compute_returns_and_advantage expects last_values as PyTorch tensor
                         # It internally calls last_values.clone() which fails if final_value is numpy array
@@ -2649,491 +2534,11 @@ class MultiESGAgent:
                                     f"[GAE_ERROR] Policy {polid} ({agent_name}): {gae_error}"
                                 ) from gae_error
 
-                        # FAMC: Apply advantage-level correction (online/meta modes)
-                        fgb_mode = getattr(self.config, 'fgb_mode', 'online')
-                        if fgb_mode in ['online', 'meta'] and getattr(self.config, 'forecast_baseline_enable', False):
-                            if agent_name != "investor_0":
-                                if hasattr(policy, '_famc_step_data'):
-                                    policy._famc_step_data = []
-                            else:
-                                self._apply_famc_correction(policy, polid)
-
                         # MAINTENANCE: Log buffer state for verification
                         self.logger.debug(f"GAE computed for policy {polid}: buffer_size={buffer.buffer_size}, pos={buffer.pos}")
             except Exception as e:
                 msg = f"Rollout finalization error for policy {polid}: {e}"
                 raise RuntimeError(msg) from e
-
-    def _apply_famc_correction(self, policy, polid):
-        """
-        FAMC: Apply learned control-variate baseline correction to advantages.
-
-        This applies mode-specific advantage correction:
-        A'_t = A_t - Î»* * C_t
-
-        where:
-        - C_t is the control variate (meta-critic prediction or expected_dnav)
-        - online mode: Î»* = Cov(A,C) / Var(C) from online EMA moments
-        - meta mode: Î»* is updated by a dNAV-driven meta-gradient objective
-
-        Args:
-            policy: PPO policy with rollout_buffer containing computed advantages
-            polid: Policy index
-        """
-        try:
-            buffer = policy.rollout_buffer
-            if buffer is None or buffer.pos == 0:
-                return
-
-            # Get FAMC configuration
-            fgb_mode = getattr(self.config, 'fgb_mode', 'online')
-            warmup_steps = getattr(self.config, 'fgb_warmup_steps', 2000)
-            lambda_max = getattr(self.config, 'fgb_lambda_max', 0.8)
-            clip_adv = getattr(self.config, 'fgb_clip_adv', getattr(self.config, 'fgb_clip_bps', 0.01))
-            moment_beta = getattr(self.config, 'fgb_moment_beta', 0.01)
-            allow_negative_lambda = bool(getattr(self.config, 'fgb_allow_negative_lambda', False))
-
-            agent_name = str(getattr(policy, "agent_name", f"policy_{polid}") or f"policy_{polid}")
-            if agent_name != "investor_0":
-                if hasattr(policy, '_famc_step_data'):
-                    policy._famc_step_data = []
-                return
-
-            # Warmup is measured in environment steps (not policy updates) so it doesn't depend on agent order.
-            try:
-                t_now = int(getattr(self.config, "training_global_step", getattr(self.env, "t", 0)))
-            except Exception:
-                t_now = int(getattr(self.env, "t", 0))
-
-            if t_now < warmup_steps:
-                return
-
-            # Get stored FAMC data
-            if not hasattr(policy, '_famc_step_data') or len(policy._famc_step_data) == 0:
-                return
-
-            famc_data_list = policy._famc_step_data
-            n_steps = min(buffer.pos, len(famc_data_list))
-
-            if n_steps == 0:
-                return
-
-            # Extract advantages from buffer (shape: (buffer_size, 1))
-            advantages = buffer.advantages[:n_steps].flatten()  # (n_steps,)
-
-            # Build control variate C_t based on mode and realized dNAV return target.
-            C_t = np.zeros(n_steps, dtype=np.float32)
-            realized_dnav_ret = np.zeros(n_steps, dtype=np.float32)
-            nav_norm = max(1.0, float(getattr(self.config, "init_budget", 0.0)) or 1.0)
-
-            for i in range(n_steps):
-                # CRITICAL FIX: Use .get() with defaults to prevent KeyError
-                famc_data = famc_data_list[i] if i < len(famc_data_list) else {}
-                tau = float(famc_data.get('tau', 0.0))
-                exp_dnav = float(famc_data.get('expected_dnav', 0.0))
-                meta_pred = float(famc_data.get('meta_adv_pred', 0.0))
-                realized_ret = float(
-                    famc_data.get(
-                        'realized_investor_dnav_return',
-                        famc_data.get('realized_dnav_return', 0.0),
-                    )
-                )
-                if not np.isfinite(realized_ret):
-                    realized_dnav = float(
-                        famc_data.get(
-                            'realized_investor_dnav',
-                            famc_data.get('realized_dnav', 0.0),
-                        )
-                    )
-                    realized_denom = float(famc_data.get('realized_investor_return_denom', nav_norm))
-                    if (not np.isfinite(realized_denom)) or realized_denom <= 0.0:
-                        realized_denom = nav_norm
-                    realized_ret = float(realized_dnav / max(realized_denom, 1.0))
-                if not np.isfinite(realized_ret):
-                    realized_ret = 0.0
-                realized_dnav_ret[i] = realized_ret
-
-                if fgb_mode == 'online':
-                    # Use expected_dnav as control variate (gated by trust)
-                    C_t[i] = tau * (exp_dnav / nav_norm)
-                elif fgb_mode == 'meta':
-                    # Meta mode: investor_0 uses the learned meta baseline head.
-                    C_t[i] = tau * meta_pred
-
-            # Standardize advantages and control variates for stable moment estimation
-            A_mean = np.mean(advantages)
-            A_std = np.std(advantages) + 1e-8
-            A_std_norm = (advantages - A_mean) / A_std
-
-            C_mean = np.mean(C_t)
-            C_std = np.std(C_t) + 1e-8
-            C_std_norm = (C_t - C_mean) / C_std
-            R_mean = np.mean(realized_dnav_ret)
-            R_std = np.std(realized_dnav_ret) + 1e-8
-            R_std_norm = (realized_dnav_ret - R_mean) / R_std
-
-            # Per-policy EMA moments (avoid mixing PPO agents, order-dependence).
-            famc_state = getattr(policy, "_famc_state", None)
-            if not isinstance(famc_state, dict):
-                famc_state = {
-                    "ema_mA": 0.0,
-                    "ema_mC": 0.0,
-                    "ema_mA2": 0.0,
-                    "ema_mC2": 0.0,
-                    "ema_mAC": 0.0,
-                    "lambda_star_prev": 0.0,
-                    "lambda_meta": 0.0,
-                    "lambda_meta_m": 0.0,
-                    "lambda_meta_prev": 0.0,
-                    "cv_alpha_ema": 1.0,
-                    "cv_alpha_batch": 1.0,
-                    "cv_gain": 1.0,
-                }
-                policy._famc_state = famc_state
-
-            # Rolling control-variate scale calibration against realized investor dNAV returns.
-            # This adjusts correction amplitude (not policy reward) to better align baseline scale
-            # with realized sleeve outcomes and reduce over-dampening.
-            cv_alpha_ema = float(famc_state.get("cv_alpha_ema", 1.0))
-            cv_alpha_batch = float(famc_state.get("cv_alpha_batch", 1.0))
-            cv_gain = float(famc_state.get("cv_gain", 1.0))
-            cv_beta = float(np.clip(getattr(self.config, "fgb_cv_calib_beta", 0.10), 0.0, 1.0))
-            cv_gain_min = float(max(0.0, getattr(self.config, "fgb_cv_gain_min", 0.50)))
-            cv_gain_max = float(max(cv_gain_min, getattr(self.config, "fgb_cv_gain_max", 1.50)))
-            cv_neg_gain = float(np.clip(getattr(self.config, "fgb_cv_neg_gain", 0.50), 0.0, cv_gain_max))
-            if n_steps >= 2:
-                c_centered = C_t.astype(np.float64) - float(np.mean(C_t))
-                r_centered = realized_dnav_ret.astype(np.float64) - float(np.mean(realized_dnav_ret))
-                var_c_raw = float(np.mean(c_centered * c_centered))
-                if np.isfinite(var_c_raw) and var_c_raw > 1e-12:
-                    cov_cr_raw = float(np.mean(c_centered * r_centered))
-                    alpha_now = cov_cr_raw / var_c_raw
-                    if np.isfinite(alpha_now):
-                        cv_alpha_batch = float(alpha_now)
-                        cv_alpha_ema = (1.0 - cv_beta) * cv_alpha_ema + cv_beta * cv_alpha_batch
-            if not np.isfinite(cv_alpha_ema):
-                cv_alpha_ema = 1.0
-            if cv_alpha_ema < 0.0:
-                cv_gain = cv_neg_gain
-            else:
-                cv_gain = float(np.clip(cv_alpha_ema, cv_gain_min, cv_gain_max))
-            famc_state["cv_alpha_ema"] = float(cv_alpha_ema)
-            famc_state["cv_alpha_batch"] = float(cv_alpha_batch)
-            famc_state["cv_gain"] = float(cv_gain)
-
-            lambda_star_prev = float(famc_state.get("lambda_star_prev", 0.0))
-            lambda_star_smooth = float(lambda_star_prev)
-            if fgb_mode == 'online':
-                # Tier 2: variance-optimal lambda via online EMA moments.
-                ema_mA = float(famc_state.get("ema_mA", 0.0))
-                ema_mC = float(famc_state.get("ema_mC", 0.0))
-                ema_mA2 = float(famc_state.get("ema_mA2", 0.0))
-                ema_mC2 = float(famc_state.get("ema_mC2", 0.0))
-                ema_mAC = float(famc_state.get("ema_mAC", 0.0))
-
-                for i in range(n_steps):
-                    a = float(A_std_norm[i])
-                    c = float(C_std_norm[i])
-
-                    ema_mA = (1 - moment_beta) * ema_mA + moment_beta * a
-                    ema_mC = (1 - moment_beta) * ema_mC + moment_beta * c
-                    ema_mA2 = (1 - moment_beta) * ema_mA2 + moment_beta * (a ** 2)
-                    ema_mC2 = (1 - moment_beta) * ema_mC2 + moment_beta * (c ** 2)
-                    ema_mAC = (1 - moment_beta) * ema_mAC + moment_beta * (a * c)
-
-                var_C = ema_mC2 - ema_mC ** 2
-                cov_AC = ema_mAC - ema_mA * ema_mC
-                if var_C > 1e-6:
-                    lambda_star_raw = cov_AC / var_C
-                    if allow_negative_lambda:
-                        lambda_star = np.clip(lambda_star_raw, -lambda_max, lambda_max)
-                    else:
-                        lambda_star = np.clip(lambda_star_raw, 0.0, lambda_max)
-                else:
-                    lambda_star = 0.0
-
-                lambda_star_prev = 0.9 * lambda_star_prev + 0.1 * lambda_star
-                lambda_star_smooth = float(lambda_star_prev)
-
-                famc_state["ema_mA"] = float(ema_mA)
-                famc_state["ema_mC"] = float(ema_mC)
-                famc_state["ema_mA2"] = float(ema_mA2)
-                famc_state["ema_mC2"] = float(ema_mC2)
-                famc_state["ema_mAC"] = float(ema_mAC)
-                famc_state["lambda_star_prev"] = float(lambda_star_prev)
-
-            if fgb_mode == 'meta':
-                # Tier 3 objective override: dNAV-driven meta-gradient lambda.
-                # Minimize L(lambda) = E[(A_std - lambda*C_std - R_std)^2] + l2*lambda^2
-                meta_lr = float(getattr(self.config, "fgb_meta_lambda_lr", 0.05))
-                meta_l2 = float(getattr(self.config, "fgb_meta_lambda_l2", 0.01))
-                meta_momentum = float(getattr(self.config, "fgb_meta_lambda_momentum", 0.9))
-                meta_grad_clip = float(getattr(self.config, "fgb_meta_lambda_grad_clip", 5.0))
-                lambda_meta = float(famc_state.get("lambda_meta", 0.0))
-                lambda_meta_m = float(famc_state.get("lambda_meta_m", 0.0))
-                lambda_star_prev = float(famc_state.get("lambda_meta_prev", lambda_meta))
-
-                pred_adv_std = A_std_norm - (lambda_meta * C_std_norm)
-                residual = pred_adv_std - R_std_norm
-                grad = float(-2.0 * np.mean(residual * C_std_norm) + 2.0 * meta_l2 * lambda_meta)
-                if not np.isfinite(grad):
-                    grad = 0.0
-                grad = float(np.clip(grad, -meta_grad_clip, meta_grad_clip))
-
-                lambda_meta_m = (meta_momentum * lambda_meta_m) + ((1.0 - meta_momentum) * grad)
-                lambda_meta_next = lambda_meta - (meta_lr * lambda_meta_m)
-                # Tier-3 stabilization:
-                # keep λ* non-negative and capped tighter than generic FGB bounds
-                # to avoid over-correction that collapses investor exposure.
-                meta_lambda_cap = float(min(lambda_max, 0.35))
-                if not np.isfinite(meta_lambda_cap) or meta_lambda_cap <= 0.0:
-                    meta_lambda_cap = float(max(lambda_max, 1e-6))
-                lambda_meta_next = float(np.clip(lambda_meta_next, 0.0, meta_lambda_cap))
-
-                lambda_star_prev = (0.9 * lambda_star_prev) + (0.1 * lambda_meta_next)
-                lambda_star_smooth = float(lambda_star_prev)
-                famc_state["lambda_star_prev"] = float(lambda_star_prev)
-                famc_state["lambda_meta_prev"] = float(lambda_star_prev)
-                famc_state["lambda_meta"] = float(lambda_meta_next)
-                famc_state["lambda_meta_m"] = float(lambda_meta_m)
-                famc_state["meta_lambda_grad"] = float(grad)
-                if np.std(R_std_norm) > 1e-6 and np.std(A_std_norm) > 1e-6:
-                    famc_state["meta_target_corr"] = float(np.corrcoef(A_std_norm, R_std_norm)[0, 1])
-                else:
-                    famc_state["meta_target_corr"] = 0.0
-                famc_state["meta_lambda_cap"] = float(meta_lambda_cap)
-
-            # Apply correction in standardized space with smooth saturation.
-            # This avoids abrupt hard-clipping artifacts and reduces meta-mode over-dampening
-            # when lambda updates spike temporarily.
-            meta_corr_scale = 1.0
-            delta_std_raw = -lambda_star_smooth * cv_gain * C_std_norm
-            if fgb_mode == 'meta':
-                meta_target_corr = float(famc_state.get("meta_target_corr", 0.0))
-                if not np.isfinite(meta_target_corr):
-                    meta_target_corr = 0.0
-                # Use correction only when Corr(A,R) is positive.
-                # Negative/zero correlation means no reliable meta signal.
-                meta_corr_scale = float(np.clip(meta_target_corr, 0.0, 1.0))
-                delta_std_raw = delta_std_raw * meta_corr_scale
-
-            # Convert configured raw-advantage clip to standardized domain and
-            # apply smooth tanh saturation to correction deltas.
-            clip_std = float(max(clip_adv / max(A_std, 1e-8), 1e-6))
-            delta_std = clip_std * np.tanh(delta_std_raw / clip_std)
-            A_corrected_std = A_std_norm + delta_std
-
-            # De-standardize back to original scale: A' = A'_std * σ_A + μ_A
-            advantages_corrected = A_corrected_std * A_std + A_mean
-            delta = advantages_corrected - advantages
-
-            # Compute variance for metrics
-            var_before = np.var(advantages)
-            var_after = np.var(advantages_corrected)
-            # "Clipped" diagnostics now represent smooth-saturation activation.
-            num_clipped = np.sum(np.abs(delta_std_raw) > clip_std)
-
-            # Write back to the buffer AFTER GAE computation but BEFORE the PPO update.
-            # NOTE: SB3 PPO may still normalize advantages per minibatch during training
-            # (normalize_advantage=True). Our correction changes the *relative* advantages;
-            # normalization rescales but does not remove the per-step structure.
-            # var_before/var_after here are diagnostics on raw buffer advantages (pre-normalization).
-            buffer.advantages[:n_steps] = advantages_corrected.reshape(-1, 1)
-
-            # Compute correlation for diagnostics
-            if np.std(advantages) > 1e-6 and np.std(C_t) > 1e-6:
-                corr_AC = np.corrcoef(advantages, C_t)[0, 1]
-            else:
-                corr_AC = 0.0
-
-            # Update metrics
-            self._famc_metrics['lambda_star'] = float(lambda_star_smooth)
-            self._famc_metrics['corr_AC'] = float(corr_AC)
-            self._famc_metrics['clip_rate'] = float(num_clipped) / max(1, n_steps)
-            self._famc_metrics['var_adv_before'] = float(var_before)
-            self._famc_metrics['var_adv_after'] = float(var_after)
-            self._famc_metrics['num_clipped'] = int(num_clipped)
-            self._famc_metrics['num_total'] = int(n_steps)
-            self._famc_metrics['var_reduction'] = float(1.0 - var_after / max(var_before, 1e-8))
-            self._famc_metrics['cv_alpha_batch'] = float(cv_alpha_batch)
-            self._famc_metrics['cv_alpha_ema'] = float(cv_alpha_ema)
-            self._famc_metrics['cv_gain'] = float(cv_gain)
-            if fgb_mode == 'meta':
-                self._famc_metrics['meta_lambda_grad'] = float(famc_state.get("meta_lambda_grad", 0.0))
-                self._famc_metrics['meta_target_corr'] = float(famc_state.get("meta_target_corr", 0.0))
-                self._famc_metrics['meta_corr_scale'] = float(meta_corr_scale)
-                self._famc_metrics['meta_lambda_cap'] = float(famc_state.get("meta_lambda_cap", 0.0))
-
-            # Periodic detailed logging
-            if t_now % 500 == 0:
-                var_red_pct = (1.0 - var_after / max(var_before, 1e-8)) * 100
-                clip_rate_pct = (float(num_clipped) / max(1, n_steps)) * 100
-                if fgb_mode == 'meta':
-                    meta_grad = float(famc_state.get("meta_lambda_grad", 0.0))
-                    target_corr = float(famc_state.get("meta_target_corr", 0.0))
-                    self.logger.info(
-                        f"[FAMC_META_DNAV] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} "
-                        f"| Corr(A,R)={target_corr:.3f} | VarRed={var_red_pct:.1f}% "
-                        f"| Clip={clip_rate_pct:.1f}% | cv_gain={cv_gain:.3f} | corr_scale={meta_corr_scale:.3f} | grad={meta_grad:.4f}"
-                    )
-                else:
-                    self.logger.info(
-                        f"[FAMC] λ*={lambda_star_smooth:.3f} | Corr={corr_AC:.3f} "
-                        f"| VarRed={var_red_pct:.1f}% | Clip={clip_rate_pct:.1f}% | cv_gain={cv_gain:.3f}"
-                    )
-
-            # Store features and advantages for meta head training (meta mode only)
-            if agent_name == "investor_0" and fgb_mode == 'meta' and getattr(self.config, 'meta_baseline_enable', False):
-                from config import OVERLAY_FEATURE_DIM
-                meta_feat_dim = int(OVERLAY_FEATURE_DIM)
-                for i in range(n_steps):
-                    famc_row = famc_data_list[i] if i < len(famc_data_list) else {}
-                    obs = famc_row.get('obs', None)
-                    if isinstance(obs, np.ndarray) and obs.shape[0] == meta_feat_dim:
-                        self._meta_features_buffer.append(obs)
-                        self._meta_adv_buffer.append(A_std_norm[i])  # Store standardized advantage
-                    else:
-                        if isinstance(obs, np.ndarray):
-                            self.logger.debug(f"[FAMC] Skipping invalid observation: shape={obs.shape}, expected {meta_feat_dim}D")
-
-                # Limit buffer size
-                max_buffer_size = 10000
-                if len(self._meta_features_buffer) > max_buffer_size:
-                    self._meta_features_buffer = self._meta_features_buffer[-max_buffer_size:]
-                    self._meta_adv_buffer = self._meta_adv_buffer[-max_buffer_size:]
-
-        except Exception as e:
-            msg = f"[FAMC] Correction failed for policy {polid}: {e}"
-            raise RuntimeError(msg) from e
-        finally:
-            # Always clear per-rollout FAMC data, including warmup/early-return paths,
-            # to prevent stale alignment against a future rollout buffer.
-            if hasattr(policy, '_famc_step_data'):
-                policy._famc_step_data = []
-
-    def _train_meta_head_if_needed(self):
-        """
-        FAMC: Train meta-critic head periodically on accumulated advantages.
-
-        This trains the meta head to predict standardized advantages
-        from state features only (no action leakage).
-        """
-        fail_fast = bool(getattr(self.config, "fgb_fail_fast", False)) and bool(
-            getattr(self.config, "forecast_baseline_enable", False)
-        )
-        try:
-            # Check if meta head training is enabled.
-            fgb_mode = getattr(self.config, 'fgb_mode', 'online')
-            if fgb_mode != 'meta' or not getattr(self.config, 'meta_baseline_enable', False):
-                return
-
-            # Check if it's time to train (use env-step clock, not policy-update count).
-            meta_train_every = int(getattr(self.config, 'meta_train_every', 512) or 512)
-            try:
-                t_now = int(getattr(self.config, "training_global_step", getattr(self.env, "t", 0)))
-            except Exception:
-                t_now = int(getattr(self.env, "t", 0))
-
-            if not hasattr(self, "_last_meta_train_step"):
-                self._last_meta_train_step = -meta_train_every
-            if int(t_now) - int(self._last_meta_train_step) < meta_train_every:
-                return
-
-            # Check if we have enough data.
-            min_samples = int(getattr(self.config, "meta_train_min_samples", 128) or 128)
-            if len(self._meta_features_buffer) < min_samples:
-                return
-
-            # Get overlay trainer from environment.
-            overlay_trainer = getattr(self.env, 'overlay_trainer', None)
-            if overlay_trainer is None:
-                msg = "[FAMC] Overlay trainer not found, skipping meta head training"
-                if fail_fast:
-                    raise RuntimeError(msg)
-                self.logger.warning(msg)
-                return
-
-            from config import OVERLAY_FEATURE_DIM
-            meta_feat_dim = int(OVERLAY_FEATURE_DIM)
-
-            # Filter valid meta-feature rows across the full buffer first.
-            valid_indices = []
-            for idx, feat in enumerate(self._meta_features_buffer):
-                if not isinstance(feat, np.ndarray):
-                    continue
-                feat_arr = np.asarray(feat, dtype=np.float32).reshape(-1)
-                if feat_arr.shape[0] != meta_feat_dim:
-                    continue
-                if not np.all(np.isfinite(feat_arr)):
-                    continue
-                valid_indices.append(idx)
-
-            valid_count = int(len(valid_indices))
-            total_count = int(len(self._meta_features_buffer))
-            self._famc_metrics['meta_valid_feature_count'] = valid_count
-            self._famc_metrics['meta_valid_feature_ratio'] = float(valid_count / max(1, total_count))
-
-            min_valid = int(getattr(self.config, "meta_train_min_valid_samples", 64) or 64)
-            if valid_count < min_valid:
-                msg = (
-                    f"[FAMC] Skipping meta head training: insufficient valid features "
-                    f"({valid_count}/{total_count}, required>={min_valid})"
-                )
-                if fail_fast:
-                    raise RuntimeError(msg)
-                self.logger.warning(msg)
-                return
-
-            batch_size = min(256, valid_count)
-            indices = np.random.choice(valid_indices, batch_size, replace=False)
-            features_batch = np.asarray([self._meta_features_buffer[i] for i in indices], dtype=np.float32)
-            adv_batch = np.asarray([self._meta_adv_buffer[i] for i in indices], dtype=np.float32).reshape(-1)
-
-            if features_batch.ndim != 2 or features_batch.shape[1] != meta_feat_dim:
-                msg = (
-                    f"[FAMC] Feature dim mismatch for meta head training: "
-                    f"got {features_batch.shape}, expected (*, {meta_feat_dim})"
-                )
-                if fail_fast:
-                    raise RuntimeError(msg)
-                self.logger.warning(msg)
-                return
-
-            if (not np.all(np.isfinite(features_batch))) or (not np.all(np.isfinite(adv_batch))):
-                msg = "[FAMC] Non-finite meta training batch detected"
-                if fail_fast:
-                    raise RuntimeError(msg)
-                self.logger.warning(msg)
-                return
-
-            if t_now % (meta_train_every * 10) == 0:
-                self.logger.info(
-                    f"[FAMC] Meta head training ({batch_size} samples, valid={valid_count}/{total_count}, "
-                    f"feature_dim={meta_feat_dim})"
-                )
-
-            # Train meta head.
-            loss_type = getattr(self.config, 'meta_baseline_loss', 'mse')
-            meta_loss = overlay_trainer.train_meta_baseline(features_batch, adv_batch, loss_type)
-
-            # Mark meta head as trained at this env step (prevents per-agent re-entry).
-            self._last_meta_train_step = int(t_now)
-
-            # Update metrics.
-            self._famc_metrics['meta_loss'] = float(meta_loss)
-            self._famc_metrics['meta_buffer_size'] = len(self._meta_features_buffer)
-
-            if self.verbose:
-                self.logger.info(
-                    f"[FAMC] Meta head trained: loss={meta_loss:.6f}, "
-                    f"buffer_size={len(self._meta_features_buffer)}"
-                )
-
-        except Exception as e:
-            msg = f"[FAMC] Meta head training failed: {e}"
-            if fail_fast:
-                raise RuntimeError(msg) from e
-            self.logger.warning(msg)
 
     def _finalize_training(self):
         for polid, policy in enumerate(self.policies):
@@ -3276,7 +2681,7 @@ class MultiESGAgent:
                 
                 # CRITICAL FIX: Check if saved policy's observation space matches current environment
                 # Load policy metadata first to check observation space dimension
-                # This prevents loading policies with incompatible observation spaces (e.g., Tier 3 13D policy into Tier 2 7D environment)
+                # This prevents loading policies with incompatible observation spaces.
                 pre_check_passed = False
                 try:
                     import zipfile
@@ -3657,59 +3062,7 @@ class OptunaHyperparameterOptimizer:
 
         return best_params, performance_summary
 
-
-# ============================= DL Overlay Tuning ================================
-def tune_overlay(env, window_size: int = 100, adjustment_factor: float = 0.05) -> None:
-    """
-    Periodic meta-controller tuning for DL overlay intensity.
-
-    Adjusts overlay_intensity based on recent P&L and drawdown:
-    - If recent P&L is positive and drawdown is low: increase intensity (more aggressive)
-    - If recent P&L is negative or drawdown is high: decrease intensity (more defensive)
-
-    Args:
-        env: The environment with reward_calculator and config
-        window_size: Number of recent steps to consider (default: 100)
-        adjustment_factor: How much to adjust intensity per call (default: 0.05)
-    """
-    try:
-        if not hasattr(env, 'reward_calculator') or env.reward_calculator is None:
-            return
-
-        if not hasattr(env, 'config') or env.config is None:
-            return
-
-        # Get recent performance metrics
-        recent_gains = float(getattr(env.reward_calculator, 'recent_trading_gains', 0.0))
-        current_dd = float(getattr(env.reward_calculator, 'current_drawdown', 0.0))
-
-        # Get current overlay intensity
-        current_intensity = getattr(env.config, 'overlay_intensity', 1.0)
-
-        # Determine adjustment direction
-        adjustment = 0.0
-
-        # Positive P&L and low drawdown: increase intensity
-        if recent_gains > 50_000 and current_dd < 0.02:
-            adjustment = adjustment_factor
-        # Negative P&L or high drawdown: decrease intensity
-        elif recent_gains < -50_000 or current_dd > 0.05:
-            adjustment = -adjustment_factor
-
-        # Apply adjustment with bounds [0.5, 1.5]
-        new_intensity = np.clip(current_intensity + adjustment, 0.5, 1.5)
-
-        # Update config
-        env.config.overlay_intensity = new_intensity
-
-        # Log if significant change
-        if abs(new_intensity - current_intensity) > 1e-6:
-            logger.info(f"[OVERLAY-TUNE] t={env.t} recent_gains={recent_gains:.0f} dd={current_dd:.3f} "
-                        f"intensity: {current_intensity:.2f} -> {new_intensity:.2f}")
-
-    except Exception as e:
-        logger.debug(f"Overlay tuning failed: {e}")
-
-
 # Keep this alias for backward compatibility with main.py
 HyperparameterOptimizer = OptunaHyperparameterOptimizer
+
+

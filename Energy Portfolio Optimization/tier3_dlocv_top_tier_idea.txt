@@ -1,0 +1,120 @@
+Tier-3 Idea: D-LOCV
+Distributional Latent Orthogonal Control Variates
+
+Status
+- This is a future Tier-3 concept note.
+- It is not implemented in the current code version.
+- Tier-1 and Tier-2 should remain untouched if this is pursued later.
+
+Why the current Tier-3 is not enough for a top-tier paper
+- The current Tier-3 is a single scalar learned residual baseline.
+- It is clean and defensible, but still reads as an incremental combination of known ideas:
+  learned baseline + orthogonal projection + closed-form control-variate fitting.
+- That is likely strong enough for an internal Tier-3 method or an applied/domain paper,
+  but not strong enough by itself for a top-tier ML methods paper.
+
+Core proposal
+- Replace the scalar Tier-3 meta head with a low-rank, uncertainty-aware latent basis
+  of control variates.
+- Keep the Tier-2 anchor exactly as-is.
+- Learn K state-conditioned residual basis signals.
+- Orthogonalize those basis signals against the Tier-2 anchor and against each other.
+- Fit rollout-level coefficients with a closed-form multivariate ridge solve.
+- Shrink coefficients using predicted uncertainty so noisy learned factors fade out.
+
+Method summary
+1. Tier-2 computes the base control variate C_t and its online coefficient lambda_2.
+2. Tier-3 defines the residual target:
+   A_res = A_std - lambda_2 * C_std
+3. A deep model maps recent enhancer-base features to:
+   - basis_mean in R^K
+   - basis_logvar in R^K
+   - optional regime logits
+4. Each basis vector is orthogonalized:
+   - first against the Tier-2 anchor C_std
+   - then against earlier basis vectors (Gram-Schmidt or QR)
+5. At rollout end, solve:
+   beta = (B^T B + lambda_ridge I)^-1 B^T A_res
+6. Apply uncertainty shrinkage:
+   beta_k <- beta_k / (1 + exp(mean_logvar_k))
+7. Final corrected advantage:
+   A' = A - lambda_2 * C - B * beta
+
+Why this is more novel
+- It moves Tier-3 from a scalar learned residual to a multivariate learned control-variate subspace.
+- It introduces low-rank latent structure, not just one extra learned scalar.
+- It adds uncertainty-aware shrinkage, which gives a stronger robustness story.
+- It creates a cleaner analytical object for proofs and ablations than the current scalar head.
+
+Deep-learning components
+- Temporal encoder over recent enhancer-base features, not just one 18D snapshot.
+- Suggested minimal encoder:
+  - rolling window W = 16
+  - 1-layer causal GRU (or small TCN)
+- Output heads:
+  - basis_mean: K channels (suggest K = 4)
+  - basis_logvar: K channels
+  - optional regime head for conditional shrinkage or mixture selection
+
+Why temporal structure matters
+- The current Tier-3 only consumes one enhancer-base feature vector at a time.
+- That throws away regime transitions in trust, exposure, forecast behavior, and sleeve state.
+- A temporal latent basis is more likely to capture residual advantage structure that Tier-2 misses.
+
+How it fits the current codebase
+
+dl_enhancer.py
+- Keep the shared encoder concept.
+- Replace the scalar meta_head with a temporal basis head.
+- New outputs should include:
+  - basis_mean
+  - basis_logvar
+  - optional regime logits
+- The current pred_reward head stays for Tier-2.
+
+environment.py
+- Keep policy observations unchanged.
+- Maintain a rolling deque of recent enhancer-base feature vectors.
+- Feed stacked feature sequences to the DL adapter.
+- Preserve current state-only discipline (no action leakage).
+
+metacontroller.py
+- Keep the Tier-2 online anchor path untouched.
+- Replace scalar C_meta_t with a basis matrix B_t of shape (n_steps, K).
+- Use the same residual target idea already present:
+  A_res = A_std - lambda_2 * C_std
+- Orthogonalize the basis matrix rollout-by-rollout.
+- Solve multivariate ridge coefficients.
+- Apply uncertainty-shrunk additive correction on top of the Tier-2 anchor.
+
+Minimal research version
+- Window length W = 16
+- Basis size K = 4
+- 1-layer GRU
+- basis_mean + basis_logvar outputs
+- Per-rollout orthogonalization + ridge solve
+- Keep Tier-1/Tier-2 exactly unchanged
+
+Paper-facing claim
+- A state-conditioned, uncertainty-aware, low-rank orthogonal control-variate subspace
+  for PPO advantage correction.
+
+Why this has better top-tier odds
+- Stronger estimator class than a scalar residual baseline
+- Easier to analyze mathematically
+- Cleaner cross-domain transfer story
+- More compelling ablation space:
+  scalar vs low-rank
+  no-orthogonalization vs orthogonalization
+  no-uncertainty vs uncertainty-shrinkage
+  static features vs temporal encoder
+
+Suggested names
+- D-LOCV: Distributional Latent Orthogonal Control Variates
+- LOBA: Latent Orthogonal Baseline Adapter
+- ORBIT: Orthogonal Residual Basis for Importance-Tempered PPO
+
+Recommended next step later
+- If this code version performs acceptably, implement D-LOCV as a new Tier-3 variant,
+  not as a mutation of the current scalar Tier-3.
+- Keep the current scalar orthogonal residual Tier-3 as the clean baseline for ablations.

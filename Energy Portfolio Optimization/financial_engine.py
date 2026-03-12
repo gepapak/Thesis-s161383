@@ -207,7 +207,7 @@ class FinancialEngine:
         budget: float,
         physical_assets: Dict[str, float],
         asset_capex: Dict[str, float],
-        financial_positions: Dict[str, float],
+        financial_mtm_values: Dict[str, float],
         accumulated_operational_revenue: float,
         current_timestep: int,
         config: EnhancedConfig
@@ -220,7 +220,7 @@ class FinancialEngine:
             budget: Trading cash position
             physical_assets: Dict with wind_capacity_mw, solar_capacity_mw, hydro_capacity_mw, battery_capacity_mwh
             asset_capex: Dict with wind_mw, solar_mw, hydro_mw, battery_mwh (CAPEX per unit)
-            financial_positions: Dict with wind_instrument_value, solar_instrument_value, hydro_instrument_value
+            financial_mtm_values: Dict with wind_instrument_value, solar_instrument_value, hydro_instrument_value
             accumulated_operational_revenue: Total accumulated operational revenue
             current_timestep: Current timestep for depreciation calculation
             config: Configuration object
@@ -259,9 +259,9 @@ class FinancialEngine:
             
             # 4) Financial instruments at mark-to-market
             financial_mtm_value = (
-                financial_positions['wind_instrument_value'] +
-                financial_positions['solar_instrument_value'] +
-                financial_positions['hydro_instrument_value']
+                financial_mtm_values['wind_instrument_value'] +
+                financial_mtm_values['solar_instrument_value'] +
+                financial_mtm_values['hydro_instrument_value']
             )
             
             # NAV calculation
@@ -664,55 +664,6 @@ class FinancialEngine:
             logger.error(msg)
             raise RuntimeError(msg) from e
     
-    @staticmethod
-    def calculate_mtm_pnl(
-        financial_positions: Dict[str, float],
-        price_return: float,
-        config: EnhancedConfig
-    ) -> Tuple[float, Dict[str, float]]:
-        """
-        REFACTORED: Calculate Mark-to-Market P&L for financial instruments.
-        
-        Args:
-            financial_positions: Dict with wind_instrument_value, solar_instrument_value, hydro_instrument_value
-            price_return: 1-step price return
-            config: Configuration object
-            
-        Returns:
-            Tuple of (mtm_pnl, updated_positions)
-        """
-        try:
-            total_financial_exposure = (
-                financial_positions['wind_instrument_value'] +
-                financial_positions['solar_instrument_value'] +
-                financial_positions['hydro_instrument_value']
-            )
-            
-            # Cap price returns to realistic energy market volatility
-            cap_min = getattr(config, 'mtm_price_return_cap_min', -0.015)
-            cap_max = getattr(config, 'mtm_price_return_cap_max', 0.015)
-            capped_price_return = float(np.clip(price_return, cap_min, cap_max))
-            
-            mtm_pnl = total_financial_exposure * capped_price_return
-            
-            # Update position values with MTM
-            updated_positions = financial_positions.copy()
-            if abs(mtm_pnl) > getattr(config, 'mtm_update_threshold', 1e-9):
-                if abs(total_financial_exposure) > 1e-9:
-                    wind_mtm = financial_positions['wind_instrument_value'] * capped_price_return
-                    solar_mtm = financial_positions['solar_instrument_value'] * capped_price_return
-                    hydro_mtm = financial_positions['hydro_instrument_value'] * capped_price_return
-                    
-                    updated_positions['wind_instrument_value'] += wind_mtm
-                    updated_positions['solar_instrument_value'] += solar_mtm
-                    updated_positions['hydro_instrument_value'] += hydro_mtm
-            
-            return mtm_pnl, updated_positions
-            
-        except Exception as e:
-            logger.error(f"[FIN_MTM_FATAL] MTM P&L calculation failed: {e}")
-            raise RuntimeError("[FIN_MTM_FATAL] MTM P&L calculation failed") from e
-
     # ------------------------------------------------------------------
     # CORRECTNESS: Exposure vs MTM separation
     # ------------------------------------------------------------------

@@ -380,6 +380,8 @@ class MultiHorizonForecastGenerator:
         # CRITICAL FIX: Store training cap values from metadata (for bounds consistency)
         # Will be populated during model loading from metadata files
         self._training_caps: Dict[str, float] = {}  # target -> cap value from training
+        self._metadata_performance: Dict[str, Dict[str, float]] = {}
+        self._loaded_cache_metadata: Dict[str, Any] = {}
 
         # caches (LRU-based for better memory management)
         # Use config as single source of truth for cache sizing so memory can be tuned centrally.
@@ -458,7 +460,7 @@ class MultiHorizonForecastGenerator:
                 self._initialize_fallback_mode()
             else:
                 # FAIL-FAST: When fallback_mode=False, raise immediately
-                # This ensures forecast features (DL overlay, FGB) fail loudly if models don't load
+                # This ensures Tier-2 forecast features fail loudly if models don't load
                 logging.error(f"[CRITICAL] Forecast generator initialization failed (fallback_mode=False): {e}")
                 raise
 
@@ -630,6 +632,18 @@ class MultiHorizonForecastGenerator:
                                 else:
                                     # Use max cap if multiple horizons have different caps
                                     self._training_caps[target] = max(self._training_caps[target], float(training_cap))
+
+                            perf = md.get("performance", {}) if isinstance(md, dict) else {}
+                            perf_block = None
+                            if isinstance(perf, dict):
+                                perf_block = perf.get("test") or perf.get("validation") or perf.get("train")
+                            if isinstance(perf_block, dict):
+                                self._metadata_performance[key] = {
+                                    "mape": float(perf_block.get("mape", np.nan)),
+                                    "std_mape": float(perf_block.get("std_mape", np.nan)),
+                                    "rmse": float(perf_block.get("rmse", np.nan)),
+                                    "mae": float(perf_block.get("mae", np.nan)),
+                                }
                             
                         except Exception as e:
                             if self.verbose:
@@ -1452,6 +1466,46 @@ class MultiHorizonForecastGenerator:
             # Fallback uncertainty
             return 0.1  # 10% default uncertainty
 
+    def get_metadata_quality(self, target: str, horizon: str) -> float:
+        """
+        Return a horizon-specific metadata quality score in [0, 1].
+
+        This uses model-metadata performance stats, not online realized errors,
+        so it remains stable and useful early in an episode.
+        """
+        key = f"{target}_{horizon}"
+        stats = self._metadata_performance.get(key, {})
+        if not stats:
+            return 0.5
+
+        mape = float(stats.get("mape", np.nan))
+        std_mape = float(stats.get("std_mape", np.nan))
+        mae = float(stats.get("mae", np.nan))
+        cap = float(self._training_caps.get(target, 0.0) or 0.0)
+
+        if not np.isfinite(mape):
+            mape = 1.0
+        if not np.isfinite(std_mape):
+            std_mape = 50.0
+        if not np.isfinite(mae):
+            mae = 0.0
+
+        q_mape = 1.0 / (1.0 + max(0.0, mape))
+        q_std = 1.0 / (1.0 + max(0.0, std_mape) / 50.0)
+        if cap > 1e-6:
+            q_mae = 1.0 / (1.0 + 10.0 * max(0.0, mae / cap))
+        else:
+            q_mae = 0.5
+        return float(np.clip(0.50 * q_mape + 0.30 * q_std + 0.20 * q_mae, 0.0, 1.0))
+
+    def get_metadata_metrics(self, target: str, horizon: str) -> Dict[str, float]:
+        """Return raw metadata metrics when available."""
+        key = f"{target}_{horizon}"
+        stats = self._metadata_performance.get(key, {})
+        if not stats:
+            return {}
+        return {k: float(v) for k, v in stats.items() if np.isfinite(v)}
+
     def _get_adaptive_refresh_stride(self, timestep: int) -> int:
         """
         Calculate adaptive refresh stride based on market conditions.
@@ -2000,6 +2054,7 @@ class MultiHorizonForecastGenerator:
                 if self.verbose:
                     print(f"Cache integrity validation failed, recomputing...")
                 return False
+            self._loaded_cache_metadata = dict(cache_metadata)
 
             # Convert CSV back to _precomputed format
             self._precomputed = {}
@@ -2181,6 +2236,7 @@ class MultiHorizonForecastGenerator:
                     logging.warning(f"Failed to remove cache file {f}: {e}")
 
             self._precomputed.clear()
+            self._loaded_cache_metadata = {}
 
             if self.verbose:
                 print(f"✅ Cache invalidated: removed {len(cache_files)} cache files")

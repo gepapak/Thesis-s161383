@@ -25,6 +25,28 @@ _logging_configured = False
 _log_file_handler = None
 
 
+class ProgressAwareConsoleHandler(logging.StreamHandler):
+    """
+    Console handler that cooperates with tqdm progress bars.
+
+    It writes through tqdm.write() when tqdm is available so normal log lines do
+    not overwrite or visually corrupt the in-place training progress display.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            try:
+                from tqdm import tqdm
+                tqdm.write(msg, file=stream)
+            except Exception:
+                stream.write(msg + self.terminator)
+                self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 def configure_logging(
     level: int = logging.INFO,
     log_file: Optional[str] = None,
@@ -70,8 +92,10 @@ def configure_logging(
             pass
         _log_file_handler = None
     
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Console handler: write to the original stderr stream (if wrapped) and use
+    # a tqdm-aware handler so progress bars remain readable during training.
+    console_stream = getattr(sys.stderr, "stderr", sys.stderr)
+    console_handler = ProgressAwareConsoleHandler(console_stream)
     console_handler.setLevel(level)
     console_handler.setFormatter(logging.Formatter(format_string))
     root_logger.addHandler(console_handler)
@@ -237,7 +261,9 @@ class RewardLogger:
                 'episode', 'timestep',
                 # Core portfolio metrics
                 'portfolio_value_usd_millions', 'cash_dkk',
+                'fund_nav_usd',
                 'trading_gains_usd_thousands', 'operating_gains_usd_thousands', 'mtm_pnl',
+                'trading_tracker_usd_thousands', 'operating_gain_usd_thousands',
                 # Fund NAV component breakdown (DKK)
                 'fund_nav_dkk', 'trading_cash_dkk', 'physical_book_value_dkk',
                 'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
@@ -258,16 +284,27 @@ class RewardLogger:
                 'risk_multiplier', 'vol_brake_mult', 'strategy_multiplier',
                 'combined_multiplier', 'tradeable_capital', 'mtm_exit_count',
                 'investor_action', 'battery_action',
+                'tier2_enhancer_enabled', 'tier2_enhancer_delta', 'tier2_enhancer_pred_sigma', 'tier2_enhancer_reliability',
+                'tier2_enhancer_mape',
+                'tier2_enhancer_alignment', 'tier2_enhancer_forecast_signal',
+                'tier2_enhancer_forecast_edge_signal', 'tier2_enhancer_forecast_consensus_signal',
+                'tier2_enhancer_forecast_curvature_signal', 'tier2_enhancer_uncertainty_quality',
+                'tier2_enhancer_metadata_skill', 'tier2_enhancer_physical_pressure_signal',
+                'tier2_enhancer_context_strength', 'tier2_enhancer_realized_gain_signal',
+                'tier2_enhancer_target_delta', 'tier2_enhancer_sharpe_signal',
+                'tier2_enhancer_sharpe_before', 'tier2_enhancer_sharpe_after',
+                'tier2_enhancer_sharpe_delta',
                 'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw', 'inv_tanh_mu', 'inv_tanh_a',
+                'inv_mu_abs_roll', 'inv_mu_sign_consistency', 'inv_pen_mean_collapse',
                 'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
                 'inv_reward_step', 'inv_value', 'inv_value_next', 'inv_td_error'
                 , 'probe_r2_base', 'probe_r2_base_plus_signal', 'probe_delta_r2'
             ],
              'forecast': ['episode', 'timestep', 'z_short', 'z_medium', 'z_long', 'z_combined',
-                          'forecast_confidence', 'forecast_mape', 'forecast_trust', 'signal_gate_multiplier',
+                          'forecast_confidence', 'forecast_mape', 'forecast_trust',
                           'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason', 'agent_followed_forecast', 'forecast_usage_bonus', 'investor_strategy_multiplier',
                           'mape_short', 'mape_medium', 'mape_long',
-                          'obs_trade_signal', 'obs_trade_action_corr', 'obs_trade_exposure_corr', 'obs_trade_delta_exposure_corr'],
+                          'obs_trade_signal'],
             'rewards': ['episode', 'timestep', 'base_reward', 'investor_reward', 'battery_reward',
                         'risk_score', 'operational_score']
         }
@@ -356,16 +393,10 @@ class RewardLogger:
                  forecast_trust: float = 0.0,
                  # OBSERVATION-LEVEL forecast signals (what the policy sees after warmup/ablation)
                  obs_z_short: float = 0.0,
-                 # Deprecated: kept for backward-compat with older callers; not logged.
-                 obs_z_medium: float = 0.0,
                  obs_z_long: float = 0.0,
                  obs_forecast_trust: float = 0.0,
                  obs_normalized_error: float = 0.0,
                  obs_trade_signal: float = 0.0,
-                 obs_trade_action_corr: float = 0.0,
-                 obs_trade_exposure_corr: float = 0.0,
-                 obs_trade_delta_exposure_corr: float = 0.0,
-                 signal_gate_multiplier: float = 0.0,
                  # Position info
                  position_signed: float = 0.0,
                  position_exposure: float = 0.0,
@@ -537,6 +568,30 @@ class RewardLogger:
                  inv_pen_boundary: float = 0.0,
                  inv_pen_exposure: float = 0.0,
                  inv_pen_exposure_stuck: float = 0.0,
+                 inv_pen_mean_collapse: float = 0.0,
+                 inv_mu_abs_roll: float = 0.0,
+                 inv_mu_sign_consistency: float = 0.0,
+                 # Tier-2 enhancer diagnostics (forecast-conditioned residual audit)
+                 tier2_enhancer_enabled: float = 0.0,
+                 tier2_enhancer_delta: float = 0.0,
+                 tier2_enhancer_pred_sigma: float = 0.0,
+                 tier2_enhancer_reliability: float = 1.0,
+                 tier2_enhancer_mape: float = 1.0,
+                 tier2_enhancer_alignment: float = 0.0,
+                 tier2_enhancer_forecast_signal: float = 0.0,
+                 tier2_enhancer_forecast_edge_signal: float = 0.0,
+                 tier2_enhancer_forecast_consensus_signal: float = 0.0,
+                 tier2_enhancer_forecast_curvature_signal: float = 0.0,
+                 tier2_enhancer_uncertainty_quality: float = 1.0,
+                 tier2_enhancer_metadata_skill: float = 0.5,
+                 tier2_enhancer_physical_pressure_signal: float = 0.0,
+                 tier2_enhancer_context_strength: float = 0.0,
+                 tier2_enhancer_realized_gain_signal: float = 0.0,
+                 tier2_enhancer_target_delta: float = 0.0,
+                 tier2_enhancer_sharpe_signal: float = 0.0,
+                 tier2_enhancer_sharpe_before: float = 0.0,
+                 tier2_enhancer_sharpe_after: float = 0.0,
+                 tier2_enhancer_sharpe_delta: float = 0.0,
                  inv_mu_raw: float = 0.0,
                  inv_sigma_raw: float = 0.0,
                  inv_a_raw: float = 0.0,
@@ -589,9 +644,12 @@ class RewardLogger:
             'episode': self.current_episode,
             'timestep': timestep,
             'portfolio_value_usd_millions': portfolio_value_usd_millions,
+            'fund_nav_usd': portfolio_value_usd_millions,
             'cash_dkk': cash_dkk,
             'trading_gains_usd_thousands': trading_gains_usd_thousands,
             'operating_gains_usd_thousands': operating_gains_usd_thousands,
+            'trading_tracker_usd_thousands': trading_gains_usd_thousands,
+            'operating_gain_usd_thousands': operating_gains_usd_thousands,
             # Primary portfolio metrics (mtm_pnl is per-step, not cumulative)
             'mtm_pnl': mtm_pnl,
             # Fund NAV component breakdown (DKK)
@@ -642,6 +700,30 @@ class RewardLogger:
             'inv_pen_boundary': float(inv_pen_boundary),
             'inv_pen_exposure': float(inv_pen_exposure),
             'inv_pen_exposure_stuck': float(inv_pen_exposure_stuck),
+            'inv_pen_mean_collapse': float(inv_pen_mean_collapse),
+            'inv_mu_abs_roll': float(inv_mu_abs_roll),
+            'inv_mu_sign_consistency': float(inv_mu_sign_consistency),
+            # Tier-2 enhancer diagnostics (forecast-conditioned residual audit)
+            'tier2_enhancer_enabled': float(tier2_enhancer_enabled),
+            'tier2_enhancer_delta': float(tier2_enhancer_delta),
+            'tier2_enhancer_pred_sigma': float(tier2_enhancer_pred_sigma),
+            'tier2_enhancer_reliability': float(tier2_enhancer_reliability),
+            'tier2_enhancer_mape': float(tier2_enhancer_mape),
+            'tier2_enhancer_alignment': float(tier2_enhancer_alignment),
+            'tier2_enhancer_forecast_signal': float(tier2_enhancer_forecast_signal),
+            'tier2_enhancer_forecast_edge_signal': float(tier2_enhancer_forecast_edge_signal),
+            'tier2_enhancer_forecast_consensus_signal': float(tier2_enhancer_forecast_consensus_signal),
+            'tier2_enhancer_forecast_curvature_signal': float(tier2_enhancer_forecast_curvature_signal),
+            'tier2_enhancer_uncertainty_quality': float(tier2_enhancer_uncertainty_quality),
+            'tier2_enhancer_metadata_skill': float(tier2_enhancer_metadata_skill),
+            'tier2_enhancer_physical_pressure_signal': float(tier2_enhancer_physical_pressure_signal),
+            'tier2_enhancer_context_strength': float(tier2_enhancer_context_strength),
+            'tier2_enhancer_realized_gain_signal': float(tier2_enhancer_realized_gain_signal),
+            'tier2_enhancer_target_delta': float(tier2_enhancer_target_delta),
+            'tier2_enhancer_sharpe_signal': float(tier2_enhancer_sharpe_signal),
+            'tier2_enhancer_sharpe_before': float(tier2_enhancer_sharpe_before),
+            'tier2_enhancer_sharpe_after': float(tier2_enhancer_sharpe_after),
+            'tier2_enhancer_sharpe_delta': float(tier2_enhancer_sharpe_delta),
             # Position breakdown
             'wind_pos_norm': wind_pos_norm,
             'solar_pos_norm': solar_pos_norm,
@@ -667,10 +749,6 @@ class RewardLogger:
             'obs_forecast_trust': obs_forecast_trust,
             'obs_normalized_error': obs_normalized_error,
             'obs_trade_signal': obs_trade_signal,
-            'obs_trade_action_corr': obs_trade_action_corr,
-            'obs_trade_exposure_corr': obs_trade_exposure_corr,
-            'obs_trade_delta_exposure_corr': obs_trade_delta_exposure_corr,
-            'signal_gate_multiplier': signal_gate_multiplier,
             # Forecast score
             'forecast_score': forecast_score,
             # Forecast weight
@@ -997,8 +1075,9 @@ class RewardLogger:
             # ===================================================================
             # Portfolio metrics (logged at every timestep)
             'episode', 'timestep',
-            'portfolio_value_usd_millions', 'cash_dkk',
+            'portfolio_value_usd_millions', 'fund_nav_usd', 'cash_dkk',
             'trading_gains_usd_thousands', 'operating_gains_usd_thousands',
+            'trading_tracker_usd_thousands', 'operating_gain_usd_thousands',
             # Primary portfolio metrics (mtm_pnl is per-step, not cumulative)
             'mtm_pnl',  # Mark-to-market PnL (per-step, not cumulative)
             # Fund NAV component breakdown (DKK)
@@ -1021,7 +1100,19 @@ class RewardLogger:
             # Final rewards (common to both tiers)
             'base_reward', 'investor_reward', 'battery_reward',
             # Penalty diagnostics (for episode-boundary collapse debugging)
-            'training_global_step', 'inv_penalty_warm', 'inv_pen_boundary', 'inv_pen_exposure', 'inv_pen_exposure_stuck',
+            'training_global_step', 'inv_penalty_warm', 'inv_pen_boundary', 'inv_pen_exposure', 'inv_pen_exposure_stuck', 'inv_pen_mean_collapse',
+            'inv_mu_abs_roll', 'inv_mu_sign_consistency',
+            # Tier-2 enhancer diagnostics (action scaling audit)
+            'tier2_enhancer_enabled', 'tier2_enhancer_delta', 'tier2_enhancer_reliability',
+            'tier2_enhancer_mape',
+            'tier2_enhancer_alignment', 'tier2_enhancer_forecast_signal',
+            'tier2_enhancer_forecast_edge_signal', 'tier2_enhancer_forecast_consensus_signal',
+            'tier2_enhancer_forecast_curvature_signal', 'tier2_enhancer_context_strength',
+            'tier2_enhancer_pred_sigma', 'tier2_enhancer_uncertainty_quality',
+            'tier2_enhancer_metadata_skill', 'tier2_enhancer_physical_pressure_signal',
+            'tier2_enhancer_realized_gain_signal', 'tier2_enhancer_target_delta',
+            'tier2_enhancer_sharpe_signal', 'tier2_enhancer_sharpe_before',
+            'tier2_enhancer_sharpe_after', 'tier2_enhancer_sharpe_delta',
             # Investor policy distribution diagnostics (pre-tanh / pre-postprocess)
             'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw', 'inv_tanh_mu', 'inv_tanh_a',
             'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
@@ -1045,9 +1136,7 @@ class RewardLogger:
             # OBSERVATION-LEVEL forecast signals (what the policy actually sees after ablations/warmup)
             # These are critical for proving forecast usage and for causal ablations.
             'obs_z_short', 'obs_z_long',
-            'obs_forecast_trust', 'obs_normalized_error', 'obs_trade_signal', 'obs_trade_action_corr',
-            'obs_trade_exposure_corr', 'obs_trade_delta_exposure_corr',
-            'signal_gate_multiplier',
+            'obs_forecast_trust', 'obs_normalized_error', 'obs_trade_signal',
             # Forecast score from reward components (0.0 for Tier 1)
             'forecast_score',
             # Forecast weight from reward weights (0.0 for Tier 1)
