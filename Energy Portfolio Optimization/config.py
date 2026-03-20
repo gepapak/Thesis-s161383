@@ -8,20 +8,19 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # These constants ensure consistent configuration across all modes and code paths
 
-# Enhancer base feature dimension retained only for environment metadata compatibility.
-ENHANCER_BASE_FEATURE_DIM = 18
-# Tier-2 DL Enhancer (live short-horizon residual memory contract):
-# Streamlined 12D = 4D core + 2 memory steps x 4 forecast channels
+BASE_FEATURE_DIM = 18  # Base observation feature dimension (policy obs space)
+# Tier-2 routed real-expert overlay (forecast-backed short-horizon investor layer):
+# Real-expert 34D = 4D core + 2 memory steps x 15 short-horizon channels
 #            Core (4D):
 #              [proposed_exposure, gross_exposure_ratio,
 #               tradeable_capital_ratio, realized_volatility_regime]
-#            Per-memory-step channels (4): price_short_signal, short_revision,
-#              forecast_quality (blend), short_imbalance_signal
-TIER2_ENHANCER_MEMORY_STEPS = 2
-TIER2_ENHANCER_MEMORY_CHANNELS = 4
-TIER2_ENHANCER_FEATURE_DIM = 12
-# Ablated 4D = forecast-feature ablation only; core only.
-TIER2_ENHANCER_ABLATED_FEATURE_DIM = 4
+#            Per-memory-step channels (15 with 4 experts; 18 with CEEMDAN):
+#              ann/lstm/svr/rf signals, qualities, conformal risks,
+#              expert_consensus_signal, expert_disagreement, short_imbalance_signal
+TIER2_CV_MEMORY_STEPS = 2
+TIER2_CV_MEMORY_CHANNELS = 15  # 4 experts * 3 + 3 (CEEMDAN deactivated)
+TIER2_CV_FEATURE_DIM = 34     # 4 + 2*15 (4D core + 2 memory steps x 15 channels)
+TIER2_CV_ABLATED_FEATURE_DIM = 4  # Effective nonforecast core; forecast block is zeroed during ablation
 
 # Price normalization constants
 PRICE_MEAN = 250.0          # Historical mean price (DKK/MWh)
@@ -158,7 +157,7 @@ class EnhancedConfig:
         self.operating_cost_rate = 0.025  # 3% of revenue
         self.maintenance_cost_mwh = 3.5 / self.dkk_to_usd_rate  # $3.5/MWh â†’ ~24.1 DKK/MWh
         self.insurance_rate = 0.004  # 0.4% of asset value annually
-        self.management_fee_rate = 0.01  # 1.5% of fund value annually (realistic for infrastructure)
+        self.management_fee_rate = 0.01  # 1% of fund value annually (realistic for infrastructure)
         self.property_tax_rate = 0.005  # 0.5% of asset value annually
         self.debt_service_rate = 0.015  # 1.5% of asset value annually (realistic debt service)
         self.distribution_rate = 0.10  # 10% of excess cash distributed
@@ -177,6 +176,7 @@ class EnhancedConfig:
         self.batt_eta_charge = 0.90     # charge efficiency (PyPSA: 90%)
         self.batt_eta_discharge = 0.90  # discharge efficiency (PyPSA: 90%)
         self.batt_power_c_rate = 0.5    # max power: 5MW for 10MWh = 0.5 C-rate (PyPSA specifications)
+        self.battery_initial_soc = 0.50  # Literature-standard neutral ESS benchmark
 
         # Trading costs - FIXED: Convert USD to DKK
         self.transaction_fixed_cost = 25.0 / self.dkk_to_usd_rate  # $25/trade â†’ ~172 DKK/trade
@@ -186,6 +186,13 @@ class EnhancedConfig:
         self.battery_hurdle_min_dkk = 5.0  # Minimum hurdle rate in DKK/MWh
         self.battery_price_sensitivity = 0.02  # Price-based hurdle factor
         self.battery_rt_loss_weight = 0.3  # Weight of round-trip loss in hurdle calculation
+        self.battery_use_heuristic_dispatch = False  # Tier1 battery should be RL-driven by default
+        self.battery_action_mode = "discrete"  # {"discrete", "target_soc", "power"} explicit power-level control
+        self.battery_discrete_action_levels = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        self.battery_action_threshold = 0.35  # Used only by continuous battery action modes
+        self.battery_arbitrage_reward_weight = 1.00  # Direct realized arbitrage reward
+        self.battery_arbitrage_reward_scale_dkk = 250.0
+        self.battery_arbitrage_reward_clip = 5.0
 
         # Battery operational parameters - FIXED: Convert USD to DKK
         self.battery_opex_rate = 0.0002  # Battery operational cost rate per MWh capacity
@@ -242,8 +249,12 @@ class EnhancedConfig:
         # canonical short horizon so both Tier 1 and Tier 2 trade on 1h decisions by default.
         self.meta_freq_min = 6   # 1h @ 10-min steps (short horizon)
         self.meta_freq_max = 6   # fixed short-horizon cadence
-        self.meta_cap_min = 0.25  # keep at least 25% of cash allocated to trading
-        self.meta_cap_max = 0.95  # allow up to 95% of cash allocated to trading
+        self.meta_cap_min = 0.10  # allow meaningful de-risking when sleeve edge is weak
+        self.meta_cap_max = 0.80  # cap capital so a single factor sleeve cannot dominate the fund
+        self.meta_rule_update_only_on_investor_step = True
+        self.meta_rule_signal_ema_alpha = 0.10
+        self.meta_rule_target_smoothing_alpha = 0.20
+        self.meta_rule_cap_deadband = 0.03
         self.sat_eps = 1e-3
 
         # Investment and operational parameters - FORECAST OPTIMIZATION
@@ -251,14 +262,15 @@ class EnhancedConfig:
         self.investment_freq = 6   # 1 hour @ 10-min steps
         self.min_investment_freq = 4   # 40 min minimum @ 10-min steps
         self.max_investment_freq = 12  # 2 hour maximum @ 10-min steps
-        self.capital_allocation_fraction = 0.90  # starting point; meta-controller clamps within [meta_cap_min, meta_cap_max]
+        self.capital_allocation_fraction = 0.60  # neutral starting point; meta-controller clamps within [meta_cap_min, meta_cap_max]
         self.risk_multiplier = 1.0  # Raised from 0.5 for full-size baseline trades
+        # Clean Tier-1 sizing contract: risk controller sets an absolute
+        # exposure cap inside the trading sleeve, not a leverage multiplier.
+        self.risk_exposure_cap_min = 0.25
+        self.risk_exposure_cap_max = 1.00
         self.no_trade_threshold = 0.01  # 1% of target position - trades below this are ignored
 
-        # Battery operational parameters
-        self.batt_soc_min = 0.1  # 10% minimum state of charge
-        self.batt_soc_max = 0.9  # 90% maximum state of charge
-        self.batt_efficiency = 0.85  # 85% round-trip efficiency
+        # Battery operational parameters (batt_eta_charge * batt_eta_discharge = round-trip efficiency)
 
         # =============================================================================
         # MEMORY AND PERFORMANCE PARAMETERS
@@ -295,7 +307,10 @@ class EnhancedConfig:
         self.risk_free_rate = 0.02      # 2% risk-free rate (Danish government bonds)
         self.max_asset_correlation = 0.3 # CAPITAL PRESERVATION: Low correlation for maximum diversification
 
-        # SINGLE-PRICE HEDGING: Risk budget allocation for hedge distribution (CONSOLIDATED)
+        # ONE-FACTOR TRADING SLEEVE:
+        # The investor trades one aggregate energy-price factor. The three sleeve
+        # entries below are bookkeeping weights used to split that single factor
+        # exposure for risk accounting and MTM attribution.
         self.risk_budget_allocation = {
             'wind': 0.40,      # 40% of risk budget to wind (highest volatility)
             'solar': 0.35,     # 35% of risk budget to solar (medium volatility)
@@ -335,6 +350,7 @@ class EnhancedConfig:
         self.operational_risk_intermittency_weight = 0.3
         self.portfolio_risk_concentration_weight = 0.6
         self.portfolio_risk_capital_weight = 0.4
+        self.portfolio_risk_exposure_weight = 0.25  # Trading exposure (financial positions) in portfolio risk
         self.liquidity_risk_buffer_weight = 0.6
         self.liquidity_risk_cashflow_weight = 0.4
         # Weight for forecast-uncertainty risk inside overall risk aggregation.
@@ -362,7 +378,7 @@ class EnhancedConfig:
 
         # PRICE NORMALIZATION: Unified rule across all code paths
         # Actual implementation: price_n = clip(z_score, -3, 3) / 3 â†’ [-1, 1]
-        # This ensures consistent feature scaling across environment, wrapper, and the Tier-2 enhancer feature path
+        # This ensures consistent feature scaling across environment, wrapper, and the Tier-2 routed overlay feature path
         # The actual pipeline uses: z_score clipped to Â±3Ïƒ, then divided by 3 to get [-1,1]
         self.price_z_score_clip = 3.0  # ACTUAL: Clip z-scores to Â±3Ïƒ before dividing by 3
 
@@ -370,15 +386,12 @@ class EnhancedConfig:
         self.price_fallback_mean = 250.0  # Typical DKK/MWh price for fallback z-score calculation
         self.price_fallback_std = 50.0    # Typical price volatility for fallback z-score calculation
 
-        # CANONICAL HORIZONS: Single source of truth matching trained models
-        # These exact values must match the saved model files
+        # CANONICAL HORIZONS: Short-only (immediate/medium/long removed)
         self.forecast_horizons = {
-            "immediate": 1,      # 10 min - direct next step
             "short": 6,          # 1 hour - 6 steps ahead
-            "medium": 24,        # 4 hours - 24 steps ahead
-            "long": 144,         # 24 hours - 144 steps ahead
-            "strategic": 1008    # 7 days - 1008 steps ahead
         }
+        self.forecast_look_back = 24  # Canonical look-back for forecast training/loading
+        self.forecast_price_short_expert_only = True
 
         # Forecast integration constants (Tier D add-ons)
         self.forecast_price_capacity = 6982.0
@@ -412,11 +425,12 @@ class EnhancedConfig:
         self.loss_penalty_multiplier = 2.0  # More aggressive penalty for losses (was 1.0)
         self.profitability_bonus_multiplier = 1.5  # Bonus multiplier for profitable positions
 
-        # CANONICAL FORECAST TARGETS: Single source of truth for all forecast models
-        self.forecast_targets = ["wind", "solar", "hydro", "price", "load"]
+        # Canonical live forecast target set for the final Tier-2 design.
+        # Tier-2 uses only short-horizon price experts.
+        self.forecast_targets = ["price"]
 
-        # CANONICAL REQUIRED HORIZONS: Minimum horizons that must exist
-        self.required_forecast_horizons = ["immediate", "short", "medium", "long", "strategic"]
+        # Canonical required horizons for the live Tier-2 design.
+        self.required_forecast_horizons = ["short"]
 
         # CAPACITY-FACTOR TO MW CONVERSION SCALES: Configurable for different datasets
         # These values are used when converting capacity factors [0,1] to raw MW values
@@ -483,7 +497,7 @@ class EnhancedConfig:
         self.expert_suggestion_strength = 1.2   # Strength of the suggestion (e.g., +1.2 or -1.2) - INCREASED FROM 0.8 FOR FULL PUNCH
 
         # =============================================================================
-        # FORECAST-BASE / TIER-2 ENHANCER PARAMETERS
+        # FORECAST-BASE / TIER-2 CONTROL VARIATE PARAMETERS
         # =============================================================================
 
         # === Confidence scaling ===
@@ -492,23 +506,28 @@ class EnhancedConfig:
         self.confidence_floor = 0.5  # Minimum confidence (50%) - lowered from 60% to allow more forecast-driven trades
         self.forecast_base_conf_thresh = 0.5  # Threshold for forecast-base activation (50%)
 
-        # === Volatility brake (general risk control; independent of enhancer) ===
+        # === Volatility brake (general risk control; independent of Tier-2 overlay) ===
         self.volatility_brake_threshold = 2.5  # Multiply size by 0.8 if vol > 2.5x median (less frequent brake)
         self.forecast_base_defense_gate_dkk = -50_000
         self.forecast_base_defense_gate_severe_dkk = -100_000
         self.forecast_base_dd_gate = 0.01
 
-        # === Per-horizon confidence thresholds (for future gating experiments) ===
+        # === Per-horizon confidence thresholds (short-only) ===
         self.horizon_confidence_thresholds = {
-            'immediate': 0.70,  # Immediate: High confidence required
             'short': 0.65,      # Short: Medium-high confidence
-            'medium': 0.60,     # Medium: Medium confidence
-            'long': 0.50,       # Long: Low confidence (risk-only anyway)
         }
 
-        # === Tier-2 DL enhancer ===
-        # The enhancer modifies investor exposure; it does not change policy observations.
+        # === Tier-2 forecast-backed controller layer ===
+        # Tier-1 observations stay intact. When enabled, Tier-2:
+        # - learns a forecast-conditioned short-horizon defer-and-route expert controller, and
+        # - applies a bounded investor-only override on top of the Tier-1 exposure.
         self.forecast_baseline_enable = False  # Default OFF; enabled explicitly for Tier-2 runs
+
+        # === Tier-2 learned forecast controller ===
+        self.cv_learning_rate = 1e-3
+        self.cv_l2_reg = 1e-4
+        self.tier2_feature_dim = int(TIER2_CV_FEATURE_DIM)
+        self.cv_forecast_dim = int(self.tier2_feature_dim)  # Backward-compatible alias
 
         # === Forecast Trust Calibration ===
         # Rolling window for online calibration of forecast trust (Ï„â‚œ)
@@ -566,7 +585,7 @@ class EnhancedConfig:
         self.forecast_return_tanh_scale = 1.5         # lower tanh scale for smoother signal
         self.forecast_return_denom_floor = 0.25       # lower floor to keep calibrated trade_signal visible
 
-        self.fgb_lambda_max = 0.8             # Legacy control-variate lambda ceiling (unused in enhancer mode)
+        self.fgb_lambda_max = 0.8             # Legacy control-variate lambda ceiling
         # NOTE: This clips the *per-step advantage correction* (delta A_t) in advantage units.
         # It is NOT a return/bps unit. (Kept small to avoid distorting PPO advantage ranking.)
         self.fgb_clip_adv = 0.10
@@ -585,47 +604,57 @@ class EnhancedConfig:
         # When enabled, forecast/meta failures raise immediately instead of silently degrading.
         self.fgb_fail_fast = True
         # expected_dnav fallback exposure floor ratio.
-        # A small nonzero default keeps the control variate informative when the sleeve is temporarily flat.
+        # A small nonzero default keeps the routed overlay informative when the sleeve is temporarily flat.
         self.fgb_expected_dnav_min_exposure_ratio = 0.01
         # expected_dnav blend weights (pred_reward + mwdir). Kept explicit for reproducible tuning.
         self.fgb_expected_dnav_pred_weight = 0.85
         self.fgb_expected_dnav_mwdir_weight = 0.15
-        # === Tier-2 DL Enhancer ===
-        # Tier-2 is a live short-horizon forecast residual memory layer.
-        # It consumes short-horizon forecast-cache revisions directly and applies
-        # a continuous residual delta during both training and evaluation.
-        # Full model: 29D = 5D core + 3 x 8-channel short-horizon memory steps.
-        # Ablation: 5D = forecast-feature ablation only.
+        # === Tier-2 short-horizon forecast real-expert controller ===
+        # Full model:
+        # - 34D Tier-2 state = 4D core context + flattened 2x15 short-memory block
+        # - short-horizon conformal decision-focused defer-and-route controller
+        # - active short-memory channels:
+        #   ann/lstm/svr/rf signals,
+        #   ann/lstm/svr/rf qualities,
+        #   ann/lstm/svr/rf conformal risks,
+        #   expert_consensus_signal, expert_disagreement, short_imbalance_signal
+        # - normalized override head + intervention-confidence head
+        # Ablation:
+        # - routed overlay keeps the same controller/runtime path
+        # - only the forecast-memory block is zeroed
         self.tier2_mape_window = 10
         self.tier2_mape_reference = 0.25
-        self.tier2_enhancer_delta_max = 0.35
-        self.tier2_enhancer_target_scale = 0.01  # Investor sleeve return scale; 1% realized return -> tanh(1)
-        self.tier2_enhancer_lr = 3e-3
-        self.tier2_enhancer_train_every = 100
-        self.tier2_enhancer_batch_size = 64
-        self.tier2_enhancer_train_epochs = 2
-        self.tier2_enhancer_intervention_l1 = 0.005
-        self.tier2_enhancer_memory_steps = int(TIER2_ENHANCER_MEMORY_STEPS)
-        self.tier2_enhancer_overconfidence_penalty = 0.03
-        self.tier2_enhancer_direction_loss_weight = 0.20
-        self.tier2_enhancer_decision_weight_floor = 0.75
-        self.tier2_enhancer_short_signal_weight = 0.55
-        self.tier2_enhancer_immediate_signal_weight = 0.20
-        self.tier2_enhancer_short_revision_weight = 0.15
-        self.tier2_enhancer_imbalance_weight = 0.10
-        self.tier2_enhancer_uncertainty_discount = 0.75
-        self.tier2_enhancer_forecast_ready_mape_samples = 5
-        self.tier2_enhancer_forecast_ready_hit_samples = 20
-        self.tier2_enhancer_min_target_exposure = 0.10
-        self.tier2_enhancer_realized_unit_return_ref = 0.0075
-        self.tier2_enhancer_downside_penalty_weight = 1.00
-        self.tier2_enhancer_drawdown_penalty_weight = 1.50
-        self.tier2_enhancer_vol_penalty_weight = 0.10
-        self.tier2_enhancer_sharpe_window = 48
-        self.tier2_enhancer_sharpe_improvement_scale = 0.05
-        self.tier2_enhancer_sharpe_target_blend = 0.85
-        self.tier2_enhancer_sharpe_loss_weight = 0.45
-        self.tier2_enhancer_ablate_forecast_features = False  # If True: 5D (no forecast); else 29D short-memory features
+        self.tier2_cv_delta_max = 0.20
+        self.tier2_cv_target_scale = 0.01  # Investor sleeve return scale; 1% realized return -> tanh(1)
+        self.tier2_cv_lr = 3e-3
+        self.tier2_cv_train_every = 100
+        self.tier2_cv_batch_size = 64
+        self.tier2_cv_train_epochs = 2
+        self.tier2_cv_memory_steps = int(TIER2_CV_MEMORY_STEPS)
+        self.tier2_cv_route_loss_weight = 0.35
+        self.tier2_cv_override_loss_weight = 0.25
+        self.tier2_cv_confidence_loss_weight = 0.15
+        self.tier2_cv_decision_loss_weight = 0.35
+        self.tier2_cv_decision_horizon = 4
+        self.tier2_cv_decision_scale = 0.05
+        self.tier2_cv_decision_downside_weight = 0.75
+        self.tier2_cv_decision_vol_weight = 0.25
+        self.tier2_cv_decision_stability_penalty = 0.12
+        self.tier2_cv_route_grid_points = 11
+        self.tier2_cv_conformal_alpha = 0.10
+        self.tier2_cv_conformal_scale = 1.0
+        # Tier-2 uses only the short price horizon.
+        # The routed expert bank is a real short-price expert family:
+        # ANN / LSTM / SVR / RF.
+        self.tier2_cv_sharpe_improvement_scale = 0.05
+        self.tier2_cv_ablate_forecast_features = False  # If True: zero only the forecast-memory block while keeping the same controller path
+        self.tier2_cv_architecture = "short_horizon_real_price_expert_conformal_decision_focused_defer_and_route_controller"
+        self.tier2_runtime_overlay_enable = True
+        self.tier2_runtime_gain = 0.65
+        self.tier2_runtime_mc_samples = 3
+        self.tier2_runtime_sigma_scale = 0.015
+        self.tier2_runtime_conformal_margin = 0.05
+        self.cv_learning_rate = float(self.tier2_cv_lr)
 
         # === Legacy Forecast-Reward Compatibility (unused in paper setup) ===
         # Reward shaping by forecast quality is disabled (forecast reward weight = 0).
@@ -678,48 +707,26 @@ class EnhancedConfig:
         self.n_epochs = 10  # STRENGTHENED: Increased from default 5 for more gradient updates
         self.n_steps = 1024  # STRENGTHENED: Increased from 512 for more experience per update
 
-        # PPO exploration knobs (optional; recommended for Tier2 to avoid action collapse)
-        # - gSDE tends to produce smoother, state-conditioned exploration in continuous control.
-        # - log_std_init controls initial action noise scale (std = exp(log_std_init)).
-        self.ppo_use_sde = True
-        # NOTE: Our training loop is custom (multi-agent) and does not use SB3's rollout collector,
-        # so we must explicitly reset gSDE noise ourselves. A small sample freq (1) reduces
-        # persistent sign-bias across long episodes.
+        # Optional SB3 PPO exploration controls. Keep the default path vanilla:
+        # standard Gaussian policy, no gSDE, default policy log_std_init.
+        self.ppo_use_sde = False
         self.ppo_sde_sample_freq = 1
-        self.ppo_log_std_init = -1.0  # std init ~= 0.37 to reduce early sigma blow-up
-        # gSDE only: clamp the actor latent passed into the StateDependentNoiseDistribution.
-        # Without this, latent magnitudes can explode and effective sigma becomes huge even if log_std is clamped,
-        # which then causes tanh-squashed actions to stick near +/-1 (high saturation, poor learning).
-        self.ppo_sde_latent_clip = 0.20
+        self.ppo_log_std_init = None
+        self.dqn_buffer_size = 50000
+        self.dqn_learning_starts = 1000
+        self.dqn_batch_size = 128
+        self.dqn_train_freq = 4
+        self.dqn_gradient_steps = 1
+        self.dqn_target_update_interval = 500
+        self.dqn_exploration_fraction = 0.20
+        self.dqn_exploration_initial_eps = 1.0
+        self.dqn_exploration_final_eps = 0.05
+        # Investor-only bounded-support policy:
+        # use a Beta policy for bounded continuous exposure instead of a Gaussian.
+        self.investor_use_beta_policy = True
+        self.investor_beta_epsilon = 1e-6
         # Debug: force-disable gSDE regardless of CLI flags
         self.force_disable_sde = False
-
-        # Anti-collapse: prevent PPO exploration std from shrinking to ~0 (which makes actions effectively deterministic).
-        # This is especially important across episode boundaries where state distribution shifts.
-        # Anti-saturation (critical for avoiding "static +/-1 actions" in evaluation and across episodes)
-        # These tighter defaults keep actions in a learnable interior region while preserving exploration.
-        # Allow larger exploration floor for investor to take more size
-        self.ppo_log_std_min = -2.0    # std >= exp(-2.0) ~= 0.14
-        self.ppo_log_std_max = -1.0    # std <= exp(-1.0) ~= 0.37 (matches tighter init)
-        # Continuous-learning fix: keep exploration early, but anneal it across the
-        # whole 20-episode run so the latest weights are closer to deployed
-        # deterministic behavior instead of relying on exploration noise.
-        self.ppo_log_std_anneal = True
-        self.ppo_log_std_anneal_steps = 400000
-        self.ppo_log_std_final_max = -1.1
-        self.ppo_mean_clip = 0.70      # tighter mean clamp to reduce raw-action boundary saturation
-
-        # Investor-specific PPO overrides.
-        # The investor is the most collapse-sensitive continuous-control agent in
-        # the MARL stack, so give it a calmer exploration contract than the other
-        # PPO agents while preserving the same overall architecture.
-        self.investor_ppo_use_sde = True
-        self.investor_ppo_sde_sample_freq = 1
-        self.investor_ppo_log_std_init = -1.20
-        self.investor_ppo_log_std_min = -2.20
-        self.investor_ppo_log_std_max = -1.20
-        self.investor_ppo_sde_latent_clip = 0.15
-        self.investor_ppo_mean_clip = 0.60
 
         # Minimal, thesis-defensible regularizer to discourage always-at-bounds allocations.
         # Interpretable as a soft leverage/turnover proxy; applied with warmup in the env reward.
@@ -729,6 +736,8 @@ class EnhancedConfig:
         # Investor observation: price momentum scale (return / scale maps to [-1,1])
         # 0.08 = 8% return over investment horizon maps to ±1
         self.investor_price_momentum_scale = 0.08
+        self.investor_recent_return_lookback = 12
+        self.investor_realized_vol_scale = 0.05
 
         # Direct investor trading-PnL reward.
         # Tier-1 investor should pursue trading profits, while still remaining
@@ -739,46 +748,64 @@ class EnhancedConfig:
         self.investor_mtm_reward_scale = 5000.0
         self.investor_mtm_reward_clip = 1.0
 
-        # Primary trading profit reward: investor optimizes for profitable trading.
-        self.investor_trading_profit_weight = 0.60
+        # Tier-1 clean reward contract:
+        # pay the investor once for sleeve performance via normalized return plus
+        # local path quality, then subtract explicit path-risk and policy-health
+        # penalties. Keep the direct profit term off by default to avoid
+        # double-paying the same trade.
+        self.investor_clean_reward_contract = True
+        self.investor_trading_profit_weight = 0.0
         self.investor_trading_profit_scale = 3000.0
         self.investor_trading_profit_clip = 1.5
 
         # Hedging alignment: OFF. Investor focuses on profitable trading, not hedging ops.
         self.investor_hedging_reward_weight = 0.0
 
-        # Shared base-reward mix: minimal anchor for fund-level coordination.
-        self.investor_base_reward_weight = 0.10
-        self.battery_base_reward_weight = 1.0
-        self.risk_base_reward_weight = 1.0
-        self.meta_base_reward_weight = 1.0
+        # Shared base-reward mix: OFF for investor/battery (agent-specific rewards only).
+        self.investor_base_reward_weight = 0.0
+        self.battery_base_reward_weight = 0.0
+        self.risk_base_reward_weight = 0.0
+        self.meta_base_reward_weight = 0.0
         # Default OFF: do not add a rolling average of recent trading gains on top
         # of NAV growth inside the shared reward. That term made profitable short
         # books sticky across episodes and was a core driver of Tier-1 one-sign drift.
         self.shared_trading_score_weight = 0.0
 
         # Investor local trading-sleeve objective.
-        # Tier-1 investor is a real trading agent. It should optimize sleeve
-        # profitability and risk quality, while still remaining coupled to the
-        # shared fund objective through investor_base_reward_weight.
+        # Keep Tier-1 simple: reward realized trading profit on allocated
+        # capital, add only a small quality stabilizer, and keep the downside
+        # contract limited to cost, mild drawdown, and one PPO-health brake.
         self.investor_trading_history_lookback = 48
-        self.investor_trading_return_weight = 0.45
-        self.investor_trading_return_scale = 0.002
-        self.investor_trading_return_clip = 2.0
-        self.investor_trading_quality_weight = 0.25
+        self.investor_trading_return_weight = 0.22
+        self.investor_trading_return_scale = 0.003
+        self.investor_trading_return_clip = 1.5
+        # Clean investor contract: health belongs in PPO optimization, not in a
+        # second path-quality bonus inside the environment reward.
+        self.investor_trading_quality_weight = 0.0
         self.investor_trading_quality_clip = 2.0
         self.investor_trading_vol_floor = 5e-4
-        self.investor_trading_drawdown_weight = 0.20
+        self.investor_trading_drawdown_weight = 0.06
         self.investor_trading_drawdown_scale = 0.05
+        self.investor_trading_cost_weight = 0.05
+        self.investor_trading_cost_scale = 0.002
         self.investor_tracker_return_clip = 0.50
+        # Active inventory risk charge: a single, principled brake on carrying
+        # large directional inventory, especially in volatile regimes.
+        self.investor_active_risk_weight = 0.18
+        self.investor_active_risk_free_band = 0.40
+        self.investor_active_risk_vol_mult = 1.00
 
         # Meta-controller dense local objective.
-        # Meta controls capital allocation / cadence, so it should learn from
-        # investor sleeve quality and risk directly, not only a sparse sign bonus.
-        self.meta_local_investor_weight = 0.0
-        self.meta_local_battery_weight = 0.0
-        self.meta_local_risk_weight = 0.0
+        # Meta is a NAV-first allocator for the investor sleeve. It should respond
+        # mainly to sleeve edge and risk, while the fund-level shared reward
+        # remains the dominant objective. Battery-specific shaping is disabled.
+        self.meta_local_investor_weight = 0.20
+        self.meta_local_battery_weight = 0.00
+        self.meta_local_risk_weight = 0.10
         self.meta_local_signal_clip = 2.0
+        self.meta_capital_alignment_weight = 0.10
+        self.risk_controller_rule_based = True
+        self.meta_controller_rule_based = True
 
         # Global training step counter (persists across episode environments in episode training).
         # Needed because episode training creates a NEW env each episode, so env-local counters reset.
@@ -793,10 +820,13 @@ class EnhancedConfig:
         self.enable_action_tanh_squash = True
 
         # Exposure-scalar remapping.
-        # The investor controls a single signed exposure scalar, but actual fund notional is
-        # heavily attenuated by trading sleeve size, capital allocation, and max_position_size.
-        # A concave signed-power map makes interior actions produce meaningful notional so PPO
-        # does not need to peg the scalar near +/-1 just to reach normal trading size.
+        # The investor controls a single signed exposure-adjustment scalar by default.
+        # This is healthier than an absolute target controller because "hold current
+        # risk" maps to a near-zero action instead of parking the policy mean on an
+        # internal PPO wall. The mapped signal still passes through a signed-power
+        # transform so interior actions remain meaningful.
+        self.investor_exposure_action_mode = "delta"   # {"delta", "absolute"}
+        self.investor_delta_exposure_scale = 0.20      # smaller step size keeps vanilla PPO from jumping to the live cap too quickly
         self.investor_exposure_power = 1.0
         # Tier-1 investor now controls direct signed trading exposure. No
         # structural hedge anchor is applied in the active trading path.
@@ -818,16 +848,19 @@ class EnhancedConfig:
         self.investor_exposure_stuck_threshold = 0.98
         self.investor_exposure_stuck_steps = 500
         self.investor_exposure_stuck_penalty = 0.0
+        # Investor policy-mean saturation monitor:
+        # track when the deterministic policy mean sits too close to the action
+        # boundary for long stretches. This is diagnostics-only metadata.
+        self.investor_mean_clip_hit_window = 128
+        self.investor_mean_clip_hit_warmup_steps = 2000
+        self.investor_mean_clip_hit_threshold = 0.35
+        self.investor_mean_clip_hit_margin = 0.96
         # Deterministic-policy anti-collapse:
-        # penalize the investor policy mean only when it stays strongly one-sided
-        # for a long rolling window. This targets the deployed-evaluation failure
-        # mode (always-long / always-short) without turning the policy into a
-        # forced oscillation system.
-        self.investor_mean_collapse_penalty = 0.0
-        self.investor_mean_collapse_window = 256
-        self.investor_mean_collapse_warmup_steps = 4000
-        self.investor_mean_collapse_abs_mean_threshold = 0.25
-        self.investor_mean_collapse_sign_threshold = 0.80
+        # diagnostics-only in the default Tier-1 baseline.
+        self.investor_mean_collapse_window = 128
+        self.investor_mean_collapse_warmup_steps = 2000
+        self.investor_mean_collapse_abs_mean_threshold = 0.22
+        self.investor_mean_collapse_sign_threshold = 0.78
 
         # =============================================================================
         # GLOBAL NORMALIZATION (ANTI EPISODE-BOUNDARY DISTRIBUTION SHIFT)
@@ -868,9 +901,9 @@ class EnhancedConfig:
         # Agent policies
         self.agent_policies = [
             {"mode": "PPO"},  # investor_0
-            {"mode": "PPO"},  # battery_operator_0
-            {"mode": "PPO"},  # risk_controller_0
-            {"mode": "SAC"},  # meta_controller_0
+            {"mode": "DQN"},  # battery_operator_0
+            {"mode": "RULE"},  # risk_controller_0
+            {"mode": "RULE"},  # meta_controller_0
         ]
 
         if optimized_params:
@@ -1005,9 +1038,10 @@ class EnhancedConfig:
         if not (0.0 <= self.batt_soc_min <= 1.0) or not (0.0 <= self.batt_soc_max <= 1.0):
             errors.append(f"Battery SOC bounds not in [0, 1]")
 
-        # 6. Battery efficiency should be in (0, 1]
-        if not (0.0 < self.batt_efficiency <= 1.0):
-            errors.append(f"batt_efficiency ({self.batt_efficiency}) not in (0, 1]")
+        # 6. Battery round-trip efficiency (eta_charge * eta_discharge) should be in (0, 1]
+        rt_eff = self.batt_eta_charge * self.batt_eta_discharge
+        if not (0.0 < rt_eff <= 1.0):
+            errors.append(f"batt_eta_charge*batt_eta_discharge ({rt_eff}) not in (0, 1]")
 
         # 7. Price bounds should be valid
         if self.minimum_price_floor >= self.maximum_price_cap:
@@ -1073,6 +1107,8 @@ class EnhancedConfig:
         self.clip_range = float(params.get('clip_range', self.clip_range))
         self.vf_coef = float(params.get('vf_coef', self.vf_coef))
         self.max_grad_norm = float(params.get('max_grad_norm', self.max_grad_norm))
+        self.investor_use_beta_policy = bool(params.get('investor_use_beta_policy', self.investor_use_beta_policy))
+        self.investor_beta_epsilon = float(params.get('investor_beta_epsilon', self.investor_beta_epsilon))
 
         # Net arch: take explicit list if provided; otherwise map from size label
         if isinstance(params.get('net_arch'), (list, tuple)):
@@ -1094,9 +1130,9 @@ class EnhancedConfig:
         else:
             self.agent_policies = [
                 {"mode": params.get('investor_mode', 'PPO')},
-                {"mode": params.get('battery_mode', 'PPO')},
-                {"mode": params.get('risk_mode', 'PPO')},
-                {"mode": params.get('meta_mode', 'SAC')},
+                {"mode": params.get('battery_mode', 'DQN')},
+                {"mode": params.get('risk_mode', 'RULE')},
+                {"mode": params.get('meta_mode', 'RULE')},
             ]
 
         print(f"   Learning rate: {self.lr:.2e}")
@@ -1108,9 +1144,9 @@ class EnhancedConfig:
 
 
 # =====================================================================
-# PAPER MODES (baseline vs Tier-2 DL Enhancer)
+# PAPER MODES (baseline vs Tier-2 routed overlay)
 # =====================================================================
 # Baseline: forecast_baseline_enable=False
-# Tier-2 DL Enhancer: forecast_baseline_enable=True (no extra observations)
-# Tier-2 sole ablation: tier2_enhancer_ablate_forecast_features=True (5D enhancer, no forecast features)
-# Tier-2 full uses the 29D short-memory residual enhancer.
+# Tier-2 routed overlay: forecast_baseline_enable=True (no extra observations)
+# Tier-2 ablation: tier2_cv_ablate_forecast_features=True (same controller, zeroed forecast-memory block)
+# Tier-2 full uses 34D temporal features: 4D core + flattened 2x15 real price-expert short-memory block.

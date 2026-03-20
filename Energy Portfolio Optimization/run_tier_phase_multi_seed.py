@@ -4,15 +4,15 @@ Run canonical tier phases across multiple seeds.
 
 Phase ordering per seed:
 - tier1_tier2:
-  1) Tier 1 basic MARL
-  2) Tier 2 DL Enhancer
+  1) Tier 1 hybrid RL baseline
+  2) Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller
 - tier1_enhancer:
-  1) Tier 1 basic MARL
-  2) Tier 2 DL Enhancer
+  1) Tier 1 hybrid RL baseline
+  2) Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller
 
 For each run: train via main.py, evaluate via evaluation.py --mode tiers.
 The runner forwards an explicit tier evaluation mode so suites can validate the
-deployed DL enhancer path or stay in paper-only policy evaluation.
+deployed Tier-2 residual path or stay in paper-only policy evaluation.
 """
 
 import argparse
@@ -27,23 +27,23 @@ from datetime import datetime
 
 VARIANT_TRAIN_SPECS = {
     "tier1_basic_marl": {
-        "name": "Tier 1 basic MARL",
+        "name": "Tier 1 hybrid RL baseline",
         "slug": "tier1_basic_marl",
         "extra": [],
     },
-    "tier2_forecast_enhancer": {
-        "name": "Tier 2 DL Enhancer (full)",
-        "slug": "tier2_forecast_enhancer",
+    "tier2_forecast_cv": {
+        "name": "Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller (full)",
+        "slug": "tier2_forecast_cv",
         "extra": [
             "--forecast_baseline_enable",
         ],
     },
-    "tier2_forecast_enhancer_ablated": {
-        "name": "Tier 2 DL Enhancer (5D no forecast features)",
-        "slug": "tier2_forecast_enhancer_ablated",
+    "tier2_forecast_cv_ablated": {
+        "name": "Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller (forecast-nullified ablation)",
+        "slug": "tier2_forecast_cv_ablated",
         "extra": [
             "--forecast_baseline_enable",
-            "--tier2_enhancer_ablate_forecast_features",
+            "--tier2_cv_ablate_forecast_features",
         ],
     },
 }
@@ -51,32 +51,33 @@ VARIANT_TRAIN_SPECS = {
 PHASE_VARIANTS = {
     "tier1_tier2": [
         "tier1_basic_marl",
-        "tier2_forecast_enhancer",
+        "tier2_forecast_cv",
     ],
+    # Legacy alias kept only for backward compatibility with existing scripts/suite dirs.
     "tier1_enhancer": [
         "tier1_basic_marl",
-        "tier2_forecast_enhancer",
+        "tier2_forecast_cv",
     ],
-    "tier2_only": ["tier2_forecast_enhancer"],
+    "tier2_only": ["tier2_forecast_cv"],
     "tier1_tier2_full_ablated": [
         "tier1_basic_marl",
-        "tier2_forecast_enhancer",
-        "tier2_forecast_enhancer_ablated",
+        "tier2_forecast_cv",
+        "tier2_forecast_cv_ablated",
     ],
 }
 
 EVAL_DIR_ARG_BY_VARIANT = {
     "tier1_basic_marl": "--tier1_dir",
-    "tier2_forecast_enhancer": "--tier2_dir",
-    "tier2_forecast_enhancer_ablated": "--tier2_ablated_dir",
+    "tier2_forecast_cv": "--tier2_dir",
+    "tier2_forecast_cv_ablated": "--tier2_ablated_dir",
 }
 
 # evaluation.py --tiers_only accepts:
 # all, baseline, tier2, tier1, tier2_ablated
 EVAL_TIERS_ONLY_BY_VARIANT = {
     "tier1_basic_marl": "tier1",
-    "tier2_forecast_enhancer": "tier2",
-    "tier2_forecast_enhancer_ablated": "tier2_ablated",
+    "tier2_forecast_cv": "tier2",
+    "tier2_forecast_cv_ablated": "tier2_ablated",
 }
 
 
@@ -268,17 +269,30 @@ def write_phase_protocol_json(path: str, payload: dict) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _load_existing_protocol(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run multi-seed tier phases with evaluation.")
     parser.add_argument("--seeds", nargs="+", required=True, help="Seeds, e.g. --seeds 7 42 123 789 2025")
     parser.add_argument("--phase", type=str, default="tier1_tier2_full_ablated",
                         choices=list(PHASE_VARIANTS.keys()),
-                        help="Phase: tier1_tier2_full_ablated (3 runs/seed) or tier1_tier2, tier1_enhancer, tier2_only")
+                        help="Phase: tier1_tier2_full_ablated (3 runs/seed) or tier1_tier2, tier1_enhancer (legacy alias only), tier2_only")
     parser.add_argument("--episode_data_dir", type=str, default="training_dataset")
     parser.add_argument("--start_episode", type=int, default=0)
     parser.add_argument("--end_episode", type=int, default=19)
     parser.add_argument("--global_norm_mode", type=str, default="global", choices=["rolling_past", "global"],
                         help="Normalization mode forwarded to main.py.")
+    parser.add_argument("--rolling_past_history_dir", type=str, default="",
+                        help="Optional rolling-past history dir forwarded to main.py when --global_norm_mode rolling_past.")
     parser.add_argument("--investment_freq", type=int, default=6)
     parser.add_argument("--meta_freq_min", type=int, default=6,
                         help="Default live investor cadence minimum forwarded to train/eval. Default pins short horizon.")
@@ -292,18 +306,14 @@ def main():
                         help="Pinned PPO learning rate for canonical seed-suite runs.")
     parser.add_argument("--ent_coef", type=float, default=0.03,
                         help="Pinned PPO entropy coefficient for canonical seed-suite runs.")
-    parser.add_argument("--ppo_log_std_init", type=float, default=-1.0,
+    parser.add_argument("--ppo_log_std_init", type=float, default=None,
                         help="Pinned PPO log_std_init for canonical seed-suite runs.")
-    parser.add_argument("--ppo_mean_clip", type=float, default=0.70,
-                        help="Pinned PPO mean-action clip for canonical seed-suite runs.")
-    parser.add_argument("--forecast_tier_ppo_mean_clip", type=float, default=0.70,
-                        help="Pinned PPO mean-action clip applied to forecast-enabled Tier-2 variants.")
-    parser.add_argument("--disable_ppo_use_sde", action="store_true",
-                        help="Disable PPO gSDE. By default this runner enables --ppo_use_sde.")
+    parser.add_argument("--enable_ppo_use_sde", action="store_true",
+                        help="Enable SB3 PPO gSDE. Default suite path stays vanilla without gSDE.")
     parser.add_argument("--eval_data", type=str, default="evaluation_dataset/unseendata.csv")
     parser.add_argument("--eval_steps", type=int, default=None)
     parser.add_argument("--tiers_eval_mode", type=str, default="deployed", choices=["paper", "deployed"],
-                        help="Evaluation mode forwarded to evaluation.py. Default is deployed so Tier-2 runs are checked with enhancer weights attached.")
+                        help="Evaluation mode forwarded to evaluation.py. Default is deployed so Tier-2 runs are checked with Tier-2 weights attached.")
     parser.add_argument("--tiers_precompute_forecasts", action="store_true",
                         help="When tiers_eval_mode=deployed, precompute/load the evaluation forecast cache for speed and determinism.")
     parser.add_argument("--tiers_precompute_batch_size", type=int, default=8192,
@@ -347,43 +357,67 @@ def main():
         "--cooling_period", str(args.cooling_period),
         "--lr", str(args.lr),
         "--ent_coef", str(args.ent_coef),
-        "--ppo_log_std_init", str(args.ppo_log_std_init),
     ]
-    if not bool(args.disable_ppo_use_sde):
+    if args.ppo_log_std_init is not None:
+        common_args.extend(["--ppo_log_std_init", str(args.ppo_log_std_init)])
+    if str(getattr(args, "rolling_past_history_dir", "")).strip():
+        common_args.extend([
+            "--rolling_past_history_dir", str(args.rolling_past_history_dir).strip(),
+        ])
+    if bool(args.enable_ppo_use_sde):
         common_args.append("--ppo_use_sde")
-    baseline_policy_args = [
-        "--ppo_mean_clip", str(args.ppo_mean_clip),
-    ]
+    baseline_policy_args = []
     forecast_args = [
         "--forecast_training_dataset_dir", args.forecast_training_dataset_dir,
         "--forecast_base_dir", args.forecast_base_dir,
         "--forecast_cache_dir", args.forecast_cache_dir,
     ]
-    enhancer_policy_args = [
-        "--ppo_mean_clip", str(args.forecast_tier_ppo_mean_clip),
-    ]
+    cv_policy_args = []
     protocol_path = os.path.join(suite_dir, "phase_protocol.json")
+    if str(args.suite_dir).strip():
+        existing_protocol = _load_existing_protocol(protocol_path)
+        if existing_protocol:
+            compatibility_checks = {
+                "phase": args.phase,
+                "global_norm_mode": str(args.global_norm_mode),
+                "investment_freq": int(args.investment_freq),
+                "meta_freq_min": int(args.meta_freq_min),
+                "meta_freq_max": int(args.meta_freq_max),
+                "ppo_use_sde": bool(args.enable_ppo_use_sde),
+                "ppo_log_std_init": None if args.ppo_log_std_init is None else float(args.ppo_log_std_init),
+            }
+            for key, expected in compatibility_checks.items():
+                actual = existing_protocol.get(key)
+                if actual != expected:
+                    print(
+                        f"Error: suite_dir protocol mismatch for '{key}': "
+                        f"existing={actual!r}, requested={expected!r}"
+                    )
+                    sys.exit(1)
     write_phase_protocol_json(
         protocol_path,
         {
             "phase": args.phase,
             "global_norm_mode": str(args.global_norm_mode),
+            "rolling_past_history_dir": str(getattr(args, "rolling_past_history_dir", "") or ""),
             "investment_freq": int(args.investment_freq),
             "meta_freq_min": int(args.meta_freq_min),
             "meta_freq_max": int(args.meta_freq_max),
+            "ppo_use_sde": bool(args.enable_ppo_use_sde),
+            "ppo_log_std_init": None if args.ppo_log_std_init is None else float(args.ppo_log_std_init),
             "tiers_eval_mode": str(args.tiers_eval_mode),
             "tiers_precompute_forecasts": bool(args.tiers_precompute_forecasts),
             "tiers_precompute_batch_size": int(args.tiers_precompute_batch_size),
             "shared_training_args": common_args,
             "tier1_policy_args": baseline_policy_args,
             "forecast_args_for_tier2": forecast_args,
-            "tier2_policy_args": enhancer_policy_args,
+            "tier2_policy_args": cv_policy_args,
             "documentation": (
-                "Tier 1 uses the baseline MARL policy stack. Tier 2 variants train from scratch with the same MARL "
-                "architecture while the forecast-backed short-memory residual enhancer is applied live during "
-                "training and validated in deployed evaluation."
+                "Tier 1 uses the hybrid RL baseline. Tier 2 variants train from scratch on the same investor-only "
+                "base trading policy while adding a short-horizon residual-aware forecast-backed decision-focused defer-and-route "
+                "controller that is validated in deployed evaluation."
             ),
-            "tier2_training_contract": "live_short_memory_residual_overlay",
+            "tier2_training_contract": "short_horizon_conformal_residual_aware_decision_focused_defer_and_route_controller",
         },
     )
     # Build full run plan with deterministic global numbering.
@@ -452,7 +486,7 @@ def main():
         extra = list(spec["extra"])
         train_extra_args = []
         if canonical != "tier1_basic_marl":
-            train_extra_args = forecast_args + enhancer_policy_args
+            train_extra_args = forecast_args + cv_policy_args
         else:
             train_extra_args = list(baseline_policy_args)
         label = f"[Run {run_no}/{total_runs}] {spec['name']} (seed={seed}, order={idx})"

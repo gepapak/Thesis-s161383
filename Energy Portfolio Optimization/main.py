@@ -55,9 +55,9 @@ logger = get_logger(__name__)
 
 # Import patched environment classes
 from environment import RenewableMultiAgentEnv
-from generator import MultiHorizonForecastGenerator
+from generator import MultiHorizonForecastGenerator, load_energy_data
 from utils import clear_tf_session, configure_tf_memory  # UNIFIED: Import from single source of truth
-from config import normalize_price, ENHANCER_BASE_FEATURE_DIM  # UNIFIED: Import from single source of truth
+from config import normalize_price, BASE_FEATURE_DIM  # UNIFIED: Import from single source of truth
 
 # CVXPY is optional; if unavailable we use a heuristic labeler.
 try:
@@ -73,83 +73,14 @@ except Exception:
     from metacontroller import MultiESGAgent
     HyperparameterOptimizer = None
 
-# =====================================================================
-# Inlined utilities so utils.py is no longer needed
-# =====================================================================
-
-def load_energy_data(csv_path: str, convert_to_raw_units: bool = True, config=None, mw_scale_overrides=None) -> pd.DataFrame:
-    """
-    Load energy time series data from CSV with optional unit conversion.
-    Requires at least: wind, solar, hydro, price, load.
-    Keeps extra cols like timestamp, risk, scenario, etc. if present.
-    Casts numeric columns to float where possible and parses timestamp when present.
-
-    Args:
-        csv_path: Path to CSV file
-        convert_to_raw_units: If True, converts capacity factors to absolute MW units
-                             to match forecast model training data
-        config: EnhancedConfig object with mw_conversion_scales
-        mw_scale_overrides: Dict with CLI override values for MW scales
-    """
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError(f"Data file not found: {csv_path}")
-
-    df = pd.read_csv(csv_path)
-
-    # Parse timestamp if present (or build from date+time)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    elif {"date", "time"}.issubset(df.columns):
-        df["timestamp"] = pd.to_datetime(
-            df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce"
-        )
-    # (We keep timestamp as a column; we do NOT set it as index so the env sees all columns.)
-
-    required = ["wind", "solar", "hydro", "price", "load"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in data: {missing}")
-
-    # Best-effort numeric casting for core cols + common extras
-    numeric_extra = [c for c in ["risk", "revenue", "battery_energy", "npv"] if c in df.columns]
-    for col in required + numeric_extra:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Drop obviously bad rows (optional, conservative)
-    df = df.dropna(subset=required).reset_index(drop=True)
-
-    # Convert capacity factors to raw MW values for direct forecasting
-    if convert_to_raw_units and _is_capacity_factor_data(df):
-        logger.info("[INFO] Converting capacity factors to raw MW values for direct forecasting...")
-        df = _convert_to_raw_mw_values(df, config=config, mw_scale_overrides=mw_scale_overrides)
-        logger.info("[OK] Raw MW conversion completed - forecasts will work directly with these units")
-    else:
-        logger.info("[INFO] Data already in raw MW units - ready for direct forecasting")
-
-    return df
+def _tier2_weights_filename() -> str:
+    """Return the canonical Tier-2 routed-overlay checkpoint filename."""
+    return "tier2_routed_overlay.h5"
 
 
-def _is_capacity_factor_data(df: pd.DataFrame) -> bool:
-    """Detect if data is in capacity factor format (0-1 range) vs absolute MW."""
-    # Check if renewable generation looks like capacity factors (typically 0..1).
-    # IMPORTANT: Do NOT use `load` here; many datasets have load already in MW
-    # even when generation is expressed as capacity factors.
-    renewable_cols = ['wind', 'solar', 'hydro']
-
-    for col in renewable_cols:
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            max_val = float(np.nanmax(s.values)) if len(s) else 0.0
-            if max_val > 2.0:  # If any renewable > 2, likely already in MW
-                return False
-
-    return True  # Renewables all <= 2.0 => likely capacity factors
-
-
-def _enhancer_weights_filename(feature_dim: int) -> str:
-    """Return the canonical enhancer checkpoint filename for the active Tier-2 contract."""
-    fd = int(feature_dim)
-    return f"dl_enhancer_{fd}d.h5"
+def _cv_weights_filename() -> str:
+    """Backward-compatible alias for older Tier-2 helper calls."""
+    return _tier2_weights_filename()
 
 
 def _capture_rolling_past_state(config) -> dict:
@@ -180,71 +111,6 @@ def _restore_rolling_past_state(config, state: Optional[dict]) -> bool:
             setattr(config, key, state.get(key))
             restored = True
     return restored
-
-
-def _convert_to_raw_mw_values(df: pd.DataFrame, config=None, mw_scale_overrides=None) -> pd.DataFrame:
-    """Convert capacity factors to raw MW values for direct forecasting.
-
-    This eliminates normalization complexity and uses the exact training scale.
-
-    Args:
-        df: DataFrame with capacity factor data
-        config: EnhancedConfig object with mw_conversion_scales
-        mw_scale_overrides: Dict with CLI override values for MW scales
-    """
-
-    # Get MW conversion scales from config or use fallback defaults
-    if config and hasattr(config, 'mw_conversion_scales'):
-        capacity_mw = config.mw_conversion_scales.copy()
-    else:
-        # Fallback to original hardcoded values if no config
-        capacity_mw = {
-            'wind': 1103,    # From training scaler mean: 1103.4 MW
-            'solar': 100,    # From training scaler mean: 61.5 MW (min 100 for stability)
-            'hydro': 534,    # From training scaler mean: 534.1 MW
-            'load': 2999,    # From training scaler mean: 2999.8 MW
-        }
-
-    # Apply CLI overrides if provided
-    if mw_scale_overrides:
-        for key, value in mw_scale_overrides.items():
-            if value is not None and key in capacity_mw:
-                capacity_mw[key] = float(value)
-                logger.info(f"[OVERRIDE] Using CLI override for {key}: {value} MW")
-
-    df_converted = df.copy()
-
-    logger.info("[INFO] Converting to raw MW values (no normalization):")
-
-    # Convert capacity factors to raw MW values.
-    # SAFETY: convert per-column only if the column still looks like a capacity factor.
-    def _looks_like_capacity_factor(series: pd.Series) -> bool:
-        s = pd.to_numeric(series, errors="coerce")
-        if len(s) == 0:
-            return False
-        max_val = float(np.nanmax(s.values))
-        min_val = float(np.nanmin(s.values))
-        # Allow small numerical negatives and occasional >1 spikes.
-        return (max_val <= 2.0) and (min_val >= -0.1)
-
-    for col, capacity in capacity_mw.items():
-        if col in df_converted.columns:
-            original_range = f"[{df[col].min():.3f}, {df[col].max():.3f}]"
-            if _looks_like_capacity_factor(df[col]):
-                df_converted[col] = df[col] * capacity
-                new_range = f"[{df_converted[col].min():.1f}, {df_converted[col].max():.1f}] MW"
-                logger.info(f"  {col}: {original_range} -> {new_range}")
-            else:
-                logger.info(f"  {col}: {original_range} (kept as-is; already looks like MW)")
-
-    # Price: Already in $/MWh (no conversion needed)
-    if 'price' in df_converted.columns:
-        price_range = f"[{df_converted['price'].min():.1f}, {df_converted['price'].max():.1f}] $/MWh"
-        logger.info(f"  price: {price_range} (no conversion)")
-
-    logger.info("[OK] Raw MW conversion complete - ready for direct forecasting")
-
-    return df_converted
 
 
 # =====================================================================
@@ -418,42 +284,225 @@ def print_portfolio_summary(env, step_count):
         while hasattr(base_env, 'env') and not hasattr(base_env, '_calculate_fund_nav'):
             base_env = base_env.env
 
-        # Get current environment state
         current_timestep = getattr(base_env, 't', 0)
+        nav_breakdown = base_env.get_fund_nav_breakdown() if hasattr(base_env, "get_fund_nav_breakdown") else {}
+        if not nav_breakdown:
+            fund_nav_dkk = float(base_env._calculate_fund_nav())
+            dkk_to_usd = float(getattr(base_env.config, 'dkk_to_usd_rate', 0.145))
+            nav_breakdown = {
+                'fund_nav_dkk': fund_nav_dkk,
+                'trading_cash_dkk': float(getattr(base_env, 'budget', 0.0)),
+                'physical_book_value_dkk': 0.0,
+                'accumulated_operational_revenue_dkk': float(getattr(base_env, 'accumulated_operational_revenue', 0.0)),
+                'financial_mtm_dkk': float(getattr(base_env, 'cumulative_mtm_pnl', 0.0)),
+                'trading_gains_dkk': float(getattr(base_env, 'cumulative_mtm_pnl', 0.0)),
+                'battery_gains_dkk': float(getattr(base_env, 'cumulative_battery_revenue', 0.0)),
+            }
+        dkk_to_usd = float(getattr(base_env.config, 'dkk_to_usd_rate', 0.145))
 
-        # Calculate NAV using the environment's method
-        fund_nav_dkk = base_env._calculate_fund_nav()
-        dkk_to_usd = 0.145  # Approximate conversion rate
-        fund_nav_usd = fund_nav_dkk * dkk_to_usd / 1_000_000  # Convert to millions USD
-
-        # Get financial positions
-        cash_dkk = getattr(base_env, 'budget', 0)
-
-        # Get MtM positions
-        mtm_positions = getattr(base_env, 'cumulative_mtm_pnl', 0)
-        mtm_usd = mtm_positions * dkk_to_usd / 1_000  # Convert to thousands USD
-
-        # Get trading gains (from cumulative mark-to-market PnL)
-        # FIX: Changed from sum(financial_positions.values()) to cumulative_mtm_pnl
-        # Rationale: financial_positions is current position values (misleading), 
-        # cumulative_mtm_pnl is actual cumulative trading performance
-        trading_gains = getattr(base_env, 'cumulative_mtm_pnl', 0)
-        trading_gains_usd = trading_gains * dkk_to_usd / 1_000  # Convert to thousands USD
-
-        # Get operational gains (generation revenue)
-        operational_gains = getattr(base_env, 'cumulative_generation_revenue', 0)
-        operational_gains_usd = operational_gains * dkk_to_usd / 1_000  # Convert to thousands USD
+        fund_nav_usd_m = float(nav_breakdown.get('fund_nav_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        cash_usd_m = float(nav_breakdown.get('trading_cash_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        physical_usd_m = float(nav_breakdown.get('physical_book_value_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        operating_usd_m = float(nav_breakdown.get('accumulated_operational_revenue_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        mtm_usd_m = float(nav_breakdown.get('financial_mtm_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        trading_gains_usd_m = float(nav_breakdown.get('trading_gains_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        battery_gains_usd_m = float(nav_breakdown.get('battery_gains_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
 
         logger.info(f"\n[STATS] PORTFOLIO SUMMARY - Step {step_count:,} (Env: {current_timestep:,})")
-        logger.info(f"   Portfolio Value: ${fund_nav_usd:.1f}M")
-        logger.info(f"   Cash: {cash_dkk:,.0f} DKK")
-        logger.info(f"   MtM Positions: ${mtm_usd:+.1f}k")
-        logger.info(f"   Trading Gains: ${trading_gains_usd:+.1f}k")
-        logger.info(f"   Operating Gains: ${operational_gains_usd:+.1f}k")
+        logger.info(
+            f"   NAV: ${fund_nav_usd_m:.2f}M = Cash ${cash_usd_m:.2f}M + "
+            f"Physical ${physical_usd_m:.2f}M + Op ${operating_usd_m:.2f}M + MTM ${mtm_usd_m:.2f}M"
+        )
+        logger.info(
+            f"   Gains: Trading ${trading_gains_usd_m:+.2f}M | "
+            f"Battery ${battery_gains_usd_m:+.2f}M | Operating ${operating_usd_m:+.2f}M"
+        )
 
     except Exception as e:
         logger.error(f"\n[STATS] PORTFOLIO SUMMARY - Step {step_count:,}")
         logger.error(f"   Error calculating portfolio: {e}")
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _export_episode_investor_health_excel(
+    episode_env,
+    episode_num: int,
+    monitoring_dirs: Dict[str, str],
+    investor_health_summary: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Save a separate Excel workbook with investor policy health diagnostics for
+    each completed training episode.
+    """
+    try:
+        debug_tracker = getattr(episode_env, "debug_tracker", None)
+        buffered_health_rows = list(
+            getattr(debug_tracker, "episode_investor_health_rows", []) or []
+        )
+        csv_path = None
+        if debug_tracker is not None:
+            try:
+                if getattr(debug_tracker, "csv_file_handle", None) is not None:
+                    debug_tracker.csv_file_handle.flush()
+            except Exception:
+                pass
+            csv_path = getattr(debug_tracker, "csv_file", None)
+
+        if not buffered_health_rows and (not csv_path or not os.path.exists(csv_path)):
+            logs_dir = monitoring_dirs.get("logs", "")
+            candidates = sorted(glob.glob(os.path.join(logs_dir, f"*_debug_ep{episode_num}.csv")))
+            if candidates:
+                csv_path = candidates[-1]
+
+        if buffered_health_rows:
+            df = pd.DataFrame(buffered_health_rows)
+        elif csv_path and os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+        else:
+            logger.warning(
+                f"   [WARN] Investor health Excel export skipped: no investor health dataset found for episode {episode_num}"
+            )
+            return None
+
+        if df.empty:
+            logger.warning(
+                f"   [WARN] Investor health Excel export skipped: investor health dataset is empty for episode {episode_num}"
+            )
+            return None
+
+        inv_cols = [c for c in df.columns if c.startswith("inv_")]
+        context_cols = [
+            "episode",
+            "timestep",
+            "training_global_step",
+            "decision_step",
+            "exposure_exec",
+            "position_exposure",
+            "action_sign",
+            "trade_signal_active",
+            "trade_signal_sign",
+            "investor_reward",
+            "fund_nav_usd",
+            "fund_nav_dkk",
+            "price_return_1step",
+            "price_return_forecast",
+        ]
+        timeseries_cols = [c for c in context_cols if c in df.columns] + [
+            c for c in inv_cols if c not in context_cols
+        ]
+        timeseries_df = df[timeseries_cols].copy()
+
+        tail_n = int(min(500, len(timeseries_df)))
+        tail_df = timeseries_df.tail(tail_n).copy()
+        last_row = timeseries_df.iloc[-1]
+
+        exposure_series = (
+            pd.to_numeric(timeseries_df["exposure_exec"], errors="coerce")
+            if "exposure_exec" in timeseries_df.columns
+            else pd.Series(dtype=float)
+        )
+        tail_exposure = (
+            pd.to_numeric(tail_df["exposure_exec"], errors="coerce")
+            if "exposure_exec" in tail_df.columns
+            else pd.Series(dtype=float)
+        )
+        decision_mask = (
+            pd.to_numeric(timeseries_df["decision_step"], errors="coerce").fillna(0.0) > 0.5
+            if "decision_step" in timeseries_df.columns
+            else pd.Series([False] * len(timeseries_df))
+        )
+        action_sign_series = (
+            pd.to_numeric(timeseries_df["action_sign"], errors="coerce").fillna(0.0)
+            if "action_sign" in timeseries_df.columns
+            else pd.Series(dtype=float)
+        )
+
+        summary_payload = {
+            "episode": int(episode_num),
+            "rows": int(len(timeseries_df)),
+            "tail_rows": int(tail_n),
+            "source_csv": str(csv_path) if csv_path else "",
+            "exported_at": datetime.now().isoformat(),
+            "clip_frac": float(
+                pd.to_numeric(timeseries_df.get("inv_mean_clip_hit", 0.0), errors="coerce")
+                .fillna(0.0)
+                .mean()
+            )
+            if "inv_mean_clip_hit" in timeseries_df.columns
+            else 0.0,
+            "tail_clip_rate": float(
+                pd.to_numeric(tail_df.get("inv_mean_clip_hit", 0.0), errors="coerce")
+                .fillna(0.0)
+                .mean()
+            )
+            if "inv_mean_clip_hit" in tail_df.columns
+            else 0.0,
+            "final_mean_clip_hit_rate": _safe_float(last_row.get("inv_mean_clip_hit_rate", 0.0)),
+            "final_mu_abs_roll": _safe_float(last_row.get("inv_mu_abs_roll", 0.0)),
+            "final_mu_sign_consistency": _safe_float(last_row.get("inv_mu_sign_consistency", 0.0)),
+            "final_mu_raw": _safe_float(last_row.get("inv_mu_raw", 0.0)),
+            "final_sigma_raw": _safe_float(last_row.get("inv_sigma_raw", 0.0)),
+            "final_tanh_mu": _safe_float(last_row.get("inv_tanh_mu", 0.0)),
+            "final_tanh_a": _safe_float(last_row.get("inv_tanh_a", 0.0)),
+            "final_exposure_exec": _safe_float(last_row.get("exposure_exec", 0.0)),
+            "tail_abs_exposure_mean": float(tail_exposure.abs().mean()) if not tail_exposure.empty else 0.0,
+            "tail_signed_exposure_mean": float(tail_exposure.mean()) if not tail_exposure.empty else 0.0,
+            "tail_near_max_exposure_frac": float((tail_exposure.abs() >= 0.90).mean()) if not tail_exposure.empty else 0.0,
+            "tail_inv_sat_mean": float(
+                pd.to_numeric(tail_df.get("inv_sat_mean", 0.0), errors="coerce").fillna(0.0).mean()
+            )
+            if "inv_sat_mean" in tail_df.columns
+            else 0.0,
+            "tail_inv_sat_sample": float(
+                pd.to_numeric(tail_df.get("inv_sat_sample", 0.0), errors="coerce").fillna(0.0).mean()
+            )
+            if "inv_sat_sample" in tail_df.columns
+            else 0.0,
+            "tail_inv_sat_noise_only": float(
+                pd.to_numeric(tail_df.get("inv_sat_noise_only", 0.0), errors="coerce").fillna(0.0).mean()
+            )
+            if "inv_sat_noise_only" in tail_df.columns
+            else 0.0,
+            "decision_count_long": int(((decision_mask) & (action_sign_series > 0)).sum()),
+            "decision_count_short": int(((decision_mask) & (action_sign_series < 0)).sum()),
+            "decision_count_flat": int(((decision_mask) & (action_sign_series == 0)).sum()),
+        }
+
+        summary_df = pd.DataFrame(
+            [{"metric": k, "value": v} for k, v in summary_payload.items()]
+        )
+        env_summary_df = pd.DataFrame(
+            [{"metric": k, "value": v} for k, v in dict(investor_health_summary or {}).items()]
+        )
+
+        if csv_path:
+            export_dir = os.path.dirname(csv_path)
+            export_basename = os.path.splitext(os.path.basename(csv_path))[0]
+        else:
+            export_dir = getattr(debug_tracker, "log_dir", monitoring_dirs.get("logs", ""))
+            tier_name = getattr(debug_tracker, "tier_name", "training")
+            export_basename = f"{tier_name}_debug_ep{episode_num}"
+        export_path = os.path.join(export_dir, f"{export_basename}_investor_health.xlsx")
+
+        with pd.ExcelWriter(export_path, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, sheet_name="summary", index=False)
+            env_summary_df.to_excel(writer, sheet_name="env_summary", index=False)
+            timeseries_df.to_excel(writer, sheet_name="timeseries", index=False)
+
+        logger.info(f"   [SAVE] Investor health Excel saved: {export_path}")
+        return export_path
+
+    except Exception as e:
+        logger.warning(f"   [WARN] Could not export investor health Excel: {e}")
+        return None
 
 # Portfolio metrics are now logged at every timestep in the debug CSV (first columns)
 # No separate checkpoint summary file needed - all data is in the per-episode CSV files
@@ -466,19 +515,32 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
 
     Args:
         agent: MultiESGAgent instance
-        env: Environment (with optional enhancer_trainer)
+        env: Environment (with optional cv_trainer)
         timesteps: Total timesteps to train
         checkpoint_freq: Frequency of checkpoints
         monitoring_dirs: Monitoring directories
         callbacks: Training callbacks
         resume_from: Resume from checkpoint path
-        dl_train_every: Frequency for online enhancer updates inside the environment
+        dl_train_every: Frequency for online Tier-2 decision-focused updates inside the environment
         preserve_agent_state: If True, don't reset agent state even on first interval (for episode continuity)
     """
     logger.info("Starting Enhanced Training Loop with Memory Monitoring")
     logger.info(f"   Total timesteps: {timesteps:,}")
     logger.info(f"   Checkpoint frequency: {checkpoint_freq:,}")
-    logger.info(f"   DL enhancer training: every {dl_train_every:,} steps (when buffer sufficient)")
+    tier2_overlay_enabled = False
+    try:
+        env_ref = getattr(env, "base_env", getattr(env, "env", env))
+        if hasattr(env_ref, "env"):
+            env_ref = getattr(env_ref, "env", env_ref)
+        cfg_ref = getattr(env_ref, "config", getattr(env, "config", None))
+        tier2_overlay_enabled = bool(getattr(cfg_ref, "forecast_baseline_enable", False))
+    except Exception:
+        tier2_overlay_enabled = False
+
+    if tier2_overlay_enabled:
+        logger.info(f"   Tier-2 decision-focused training: every {dl_train_every:,} steps (when buffer sufficient)")
+    else:
+        logger.info("   Tier-2 decision-focused training: disabled for this run")
 
     # Initialize memory monitoring
     try:
@@ -509,17 +571,12 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                 checkpoint_count = checkpoint_state.get('checkpoint_count', 0)
                 logger.info(f"[OK] Resuming from step {total_trained:,} (checkpoint {checkpoint_count})")
 
-                # Load DL Enhancer weights when resuming
-                if hasattr(env, 'enhancer_adapter') and env.enhancer_adapter is not None:
+                # Load Tier-2 routed overlay weights when resuming
+                if hasattr(env, 'control_variate_adapter') and env.control_variate_adapter is not None:
                     clear_tf_session()
-                    fd = env.enhancer_adapter.feature_dim
-                    enh_path = os.path.join(resume_from, _enhancer_weights_filename(fd))
-                    if os.path.exists(enh_path):
-                        try:
-                            env.enhancer_adapter.model.load_weights(enh_path)
-                            logger.info(f"[OK] Loaded DL enhancer weights from {enh_path}")
-                        except Exception as e:
-                            logger.warning(f"[WARN] Could not load enhancer weights: {e}")
+                    cv_path = os.path.join(resume_from, _cv_weights_filename())
+                    if not env.control_variate_adapter.load_weights(cv_path):
+                        logger.warning("[WARN] Could not load Tier-2 routed overlay weights")
             else:
                 logger.warning("[WARN] No training state found, starting from step 0")
         else:
@@ -608,9 +665,9 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                 if memory_growth > 2000:  # More than 2GB growth
                     logger.warning(f"[WARN]  High memory usage detected ({current_memory:.1f}MB), triggering cleanup...")
                     try:
-                        # Force cleanup on environment if it has DL enhancer
-                        if hasattr(env, 'enhancer_adapter') and env.enhancer_adapter is not None:
-                            pass  # Enhancer has no explicit cleanup
+                        # Force cleanup on environment if it has the Tier-2 routed overlay
+                        if hasattr(env, 'control_variate_adapter') and env.control_variate_adapter is not None:
+                            pass  # Control variate has no explicit cleanup
 
                         # Force cleanup on wrapper
                         if hasattr(env, '_cleanup_memory_enhanced'):
@@ -1188,17 +1245,14 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         logger.warning(f"   [WARN] No agent training state found - this checkpoint may be from before the fix")
                         logger.warning(f"   [WARN] Agent will start with total_steps=0 (learning continuity may be affected)")
 
-                    # Load DL Enhancer weights from episode checkpoint
-                    if args.forecast_baseline_enable and hasattr(base_env, 'enhancer_adapter') and base_env.enhancer_adapter is not None:
+                    # Load Tier-2 residual-layer weights from episode checkpoint
+                    if args.forecast_baseline_enable and hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
                         clear_tf_session()
-                        fd = base_env.enhancer_adapter.feature_dim
-                        enh_path = os.path.join(episode_checkpoint_dir, _enhancer_weights_filename(fd))
-                        if os.path.exists(enh_path):
-                            try:
-                                base_env.enhancer_adapter.model.load_weights(enh_path)
-                                logger.info(f"   [OK] Loaded DL enhancer weights from Episode {args.resume_episode}: {enh_path}")
-                            except Exception as e:
-                                logger.warning(f"   [WARN] Could not load enhancer weights: {e}")
+                        cv_path = os.path.join(episode_checkpoint_dir, _cv_weights_filename())
+                        if base_env.control_variate_adapter.load_weights(cv_path):
+                            logger.info(f"   [OK] Loaded Tier-2 routed overlay weights from Episode {args.resume_episode}: {cv_path}")
+                        else:
+                            logger.warning(f"   [WARN] Could not load Tier-2 routed overlay weights from {cv_path}")
 
                     # Adjust start episode to resume from next episode
                     args.start_episode = args.resume_episode + 1
@@ -1214,6 +1268,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
     # Initialize episode tracking (may be overridden by resume)
     total_trained_all_episodes = locals().get('restored_total_trained', 0)
     successful_episodes = 0
+    last_episode_investor_health = {}
 
     # CRITICAL FIX: Track if we resumed from a checkpoint
     # When resuming from episode N, we've already loaded policies from episode N
@@ -1411,10 +1466,10 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 1.5. EPISODE-SPECIFIC FORECAST MODEL VALIDATION AND CACHE GENERATION
             # Tier-2 requires prebuilt episode-specific forecast models.
             # We validate that the no-leakage forecast models exist for this episode,
-            # then generate/load the forecast cache used by the enhancer feature builder.
+            # then generate/load the forecast cache used by the Tier-2 routed overlay feature builder.
             episode_forecasts_required = bool(args.forecast_baseline_enable)
             if episode_forecasts_required:
-                from episode_forecast_integration import (
+                from forecast_engine import (
                     ensure_episode_forecasts_ready,
                     check_episode_cache_exists,
                     get_episode_forecast_paths
@@ -1422,10 +1477,10 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 
                 logger.info(f"\n   [FORECAST] Preparing Episode {episode_num} forecast models...")
 
-                # NO-LEAKAGE FORECAST TRAINING (rolling 1-year windows):
+                # NO-LEAKAGE FORECAST TRAINING (Tier2 only):
                 # - MARL episode 0 (2015H1) uses forecast models trained on forecast_scenario_00 (2014H1+H2)
-                # - MARL episode k uses forecast models trained on forecast_scenario_{k:02d}
-                # - forecast_scenario_20 (2024H1+H2) is reserved for 2025 evaluation (not used in MARL training)
+                # - MARL episode k uses forecast models trained on forecast_scenario_{k:02d} (prior data, no cheating)
+                # - forecast_scenario_20 (2023+2024) is reserved for 2025 evaluation (unseen data)
                 import os
                 forecast_dataset_dir = getattr(args, "forecast_training_dataset_dir", "forecast_training_dataset")
                 forecast_scenario_file = f"forecast_scenario_{episode_num:02d}.csv"
@@ -1445,12 +1500,13 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     episode_num=episode_num,
                     episode_data_path=forecast_data_path,
                     forecast_base_dir=forecast_base_dir,
-                    cache_base_dir=cache_base_dir
+                    cache_base_dir=cache_base_dir,
+                    config=config,
                 )
                 
                 if not success:
                     logger.error(f"   [ERROR] Missing prebuilt forecast models for Episode {episode_num}")
-                    logger.error(f"   [ERROR] Cannot continue - forecast models are required for the Tier-2 DL enhancer")
+                    logger.error(f"   [ERROR] Cannot continue - forecast models are required for the Tier-2 routed residual-aware overlay")
                     raise RuntimeError(f"Episode {episode_num} forecast model validation failed")
                 
                 # Step 2: Reinitialize forecaster with episode-specific models
@@ -1465,29 +1521,40 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         model_dir=forecast_paths['model_dir'],
                         scaler_dir=forecast_paths['scaler_dir'],
                         metadata_dir=forecast_paths['metadata_dir'],
-                        look_back=24,  # Will be overridden by metadata if available
+                        look_back=int(getattr(config, 'forecast_look_back', 24)),
+                        expert_refresh_stride=int(getattr(config, 'investment_freq', 6)),
                         verbose=args.debug,
-                        fallback_mode=False  # CRITICAL: Fail fast - no fallback allowed
+                        fallback_mode=False,  # CRITICAL: Fail fast - no fallback allowed
+                        config=config,
                     )
                     
                     # Verify models loaded correctly
                     stats = forecaster.get_loading_stats()
-                    logger.info(f"   [STATS] Episode {episode_num} models: {stats['models_loaded']}/{stats['models_attempted']} loaded ({stats['success_rate']:.1f}% success)")
+                    if bool(stats.get('expert_only_mode', False)):
+                        logger.info(
+                            f"   [STATS] Episode {episode_num} short-price experts: "
+                            f"{stats['price_short_experts_loaded']}/{stats['price_short_experts_expected']} "
+                            f"loaded ({stats['success_rate']:.1f}% success)"
+                        )
+                    else:
+                        logger.info(
+                            f"   [STATS] Episode {episode_num} models: "
+                            f"{stats['models_loaded']}/{stats['models_attempted']} "
+                            f"loaded ({stats['success_rate']:.1f}% success)"
+                        )
                     models_loaded = int(stats.get('models_loaded', 0) or 0)
                     models_attempted = int(stats.get('models_attempted', 0) or 0)
                     scalers_loaded = int(stats.get('scalers_loaded', 0) or 0)
                     scalers_attempted = int(stats.get('scalers_attempted', 0) or 0)
+                    experts_loaded = int(stats.get('price_short_experts_loaded', 0) or 0)
+                    experts_expected = int(stats.get('price_short_experts_expected', 0) or 0)
 
-                    if (
-                        bool(stats.get('fallback_mode', False))
-                        or models_loaded <= 0
-                        or models_loaded != models_attempted
-                        or scalers_loaded != scalers_attempted
-                    ):
+                    if not bool(getattr(forecaster, 'is_complete_stack', lambda: False)()):
                         error_msg = (
                             f"Episode {episode_num} forecast models failed to load!\n"
                             f"   Models loaded: {models_loaded}/{models_attempted}\n"
                             f"   Scalers loaded: {scalers_loaded}/{scalers_attempted}\n"
+                            f"   Price experts loaded: {experts_loaded}/{experts_expected}\n"
                             f"   Fallback mode: {bool(stats.get('fallback_mode', False))}\n"
                             f"   Model directory: {forecast_paths['model_dir']}\n"
                             f"   Scaler directory: {forecast_paths['scaler_dir']}\n"
@@ -1496,7 +1563,16 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         logger.error(f"   [ERROR] {error_msg}")
                         raise RuntimeError(error_msg)
                     
-                    logger.info(f"   [OK] Forecaster reinitialized with Episode {episode_num} models ({stats['models_loaded']} models loaded)")
+                    if bool(stats.get('expert_only_mode', False)):
+                        logger.info(
+                            f"   [OK] Forecaster reinitialized with Episode {episode_num} short-price expert bank "
+                            f"({experts_loaded}/{experts_expected} experts loaded)"
+                        )
+                    else:
+                        logger.info(
+                            f"   [OK] Forecaster reinitialized with Episode {episode_num} models "
+                            f"({stats['models_loaded']} models loaded)"
+                        )
                 except Exception as e:
                     error_msg = f"Episode {episode_num} forecaster reinitialization failed: {e} - cannot continue (no fallback)"
                     logger.error(f"   [ERROR] {error_msg}")
@@ -1533,7 +1609,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         logger.info(f"   [OK] Episode {episode_num} forecasts precomputed and cached")
                 except Exception as pe:
                     logger.error(f"   [ERROR] Episode {episode_num} forecast precomputation failed: {pe}")
-                    raise  # Fail fast - forecasts are mandatory when the Tier-2 enhancer is enabled
+                    raise  # Fail fast - forecasts are mandatory when the Tier-2 layer is enabled
             elif episode_forecasts_required and forecaster is None:
                 # This should not happen - forecaster should have been initialized above
                 logger.error(f"   [ERROR] Forecasts required but forecaster is None!")
@@ -1578,7 +1654,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 # For episode training, CalibrationTracker must be initialized per-episode with episode-specific forecaster
                 if args.forecast_baseline_enable and forecaster is not None:
                     try:
-                        from dl_enhancer import CalibrationTracker
+                        from tier2_routed_overlay import CalibrationTracker
                         episode_base_env.calibration_tracker = CalibrationTracker(
                             window_size=config.forecast_trust_window,
                             trust_metric=config.forecast_trust_metric,
@@ -1598,13 +1674,13 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 else:
                     episode_base_env.calibration_tracker = None
                     if args.forecast_baseline_enable and forecaster is None:
-                        msg = "   [WARN] Tier-2 enhancer enabled but forecaster is None - CalibrationTracker not initialized"
+                        msg = "   [WARN] Tier-2 layer enabled but forecaster is None - CalibrationTracker not initialized"
                         if bool(getattr(config, "fgb_fail_fast", False)):
                             raise RuntimeError(msg)
                         logger.warning(msg)
 
                 logger.debug(f"   [DEBUG] episode_base_env.forecast_generator = {episode_base_env.forecast_generator}")
-                logger.debug(f"   [DEBUG] Enhancer feature_dim = {getattr(base_env, 'enhancer_feature_dim', 'N/A')}")
+                logger.debug(f"   [DEBUG] Tier-2 routed overlay on base_env = {getattr(base_env, 'control_variate_adapter', None) is not None}")
 
                 # MEMORY FIX: Explicitly clear episode data from memory after env creation
                 # Keep only essential references
@@ -1622,52 +1698,44 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             episode_base_env.reset()
             logger.info(f"   [OK] Episode environment initialized")
 
-            # CRITICAL: Initialize Tier-2 enhancer state for the episode environment.
-            # FIXED: For episode training, reuse the enhancer from base_env (initialized at startup)
+            # CRITICAL: Initialize Tier-2 layer state for the episode environment.
+            # FIXED: For episode training, reuse the Tier-2 routed overlay from base_env (initialized at startup)
             # This prevents dimension changes per-episode, avoiding policy recreation
             if args.forecast_baseline_enable:
                 if args.episode_training:
-                    # EPISODE TRAINING MODE: Reuse DL enhancer from base_env (initialized at startup with correct dimensions)
-                    # This ensures episode environments have the same enhancer structure, preventing dimension mismatches
-                    if hasattr(base_env, 'enhancer_adapter') and base_env.enhancer_adapter is not None:
+                    # EPISODE TRAINING MODE: Reuse the Tier-2 routed overlay from base_env (initialized at startup with correct dimensions)
+                    # This ensures episode environments have the same Tier-2 structure, preventing dimension mismatches
+                    if hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
                         try:
-                            episode_base_env.enhancer_adapter = base_env.enhancer_adapter
-                            episode_base_env.enhancer_trainer = base_env.enhancer_trainer
-                            episode_base_env.enhancer_adapter = getattr(base_env, 'enhancer_adapter', None)
-                            episode_base_env.enhancer_trainer = getattr(base_env, 'enhancer_trainer', None)
-                            episode_base_env.feature_dim = base_env.feature_dim
-                            episode_base_env.enhancer_feature_dim = getattr(base_env, 'enhancer_feature_dim', None)
-                            # Attach forecaster to episode environment for Tier-2 enhancer features
+                            episode_base_env.control_variate_adapter = getattr(base_env, 'control_variate_adapter', None)
+                            episode_base_env.cv_trainer = getattr(base_env, 'cv_trainer', None)
+                            episode_base_env.cv_experience_buffer = getattr(base_env, 'cv_experience_buffer', None)
+                            # Attach forecaster to episode environment for Tier-2 routed-feature construction
                             if forecaster is not None:
                                 episode_base_env.forecast_generator = forecaster
                             logger.info(
-                                f"   [OK] DL enhancer linked from base_env to episode environment "
-                                f"(enhancer_feature_dim={episode_base_env.enhancer_feature_dim})"
+                                f"   [OK] Tier-2 routed overlay linked from base_env to episode environment"
                             )
                         except Exception as e:
                             raise RuntimeError(
-                                f"[ENHANCER_EPISODE_FATAL] Failed to link DL enhancer from base_env to episode {episode_num}: {e}"
+                                f"[TIER2_EPISODE_FATAL] Failed to link Tier-2 routed overlay from base_env to episode {episode_num}: {e}"
                             ) from e
                     else:
                         raise RuntimeError(
-                            f"[ENHANCER_EPISODE_FATAL] Forecast baseline enabled but base_env.enhancer_adapter is missing for episode {episode_num}."
+                            f"[TIER2_EPISODE_FATAL] Forecast baseline enabled but base_env.control_variate_adapter is missing for episode {episode_num}."
                         )
                 else:
-                    # NON-EPISODE TRAINING MODE: Reuse the same DL enhancer from base_env for consistency
-                    if hasattr(base_env, 'enhancer_adapter') and base_env.enhancer_adapter is not None:
+                    # NON-EPISODE TRAINING MODE: Reuse the same Tier-2 routed overlay from base_env for consistency
+                    if hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
                         try:
-                            episode_base_env.enhancer_adapter = base_env.enhancer_adapter
-                            episode_base_env.enhancer_trainer = base_env.enhancer_trainer
-                            episode_base_env.enhancer_adapter = getattr(base_env, 'enhancer_adapter', None)
-                            episode_base_env.enhancer_trainer = getattr(base_env, 'enhancer_trainer', None)
-                            episode_base_env.feature_dim = base_env.feature_dim
-                            episode_base_env.enhancer_feature_dim = getattr(base_env, 'enhancer_feature_dim', None)
+                            episode_base_env.control_variate_adapter = base_env.control_variate_adapter
+                            episode_base_env.cv_trainer = base_env.cv_trainer
+                            episode_base_env.cv_experience_buffer = base_env.cv_experience_buffer
                             logger.info(
-                                f"   [OK] DL enhancer linked to episode environment "
-                                f"(enhancer_feature_dim={episode_base_env.enhancer_feature_dim})"
+                                f"   [OK] Tier-2 routed overlay linked to episode environment"
                             )
                         except Exception as e:
-                            logger.warning(f"Failed to link DL enhancer to episode: {e}")
+                            logger.warning(f"Failed to link Tier-2 routed overlay to episode: {e}")
 
             # Forecasts are never appended to agent observations.
             # Use the base environment as-is (Tier-1 observation spaces remain unchanged).
@@ -1752,33 +1820,29 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             else:
                 logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh policies")
 
-            if hasattr(episode_base_env, 'enhancer_adapter') and episode_base_env.enhancer_adapter is not None:
-                episode_base_env.feature_dim = ENHANCER_BASE_FEATURE_DIM
-                episode_base_env.enhancer_feature_dim = int(episode_base_env.enhancer_adapter.feature_dim)
-
-                # Load DL enhancer weights from PREVIOUS episode to continue learning
+            if hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter is not None:
+                # Load Tier-2 routed overlay weights from PREVIOUS episode to continue learning
                 # CRITICAL FIX: When resuming, the first episode after resume should load from the resume episode
                 if should_load_previous:
                     prev_episode_num = episode_num - 1
                     prev_episode_checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"episode_{prev_episode_num}")
 
                     if os.path.exists(prev_episode_checkpoint_dir):
-                        # Load enhancer weights from previous episode
-                        if hasattr(episode_base_env, 'enhancer_adapter') and episode_base_env.enhancer_adapter is not None:
-                            fd = episode_base_env.enhancer_adapter.feature_dim
-                            enh_path = os.path.join(prev_episode_checkpoint_dir, _enhancer_weights_filename(fd))
-                            if os.path.exists(enh_path):
+                        # Load Tier-2 routed overlay weights from previous episode
+                        if hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter is not None:
+                            cv_path = os.path.join(prev_episode_checkpoint_dir, _cv_weights_filename())
+                            if os.path.exists(cv_path):
                                 try:
-                                    episode_base_env.enhancer_adapter.model.load_weights(enh_path)
-                                    logger.info(f"   [OK] Loaded DL enhancer weights ({fd}D) from Episode {prev_episode_num}")
+                                    episode_base_env.control_variate_adapter.load_weights(cv_path)
+                                    logger.info(f"   [OK] Loaded Tier-2 routed overlay weights from Episode {prev_episode_num}")
                                 except Exception as e:
-                                    logger.warning(f"   [WARN] Could not load enhancer weights: {e}")
+                                    logger.warning(f"   [WARN] Could not load Tier-2 routed overlay weights: {e}")
                         else:
-                            logger.info(f"   [INFO] Starting Episode {episode_num} with fresh DL enhancer - no compatible weights from Episode {prev_episode_num}")
+                            logger.info(f"   [INFO] Starting Episode {episode_num} with fresh Tier-2 routed overlay weights - no compatible checkpoint from Episode {prev_episode_num}")
                     else:
                         logger.warning(f"   [WARN] Previous episode checkpoint not found: {prev_episode_checkpoint_dir}")
                 else:
-                    logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh DL weights")
+                    logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh Tier-2 routed overlay weights")
 
             # CRITICAL FIX: Reset RL agent buffers AND internal state for new episode data
             # FIX: Use comprehensive reset method that handles optimizer states and learning rate schedules
@@ -1841,7 +1905,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 monitoring_dirs=monitoring_dirs,
                 callbacks=callbacks,
                 resume_from=None,  # Each episode starts fresh with data
-                dl_train_every=args.dl_train_every,  # Pass enhancer training frequency
+                dl_train_every=args.dl_train_every,  # Pass Tier-2 training frequency
                 preserve_agent_state=preserve_state  # CRITICAL: Preserve learning continuity across episodes
             )
 
@@ -1857,6 +1921,21 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             logger.info(f"   Steps trained: {episode_trained:,}")
             logger.info(f"   Total progress: {successful_episodes}/{args.end_episode - args.start_episode + 1} episodes")
 
+            episode_investor_health = {}
+            try:
+                if hasattr(episode_env, "get_investor_health_summary"):
+                    episode_investor_health = dict(episode_env.get_investor_health_summary() or {})
+                    last_episode_investor_health = dict(episode_investor_health)
+                    logger.info(
+                        "   [INV_HEALTH] "
+                        f"clip_rate={float(episode_investor_health.get('mean_clip_hit_rate', 0.0)):.3f} "
+                        f"mu_abs={float(episode_investor_health.get('mu_abs_roll', 0.0)):.3f} "
+                        f"sign_cons={float(episode_investor_health.get('mu_sign_consistency', 0.0)):.3f} "
+                        f"sigma={float(episode_investor_health.get('policy_sigma_raw', 0.0)):.3f}"
+                    )
+            except Exception as e:
+                logger.warning(f"   [WARN] Could not capture investor health summary: {e}")
+
             # [ALERT] CRITICAL: Print final NAV at end of episode
             print_portfolio_summary(episode_env, episode_trained)
 
@@ -1865,18 +1944,17 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             os.makedirs(episode_checkpoint_dir, exist_ok=True)
             agent.save_policies(episode_checkpoint_dir)
 
-            # 7.1 CRITICAL: Save DL enhancer weights for episode checkpoint
-            enhancer_env = episode_env if hasattr(episode_env, 'enhancer_adapter') and episode_env.enhancer_adapter else (
-                episode_base_env if 'episode_base_env' in locals() and hasattr(episode_base_env, 'enhancer_adapter') and episode_base_env.enhancer_adapter else None
+            # 7.1 CRITICAL: Save Tier-2 routed overlay weights for episode checkpoint
+            cv_env = episode_env if hasattr(episode_env, 'control_variate_adapter') and episode_env.control_variate_adapter else (
+                episode_base_env if 'episode_base_env' in locals() and hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter else None
             )
-            if enhancer_env is not None and enhancer_env.enhancer_adapter is not None:
+            if cv_env is not None and cv_env.control_variate_adapter is not None:
                 try:
-                    fd = enhancer_env.enhancer_adapter.feature_dim
-                    enh_path = os.path.join(episode_checkpoint_dir, _enhancer_weights_filename(fd))
-                    enhancer_env.enhancer_adapter.model.save_weights(enh_path)
-                    logger.info(f"   [SAVE] DL enhancer weights ({fd}D) saved: {enh_path}")
+                    cv_path = os.path.join(episode_checkpoint_dir, _cv_weights_filename())
+                    if cv_env.control_variate_adapter.save_weights(cv_path):
+                        logger.info(f"   [SAVE] Tier-2 routed overlay weights saved: {cv_path}")
                 except Exception as e:
-                    logger.warning(f"   [WARN] Could not save DL enhancer weights: {e}")
+                    logger.warning(f"   [WARN] Could not save Tier-2 routed overlay weights: {e}")
 
             # 7.2 CRITICAL: Save agent training state (total_steps, etc.)
             try:
@@ -1889,6 +1967,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     'timestamp': datetime.now().isoformat(),
                     'training_metrics': getattr(agent, '_training_metrics', {}),
                     'consecutive_errors': getattr(agent, '_consecutive_errors', 0),
+                    'investor_health': episode_investor_health,
                     'rolling_past_state': _capture_rolling_past_state(config),
                 }
                 with open(agent_state_path, 'w') as f:
@@ -1896,6 +1975,16 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 logger.info(f"   [SAVE] Agent training state saved: {agent_state_path}")
             except Exception as e:
                 logger.warning(f"   [WARN] Could not save agent training state: {e}")
+
+            try:
+                _export_episode_investor_health_excel(
+                    episode_env=episode_env,
+                    episode_num=episode_num,
+                    monitoring_dirs=monitoring_dirs,
+                    investor_health_summary=episode_investor_health,
+                )
+            except Exception as e:
+                logger.warning(f"   [WARN] Investor health Excel export failed: {e}")
 
             logger.info(f"   [SAVE] Episode checkpoint saved: {episode_checkpoint_dir}")
 
@@ -2111,18 +2200,17 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             try:
                 agent.save_policies(emergency_dir)
 
-                # Save DL enhancer weights for emergency checkpoint
-                enhancer_env = episode_env if 'episode_env' in locals() and hasattr(episode_env, 'enhancer_adapter') and episode_env.enhancer_adapter else (
-                    episode_base_env if 'episode_base_env' in locals() and hasattr(episode_base_env, 'enhancer_adapter') and episode_base_env.enhancer_adapter else None
+                # Save Tier-2 routed overlay weights for emergency checkpoint
+                cv_env = episode_env if 'episode_env' in locals() and hasattr(episode_env, 'control_variate_adapter') and episode_env.control_variate_adapter else (
+                    episode_base_env if 'episode_base_env' in locals() and hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter else None
                 )
-                if enhancer_env is not None and enhancer_env.enhancer_adapter is not None:
+                if cv_env is not None and cv_env.control_variate_adapter is not None:
                     try:
-                        fd = enhancer_env.enhancer_adapter.feature_dim
-                        enh_path = os.path.join(emergency_dir, _enhancer_weights_filename(fd))
-                        enhancer_env.enhancer_adapter.model.save_weights(enh_path)
-                        logger.info(f"   [SAVE] Emergency DL enhancer weights saved: {enh_path}")
+                        cv_path = os.path.join(emergency_dir, _cv_weights_filename())
+                        if cv_env.control_variate_adapter.save_weights(cv_path):
+                            logger.info(f"   [SAVE] Emergency Tier-2 routed overlay weights saved: {cv_path}")
                     except Exception as dl_save_error:
-                        logger.warning(f"   [WARN] Emergency DL enhancer save failed: {dl_save_error}")
+                        logger.warning(f"   [WARN] Emergency Tier-2 routed overlay save failed: {dl_save_error}")
 
                 # Save agent training state for emergency checkpoint
                 try:
@@ -2165,79 +2253,149 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 # Main
 # =====================================================================
 
-def initialize_dl_enhancer(env: RenewableMultiAgentEnv, config, args) -> bool:
+def initialize_tier2_routed_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
     """
-    Initialize Tier-2 DL Enhancer for an environment.
+    Initialize the Tier-2 short-horizon price-expert routed overlay.
 
-    Called when --forecast_baseline_enable. Only the DL enhancer is used for
-    Tier-2 exposure adjustment.
+    Called when --forecast_baseline_enable. Uses (state, forecast) to learn a
+    compact short-horizon investor-only controller:
+    - an abstain-or-route head over short-horizon forecast experts
+    - a normalized override head used by the Tier-2 exposure overlay
+    - an intervention-confidence head used for calibration and diagnostics
     """
     if not bool(getattr(args, "forecast_baseline_enable", False)):
         return False
 
     try:
-        from config import TIER2_ENHANCER_FEATURE_DIM, TIER2_ENHANCER_ABLATED_FEATURE_DIM
-        from dl_enhancer import EnhancerAdapter, EnhancerTrainer
-        ablate = bool(getattr(config, "tier2_enhancer_ablate_forecast_features", False))
-        feature_dim = int(TIER2_ENHANCER_ABLATED_FEATURE_DIM if ablate else TIER2_ENHANCER_FEATURE_DIM)
-        logger.info(f"[DL] Initializing Tier-2 DL Enhancer ({feature_dim}D{' ablated' if ablate else ''})")
-        logger.debug(f"[DEBUG] env.forecast_generator = {env.forecast_generator}")
+        from tier2_routed_overlay import (
+            Tier2RoutedOverlayAdapter,
+            Tier2RoutedOverlayTrainer,
+            Tier2ExperienceBuffer,
+            TIER2_ROUTED_OVERLAY_FEATURE_DIM,
+        )
+        obs_dim = int(env.observation_spaces["investor_0"].shape[0])
+        forecast_dim = int(
+            getattr(
+                config,
+                "tier2_feature_dim",
+                getattr(config, "cv_forecast_dim", TIER2_ROUTED_OVERLAY_FEATURE_DIM),
+            )
+            or TIER2_ROUTED_OVERLAY_FEATURE_DIM
+        )
+        seed = int(getattr(args, "seed", 42))
+        cv_lr = float(
+            getattr(
+                config,
+                "tier2_cv_lr",
+                getattr(config, "cv_learning_rate", 1e-3),
+            ) or 1e-3
+        )
+        cv_l2 = float(getattr(config, "cv_l2_reg", 1e-4) or 1e-4)
+
+        logger.info(f"[DL] Initializing Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller (obs={obs_dim}, forecast={forecast_dim})")
 
         if env.forecast_generator is None:
             episode_training_mode = getattr(args, 'episode_training', False)
             if not episode_training_mode:
-                raise ValueError("DL Enhancer requires forecast_generator. Forecasts are mandatory.")
-            logger.info("[EPISODE_TRAINING] DL Enhancer: Initializing at startup without forecaster (will be attached per-episode)")
+                raise ValueError("Tier-2 routed overlay requires forecast_generator. Forecasts are mandatory.")
+            logger.info("[EPISODE_TRAINING] Tier-2 routed overlay: initializing at startup without forecaster (will be attached per-episode)")
 
-        delta_max = float(getattr(config, "tier2_enhancer_delta_max", 0.35) or 0.35)
-        enhancer_lr = float(getattr(config, "tier2_enhancer_lr", 3e-3) or 3e-3)
-        intervention_l1 = float(getattr(config, "tier2_enhancer_intervention_l1", 0.02) or 0.0)
-        uncertainty_discount = float(getattr(config, "tier2_enhancer_uncertainty_discount", 1.10) or 1.10)
-        overconfidence_penalty = float(
-            getattr(config, "tier2_enhancer_overconfidence_penalty", 0.03) or 0.03
-        )
-        direction_loss_weight = float(
-            getattr(config, "tier2_enhancer_direction_loss_weight", 0.08) or 0.0
-        )
-        sharpe_loss_weight = float(
-            getattr(config, "tier2_enhancer_sharpe_loss_weight", 0.30) or 0.0
-        )
-        seed = int(getattr(args, "seed", 42))
-        enhancer_adapter = EnhancerAdapter(
-            feature_dim=feature_dim,
-            delta_max=delta_max,
+        cv_adapter = Tier2RoutedOverlayAdapter(
+            obs_dim=obs_dim,
+            forecast_dim=forecast_dim,
+            memory_steps=int(getattr(config, "tier2_cv_memory_steps", 2) or 2),
             seed=seed,
-            uncertainty_discount=uncertainty_discount,
         )
-        enhancer_trainer = EnhancerTrainer(
-            model=enhancer_adapter.model,
-            delta_max=delta_max,
-            learning_rate=enhancer_lr,
+        cv_trainer = Tier2RoutedOverlayTrainer(
+            model=cv_adapter.model,
+            obs_dim=obs_dim,
+            forecast_dim=forecast_dim,
+            learning_rate=cv_lr,
+            l2_reg=cv_l2,
             seed=seed,
-            intervention_l1=intervention_l1,
-            overconfidence_penalty=overconfidence_penalty,
-            direction_loss_weight=direction_loss_weight,
-            sharpe_loss_weight=sharpe_loss_weight,
+            replay_batch_size=int(
+                getattr(config, "tier2_cv_batch_size", 64)
+            ),
+            train_epochs=int(getattr(config, "tier2_cv_train_epochs", 1) or 1),
+            route_loss_weight=float(getattr(config, "tier2_cv_route_loss_weight", 0.35) or 0.35),
+            override_loss_weight=float(getattr(config, "tier2_cv_override_loss_weight", 0.25) or 0.25),
+            decision_weight=float(
+                getattr(
+                    config,
+                    "tier2_cv_decision_loss_weight",
+                    0.35,
+                ) or 0.35
+            ),
+            confidence_weight=float(getattr(config, "tier2_cv_confidence_loss_weight", 0.15) or 0.15),
+            decision_horizon=int(
+                getattr(
+                    config,
+                    "tier2_cv_decision_horizon",
+                    4,
+                ) or 4
+            ),
+            decision_scale=float(
+                getattr(
+                    config,
+                    "tier2_cv_decision_scale",
+                    0.05,
+                ) or 0.05
+            ),
+            decision_downside_weight=float(
+                getattr(
+                    config,
+                    "tier2_cv_decision_downside_weight",
+                    0.75,
+                ) or 0.75
+            ),
+            decision_vol_weight=float(
+                getattr(
+                    config,
+                    "tier2_cv_decision_vol_weight",
+                    0.25,
+                ) or 0.25
+            ),
+            decision_stability_penalty=float(getattr(config, "tier2_cv_decision_stability_penalty", 0.12) or 0.12),
+            magnitude_grid_points=int(getattr(config, "tier2_cv_route_grid_points", 11) or 11),
+            conformal_risk_scale=float(getattr(config, "tier2_cv_conformal_scale", 1.0) or 1.0),
+            delta_limit=float(
+                max(
+                    float(getattr(config, "tier2_cv_delta_max", 0.20) or 0.20),
+                    1e-6,
+                )
+            ),
+            runtime_gain=float(
+                np.clip(float(getattr(config, "tier2_runtime_gain", 0.65) or 0.65), 0.0, 1.0)
+            ),
+            runtime_conformal_margin=float(
+                max(getattr(config, "tier2_runtime_conformal_margin", 0.05) or 0.05, 0.0)
+            ),
         )
-        env.enhancer_adapter = enhancer_adapter
-        env.enhancer_trainer = enhancer_trainer
-        env.feature_dim = ENHANCER_BASE_FEATURE_DIM
-        env.enhancer_feature_dim = feature_dim
+        cv_buffer = Tier2ExperienceBuffer(max_size=50_000, replay_size=20_000, seed=seed)
+
+        env.control_variate_adapter = cv_adapter
+        env.cv_trainer = cv_trainer
+        env.cv_experience_buffer = cv_buffer
+        env.tier2_overlay_adapter = cv_adapter
+        env.tier2_overlay_trainer = cv_trainer
+        env.tier2_experience_buffer = cv_buffer
+        env.tier2_feature_dim = forecast_dim
+        env.cv_feature_dim = forecast_dim  # Backward-compatible alias
         logger.info(
-            f"   [OK] Tier-2 DL Enhancer initialized "
-            f"({feature_dim}D, delta_max={delta_max:.3f}, lr={enhancer_lr:.6f}, "
-            f"memory_steps={getattr(config, 'tier2_enhancer_memory_steps', 3)}, "
-            f"l1={intervention_l1:.3f}, dir_loss={direction_loss_weight:.3f}, "
-            f"sharpe_loss={sharpe_loss_weight:.3f}, seed={seed})"
+            f"   [OK] Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller initialized "
+            f"(obs={obs_dim}, forecast={forecast_dim}, lr={cv_lr:.2e}, l2={cv_l2:.2e})"
         )
         return True
 
     except Exception as e:
-        logger.error(f"[ENHANCER_INIT_FATAL] Failed to initialize DL enhancer: {e}")
-        env.enhancer_adapter = None
-        env.enhancer_trainer = None
-        env.enhancer_feature_dim = None
-        raise RuntimeError("[ENHANCER_INIT_FATAL] DL enhancer initialization failed") from e
+        logger.error(f"[TIER2_INIT_FATAL] Failed to initialize the Tier-2 routed overlay: {e}")
+        env.control_variate_adapter = None
+        env.cv_trainer = None
+        env.cv_experience_buffer = None
+        env.tier2_overlay_adapter = None
+        env.tier2_overlay_trainer = None
+        env.tier2_experience_buffer = None
+        raise RuntimeError("[TIER2_INIT_FATAL] Tier-2 routed overlay initialization failed") from e
 
 
 def main():
@@ -2248,8 +2406,8 @@ def main():
     parser.add_argument("--investment_freq", type=int, default=6, help="Investor action frequency in steps")
     parser.add_argument("--meta_freq_min", type=int, default=None, help="Minimum live investor trade cadence in steps (default: config.meta_freq_min).")
     parser.add_argument("--meta_freq_max", type=int, default=None, help="Maximum live investor trade cadence in steps (default: config.meta_freq_max).")
-    parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models", help="Dir with trained forecast models (NEW: Updated to Forecast_ANN structure)")
-    parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers", help="Dir with trained scalers (NEW: Updated to Forecast_ANN structure)")
+    parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models", help="Legacy standalone forecast compatibility path; tiered runs use --forecast_base_dir episode expert-bank artifacts instead.")
+    parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers", help="Legacy standalone forecast compatibility path; tiered runs use episode expert-bank scalers instead.")
     parser.add_argument("--forecast_training_data", type=str, default="training_dataset/trainset.csv", help="Path to training dataset for episode-specific forecast training")
     parser.add_argument("--forecast_base_dir", type=str, default="forecast_models", help="Base directory for episode-specific forecast models (episode_N subdirectories)")
     parser.add_argument(
@@ -2260,7 +2418,7 @@ def main():
             "Directory containing rolling 1-year forecast training scenarios: "
             "forecast_scenario_00.csv .. forecast_scenario_20.csv. "
             "For MARL episode k, forecast models are trained on forecast_scenario_{k:02d} (no leakage). "
-            "forecast_scenario_20 is reserved for 2025 evaluation."
+            "forecast_scenario_20 (2023+2024) is reserved for 2025 evaluation (unseen data)."
         ),
     )
 
@@ -2286,22 +2444,22 @@ def main():
     parser.add_argument("--expert_blend_weight", type=float, default=0.0, help="Expert suggestion blend weight (0.0=pure PPO, 1.0=pure expert, 0.3=30%% expert)")
     parser.add_argument("--expert_blend_mode", type=str, default="none", choices=["none", "fixed", "adaptive", "residual"],
                        help="Expert blending mode: none (passive hints), fixed (constant blend), adaptive (confidence-based), residual (PPO learns corrections)")
-    parser.add_argument("--dl_train_every", type=int, default=100, help="Tier-2 enhancer online training frequency in environment steps.")
-    parser.add_argument("--tier2_enhancer_lr", type=float, default=None,
-                       help="Tier-2 enhancer optimizer learning rate (default: config.tier2_enhancer_lr).")
+    parser.add_argument("--dl_train_every", type=int, default=100, help="Tier-2 online training frequency in environment steps.")
+    parser.add_argument("--tier2_cv_lr", type=float, default=None,
+                       help="Tier-2 optimizer learning rate (default: config.tier2_cv_lr).")
 
-    # Forecast backend (Tier-2 DL enhancer)
+    # Forecast backend (Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller)
     parser.add_argument("--forecast_baseline_enable", action="store_true", default=False,
-                       help="Enable the Tier-2 DL enhancer runtime path (does NOT change agent observations).")
+                       help="Enable the Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller (keeps Tier-1 observations intact).")
     parser.add_argument("--forecast_trust_window", type=int, default=None, help="Forecast backend: rolling window for trust calibration (default: config.forecast_trust_window).")
     # Default to directional hit-rate for trust calibration. Users can still select "combo" (dir + magnitude).
     parser.add_argument("--forecast_trust_metric", type=str, default="hitrate", choices=["combo", "hitrate", "absdir"], help="Forecast backend: trust computation method (default: hitrate for canonical parity)")
     parser.add_argument("--forecast_trust_boost", type=float, default=None, help="Forecast backend: optional trust optimism boost (default: config.forecast_trust_boost).")
     parser.add_argument(
-        "--tier2_enhancer_ablate_forecast_features",
+        "--tier2_cv_ablate_forecast_features",
         action="store_true",
         default=False,
-        help="Tier-2 ablation: DL enhancer uses 5D non-forecast core only (no forecast features).",
+        help="Tier-2 ablation: the routed residual-aware overlay uses nullified (zero) forecast-memory features.",
     )
 
 
@@ -2320,10 +2478,8 @@ def main():
                         help="PPO gSDE: sample a new noise matrix every n steps (default: config.ppo_sde_sample_freq).")
     parser.add_argument("--ppo_log_std_init", type=float, default=None,
                         help="Override PPO policy log_std_init for continuous actions (e.g., -0.3 to increase exploration).")
-    parser.add_argument("--ppo_mean_clip", type=float, default=None,
-                        help="Override PPO mean-action clip before tanh (default: config.ppo_mean_clip).")
 
-    # Forecasting Control (only used when forecasts are enabled for the Tier-2 DL enhancer)
+    # Forecasting control (only used when forecasts are enabled for the Tier-2 routed residual-aware overlay)
     parser.add_argument("--confidence_floor", type=float, default=0.6, help="Minimum confidence floor (0.0-1.0, default 0.6). MAPE-based confidence cannot go below this value.")
     parser.add_argument(
         "--precompute_batch_size",
@@ -2404,8 +2560,8 @@ def main():
         """
         Automatically resolve configuration dependencies for paper-friendly modes:
 
-        - Baseline (Tier 1): No forecasts, no Tier-2 enhancer (observations unchanged).
-        - Tier-2 DL Enhancer: --forecast_baseline_enable with forecast backend enabled.
+        - Baseline (Tier 1): No forecasts, no Tier-2 layer (observations unchanged).
+        - Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller: --forecast_baseline_enable with forecast backend enabled.
         """
         changes_made = []
 
@@ -2420,9 +2576,9 @@ def main():
 
         # Log mode information
         if args.forecast_baseline_enable:
-            logger.info("[MODE] Tier-2 DL Enhancer: Tier-1 observations + learned exposure adjustment")
+            logger.info("[MODE] Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller: Tier-1 observations + investor-only learned routed override")
         else:
-            logger.info("[MODE] Baseline MARL: no forecasts, no enhancer (Tier-1 observations)")
+            logger.info("[MODE] Tier-1 hybrid RL baseline: no forecasts, no Tier-2 overlay (Tier-1 observations)")
 
         return args
 
@@ -2521,7 +2677,7 @@ def main():
 
     # === OBSERVATION POLICY (TIER-1 OBSERVATION SPACE) ===
     logger.info("\nObservation configuration...")
-    logger.info("[OBS] Investor observations: 6D (Tier-1 base)")
+    logger.info("[OBS] Investor observations: 9D (price_momentum, realized_vol, budget, exposure, mtm_pnl, decision_step, cap_frac, risk_cap, drawdown)")
     config.investment_freq = int(args.investment_freq)
     if args.meta_freq_min is not None:
         config.meta_freq_min = int(args.meta_freq_min)
@@ -2548,9 +2704,6 @@ def main():
     if getattr(args, "ppo_log_std_init", None) is not None:
         config.ppo_log_std_init = float(args.ppo_log_std_init)
         logger.info(f"[PPO] Overriding log_std_init -> {config.ppo_log_std_init}")
-    if getattr(args, "ppo_mean_clip", None) is not None:
-        config.ppo_mean_clip = float(args.ppo_mean_clip)
-        logger.info(f"[PPO] Overriding ppo_mean_clip -> {config.ppo_mean_clip}")
     if bool(getattr(config, "force_disable_sde", False)):
         if config.ppo_use_sde:
             logger.info("[PPO] force_disable_sde=True: overriding use_sde -> False")
@@ -2558,24 +2711,28 @@ def main():
     logger.info(
         f"[PPO] use_sde={config.ppo_use_sde} "
         f"sde_sample_freq={config.ppo_sde_sample_freq} "
-        f"log_std_init={config.ppo_log_std_init} "
-        f"mean_clip={getattr(config, 'ppo_mean_clip', None)}"
+        f"log_std_init={config.ppo_log_std_init}"
+    )
+    logger.info(
+        f"[PPO] investor_beta_policy={bool(getattr(config, 'investor_use_beta_policy', False))} "
+        f"beta_epsilon={float(getattr(config, 'investor_beta_epsilon', 1e-6)):.1e}"
     )
 
     # Apply forecast backend CLI args to config
-    logger.info("\nApplying Tier-2 DL enhancer configuration...")
+    logger.info("\nApplying Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller configuration...")
     config.forecast_baseline_enable = args.forecast_baseline_enable
-    # The manifest reflects the Tier-2 enhancer runtime directly.
-    # initialize_dl_enhancer() will perform concrete adapter construction when forecast_baseline_enable.
+    # The manifest reflects the Tier-2 runtime layer directly.
+    # initialize_tier2_routed_overlay() will perform concrete adapter construction when forecast_baseline_enable.
     if args.forecast_trust_window is not None:
         config.forecast_trust_window = args.forecast_trust_window
     config.forecast_trust_metric = args.forecast_trust_metric
     if args.forecast_trust_boost is not None:
         config.forecast_trust_boost = float(args.forecast_trust_boost)
-    config.tier2_enhancer_ablate_forecast_features = bool(getattr(args, "tier2_enhancer_ablate_forecast_features", False))
-    if args.tier2_enhancer_lr is not None:
-        config.tier2_enhancer_lr = float(args.tier2_enhancer_lr)
-    config.tier2_enhancer_train_every = int(getattr(args, "dl_train_every", 100) or 100)
+    config.tier2_cv_ablate_forecast_features = bool(getattr(args, "tier2_cv_ablate_forecast_features", False))
+    if getattr(args, "tier2_cv_lr", None) is not None:
+        config.tier2_cv_lr = float(args.tier2_cv_lr)
+        config.cv_learning_rate = float(args.tier2_cv_lr)
+    config.tier2_cv_train_every = int(getattr(args, "dl_train_every", 100) or 100)
     if args.global_norm_mode is not None:
         config.use_global_normalization = bool(args.global_norm_mode == "global")
         logger.info(f"[GLOBAL_NORM] global_norm_mode={args.global_norm_mode} -> use_global_normalization={config.use_global_normalization}")
@@ -2583,7 +2740,7 @@ def main():
         config.rolling_past_history_dir = str(args.rolling_past_history_dir)
         logger.info(f"[ROLLING_PAST] history_dir={config.rolling_past_history_dir}")
 
-    # Forecast backend configuration (Tier-2 DL Enhancer)
+    # Forecast backend configuration (Tier-2 residual-aware decision-focused controller)
     logger.info("\nApplying forecast backend configuration...")
     config.fgb_fail_fast = True
     logger.info(
@@ -2599,12 +2756,13 @@ def main():
     if config.expert_blend_mode != 'none':
         logger.info(f"[EXPERT_BLEND] Weight: {config.expert_blend_weight}")
 
-    logger.info(f"\n[TIER2_ENHANCER] Enabled: {bool(config.forecast_baseline_enable)}")
+    logger.info(f"\n[TIER2] Enabled: {bool(config.forecast_baseline_enable)}")
     if bool(config.forecast_baseline_enable):
-        logger.info(
-            f"[TIER2_CONTRACT] live_residual_memory=True "
-            f"delta_max={float(getattr(config, 'tier2_enhancer_delta_max', 0.35) or 0.35):.3f}"
-        )
+            logger.info(
+                f"[TIER2_CONTRACT] architecture={getattr(config, 'tier2_cv_architecture', 'short_horizon_conformal_residual_aware_decision_focused_defer_and_route_controller')} "
+                f"investor_only_overlay=True "
+                f"delta_max={float(getattr(config, 'tier2_cv_delta_max', 0.20) or 0.20):.3f}"
+            )
 
     # DEBUG: Verify forecast backend + expert blending config values.
     logger.info("\n" + "="*70)
@@ -2612,13 +2770,13 @@ def main():
     logger.info("="*70)
     logger.info(f"forecast_baseline_enable:  {config.forecast_baseline_enable}")
     logger.info(f"fgb_fail_fast:             {getattr(config, 'fgb_fail_fast', False)}")
-    logger.info("tier2_mode:                DL Enhancer")
-    logger.info(f"enhancer_lr:               {getattr(config, 'tier2_enhancer_lr', 3e-3)}")
-    logger.info(f"enhancer_train_every:      {getattr(config, 'tier2_enhancer_train_every', 100)}")
-    logger.info(f"enhancer_delta_max:        {getattr(config, 'tier2_enhancer_delta_max', 0.35)}")
-    logger.info(f"enhancer_memory_steps:     {getattr(config, 'tier2_enhancer_memory_steps', 3)}")
-    logger.info(f"enhancer_unit_return_ref:  {getattr(config, 'tier2_enhancer_realized_unit_return_ref', 0.01)}")
-    logger.info(f"enhancer_intervention_l1:  {getattr(config, 'tier2_enhancer_intervention_l1', 0.02)}")
+    logger.info("tier2_mode:                short-horizon conformal residual-aware decision-focused defer-and-route controller")
+    logger.info(f"tier2_lr:            {getattr(config, 'tier2_cv_lr', 3e-3)}")
+    logger.info(f"tier2_train_every:   {getattr(config, 'tier2_cv_train_every', 100)}")
+    logger.info(f"tier2_delta_max:     {getattr(config, 'tier2_cv_delta_max', 0.20)}")
+    logger.info(f"tier2_memory_steps:  {getattr(config, 'tier2_cv_memory_steps', 2)}")
+    logger.info(f"tier2_runtime_gain:  {getattr(config, 'tier2_runtime_gain', 0.65)}")
+    logger.info(f"tier2_mc_samples:    {getattr(config, 'tier2_runtime_mc_samples', 3)}")
     logger.info(f"expert_blend_mode:         {getattr(config, 'expert_blend_mode', 'NOT SET')}")
     logger.info(f"expert_blend_weight:       {getattr(config, 'expert_blend_weight', 'NOT SET')}")
     logger.info("="*70)
@@ -2633,7 +2791,7 @@ def main():
         logger.error(f"  {e}")
         return
 
-    # Validate forecast configuration - forecasts are needed for the Tier-2 DL enhancer.
+    # Validate forecast configuration - forecasts are needed for the Tier-2 routed residual-aware overlay.
     logger.info("\nValidating forecast configuration...")
     forecast_required = bool(args.forecast_baseline_enable)
 
@@ -2666,7 +2824,7 @@ def main():
                 raise FileNotFoundError(error_msg)
             logger.info(f"[OK] Forecast directories validated: model_dir={args.model_dir}, scaler_dir={args.scaler_dir}")
     else:
-        logger.info("[TIER 1] Baseline MARL mode - no forecasts required")
+        logger.info("[TIER 1] Hybrid RL baseline mode - no forecasts required")
 
     # === RUN MANIFEST (REPRODUCIBILITY) ===
     # Write a lightweight JSON manifest capturing argv/args/final config + git hash (if available).
@@ -2736,8 +2894,8 @@ def main():
             return
 
     # 2) Forecaster
-    # Tier 1 (Baseline MARL): No forecasts needed
-    # Tier-2 enhancer mode:
+    # Tier 1 (hybrid RL baseline): No forecasts needed
+    # Tier-2 mode:
     # - forecasts are needed for the short-horizon Tier-2 memory features
     # - forecasts are never injected into policy observations or rewards
     forecaster = None
@@ -2746,8 +2904,8 @@ def main():
     if forecast_required:
         feature_description = []
         if args.forecast_baseline_enable:
-            feature_description.append("Tier-2 DL Enhancer")
-            feature_description.append("29D/5D short-memory enhancer feature builder")
+            feature_description.append("Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller")
+            feature_description.append("26D core+memory Tier-2 state + runtime investor overlay")
 
         # CRITICAL: For episode-based training, skip forecaster initialization at startup
         # Forecaster will be initialized per-episode with episode-specific models
@@ -2759,7 +2917,7 @@ def main():
         else:
             logger.info(f"\nInitializing multi-horizon forecaster (required for: {', '.join(feature_description)})...")
             try:
-                # Auto-detect metadata directory if using Forecast_ANN structure
+                # Auto-detect metadata directory when using the legacy standalone forecast layout
                 metadata_dir = None
                 if "Forecast_ANN" in args.model_dir or os.path.exists(os.path.join(os.path.dirname(args.model_dir), "metadata")):
                     potential_metadata = os.path.join(os.path.dirname(args.model_dir), "metadata")
@@ -2770,32 +2928,42 @@ def main():
                     model_dir=args.model_dir,
                     scaler_dir=args.scaler_dir,
                     metadata_dir=metadata_dir,  # NEW: Auto-detected metadata directory
-                    look_back=24,  # IMPROVED: Default to 24 (will be overridden by metadata if available)
+                    look_back=int(getattr(config, 'forecast_look_back', 24)),
+                    expert_refresh_stride=int(getattr(config, 'investment_freq', 6)),
                     verbose=True,
                     fallback_mode=False,  # CRITICAL: Disable fallback - we need real models
-                    timing_log_path=None  # Timing logging disabled (optional performance monitoring)
+                    timing_log_path=None,  # Timing logging disabled (optional performance monitoring)
+                    config=config,
                 )
                 logger.info("Forecaster initialized successfully!")
 
                 # DIAGNOSTIC: Check if models are actually loaded
                 stats = forecaster.get_loading_stats()
-                logger.info(f"   [STATS] Forecast models: {stats['models_loaded']}/{stats['models_attempted']} loaded ({stats['success_rate']:.1f}% success)")
+                if bool(stats.get('expert_only_mode', False)):
+                    logger.info(
+                        f"   [STATS] Forecast short-price experts: "
+                        f"{stats['price_short_experts_loaded']}/{stats['price_short_experts_expected']} "
+                        f"loaded ({stats['success_rate']:.1f}% success)"
+                    )
+                else:
+                    logger.info(
+                        f"   [STATS] Forecast models: {stats['models_loaded']}/{stats['models_attempted']} "
+                        f"loaded ({stats['success_rate']:.1f}% success)"
+                    )
                 models_loaded = int(stats.get('models_loaded', 0) or 0)
                 models_attempted = int(stats.get('models_attempted', 0) or 0)
                 scalers_loaded = int(stats.get('scalers_loaded', 0) or 0)
                 scalers_attempted = int(stats.get('scalers_attempted', 0) or 0)
+                experts_loaded = int(stats.get('price_short_experts_loaded', 0) or 0)
+                experts_expected = int(stats.get('price_short_experts_expected', 0) or 0)
 
                 # FAIL-FAST: No silent fallback or partial loads allowed when forecasts are required
-                if (
-                    bool(stats.get('fallback_mode', False))
-                    or models_loaded <= 0
-                    or models_loaded != models_attempted
-                    or scalers_loaded != scalers_attempted
-                ):
+                if not bool(getattr(forecaster, 'is_complete_stack', lambda: False)()):
                     error_msg = (
                         f"\n[CRITICAL ERROR] Forecast models failed to load!\n"
                         f"   Models loaded: {models_loaded}/{models_attempted}\n"
                         f"   Scalers loaded: {scalers_loaded}/{scalers_attempted}\n"
+                        f"   Price experts loaded: {experts_loaded}/{experts_expected}\n"
                         f"   Fallback mode: {bool(stats.get('fallback_mode', False))}\n"
                         f"   Required for: {', '.join(feature_description)}\n"
                         f"   Model directory: {args.model_dir}\n"
@@ -2845,9 +3013,9 @@ def main():
                 logger.error(error_msg)
                 raise RuntimeError(error_msg)
     else:
-        logger.info("\n[TIER 1] Baseline MARL mode: Skipping forecaster initialization")
-        logger.info("[TIER 1] Investor observations: 6D (wind, solar, hydro, price, load, budget)")
-        logger.info("[TIER 1] To enable Tier-2 DL Enhancer, use: --forecast_baseline_enable")
+        logger.info("\n[TIER 1] Hybrid RL baseline mode: Skipping forecaster initialization")
+        logger.info("[TIER 1] Investor observations: 9D (price_momentum, realized_vol, budget, exposure, mtm_pnl, decision_step, cap_frac, risk_cap, drawdown)")
+        logger.info("[TIER 1] To enable the Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller, use: --forecast_baseline_enable")
 
     # Re-seed using config.seed to ensure consistency with agent init
     # (config.seed was already set from args.seed above)
@@ -2890,8 +3058,8 @@ def main():
             log_dir=bootstrap_logs_dir  # Keep bootstrap logs isolated in episode training
         )
 
-        # Step 2: Initialize the Tier-2 DL enhancer (shared runtime adapter + trainer)
-        initialize_dl_enhancer(base_env, config, args)
+        # Step 2: Initialize the Tier-2 routed residual-aware overlay (shared runtime adapter + trainer)
+        initialize_tier2_routed_overlay(base_env, config, args)
 
         # Initialize CalibrationTracker for forecast trust computation.
         # CRITICAL: For episode training, CalibrationTracker is initialized per-episode with episode-specific forecaster.
@@ -2900,7 +3068,7 @@ def main():
             base_env.calibration_tracker = None
         elif config.forecast_baseline_enable and forecaster is not None:
             try:
-                from dl_enhancer import CalibrationTracker
+                from tier2_routed_overlay import CalibrationTracker
                 base_env.calibration_tracker = CalibrationTracker(
                     window_size=config.forecast_trust_window,
                     trust_metric=config.forecast_trust_metric,
@@ -2919,7 +3087,7 @@ def main():
         else:
             base_env.calibration_tracker = None
             if config.forecast_baseline_enable and forecaster is None:
-                logger.warning("[WARN] Tier-2 enhancer enabled but forecaster not available - CalibrationTracker not initialized")
+                logger.warning("[WARN] Tier-2 layer enabled but forecaster not available - CalibrationTracker not initialized")
 
         # Forecasts are never appended to agent observations in the paper setup.
         # Use the base environment as-is (Tier-1 observation spaces remain unchanged).
@@ -2967,9 +3135,9 @@ def main():
         
         # Determine active evaluation/training variant (paper modes)
         if args.forecast_baseline_enable:
-            active_variant = "Tier-2 DL Enhancer"
+            active_variant = "Tier-2 Forecast Residual Layer"
         else:
-            active_variant = "Baseline (Tier-1 MARL)"
+            active_variant = "Baseline (Tier-1 hybrid RL)"
         logger.info(f"Active Variant:                 {active_variant}")
         
         if forecaster is not None:
@@ -2982,20 +3150,15 @@ def main():
                 forecaster_status = "NO"
         logger.info(f"Forecaster loaded:              {forecaster_status}")
         if args.forecast_baseline_enable:
-            from config import TIER2_ENHANCER_FEATURE_DIM, TIER2_ENHANCER_ABLATED_FEATURE_DIM
-            enhancer_dim = (
-                TIER2_ENHANCER_ABLATED_FEATURE_DIM
-                if bool(getattr(config, "tier2_enhancer_ablate_forecast_features", False))
-                else TIER2_ENHANCER_FEATURE_DIM
-            )
-            logger.info(f"DL Enhancer enabled:            YES ({enhancer_dim}D)")
+            ablate = bool(getattr(config, "tier2_cv_ablate_forecast_features", False))
+            logger.info(f"Tier-2 layer enabled:          YES (ablated={ablate})")
         else:
-            logger.info("DL Enhancer enabled:            NO")
+            logger.info("Tier-2 layer enabled:          NO")
 
-        # Only show Tier-2 enhancer details if enabled
+        # Only show Tier-2 details if enabled
         if args.forecast_baseline_enable:
-            logger.info("  └─ Tier-2 DL Enhancer:        YES")
-            logger.info("  └─ Mode:                      learned investor exposure adjustment from tight short-horizon forecast features")
+            logger.info("  └─ Tier-2 layer:              YES")
+            logger.info("  └─ Mode:                      investor-only learned defer-and-route override + residual-aware forecast memory")
         else:
             logger.info("Forecast backend mode:          DISABLED")
 
@@ -3006,9 +3169,9 @@ def main():
         if not args.episode_training:
             if args.forecast_baseline_enable and forecaster is None:
                 validation_errors.append("Forecast-guided baseline enabled but forecaster not loaded!")
-        # Validate enhancer when forecast_baseline_enable
-        if not args.episode_training and args.forecast_baseline_enable and (not hasattr(base_env, 'enhancer_adapter') or base_env.enhancer_adapter is None):
-            validation_errors.append("Forecast baseline enabled but enhancer not initialized!")
+        # Validate Tier-2 layer when forecast_baseline_enable
+        if not args.episode_training and args.forecast_baseline_enable and (not hasattr(base_env, 'control_variate_adapter') or base_env.control_variate_adapter is None):
+            validation_errors.append("Forecast baseline enabled but Tier-2 layer not initialized!")
 
         if validation_errors:
             logger.error("\n" + "!"*70)
@@ -3028,7 +3191,7 @@ def main():
         logger.error(f"Failed to setup environment: {e}")
         import traceback
         traceback.print_exc()
-        return
+        raise SystemExit(1) from e
 
     # Optional one-time validation (safe)
     if args.validate_env:
@@ -3039,7 +3202,7 @@ def main():
             logger.warning(f"Env validation reset failed (continuing): {e}")
 
     if args.forecast_baseline_enable:
-        logger.info("DL Enhancer active (Tier-2 exposure adjustment)")
+        logger.info("Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller active")
 
     # 4) (Optional) HPO (best_params already initialized above)
     if args.optimize and not best_params:
@@ -3215,8 +3378,7 @@ def main():
                 monitoring_dirs=monitoring_dirs,
                 callbacks=callbacks,
                 resume_from=args.resume_from,
-                dl_train_every=args.dl_train_every  # Pass enhancer training frequency
-            )
+                dl_train_every=args.dl_train_every              )
 
         logger.info("Enhanced training completed!")
 
@@ -3258,6 +3420,14 @@ def main():
     os.makedirs(final_dir, exist_ok=True)
     saved_count = agent.save_policies(final_dir)
 
+    final_investor_health = dict(locals().get("last_episode_investor_health", {}) or {})
+    if not final_investor_health:
+        try:
+            if hasattr(base_env, "get_investor_health_summary"):
+                final_investor_health = dict(base_env.get_investor_health_summary() or {})
+        except Exception as e:
+            logger.warning(f"Could not capture final investor health summary: {e}")
+
     if saved_count > 0:
         logger.info(f"Saved {saved_count} trained agents to: {final_dir}")
         cfg_file = os.path.join(final_dir, "training_config.json")
@@ -3270,20 +3440,97 @@ def main():
                 'device': args.device,
                 'flags': {
                     'forecast_baseline_enable': bool(getattr(config, 'forecast_baseline_enable', False)),
-                    'tier2_live_overlay': bool(getattr(config, 'forecast_baseline_enable', False)),
+                    'tier2_routed_overlay_enabled': bool(getattr(config, 'forecast_baseline_enable', False)),
+                    'tier2_runtime_overlay_enabled': bool(
+                        getattr(config, 'forecast_baseline_enable', False)
+                        and getattr(config, 'tier2_runtime_overlay_enable', True)
+                        and not getattr(config, 'tier2_cv_ablate_forecast_features', False)
+                    ),
                 },
                 'optimized_params': best_params,
+                'investor_health': final_investor_health,
                 'enhanced_features': {
                     'forecasting_enabled': args.forecast_baseline_enable,
-                    'enhancer_enabled': args.forecast_baseline_enable,
-                    'dl_enhancer_enabled': args.forecast_baseline_enable,
-                    'has_enhancer_weights': args.forecast_baseline_enable and getattr(base_env, "enhancer_adapter", None) is not None,
-                    'short_memory_residual_overlay': bool(args.forecast_baseline_enable),
+                    'tier2_enabled': args.forecast_baseline_enable,
+                    'has_tier2_weights': args.forecast_baseline_enable and getattr(base_env, "control_variate_adapter", None) is not None,
+                    'forecast_routed_overlay_features': bool(
+                        args.forecast_baseline_enable and not getattr(config, 'tier2_cv_ablate_forecast_features', False)
+                    ),
+                    'tier2_runtime_overlay_enabled': bool(
+                        args.forecast_baseline_enable
+                        and getattr(config, 'tier2_runtime_overlay_enable', True)
+                        and not getattr(config, 'tier2_cv_ablate_forecast_features', False)
+                    ),
+                    'tier2_ablated': bool(getattr(config, 'tier2_cv_ablate_forecast_features', False)),
+                    'tier2_contract': (
+                        getattr(config, 'tier2_cv_architecture', 'short_horizon_conformal_residual_aware_decision_focused_defer_and_route_controller')
+                        if bool(getattr(config, 'forecast_baseline_enable', False))
+                        else 'baseline'
+                    ),
+                    'tier2_architecture': getattr(config, 'tier2_cv_architecture', None),
+                    'one_factor_investor_sleeve': True,
                 },
                 'final_config': {
                     'lr': config.lr,
                     'ent_coef': config.ent_coef,
                     'batch_size': config.batch_size,
+                    'ppo_use_sde': getattr(config, 'ppo_use_sde', None),
+                    'ppo_log_std_init': getattr(config, 'ppo_log_std_init', None),
+                    'investor_use_beta_policy': getattr(config, 'investor_use_beta_policy', None),
+                    'investor_beta_epsilon': getattr(config, 'investor_beta_epsilon', None),
+                    'investor_clean_reward_contract': getattr(config, 'investor_clean_reward_contract', None),
+                    'investor_exposure_action_mode': getattr(config, 'investor_exposure_action_mode', None),
+                    'investor_delta_exposure_scale': getattr(config, 'investor_delta_exposure_scale', None),
+                    'investor_trading_return_weight': getattr(config, 'investor_trading_return_weight', None),
+                    'investor_trading_return_clip': getattr(config, 'investor_trading_return_clip', None),
+                    'investor_trading_quality_weight': getattr(config, 'investor_trading_quality_weight', None),
+                    'investor_trading_drawdown_weight': getattr(config, 'investor_trading_drawdown_weight', None),
+                    'investor_trading_cost_weight': getattr(config, 'investor_trading_cost_weight', None),
+                    'investor_active_risk_weight': getattr(config, 'investor_active_risk_weight', None),
+                    'investor_active_risk_free_band': getattr(config, 'investor_active_risk_free_band', None),
+                    'investor_active_risk_vol_mult': getattr(config, 'investor_active_risk_vol_mult', None),
+                    'investor_mean_clip_hit_window': getattr(config, 'investor_mean_clip_hit_window', None),
+                    'investor_mean_clip_hit_threshold': getattr(config, 'investor_mean_clip_hit_threshold', None),
+                    'tier2_cv_lr': getattr(config, 'tier2_cv_lr', None),
+                    'tier2_cv_batch_size': getattr(config, 'tier2_cv_batch_size', None),
+                    'tier2_runtime_overlay_enable': getattr(config, 'tier2_runtime_overlay_enable', None),
+                    'tier2_runtime_gain': getattr(config, 'tier2_runtime_gain', None),
+                    'tier2_runtime_mc_samples': getattr(config, 'tier2_runtime_mc_samples', None),
+                    'tier2_runtime_sigma_scale': getattr(config, 'tier2_runtime_sigma_scale', None),
+                    'tier2_runtime_conformal_margin': getattr(config, 'tier2_runtime_conformal_margin', None),
+                    'tier2_cv_delta_max': getattr(config, 'tier2_cv_delta_max', None),
+                    'tier2_cv_confidence_loss_weight': getattr(config, 'tier2_cv_confidence_loss_weight', None),
+                    'tier2_cv_decision_loss_weight': getattr(config, 'tier2_cv_decision_loss_weight', None),
+                    'tier2_cv_decision_horizon': getattr(config, 'tier2_cv_decision_horizon', None),
+                    'tier2_cv_decision_scale': getattr(config, 'tier2_cv_decision_scale', None),
+                    'tier2_cv_decision_downside_weight': getattr(config, 'tier2_cv_decision_downside_weight', None),
+                    'tier2_cv_decision_vol_weight': getattr(config, 'tier2_cv_decision_vol_weight', None),
+                    'tier2_cv_decision_stability_penalty': getattr(config, 'tier2_cv_decision_stability_penalty', None),
+                    'tier2_cv_route_loss_weight': getattr(config, 'tier2_cv_route_loss_weight', None),
+                    'tier2_cv_override_loss_weight': getattr(config, 'tier2_cv_override_loss_weight', None),
+                    'tier2_cv_route_grid_points': getattr(config, 'tier2_cv_route_grid_points', None),
+                    'tier2_cv_conformal_alpha': getattr(config, 'tier2_cv_conformal_alpha', None),
+                    'tier2_cv_conformal_scale': getattr(config, 'tier2_cv_conformal_scale', None),
+                    'tier2_feature_dim': getattr(config, 'tier2_feature_dim', getattr(config, 'cv_forecast_dim', None)),
+                    'cv_forecast_dim': getattr(config, 'cv_forecast_dim', None),
+                    'tier2_cv_architecture': getattr(config, 'tier2_cv_architecture', None),
+                    'investor_mean_collapse_window': getattr(config, 'investor_mean_collapse_window', None),
+                    'investor_mean_collapse_abs_mean_threshold': getattr(config, 'investor_mean_collapse_abs_mean_threshold', None),
+                    'investor_mean_collapse_sign_threshold': getattr(config, 'investor_mean_collapse_sign_threshold', None),
+                    'meta_freq_min': getattr(config, 'meta_freq_min', None),
+                    'meta_freq_max': getattr(config, 'meta_freq_max', None),
+                    'meta_cap_min': getattr(config, 'meta_cap_min', None),
+                    'meta_cap_max': getattr(config, 'meta_cap_max', None),
+                    'capital_allocation_fraction': getattr(config, 'capital_allocation_fraction', None),
+                    'meta_local_investor_weight': getattr(config, 'meta_local_investor_weight', None),
+                    'meta_local_battery_weight': getattr(config, 'meta_local_battery_weight', None),
+                    'meta_local_risk_weight': getattr(config, 'meta_local_risk_weight', None),
+                    'meta_local_signal_clip': getattr(config, 'meta_local_signal_clip', None),
+                    'meta_capital_alignment_weight': getattr(config, 'meta_capital_alignment_weight', None),
+                    'risk_controller_rule_based': getattr(config, 'risk_controller_rule_based', None),
+                    'meta_controller_rule_based': getattr(config, 'meta_controller_rule_based', None),
+                    'risk_base_reward_weight': getattr(config, 'risk_base_reward_weight', None),
+                    'meta_base_reward_weight': getattr(config, 'meta_base_reward_weight', None),
                     'agent_policies': config.agent_policies,
                     'net_arch': config.net_arch,
                     'activation_fn': config.activation_fn,
@@ -3292,15 +3539,14 @@ def main():
             }, f, indent=2)
         logger.info(f"Training configuration saved to: {cfg_file}")
 
-    # 10) Save the online-trained DL enhancer model (if possible)
-    if args.forecast_baseline_enable and hasattr(base_env, 'enhancer_adapter') and base_env.enhancer_adapter is not None:
+    # 10) Save the online-trained Tier-2 routed overlay weights (if possible)
+    if args.forecast_baseline_enable and hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
         try:
-            fd = base_env.enhancer_adapter.feature_dim
-            enh_path = os.path.join(final_dir, _enhancer_weights_filename(fd))
-            base_env.enhancer_adapter.model.save_weights(enh_path)
-            logger.info(f"[SAVE] DL enhancer weights ({fd}D) saved: {enh_path}")
+            cv_path = os.path.join(final_dir, _cv_weights_filename())
+            if base_env.control_variate_adapter.save_weights(cv_path):
+                logger.info(f"[SAVE] Tier-2 routed overlay weights saved: {cv_path}")
         except Exception as e:
-            logger.warning(f"Could not save DL enhancer weights: {e}")
+            logger.warning(f"Could not save Tier-2 routed overlay weights: {e}")
 
     # 11) Force a final log flush (avoid losing buffered rows)
     try:
@@ -3354,10 +3600,10 @@ def smoke_test():
         return False
 
     try:
-        import dl_enhancer
-        logger.info("[OK] dl_enhancer.py imported successfully")
+        import tier2_routed_overlay
+        logger.info("[OK] tier2_routed_overlay.py imported successfully")
     except Exception as e:
-        logger.error(f"[FAIL] dl_enhancer.py import failed: {e}")
+        logger.error(f"[FAIL] tier2_routed_overlay.py import failed: {e}")
         return False
 
     try:

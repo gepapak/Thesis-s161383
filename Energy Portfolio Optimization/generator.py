@@ -9,11 +9,118 @@ from typing import Dict, List, Optional, Tuple, Any, Mapping
 import pandas as pd
 from collections import deque, OrderedDict
 import logging
+from forecast_price_experts import (
+    PRICE_SHORT_EXPERT_METHODS,
+    PRICE_SHORT_EXPERT_LABELS,
+    PriceShortExpertBank,
+)
 from utils import UnifiedMemoryManager, SafeDivision, configure_tf_memory, _get_tf  # UNIFIED: Import from single source of truth
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # TensorFlow setup (optional)
 # =========================
+
+
+def _is_capacity_factor_data(df: pd.DataFrame) -> bool:
+    """Detect whether renewable generation columns look like capacity factors."""
+    renewable_cols = ["wind", "solar", "hydro"]
+    for col in renewable_cols:
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            max_val = float(np.nanmax(s.values)) if len(s) else 0.0
+            if max_val > 2.0:
+                return False
+    return True
+
+
+def _convert_to_raw_mw_values(df: pd.DataFrame, config=None, mw_scale_overrides=None) -> pd.DataFrame:
+    """Convert capacity-factor data to raw MW values for direct forecasting."""
+    if config and hasattr(config, "mw_conversion_scales"):
+        capacity_mw = config.mw_conversion_scales.copy()
+    else:
+        capacity_mw = {
+            "wind": 1103,
+            "solar": 100,
+            "hydro": 534,
+            "load": 2999,
+        }
+
+    if mw_scale_overrides:
+        for key, value in mw_scale_overrides.items():
+            if value is not None and key in capacity_mw:
+                capacity_mw[key] = float(value)
+                logger.info("[OVERRIDE] Using CLI override for %s: %s MW", key, value)
+
+    df_converted = df.copy()
+    logger.info("[INFO] Converting to raw MW values (no normalization):")
+
+    def _looks_like_capacity_factor(series: pd.Series) -> bool:
+        s = pd.to_numeric(series, errors="coerce")
+        if len(s) == 0:
+            return False
+        max_val = float(np.nanmax(s.values))
+        min_val = float(np.nanmin(s.values))
+        return (max_val <= 2.0) and (min_val >= -0.1)
+
+    for col, capacity in capacity_mw.items():
+        if col in df_converted.columns:
+            original_range = f"[{df[col].min():.3f}, {df[col].max():.3f}]"
+            if _looks_like_capacity_factor(df[col]):
+                df_converted[col] = df[col] * capacity
+                new_range = f"[{df_converted[col].min():.1f}, {df_converted[col].max():.1f}] MW"
+                logger.info("  %s: %s -> %s", col, original_range, new_range)
+            else:
+                logger.info("  %s: %s (kept as-is; already looks like MW)", col, original_range)
+
+    if "price" in df_converted.columns:
+        price_range = f"[{df_converted['price'].min():.1f}, {df_converted['price'].max():.1f}] $/MWh"
+        logger.info("  price: %s (no conversion)", price_range)
+
+    logger.info("[OK] Raw MW conversion complete - ready for direct forecasting")
+    return df_converted
+
+
+def load_energy_data(csv_path: str, convert_to_raw_units: bool = True, config=None, mw_scale_overrides=None) -> pd.DataFrame:
+    """
+    Load energy time series data from CSV with optional MW conversion.
+
+    Requires at least: wind, solar, hydro, price, load.
+    Keeps extra columns if present and parses timestamp when possible.
+    """
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"Data file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    elif {"date", "time"}.issubset(df.columns):
+        df["timestamp"] = pd.to_datetime(
+            df["date"].astype(str) + " " + df["time"].astype(str),
+            errors="coerce",
+        )
+
+    required = ["wind", "solar", "hydro", "price", "load"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in data: {missing}")
+
+    numeric_extra = [c for c in ["risk", "revenue", "battery_energy", "npv"] if c in df.columns]
+    for col in required + numeric_extra:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=required).reset_index(drop=True)
+
+    if convert_to_raw_units and _is_capacity_factor_data(df):
+        logger.info("[INFO] Converting capacity factors to raw MW values for direct forecasting...")
+        df = _convert_to_raw_mw_values(df, config=config, mw_scale_overrides=mw_scale_overrides)
+        logger.info("[OK] Raw MW conversion completed - forecasts will work directly with these units")
+    else:
+        logger.info("[INFO] Data already in raw MW units - ready for direct forecasting")
+
+    return df
 
 def get_gpu_memory_info():
     """Get available GPU memory information."""
@@ -316,15 +423,18 @@ class MultiHorizonForecastGenerator:
         fallback_mode: bool = True,
         # Simple refresh - no throttling complexity
         agent_refresh_stride: int = 1,
+        expert_refresh_stride: int = 6,
         # Data leakage validation
         validate_data_integrity: bool = True,
         rl_train_start_date: Optional[str] = None,
-        timing_log_path: Optional[str] = None): 
+        timing_log_path: Optional[str] = None,
+        config: Optional[Any] = None): 
         self.look_back = int(look_back)
         self.verbose = verbose
         self.metadata_dir = metadata_dir  # Store metadata directory
         self.fallback_mode = fallback_mode
         self.agent_refresh_stride = max(1, int(agent_refresh_stride))
+        self.expert_refresh_stride = max(1, int(expert_refresh_stride))
         self.validate_data_integrity = validate_data_integrity
         self.rl_train_start_date = rl_train_start_date
 
@@ -334,9 +444,18 @@ class MultiHorizonForecastGenerator:
 
         # CANONICAL: Use single source of truth from config for horizon definitions
         try:
-            from config import EnhancedConfig
-            self.config = EnhancedConfig()  # Cache config for reuse
-            self.horizons: Dict[str, int] = self.config.forecast_horizons.copy()
+            if config is not None:
+                self.config = config
+            else:
+                from config import EnhancedConfig
+                self.config = EnhancedConfig()  # Cache config for reuse
+            self.price_short_expert_only = bool(
+                getattr(self.config, "forecast_price_short_expert_only", False)
+            )
+            if self.price_short_expert_only:
+                self.horizons = {"short": int(self.config.forecast_horizons["short"])}
+            else:
+                self.horizons = self.config.forecast_horizons.copy()
         except Exception as e:
             # FAIL-FAST: No hardcoded horizon fallbacks allowed for production safety
             raise ValueError(f"Cannot initialize forecast horizons: config.EnhancedConfig unavailable. "
@@ -346,7 +465,10 @@ class MultiHorizonForecastGenerator:
         # Get forecast targets from config to maintain single source of truth
         try:
             if hasattr(self.config, 'forecast_targets'):
-                self.targets: List[str] = list(self.config.forecast_targets)
+                if self.price_short_expert_only:
+                    self.targets = ["price"]
+                else:
+                    self.targets = list(self.config.forecast_targets)
             else:
                 # If not defined in config, require explicit definition
                 raise ValueError("config.forecast_targets missing. Define forecast targets in config to maintain single source of truth.")
@@ -354,20 +476,18 @@ class MultiHorizonForecastGenerator:
             raise ValueError(f"Cannot initialize forecast targets: {str(e)}. "
                            f"Add forecast_targets to config.EnhancedConfig to maintain single source of truth.")
 
-        # TUNED: Expanded agent horizon assignments for maximum value creation
-        # RESTORED: Include strategic horizon for agents that benefit from long-term planning
-        self.agent_horizons: Dict[str, List[str]] = {
-            "investor_0": ["immediate", "short", "medium", "long"],  # RESTORED: Include long for day-ahead positioning
-            "battery_operator_0": ["immediate", "short", "medium", "long"],  # Battery needs up to day-ahead planning
-            "risk_controller_0": ["immediate", "short", "medium", "long", "strategic"],  # RESTORED: Risk needs multi-day view
-            "meta_controller_0": ["immediate", "short", "medium", "long", "strategic"],  # RESTORED: Meta needs full horizon set
+        # Tier-2 design: price + short horizon only. Legacy multi-target/horizon removed.
+        self.agent_horizons = {
+            "investor_0": ["short"],
+            "battery_operator_0": ["short"],
+            "risk_controller_0": ["short"],
+            "meta_controller_0": ["short"],
         }
-        # TUNED: Optimized agent target assignments for enhanced decision-making
-        self.agent_targets: Dict[str, List[str]] = {
-            "investor_0": ["wind", "solar", "hydro", "price"],           # Financial trading (unchanged - optimal)
-            "battery_operator_0": ["price", "load", "wind"],             # Battery operations (unchanged - optimal)
-            "risk_controller_0": ["price", "wind", "solar", "load"],     # TUNED: Added load for grid stress prediction
-            "meta_controller_0": ["wind", "solar", "hydro", "price", "load"], # Overall coordination (unchanged - comprehensive)
+        self.agent_targets = {
+            "investor_0": ["price"],
+            "battery_operator_0": ["price"],
+            "risk_controller_0": ["price"],
+            "meta_controller_0": ["price"],
         }
 
         # storage
@@ -382,6 +502,8 @@ class MultiHorizonForecastGenerator:
         self._training_caps: Dict[str, float] = {}  # target -> cap value from training
         self._metadata_performance: Dict[str, Dict[str, float]] = {}
         self._loaded_cache_metadata: Dict[str, Any] = {}
+        self._price_short_expert_bank: Optional[PriceShortExpertBank] = None
+        self._precomputed_price_short_experts: Dict[str, np.ndarray] = {}
 
         # caches (LRU-based for better memory management)
         # Use config as single source of truth for cache sizing so memory can be tuned centrally.
@@ -425,7 +547,10 @@ class MultiHorizonForecastGenerator:
             "scalers_attempted": 0,
             "scalers_loaded": 0,
             "loading_errors": [],
+            "price_short_experts_loaded": 0,
+            "price_short_experts_expected": len(PRICE_SHORT_EXPERT_METHODS),
         }
+        self._runtime_fallback_mode = False
         # clip diagnostics
         self._clip_stats = {
             t: {"total": 0, "high": 0, "low": 0} for t in self.targets
@@ -445,6 +570,7 @@ class MultiHorizonForecastGenerator:
         # load and init
         try:
             self._load_models_and_scalers(model_dir, scaler_dir, metadata_dir)
+            self._load_price_short_expert_bank(model_dir)
 
             # CRITICAL: Validate data integrity to prevent leakage
             if self.validate_data_integrity:
@@ -453,6 +579,7 @@ class MultiHorizonForecastGenerator:
             self._initialize_history()
             self._preallocate_buffers()
             self._precompute_availability()
+            self._runtime_fallback_mode = False
 
         except Exception as e:
             if self.fallback_mode:
@@ -467,13 +594,39 @@ class MultiHorizonForecastGenerator:
     # -------- init helpers --------
 
     def _initialize_fallback_mode(self):
+        self._runtime_fallback_mode = True
         self.models.clear()
         self.scalers.clear()
         self._model_available.clear()
+        self._price_short_expert_bank = None
+        self._precomputed_price_short_experts.clear()
         self._initialize_history()
         self._preallocate_buffers()
         if self.verbose:
             print("[OK] Fallback mode enabled (forecasts will use history/defaults)")
+
+    def _load_price_short_expert_bank(self, model_dir: str) -> None:
+        """Load the real short-horizon price expert bank when present."""
+        try:
+            episode_dir = os.path.dirname(str(model_dir).rstrip("\\/"))
+            bank = PriceShortExpertBank(
+                episode_dir=episode_dir,
+                look_back=self.look_back,
+                horizon_steps=int(self.horizons.get("short", 6)),
+                verbose=self.verbose,
+                refresh_stride=self.expert_refresh_stride,
+            )
+            if bank.is_complete():
+                self._price_short_expert_bank = bank
+                self.loading_stats["price_short_experts_loaded"] = len(bank.methods())
+            else:
+                self._price_short_expert_bank = None
+                self.loading_stats["loading_errors"].append(
+                    "price_short_expert_bank incomplete"
+                )
+        except Exception as e:
+            self._price_short_expert_bank = None
+            self.loading_stats["loading_errors"].append(f"price_short_expert_bank: {e}")
 
     def _load_models_and_scalers(self, model_dir: str, scaler_dir: str, metadata_dir: Optional[str] = None):
         """
@@ -483,12 +636,18 @@ class MultiHorizonForecastGenerator:
         - Looks for metadata/{target}_{horizon}_metadata.json
         - Uses model_path_best from metadata (prefers best checkpoint)
         - Gets look_back and other params from metadata
-        - Paths in metadata are relative to Forecast_ANN/ or absolute
+        - Paths in metadata are relative to the standalone forecast root or absolute
         
         OLD STRUCTURE (fallback):
         - Direct file lookup in model_dir and scaler_dir
         - Pattern: {target}_{horizon}_model.h5
         """
+        if self.price_short_expert_only:
+            self.training_summary = {}
+            if self.verbose:
+                print("[OK] Expert-only forecast mode: skipping legacy target/horizon model loading")
+            return
+
         if not os.path.exists(model_dir):
             msg = f"Model dir not found: {model_dir}"
             if self.fallback_mode:
@@ -504,7 +663,7 @@ class MultiHorizonForecastGenerator:
 
         # Determine metadata directory
         if metadata_dir is None:
-            # Try to infer: if model_dir is Forecast_ANN/models, metadata is Forecast_ANN/metadata
+            # Try to infer the sibling metadata directory from the standalone layout.
             if "Forecast_ANN" in model_dir or "models" in model_dir:
                 potential_metadata_dir = model_dir.replace("models", "metadata")
                 if os.path.exists(potential_metadata_dir):
@@ -1005,6 +1164,24 @@ class MultiHorizonForecastGenerator:
         try:
             # Try new structure: look for any metadata file to get training_end
             forecast_train_end = None
+            if self.price_short_expert_only:
+                episode_dir = os.path.dirname(str(model_dir).rstrip("\\/"))
+                for method in PRICE_SHORT_EXPERT_METHODS:
+                    try:
+                        metadata_path = os.path.join(
+                            episode_dir,
+                            "price_short_experts",
+                            PRICE_SHORT_EXPERT_LABELS[method],
+                            f"{method}_metadata.json",
+                        )
+                        if os.path.exists(metadata_path):
+                            with open(metadata_path, "r", encoding="utf-8") as f:
+                                md = json.load(f)
+                            forecast_train_end = md.get("training_end")
+                            if forecast_train_end:
+                                break
+                    except Exception:
+                        continue
             if metadata_dir and os.path.exists(metadata_dir):
                 # Try to find any metadata file to get training dates
                 for target in self.targets:
@@ -1284,6 +1461,24 @@ class MultiHorizonForecastGenerator:
         if agent == "risk_controller_0":
             return 1.0  # Risk controller doesn't need forecast confidence
 
+        if self.is_expert_only_mode() and self.has_price_short_expert_bank():
+            expert_preds = self._predict_price_short_experts(int(timestep or 0))
+            if expert_preds:
+                preds = np.asarray(list(expert_preds.values()), dtype=np.float32)
+                pred_mean = float(np.mean(preds))
+                pred_std = float(np.std(preds))
+                scale = max(abs(pred_mean), 50.0)
+                dispersion = float(np.clip(pred_std / scale, 0.0, 1.0))
+                quality = float(
+                    np.mean(
+                        [
+                            self.get_price_short_expert_metadata_quality(method)
+                            for method in expert_preds.keys()
+                        ]
+                    )
+                )
+                return float(np.clip(0.65 * quality + 0.35 * (1.0 - dispersion), 0.6, 1.0))
+
         # MAPE-BASED CONFIDENCE: Calculate from recent forecast errors
         # This provides a simple fallback if environment doesn't override
         try:
@@ -1383,6 +1578,31 @@ class MultiHorizonForecastGenerator:
         self._predict_accumulator = 0.0
         results: Dict[str, float] = {}
 
+        if self.is_expert_only_mode():
+            forecast_value = self._predict_target_horizon("price", "short", t)
+            results["price_forecast_short"] = forecast_value
+            uncertainty = self._calculate_forecast_uncertainty("price", "short", t)
+            results["price_uncertainty_short"] = uncertainty
+            results["price_lower95_short"] = forecast_value - 1.96 * uncertainty
+            results["price_upper95_short"] = forecast_value + 1.96 * uncertainty
+
+            expert_preds = self._predict_price_short_experts(t)
+            for method, pred in expert_preds.items():
+                results[f"price_short_expert_{method}"] = float(pred)
+
+            results["forecast_inference_time_ms"] = float(self._predict_accumulator)
+
+            if self.timing_log_path:
+                try:
+                    num_preds = 1 + len(expert_preds)
+                    mean_ms = float(self._predict_accumulator / max(1, num_preds))
+                    with open(self.timing_log_path, 'a', newline='') as tf:
+                        w = csv.writer(tf)
+                        w.writerow([time.strftime('%Y-%m-%dT%H:%M:%S'), t, 'all', f"{self._predict_accumulator:.6f}", num_preds, f"{mean_ms:.6f}"])
+                except Exception:
+                    pass
+            return results
+
         for target in self.targets:
             for hname in self.horizons.keys():
                 k = f"{target}_forecast_{hname}"
@@ -1398,6 +1618,10 @@ class MultiHorizonForecastGenerator:
                 upper_bound = forecast_value + 1.96 * uncertainty
                 results[f"{target}_lower95_{hname}"] = lower_bound
                 results[f"{target}_upper95_{hname}"] = upper_bound
+
+        expert_preds = self._predict_price_short_experts(t)
+        for method, pred in expert_preds.items():
+            results[f"price_short_expert_{method}"] = float(pred)
 
         # Include timing summary for full-horizon predictions
         results['forecast_inference_time_ms'] = float(self._predict_accumulator)
@@ -1421,6 +1645,15 @@ class MultiHorizonForecastGenerator:
         Returns uncertainty estimate (standard deviation).
         """
         try:
+            if self.is_expert_only_mode() and target == "price" and horizon == "short":
+                expert_preds = self._predict_price_short_experts(int(timestep))
+                if expert_preds:
+                    preds = np.asarray(list(expert_preds.values()), dtype=np.float32)
+                    pred_mean = float(np.mean(preds))
+                    pred_std = float(np.std(preds))
+                    scale = max(abs(pred_mean), 50.0)
+                    return float(np.clip(pred_std / scale, 0.01, 0.5))
+
             # Base uncertainty from model availability
             model_key = f"{target}_{horizon}"
             model_available = model_key in self.models and self.models[model_key] is not None
@@ -1505,6 +1738,85 @@ class MultiHorizonForecastGenerator:
         if not stats:
             return {}
         return {k: float(v) for k, v in stats.items() if np.isfinite(v)}
+
+    def has_price_short_expert_bank(self) -> bool:
+        return bool(self._price_short_expert_bank is not None and self._price_short_expert_bank.is_complete())
+
+    def is_expert_only_mode(self) -> bool:
+        return bool(self.price_short_expert_only)
+
+    def is_complete_stack(self) -> bool:
+        experts_loaded = int(self.loading_stats.get("price_short_experts_loaded", 0) or 0)
+        experts_expected = int(self.loading_stats.get("price_short_experts_expected", 0) or 0)
+        if self.is_expert_only_mode():
+            return (
+                not bool(self._runtime_fallback_mode)
+                and experts_expected > 0
+                and experts_loaded == experts_expected
+                and self.has_price_short_expert_bank()
+            )
+        models_loaded = int(self.loading_stats.get("models_loaded", 0) or 0)
+        models_attempted = int(self.loading_stats.get("models_attempted", 0) or 0)
+        scalers_loaded = int(self.loading_stats.get("scalers_loaded", 0) or 0)
+        scalers_attempted = int(self.loading_stats.get("scalers_attempted", 0) or 0)
+        return (
+            not bool(self._runtime_fallback_mode)
+            and models_loaded > 0
+            and models_loaded == models_attempted
+            and scalers_loaded == scalers_attempted
+            and experts_loaded == experts_expected
+            and self.has_price_short_expert_bank()
+        )
+
+    def get_price_short_expert_methods(self) -> Tuple[str, ...]:
+        if not self.has_price_short_expert_bank():
+            return tuple()
+        return self._price_short_expert_bank.methods()
+
+    def get_price_short_expert_metadata_quality(self, method: str) -> float:
+        if not self.has_price_short_expert_bank():
+            return 0.5
+        return float(np.clip(self._price_short_expert_bank.get_metadata_quality(method), 0.0, 1.0))
+
+    def get_price_short_expert_metadata_metrics(self, method: str) -> Dict[str, float]:
+        if not self.has_price_short_expert_bank():
+            return {}
+        return self._price_short_expert_bank.get_metadata_metrics(method)
+
+    def _combine_price_short_expert_predictions(self, expert_preds: Dict[str, float]) -> float:
+        if not expert_preds:
+            return float(self._fallback_value("price"))
+        weights = []
+        values = []
+        for method, pred in expert_preds.items():
+            metrics = self.get_price_short_expert_metadata_metrics(method)
+            quality = self.get_price_short_expert_metadata_quality(method)
+            risk = float(np.clip(metrics.get("residual_risk", 0.5), 0.0, 1.0))
+            weight = max(1e-6, quality * (1.0 - 0.5 * risk))
+            weights.append(weight)
+            values.append(float(pred))
+        weights_np = np.asarray(weights, dtype=np.float32)
+        values_np = np.asarray(values, dtype=np.float32)
+        if weights_np.sum() <= 1e-8:
+            return float(np.mean(values_np))
+        return float(np.average(values_np, weights=weights_np))
+
+    def _predict_price_short_experts(self, timestep: int) -> Dict[str, float]:
+        if not self.has_price_short_expert_bank():
+            return {}
+        t = int(max(timestep, 0))
+        results: Dict[str, float] = {}
+        for method in self._price_short_expert_bank.methods():
+            arr = self._precomputed_price_short_experts.get(method)
+            if arr is not None and 0 <= t < len(arr):
+                results[method] = float(arr[t])
+                continue
+            window = self._prepare_input_buffer("price").reshape(-1)
+            try:
+                results[method] = float(self._price_short_expert_bank.predict_from_window(method, window))
+            except Exception:
+                results[method] = float(self._fallback_value("price"))
+        return results
 
     def _get_adaptive_refresh_stride(self, timestep: int) -> int:
         """
@@ -1663,6 +1975,12 @@ class MultiHorizonForecastGenerator:
         cached_value = self._global_cache.get(gkey)
         if cached_value is not None:
             return cached_value
+
+        if self.is_expert_only_mode() and target == "price" and hname == "short":
+            expert_preds = self._predict_price_short_experts(t)
+            y = self._combine_price_short_expert_predictions(expert_preds)
+            self._global_cache.put(gkey, y)
+            return y
 
         # 3) Model prediction (simplified)
         model_key = f"{target}_{hname}"
@@ -1996,6 +2314,40 @@ class MultiHorizonForecastGenerator:
             except Exception:
                 pass
 
+        if self.has_price_short_expert_bank() and 'price' in df.columns:
+            try:
+                price_series = df['price'].to_numpy(dtype=np.float32, copy=False)
+                self._precomputed_price_short_experts = self._price_short_expert_bank.precompute_for_series(price_series)
+                if self.is_expert_only_mode():
+                    expert_methods = tuple(self._price_short_expert_bank.methods())
+                    if expert_methods:
+                        weights = []
+                        series_list = []
+                        for method in expert_methods:
+                            expert_series = np.asarray(
+                                self._precomputed_price_short_experts.get(method, np.zeros(T, dtype=np.float32)),
+                                dtype=np.float32,
+                            )
+                            metrics = self.get_price_short_expert_metadata_metrics(method)
+                            quality = self.get_price_short_expert_metadata_quality(method)
+                            risk = float(np.clip(metrics.get("residual_risk", 0.5), 0.0, 1.0))
+                            weight = max(1e-6, quality * (1.0 - 0.5 * risk))
+                            weights.append(weight)
+                            series_list.append(expert_series)
+                        weights_np = np.asarray(weights, dtype=np.float32)
+                        stacked = np.stack(series_list, axis=0).astype(np.float32)
+                        if float(np.sum(weights_np)) > 1e-8:
+                            combined = np.average(stacked, axis=0, weights=weights_np).astype(np.float32)
+                        else:
+                            combined = np.mean(stacked, axis=0, dtype=np.float32)
+                        self._precomputed[("price", "short")] = np.asarray(combined, dtype=np.float32)
+            except Exception as e:
+                self._precomputed_price_short_experts = {}
+                if self.is_expert_only_mode() and not self.fallback_mode:
+                    raise RuntimeError(f"Failed to precompute price-short expert bank: {e}") from e
+                if self.verbose:
+                    print(f"Failed to precompute price-short expert bank: {e}")
+
         if self.verbose:
             total_forecasts = len(self.targets) * len(self.horizons)
             print(f"Offline precompute complete: {total_forecasts} forecast series cached.")
@@ -2082,6 +2434,16 @@ class MultiHorizonForecastGenerator:
                     else:
                         self._precomputed[(target, hname)] = series
 
+            self._precomputed_price_short_experts = {}
+            if self.has_price_short_expert_bank():
+                for method in self._price_short_expert_bank.methods():
+                    col_name = f"price_short_expert_{method}"
+                    if col_name not in cached_df.columns:
+                        if self.verbose:
+                            print(f"Missing column {col_name} in cache, recomputing...")
+                        return False
+                    self._precomputed_price_short_experts[method] = cached_df[col_name].values.astype(np.float32)
+
             # Store minimal series for bounded debiasing (avoid copying the full dataframe).
             try:
                 if 'price' in df.columns:
@@ -2146,11 +2508,38 @@ class MultiHorizonForecastGenerator:
                             print(f"Model {model_key} modified, invalidating cache")
                         return None
 
+            expert_paths = cache_metadata.get('expert_model_paths', {})
+            expert_times = cache_metadata.get('expert_model_modification_times', {})
+            expert_metadata_paths = cache_metadata.get('expert_metadata_paths', {})
+            expert_metadata_times = cache_metadata.get('expert_metadata_modification_times', {})
+            for method, model_path in expert_paths.items():
+                if model_path and os.path.exists(model_path):
+                    current_mtime = os.path.getmtime(model_path)
+                    cached_mtime = expert_times.get(method)
+                    if cached_mtime is None or abs(current_mtime - cached_mtime) > 1.0:
+                        if self.verbose:
+                            print(f"Expert model {method} modified, invalidating cache")
+                        return None
+            for method, metadata_path in expert_metadata_paths.items():
+                if metadata_path and os.path.exists(metadata_path):
+                    current_mtime = os.path.getmtime(metadata_path)
+                    cached_mtime = expert_metadata_times.get(method)
+                    if cached_mtime is None or abs(current_mtime - cached_mtime) > 1.0:
+                        if self.verbose:
+                            print(f"Expert metadata {method} modified, invalidating cache")
+                        return None
+
             # Check look_back parameter
             if cache_metadata.get('look_back') != self.look_back:
                 if self.verbose:
                     print(f"look_back changed ({cache_metadata.get('look_back')} -> {self.look_back}), invalidating cache")
-                return None
+                    return None
+
+            if self.has_price_short_expert_bank():
+                if int(cache_metadata.get('expert_refresh_stride', self.expert_refresh_stride)) != int(self.expert_refresh_stride):
+                    if self.verbose:
+                        print("expert_refresh_stride changed, invalidating cache")
+                    return None
 
             return cache_metadata
 
@@ -2236,6 +2625,7 @@ class MultiHorizonForecastGenerator:
                     logging.warning(f"Failed to remove cache file {f}: {e}")
 
             self._precomputed.clear()
+            self._precomputed_price_short_experts.clear()
             self._loaded_cache_metadata = {}
 
             if self.verbose:
@@ -2267,6 +2657,7 @@ class MultiHorizonForecastGenerator:
 
             horizon_offsets = {hname: int(steps) for hname, steps in self.horizons.items()}
             forecast_tails: Dict[str, Dict[str, List[float]]] = {}
+            alignment_mode = "origin_timestamp" if self.is_expert_only_mode() else "target_timestamp"
 
             # Add forecast columns (aligned to target timestamps)
             for target in self.targets:
@@ -2281,14 +2672,25 @@ class MultiHorizonForecastGenerator:
                     else:
                         raw_series = np.asarray(raw_series, dtype=np.float32)
 
-                    aligned_series = self._align_forecast_for_export(raw_series, int(horizon_steps))
+                    if alignment_mode == "target_timestamp":
+                        aligned_series = self._align_forecast_for_export(raw_series, int(horizon_steps))
+                    else:
+                        aligned_series = raw_series.copy()
                     forecast_data[col_name] = aligned_series
 
                     tail_len = min(int(horizon_steps), len(raw_series))
-                    if tail_len > 0:
+                    if alignment_mode == "target_timestamp" and tail_len > 0:
                         forecast_tails[target][hname] = raw_series[-tail_len:].astype(float).tolist()
                     else:
                         forecast_tails[target][hname] = []
+
+            if self.has_price_short_expert_bank():
+                for method in self._price_short_expert_bank.methods():
+                    col_name = f"price_short_expert_{method}"
+                    series = self._precomputed_price_short_experts.get(method)
+                    if series is None:
+                        series = np.full(len(df), self._default_for_target('price'), dtype=np.float32)
+                    forecast_data[col_name] = np.asarray(series, dtype=np.float32)
 
             # Save to CSV
             forecast_df = pd.DataFrame(forecast_data)
@@ -2301,10 +2703,15 @@ class MultiHorizonForecastGenerator:
                 'targets': self.targets,
                 'horizons': list(self.horizons.keys()),
                 'horizon_offsets': horizon_offsets,
-                'forecast_alignment': 'target_timestamp',
+                'forecast_alignment': alignment_mode,
                 'forecast_tails': forecast_tails,
                 'model_modification_times': {},
                 'model_paths': {},
+                'expert_model_modification_times': {},
+                'expert_model_paths': {},
+                'expert_metadata_modification_times': {},
+                'expert_metadata_paths': {},
+                'expert_refresh_stride': int(self.expert_refresh_stride),
                 'cache_created': pd.Timestamp.now().isoformat(),
             }
 
@@ -2317,6 +2724,13 @@ class MultiHorizonForecastGenerator:
                         metadata['model_paths'][model_key] = model_path
                         metadata['model_modification_times'][model_key] = os.path.getmtime(model_path)
                         break
+
+            if self.has_price_short_expert_bank():
+                for method, info in self._price_short_expert_bank.get_cache_validation_info().items():
+                    metadata['expert_model_paths'][method] = str(info.get('model_path', ''))
+                    metadata['expert_model_modification_times'][method] = float(info.get('model_mtime', 0.0))
+                    metadata['expert_metadata_paths'][method] = str(info.get('metadata_path', ''))
+                    metadata['expert_metadata_modification_times'][method] = float(info.get('metadata_mtime', 0.0))
 
             with open(metadata_file, 'w') as f:
                 json.dump(metadata, f, indent=2)
@@ -2381,16 +2795,28 @@ class MultiHorizonForecastGenerator:
         return dims
 
     def get_loading_stats(self) -> Dict[str, Any]:
+        expert_only_mode = bool(self.is_expert_only_mode())
+        models_loaded = int(self.loading_stats["models_loaded"] or 0)
+        models_attempted = int(self.loading_stats["models_attempted"] or 0)
+        experts_loaded = int(self.loading_stats.get("price_short_experts_loaded", 0) or 0)
+        experts_expected = int(self.loading_stats.get("price_short_experts_expected", 0) or 0)
+        primary_loaded = experts_loaded if expert_only_mode else models_loaded
+        primary_attempted = experts_expected if expert_only_mode else models_attempted
+        primary_label = "price_short_experts" if expert_only_mode else "models"
         return {
-            "models_loaded": self.loading_stats["models_loaded"],
-            "models_attempted": self.loading_stats["models_attempted"],
+            "models_loaded": models_loaded,
+            "models_attempted": models_attempted,
             "scalers_loaded": self.loading_stats["scalers_loaded"],
             "scalers_attempted": self.loading_stats["scalers_attempted"],
+            "price_short_experts_loaded": experts_loaded,
+            "price_short_experts_expected": experts_expected,
             "loading_errors": self.loading_stats["loading_errors"],
-            "success_rate": (
-                (self.loading_stats["models_loaded"] / max(1, self.loading_stats["models_attempted"])) * 100.0
-            ),
-            "fallback_mode": len(self.models) == 0,
+            "primary_loaded": primary_loaded,
+            "primary_attempted": primary_attempted,
+            "primary_label": primary_label,
+            "success_rate": ((primary_loaded / max(1, primary_attempted)) * 100.0),
+            "fallback_mode": bool(self._runtime_fallback_mode),
+            "expert_only_mode": expert_only_mode,
         }
 
     def get_clip_stats(self) -> Dict[str, Dict[str, int]]:
@@ -2402,7 +2828,14 @@ class MultiHorizonForecastGenerator:
         print(f"look_back={self.look_back}, horizons={self.horizons}")
         print(f"targets={self.targets}")
         stats = self.get_loading_stats()
-        print(f"models: {stats['models_loaded']}/{stats['models_attempted']} (success {stats['success_rate']:.1f}%)")
+        if stats.get("expert_only_mode", False):
+            print(
+                "price_short_experts: "
+                f"{stats['price_short_experts_loaded']}/{stats['price_short_experts_expected']} "
+                f"(success {stats['success_rate']:.1f}%)"
+            )
+        else:
+            print(f"models: {stats['models_loaded']}/{stats['models_attempted']} (success {stats['success_rate']:.1f}%)")
         print(f"fallback: {'yes' if stats['fallback_mode'] else 'no'}")
         print("\nAgent assignments:")
         for a in self.agent_horizons:

@@ -3,7 +3,7 @@
 from copy import deepcopy
 from gymnasium import Env, spaces
 from gymnasium.spaces import Box, Discrete
-from stable_baselines3 import PPO, SAC, TD3
+from stable_baselines3 import PPO, SAC, TD3, DQN
 from stable_baselines3.common.utils import obs_as_tensor
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
@@ -19,6 +19,8 @@ import warnings
 import gc
 import psutil
 import os
+import logging
+import time
 import threading
 import inspect
 import weakref
@@ -28,16 +30,22 @@ import json
 import pandas as pd
 import optuna
 from config import EnhancedConfig
-from logger import get_logger
+from policy import BetaActorCriticPolicy
+from logger import (
+    get_logger,
+    set_console_logging_level,
+    restore_console_logging_levels,
+    emit_progress_lines,
+)
 from utils import UnifiedMemoryManager, UnifiedObservationValidator, ErrorHandler, safe_operation  # UNIFIED: Import from single source of truth
-from clamped_policy import ClampedActorCriticPolicy
+from policy import RuleBasedPolicy
 
 # Centralized logging - ALL logging goes through logger.py
 logger = get_logger(__name__)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-LEARNING_MODES = ["PPO", "SAC", "TD3"]
+LEARNING_MODES = ["PPO", "SAC", "TD3", "DQN"]
 
 __all__ = ["MultiESGAgent", "HyperparameterOptimizer"]
 
@@ -45,6 +53,10 @@ __all__ = ["MultiESGAgent", "HyperparameterOptimizer"]
 # EnhancedMemoryTracker is now replaced by UnifiedMemoryManager from memory_manager.py
 # For backward compatibility, we create an alias
 EnhancedMemoryTracker = UnifiedMemoryManager
+
+
+def resolve_algo_class(policy_mode: str, agent_name: str, config: Optional[EnhancedConfig] = None):
+    return {"PPO": PPO, "SAC": SAC, "TD3": TD3, "DQN": DQN}[policy_mode]
 
 
 # ============================= Training Monitor =============================
@@ -600,20 +612,6 @@ class MultiESGAgent:
                 self.logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
-    def _get_agent_ppo_setting(self, agent_name: str, base_attr: str, default=None):
-        """
-        Resolve optional investor-specific PPO overrides while preserving global defaults
-        for the other agents.
-        """
-        try:
-            if agent_name == "investor_0":
-                investor_attr = f"investor_{base_attr}"
-                if hasattr(self.config, investor_attr):
-                    return getattr(self.config, investor_attr)
-            return getattr(self.config, base_attr, default)
-        except Exception:
-            return default
-
     def _create_single_policy(self, config, device, agent, agent_idx, activation_fn):
         try:
             policy_cfg = getattr(config, "agent_policies", None)
@@ -622,27 +620,23 @@ class MultiESGAgent:
             else:
                 policy_mode = getattr(config, "default_policy", "PPO")
 
+            if policy_mode == "RULE":
+                return RuleBasedPolicy(
+                    agent_name=agent,
+                    observation_space=self.observation_spaces[agent],
+                    action_space=self.action_spaces[agent],
+                    env=self.env,
+                )
+
             obs_space = self.observation_spaces[agent]
             act_space = self.action_spaces[agent]
 
             dummy_env = DummyVecEnv([partial(DummyGymEnv, obs_space, act_space)])
             self.memory_tracker.register_env(dummy_env)
 
-            algo_cls = {"PPO": PPO, "SAC": SAC, "TD3": TD3}[policy_mode]
+            algo_cls = resolve_algo_class(policy_mode, agent, config)
             ppo_n_steps = int(min(self.n_steps, getattr(config, "n_steps", 1024)))
             ppo_batch_size = int(min(getattr(config, "batch_size", 256), ppo_n_steps))
-
-            # Anti-collapse kwargs for PPO continuous actions only.
-            # IMPORTANT: Do NOT pass these to SAC/TD3 policies (different policy classes).
-            clamp_kwargs = None
-            if policy_mode == "PPO":
-                clamp_kwargs = {
-                    "log_std_min": float(self._get_agent_ppo_setting(agent, "ppo_log_std_min", -2.0)),
-                    "log_std_max": float(self._get_agent_ppo_setting(agent, "ppo_log_std_max", -0.5)),
-                    "mean_clip": float(self._get_agent_ppo_setting(agent, "ppo_mean_clip", 0.85)),
-                    # gSDE only: keep effective sigma bounded by clamping latent_pi passed into the SDE distribution.
-                    "sde_latent_clip": float(self._get_agent_ppo_setting(agent, "ppo_sde_latent_clip", 2.0)),
-                }
 
             # Standard MLP policy
             policy_kwargs = {
@@ -652,22 +646,24 @@ class MultiESGAgent:
                 "optimizer_class": torch.optim.Adam,
                 "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0},
             }
-            if clamp_kwargs is not None:
-                policy_kwargs.update(clamp_kwargs)
-                # PPO: use clamped policy to avoid action collapse in continuous control
-                policy_class = ClampedActorCriticPolicy
-            else:
-                # SAC/TD3: keep standard SB3 MLP policy classes
-                policy_class = "MlpPolicy"
+            policy_class = "MlpPolicy"
+            if (
+                policy_mode == "PPO"
+                and agent == "investor_0"
+                and bool(getattr(config, "investor_use_beta_policy", False))
+            ):
+                policy_class = BetaActorCriticPolicy
 
             # Optional: increase initial exploration for continuous actions
             # (helps avoid near-constant actions / premature collapse)
-            log_std_init = self._get_agent_ppo_setting(agent, "ppo_log_std_init", None)
-            if log_std_init is not None:
+            log_std_init = getattr(config, "ppo_log_std_init", None)
+            if log_std_init is not None and policy_class == "MlpPolicy":
                 try:
                     policy_kwargs["log_std_init"] = float(log_std_init)
                 except Exception:
                     pass
+            if policy_class is BetaActorCriticPolicy:
+                policy_kwargs["beta_epsilon"] = float(getattr(config, "investor_beta_epsilon", 1e-6))
 
             algo_kwargs = {
                 "policy": policy_class,
@@ -693,8 +689,8 @@ class MultiESGAgent:
                         "gamma": float(getattr(config, "gamma", 0.995)),
                         "n_epochs": int(min(getattr(config, "n_epochs", 10), getattr(config, "n_epochs", 10))),  # STRENGTHENED: Increased from 5 to 10
                         # Exploration knobs (optional)
-                        "use_sde": bool(self._get_agent_ppo_setting(agent, "ppo_use_sde", True)),
-                        "sde_sample_freq": int(self._get_agent_ppo_setting(agent, "ppo_sde_sample_freq", 1)),
+                        "use_sde": bool(getattr(config, "ppo_use_sde", False)),
+                        "sde_sample_freq": int(getattr(config, "ppo_sde_sample_freq", 1)),
                     }
                 )
             elif policy_mode in ("SAC", "TD3"):
@@ -724,6 +720,22 @@ class MultiESGAgent:
                             "target_noise_clip": float(getattr(config, "target_noise_clip", 0.5)),
                         }
                     )
+            elif policy_mode == "DQN":
+                algo_kwargs.update(
+                    {
+                        "buffer_size": int(getattr(config, "dqn_buffer_size", 50000)),
+                        "learning_starts": int(getattr(config, "dqn_learning_starts", 1000)),
+                        "batch_size": int(getattr(config, "dqn_batch_size", 128)),
+                        "tau": 1.0,
+                        "gamma": float(getattr(config, "gamma", 0.99)),
+                        "train_freq": int(getattr(config, "dqn_train_freq", 4)),
+                        "gradient_steps": int(getattr(config, "dqn_gradient_steps", 1)),
+                        "target_update_interval": int(getattr(config, "dqn_target_update_interval", 500)),
+                        "exploration_fraction": float(getattr(config, "dqn_exploration_fraction", 0.20)),
+                        "exploration_initial_eps": float(getattr(config, "dqn_exploration_initial_eps", 1.0)),
+                        "exploration_final_eps": float(getattr(config, "dqn_exploration_final_eps", 0.05)),
+                    }
+                )
 
             policy = algo_cls(**algo_kwargs)
             policy.mode = policy_mode
@@ -1342,44 +1354,56 @@ class MultiESGAgent:
                     f"[TRAINING_POLICY_FATAL] Training failed for {getattr(policy, 'agent_name', polid)}: {e}"
                 ) from e
 
-        pbar = tqdm(total=int(total_timesteps), desc="Training..", unit="steps")
-        trainable_policies = list(self.policies)
+        pbar = tqdm(total=int(total_timesteps), desc="Training..", unit="steps", disable=True)
+        trainable_policies = [
+            policy for policy in self.policies
+            if getattr(policy, "mode", None) in LEARNING_MODES
+        ]
+        saved_console_levels = set_console_logging_level(logging.WARNING)
 
-        self._initialize_environment_enhanced()
-        target = self.total_steps + int(total_timesteps)
+        try:
+            self._initialize_environment_enhanced()
+            target = self.total_steps + int(total_timesteps)
+            self._progress_interval_start_steps = int(self.total_steps)
+            last_progress_bucket = int(self.total_steps // 1000)
+            self._progress_last_time = time.perf_counter()
+            self._progress_last_steps = int(self.total_steps)
 
-        while self.total_steps < target:
-            try:
-                steps_collected = self._collect_rollouts_enhanced(callbacks)
-                if steps_collected == 0:
-                    self._handle_rollout_failure_enhanced()
-                    continue
+            while self.total_steps < target:
+                try:
+                    steps_collected = self._collect_rollouts_enhanced(callbacks)
+                    if steps_collected == 0:
+                        self._handle_rollout_failure_enhanced()
+                        continue
 
-                self.total_steps += steps_collected
-                self._training_metrics["successful_steps"] += steps_collected
-                pbar.update(steps_collected)
+                    self.total_steps += steps_collected
+                    self._training_metrics["successful_steps"] += steps_collected
+                    pbar.update(steps_collected)
 
-                if self.total_steps % 1000 == 0:
-                    self._update_progress_display(pbar, total_timesteps)
+                    current_progress_bucket = int(self.total_steps // 1000)
+                    if current_progress_bucket > last_progress_bucket:
+                        self._update_progress_display(pbar, total_timesteps)
+                        last_progress_bucket = current_progress_bucket
 
-                if trainable_policies:
-                    safe_multithreaded_processing(
-                        train_with_memory,
-                        trainable_policies,
-                        self.multithreading,
-                        max_workers=2,
-                    )
-                self._consecutive_errors = 0
+                    if trainable_policies:
+                        safe_multithreaded_processing(
+                            train_with_memory,
+                            trainable_policies,
+                            self.multithreading,
+                            max_workers=2,
+                        )
+                    self._consecutive_errors = 0
 
-                if self.total_steps % 5000 == 0:
-                    self.memory_tracker.cleanup("medium")
+                    if self.total_steps % 5000 == 0:
+                        self.memory_tracker.cleanup("medium")
 
-            except Exception as e:
-                self._handle_training_error_enhanced(e)
-                if self._consecutive_errors >= self._max_consecutive_errors:
-                    break
-
-        pbar.close()
+                except Exception as e:
+                    self._handle_training_error_enhanced(e)
+                    if self._consecutive_errors >= self._max_consecutive_errors:
+                        break
+        finally:
+            pbar.close()
+            restore_console_logging_levels(saved_console_levels)
 
     def _train_ppo_enhanced(self, policy):
         """
@@ -1527,6 +1551,11 @@ class MultiESGAgent:
             return
 
     # ----------------------------- Core Loop ---------------------------------
+    @staticmethod
+    def _snapshot_action(action: Any) -> Any:
+        """Copy array-like actions while preserving scalar discrete actions."""
+        return action.copy() if hasattr(action, "copy") else action
+
     def _initialize_environment_enhanced(self):
         try:
             self._last_obs, _ = self.env.reset()
@@ -1623,7 +1652,7 @@ class MultiESGAgent:
         return steps_collected
 
     # REMOVED: _blend_with_expert_suggestions() - Legacy action blending removed.
-    # Tier-2 enhancer does NOT blend actions; PPO learns directly from observations.
+    # Tier-2 routed overlay does NOT blend actions inside PPO; PPO learns directly from observations.
 
     def _collect_actions_enhanced(self):
         actions_dict: Dict[str, Any] = {}
@@ -1635,6 +1664,27 @@ class MultiESGAgent:
         for polid, policy in enumerate(self.policies):
             agent_name = self.possible_agents[polid]
             try:
+                if getattr(policy, "mode", None) == "RULE":
+                    raw_obs = self._last_obs[agent_name]
+                    if isinstance(raw_obs, np.ndarray):
+                        if raw_obs.ndim > 1:
+                            raw_obs = raw_obs.squeeze(0) if raw_obs.shape[0] == 1 else raw_obs.flatten()
+                        raw_obs = raw_obs.astype(np.float32)
+                    obs = raw_obs.reshape(1, -1)
+                    pred = policy.predict(obs, deterministic=True)[0]
+                    if hasattr(pred, "flatten"):
+                        pred = pred.flatten()
+                    proc = self._process_action_enhanced(pred, self.action_spaces[agent_name])
+                    proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
+                    agent_data[polid] = {
+                        "obs": self._last_obs[agent_name].copy(),
+                        "action": self._snapshot_action(proc),
+                        "value_t": None,
+                        "log_prob_t": None,
+                    }
+                    actions_dict[agent_name] = proc
+                    continue
+
                 # CRITICAL FIX: Ensure observation is 1D before reshaping
                 raw_obs = self._last_obs[agent_name]
                 if isinstance(raw_obs, np.ndarray):
@@ -1679,24 +1729,6 @@ class MultiESGAgent:
                 with torch.no_grad():
                     obs_tensor = obs_as_tensor(obs, policy.device)
                     if getattr(policy, "mode", None) == "PPO":
-                        log_std_min = float(self._get_agent_ppo_setting(agent_name, "ppo_log_std_min", -2.0))
-                        log_std_max = float(self._get_agent_ppo_setting(agent_name, "ppo_log_std_max", -0.5))
-                        if bool(self._get_agent_ppo_setting(agent_name, "ppo_log_std_anneal", False)):
-                            anneal_steps = max(1, int(self._get_agent_ppo_setting(agent_name, "ppo_log_std_anneal_steps", 400000)))
-                            final_log_std_max = float(self._get_agent_ppo_setting(agent_name, "ppo_log_std_final_max", log_std_max))
-                            global_step = int(getattr(self.config, "training_global_step", 0))
-                            anneal_progress = float(np.clip(global_step / float(anneal_steps), 0.0, 1.0))
-                            log_std_max = float(
-                                log_std_max + (final_log_std_max - log_std_max) * anneal_progress
-                            )
-                        try:
-                            if hasattr(policy.policy, "_log_std_min"):
-                                policy.policy._log_std_min = float(log_std_min)
-                            if hasattr(policy.policy, "_log_std_max"):
-                                policy.policy._log_std_max = float(log_std_max)
-                        except Exception:
-                            pass
-
                         # Stable SB3 API: distribution sampling + log_prob + value
                         distribution = policy.policy.get_distribution(obs_tensor)
                         action_t = distribution.get_actions(deterministic=False)
@@ -1768,7 +1800,6 @@ class MultiESGAgent:
                                             target_env._inv_a_raw = a0
                                             target_env._inv_tanh_mu = tanh_mu0
                                             target_env._inv_tanh_a = tanh_a0
-                                            target_env._inv_log_std_cap = float(log_std_max)
                                             target_env._inv_sat_mean = float(mean_sat)
                                             target_env._inv_sat_sample = float(samp_sat)
                                             target_env._inv_sat_noise_only = float(noise_only_sat)
@@ -1822,13 +1853,13 @@ class MultiESGAgent:
                                            f"(value={value_mean}, log_prob={log_prob_mean})")
 
                         # Legacy expert-action blending removed.
-                        # The Tier-2 enhancer never overrides PPO actions directly.
+                        # The Tier-2 routed overlay never overrides PPO actions directly inside PPO sampling.
                         # if agent_name == "investor_0":
                         #     proc = self._blend_with_expert_suggestions(proc, agent_name)
 
                         agent_data[polid] = {
                             "obs": self._last_obs[agent_name].copy(),
-                            "action": proc.copy(),
+                            "action": self._snapshot_action(proc),
                             "value_t": value_t,
                             "log_prob_t": log_prob_t,
                         }
@@ -1841,7 +1872,7 @@ class MultiESGAgent:
                         proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
                         agent_data[polid] = {
                             "obs": self._last_obs[agent_name].copy(),
-                            "action": proc.copy(),
+                            "action": self._snapshot_action(proc),
                             "value_t": None,
                             "log_prob_t": None,
                         }
@@ -1868,21 +1899,62 @@ class MultiESGAgent:
 
     def _update_progress_display(self, pbar, interval_total_timesteps):
         memory_stats = self.memory_tracker.get_memory_stats()
-        denom = self._progress_denominator(interval_total_timesteps)
-        overall_pct = min(100.0, (self.total_steps / denom) * 100.0)
-        interval_pct = min(100.0, (pbar.n / max(1, interval_total_timesteps)) * 100.0)
-        pbar.set_postfix(
-            {
-                "step": self.total_steps,
-                "interval": f"{interval_pct:.1f}%",
-                "overall": f"{overall_pct:.1f}%",
-                "mem": f"{memory_stats['current_memory_mb']:.0f}MB",
-                "use": f"{memory_stats['memory_usage_pct']:.1f}%",
-                "errs": self._consecutive_errors,
-                "clean": self._training_metrics["memory_cleanups"],
-                "fix": self._training_metrics["observation_fixes"],
-            }
-        )
+        interval_start = int(getattr(self, "_progress_interval_start_steps", 0))
+        interval_total = max(1, int(interval_total_timesteps))
+        interval_done = max(0, int(self.total_steps) - interval_start)
+        interval_done_clamped = min(interval_total, interval_done)
+        interval_pct = min(100.0, (interval_done / max(1, interval_total_timesteps)) * 100.0)
+        global_total = self._progress_denominator(interval_total_timesteps)
+        global_total = max(1, int(global_total))
+        global_done = max(0, int(self.total_steps))
+        global_pct = min(100.0, (global_done / global_total) * 100.0)
+        now = time.perf_counter()
+        last_time = float(getattr(self, "_progress_last_time", now))
+        last_steps = int(getattr(self, "_progress_last_steps", self.total_steps))
+        elapsed = max(now - last_time, 1e-9)
+        step_delta = max(0, int(self.total_steps) - last_steps)
+        steps_per_second = float(step_delta / elapsed) if step_delta > 0 else 0.0
+        self._progress_last_time = now
+        self._progress_last_steps = int(self.total_steps)
+        lines = [
+            (
+                f"[TRAINING] episode {interval_done_clamped:,}/{interval_total:,} ({interval_pct:.1f}%) "
+                f"| global {global_done:,}/{global_total:,} ({global_pct:.1f}%) "
+                f"spd={steps_per_second:.1f}/s mem={memory_stats['current_memory_mb']:.0f}MB errs={self._consecutive_errors}"
+            )
+        ]
+        try:
+            env_ref = getattr(self, "env", None)
+            base_env = getattr(env_ref, "base_env", env_ref)
+            if base_env is not None and hasattr(base_env, "get_progress_snapshot"):
+                snap = dict(base_env.get_progress_snapshot() or {})
+                if snap:
+                    lines.extend(
+                        [
+                            (
+                                f"NAV: ${float(snap.get('total_nav_usd_m', 0.0)):.2f}M = "
+                                f"Cash ${float(snap.get('cash_usd_m', 0.0)):.2f}M + "
+                                f"Physical ${float(snap.get('physical_book_usd_m', 0.0)):.2f}M + "
+                                f"Op ${float(snap.get('operating_usd_m', 0.0)):.2f}M + "
+                                f"MTM ${float(snap.get('mtm_usd_m', 0.0)):.2f}M"
+                            ),
+                            (
+                                f"Gains: Trading {self._format_progress_usd(float(snap.get('trading_gains_usd_m', 0.0)))} | "
+                                f"Battery {self._format_progress_usd(float(snap.get('battery_gains_usd_m', 0.0)))} | "
+                                f"Operating {self._format_progress_usd(float(snap.get('operating_usd_m', 0.0)))}"
+                            ),
+                        ]
+                    )
+        except Exception:
+            pass
+        emit_progress_lines(lines)
+
+    @staticmethod
+    def _format_progress_usd(value_millions: float) -> str:
+        value_millions = float(value_millions)
+        if abs(value_millions) >= 0.05:
+            return f"${value_millions:+.2f}M"
+        return f"${value_millions * 1000.0:+.1f}k"
 
     def _handle_rollout_failure_enhanced(self):
         if self.debug:
@@ -1924,6 +1996,8 @@ class MultiESGAgent:
             agent_name = self.possible_agents[polid]
             if polid not in agent_data:
                 continue
+            if getattr(policy, "mode", None) not in LEARNING_MODES:
+                continue
             try:
                 data = agent_data[polid]
                 reward = float(rewards.get(agent_name, 0.0))
@@ -1956,10 +2030,10 @@ class MultiESGAgent:
                 except Exception:
                     pass
 
-                # Legacy online/meta baseline payload removed (enhancer-only backend).
+                # Legacy online/meta baseline payload removed (CV-only backend).
 
                 if getattr(policy, "mode", None) == "PPO":
-                    self._add_ppo_experience(policy, data, reward, polid)
+                    self._add_ppo_experience(policy, data, reward, polid, agent_name, infos)
                 else:
                     self._add_offpolicy_experience(policy, data, reward, done, truncs, next_obs, agent_name)
                 if hasattr(policy, "num_timesteps"):
@@ -2041,7 +2115,7 @@ class MultiESGAgent:
             self.logger.error(msg)
             raise RuntimeError(msg) from e
 
-    def _add_ppo_experience(self, policy, data, reward, polid):
+    def _add_ppo_experience(self, policy, data, reward, polid, agent_name=None, infos=None):
         """
         Add one transition to SB3's RolloutBuffer.
 
@@ -2080,6 +2154,49 @@ class MultiESGAgent:
                 log_prob_t = log_prob_t.reshape(1, 1)
             value_t = value_t.to(policy.device)
             log_prob_t = log_prob_t.to(policy.device)
+            buffer = policy.rollout_buffer
+            buffer_size = getattr(buffer, 'buffer_size', 128)
+            current_pos = getattr(buffer, 'pos', 0)
+
+            # --- Tier-2 controller experience collection (investor_0 only) ---
+            base_env = getattr(self.env, "base_env", getattr(self.env, "env", self.env))
+            if hasattr(base_env, "env"):
+                base_env = getattr(base_env, "env", base_env)
+            cv_adapter = getattr(base_env, "control_variate_adapter", None)
+            cv_buffer = getattr(base_env, "cv_experience_buffer", None)
+            fgb_enabled = bool(getattr(self.config, "forecast_baseline_enable", False))
+            if (
+                agent_name == "investor_0"
+                and fgb_enabled
+                and cv_adapter is not None
+                and infos is not None
+            ):
+                info_inv = infos.get("investor_0", infos) if isinstance(infos, dict) else {}
+                cv_features = info_inv.get("cv_features")
+                if cv_features is not None and cv_buffer is not None:
+                    obs = data.get("obs")
+                    if obs is not None:
+                        obs_np = np.asarray(obs, dtype=np.float32).flatten()
+                        is_decision_step = bool(obs_np.size > 5 and float(obs_np[5]) > 0.5)
+                        if not is_decision_step:
+                            obs_np = None
+                        if obs_np is None:
+                            pass
+                        else:
+                            cv_features = np.asarray(cv_features, dtype=np.float32).flatten()
+                            realized_return = float(info_inv.get("realized_investor_return", 0.0) or 0.0)
+                            executed_exposure = info_inv.get("executed_investor_exposure", None)
+                            if executed_exposure is None and cv_features.size > 0:
+                                executed_exposure = float(cv_features[0])
+                            env_step = int(info_inv.get("timestep", info_inv.get("step_in_episode", -1)) or -1)
+                            cv_buffer.add(
+                                obs_np,
+                                cv_features,
+                                realized_return=realized_return,
+                                executed_exposure=executed_exposure,
+                                rollout_pos=current_pos,
+                                env_step=env_step,
+                            )
 
             # --- obs -> numpy (CPU, float32, shape (obs_dim,)) ---
             # CRITICAL FIX: SB3 RolloutBuffer.add() expects observations as (obs_dim,) NOT (1, obs_dim)
@@ -2152,10 +2269,6 @@ class MultiESGAgent:
             
             # CRITICAL FIX: Check buffer position BEFORE adding to prevent overflow
             # SB3's RolloutBuffer wraps automatically, but we need to check BEFORE add() is called
-            buffer = policy.rollout_buffer
-            buffer_size = getattr(buffer, 'buffer_size', 128)
-            current_pos = getattr(buffer, 'pos', 0)
-            
             # Fail fast on overflow instead of silently wrapping.
             # Wrapping here can hide rollout-finalization bugs and corrupt PPO updates.
             if current_pos >= buffer_size:
@@ -2510,6 +2623,55 @@ class MultiESGAgent:
                         # Call GAE with tensor final_value - SB3 will handle tensor operations correctly
                         try:
                             policy.rollout_buffer.compute_returns_and_advantage(final_value, dones_b)
+                            # Tier-2: Train the routed residual-aware overlay on this rollout (investor_0 only)
+                            if agent_name == "investor_0" and bool(getattr(self.config, "forecast_baseline_enable", False)):
+                                base_env = getattr(self.env, "base_env", getattr(self.env, "env", self.env))
+                                if hasattr(base_env, "env"):
+                                    base_env = getattr(base_env, "env", base_env)
+                                cv_trainer = getattr(base_env, "cv_trainer", None)
+                                cv_buffer = getattr(base_env, "cv_experience_buffer", None)
+                                if cv_trainer is not None and cv_buffer is not None and cv_buffer.size() > 0:
+                                    try:
+                                        current_rollout = cv_buffer.get_current_rollout()
+                                        cv_train_every = max(
+                                            1,
+                                            int(getattr(self.config, "tier2_cv_train_every", 100) or 100),
+                                        )
+                                        last_cv_train_step = int(getattr(self, "_last_cv_train_step", -10**12))
+                                        should_train = int(getattr(self, "total_steps", 0)) - last_cv_train_step >= cv_train_every
+                                        if should_train:
+                                            if len(current_rollout) >= 8:
+                                                cv_trainer.train_continuous(current_rollout, None, cv_buffer)
+                                                self._last_cv_train_step = int(getattr(self, "total_steps", 0))
+                                            else:
+                                                self.logger.debug(
+                                                    "[CV_TRAIN_SKIP_SHORT] rollout=%s",
+                                                    len(current_rollout),
+                                                )
+                                                cv_buffer.clear_rollout()
+                                        else:
+                                            # Keep the CV buffer scoped to one completed rollout.
+                                            # If this rollout is not trained now, drop it instead of
+                                            # carrying stale experiences into a later return target.
+                                            cv_buffer.clear_rollout()
+                                    except Exception as cv_err:
+                                        cv_error_signature = f"{type(cv_err).__name__}: {cv_err}"
+                                        cv_error_count = int(getattr(self, "_cv_train_error_count", 0)) + 1
+                                        last_cv_error_signature = getattr(self, "_last_cv_train_error_signature", None)
+                                        self._cv_train_error_count = cv_error_count
+                                        self._last_cv_train_error_signature = cv_error_signature
+                                        if cv_error_signature != last_cv_error_signature or cv_error_count in (1, 5, 20, 100):
+                                            self.logger.warning(
+                                                "[CV_TRAIN_ERROR] step=%s count=%s error=%s",
+                                                int(getattr(self, "total_steps", 0)),
+                                                cv_error_count,
+                                                cv_error_signature,
+                                            )
+                                        if bool(getattr(self.config, "fgb_fail_fast", False)):
+                                            raise RuntimeError(
+                                                f"Tier-2 training failed at step {int(getattr(self, 'total_steps', 0))}"
+                                            ) from cv_err
+                                        cv_buffer.clear_rollout()
                         except Exception as gae_error:
                             error_str = str(gae_error)
                             if 'clone' in error_str.lower():
@@ -2586,9 +2748,13 @@ class MultiESGAgent:
 
         saved_count = 0
         save_errors: List[str] = []
+        trainable_total = 0
 
         for agent_name, policy in zip(self.possible_agents, self.policies):
             try:
+                if getattr(policy, "mode", None) not in LEARNING_MODES:
+                    continue
+                trainable_total += 1
                 if not hasattr(policy, "save"):
                     self.logger.warning(f"Policy {agent_name} has no save()")
                     continue
@@ -2649,7 +2815,7 @@ class MultiESGAgent:
         except Exception as e:
             self.logger.warning(f"Failed to save training metadata: {e}")
 
-        print(f"Save complete: {saved_count}/{len(self.policies)} policies saved")
+        print(f"Save complete: {saved_count}/{trainable_total} trainable policies saved")
         if save_errors:
             print("Save errors:")
             for err in save_errors:
@@ -2668,12 +2834,16 @@ class MultiESGAgent:
 
         for idx, (agent_name, policy) in enumerate(zip(self.possible_agents, self.policies)):
             path = os.path.join(load_dir, f"{agent_name}_policy.zip")
+            if getattr(policy, "mode", None) not in LEARNING_MODES:
+                if os.path.exists(path):
+                    loaded_count += 1
+                continue
             if not os.path.exists(path):
                 load_errors.append(f"Policy file not found: {path}")
                 continue
             try:
                 algo_name = getattr(policy, "mode", "PPO")
-                algo_cls = {"PPO": PPO, "SAC": SAC, "TD3": TD3}.get(algo_name, PPO)
+                algo_cls = resolve_algo_class(algo_name, agent_name, self.config)
 
                 # reattach a dummy env with correct spaces
                 obs_space = self.observation_spaces[agent_name]
@@ -2838,7 +3008,10 @@ class MultiESGAgent:
         except Exception as e:
             self.logger.warning(f"Failed to load training metadata: {e}")
 
-        print(f"Load complete: {loaded_count}/{len(self.policies)} policies loaded")
+        trainable_total = sum(
+            1 for policy in self.policies if getattr(policy, "mode", None) in LEARNING_MODES
+        )
+        print(f"Load complete: {loaded_count}/{trainable_total} trainable policies loaded")
         if load_errors:
             print("Load errors:")
             for err in load_errors:
@@ -2971,11 +3144,7 @@ class OptunaHyperparameterOptimizer:
                 'activation_fn': trial.suggest_categorical('activation_fn', ['tanh', 'relu']),
                 'update_every': trial.suggest_categorical('update_every', [128, 256, 512]),
                 'batch_size': 128,  # FIXED: Standardized batch size (no longer a hyperparameter)
-                # Suggest a single mode for all agents for simplicity, can be expanded
-                'agent_mode': trial.suggest_categorical('agent_mode', ['PPO', 'SAC'])
             }
-            # Apply the same mode to all agents in this trial
-            params['agent_policies'] = [{"mode": params['agent_mode']}] * len(self.env.possible_agents)
             
             # 2. Configure and Initialize the Agent
             config = EnhancedConfig(optimized_params=params)
@@ -3048,9 +3217,6 @@ class OptunaHyperparameterOptimizer:
 
         best_params = study.best_params
         best_value = study.best_value
-        
-        # Format the agent policies correctly for the config
-        best_params['agent_policies'] = [{"mode": best_params.get('agent_mode', 'PPO')}] * len(self.env.possible_agents)
 
         performance_summary = {"best_sharpe_ratio": best_value}
         
@@ -3064,5 +3230,3 @@ class OptunaHyperparameterOptimizer:
 
 # Keep this alias for backward compatibility with main.py
 HyperparameterOptimizer = OptunaHyperparameterOptimizer
-
-

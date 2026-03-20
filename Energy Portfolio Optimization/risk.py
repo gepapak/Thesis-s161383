@@ -16,7 +16,7 @@ PATCHED:
 - Replaced raw divisions with a safe division utility to prevent NaNs or Inf.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import numpy as np
 from collections import deque
 import logging
@@ -225,39 +225,68 @@ class EnhancedRiskController:
             self.logger.warning(f"Operational risk calculation failed: {e}")
             return 0.20
 
-    def calculate_portfolio_risk(self, capacities: Dict[str, float], budget: float, initial_budget: float) -> float:
+    def calculate_portfolio_risk(
+        self,
+        capacities: Dict[str, float],
+        budget: float,
+        initial_budget: float,
+        financial_positions: Optional[Dict[str, float]] = None,
+    ) -> float:
         """
-        Portfolio risk from concentration + capital deployment.
+        Portfolio risk from concentration + capital deployment + trading exposure.
         Returns a value in [0, 1].
+        financial_positions: optional dict with wind_instrument_value, solar_instrument_value, hydro_instrument_value.
         """
         try:
-            if not capacities:
-                return 0.25
-
-            caps = [float(v) for v in capacities.values() if isinstance(v, (int, float)) and v > 0]
-            if len(caps) > 1:
-                total = sum(caps)
-                if total > 0:
-                    shares = [c / total for c in caps]
-                    hhi = sum(s * s for s in shares)  # Herfindahl index
-                    # Normalize HHI to [0,1] concentration risk (0 best diversified → 1 fully concentrated)
-                    min_hhi = SafeDivision.div(1.0, len(shares))
-                    conc = SafeDivision.div((hhi - min_hhi), (1.0 - min_hhi), default=0.5)
+            conc = 0.5
+            if capacities:
+                caps = [float(v) for v in capacities.values() if isinstance(v, (int, float)) and v > 0]
+                if len(caps) > 1:
+                    total = sum(caps)
+                    if total > 0:
+                        shares = [c / total for c in caps]
+                        hhi = sum(s * s for s in shares)  # Herfindahl index
+                        min_hhi = SafeDivision.div(1.0, len(shares))
+                        conc = SafeDivision.div((hhi - min_hhi), (1.0 - min_hhi), default=0.5)
+                    else:
+                        conc = 0.5
                 else:
-                    conc = 0.5
-            else:
-                conc = 0.8  # single-tech concentration
+                    conc = 0.8  # single-tech concentration
 
+            capital = 0.50
             if initial_budget > 0:
                 deploy = SafeDivision.div(max(0.0, (initial_budget - max(0.0, float(budget)))), float(initial_budget))
                 capital = min(1.0, 1.5 * deploy)
-            else:
-                capital = 0.50
+
+            # Trading exposure risk: large financial positions relative to init_budget increase risk
+            exposure_risk = 0.0
+            if financial_positions and initial_budget > 0:
+                try:
+                    total_abs_exposure = sum(
+                        abs(float(v))
+                        for k, v in financial_positions.items()
+                        if isinstance(v, (int, float)) and 'instrument' in str(k).lower()
+                    )
+                    exposure_ratio = SafeDivision.div(total_abs_exposure, float(initial_budget), default=0.0)
+                    exposure_risk = float(np.clip(exposure_ratio * 2.0, 0.0, 1.0))  # scale: 50% of budget → 1.0
+                except Exception:
+                    exposure_risk = 0.0
 
             # PHASE 5.10 FIX: Use config parameters for portfolio risk weights
             conc_weight = getattr(self.config, 'portfolio_risk_concentration_weight', 0.6) if self.config else 0.6
             cap_weight = getattr(self.config, 'portfolio_risk_capital_weight', 0.4) if self.config else 0.4
+            exp_weight = getattr(self.config, 'portfolio_risk_exposure_weight', 0.25) if self.config else 0.25
+            if not financial_positions:
+                exp_weight = 0.0
+            if exp_weight > 0 and (conc_weight + cap_weight + exp_weight) > 1e-12:
+                w_sum = conc_weight + cap_weight + exp_weight
+                conc_weight, cap_weight, exp_weight = conc_weight / w_sum, cap_weight / w_sum, exp_weight / w_sum
+            else:
+                exp_weight = 0.0
+
             prisk = conc_weight * conc + cap_weight * capital
+            if exp_weight > 0:
+                prisk = prisk * (1.0 - exp_weight) + exp_weight * exposure_risk
             return _adaptive_scale(prisk, 0.0, 1.0)
         except Exception as e:
             self.logger.warning(f"Portfolio risk calculation failed: {e}")
@@ -400,10 +429,16 @@ class EnhancedRiskController:
             # ENHANCEMENT: Add forecast uncertainty risk
             forecast_uncertainty_risk = self.calculate_forecast_uncertainty_risk(env_state)
 
+            financial_positions = env_state.get('financial_positions')
+            if isinstance(financial_positions, dict):
+                fp = financial_positions
+            else:
+                fp = None
+
             comp = {
                 'market_risk':      self.calculate_market_risk(price),
                 'operational_risk': self.calculate_operational_risk(),
-                'portfolio_risk':   self.calculate_portfolio_risk(capacities, budget, initial_budget),
+                'portfolio_risk':   self.calculate_portfolio_risk(capacities, budget, initial_budget, financial_positions=fp),
                 'liquidity_risk':   self.calculate_liquidity_risk(budget, initial_budget),
                 'regulatory_risk':  self.calculate_regulatory_risk(timestep),
                 'forecast_uncertainty_risk': forecast_uncertainty_risk,

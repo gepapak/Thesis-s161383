@@ -37,6 +37,7 @@ Usage:
 """
 
 import argparse
+import builtins as _builtins
 import os
 import sys
 import warnings
@@ -48,6 +49,8 @@ from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
+
+from config import EnhancedConfig
 
 def setup_console_encoding():
     """
@@ -70,8 +73,49 @@ def setup_console_encoding():
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
+def _sanitize_console_text(message: str) -> str:
+    """Best-effort cleanup for legacy mojibake and old icon-heavy console strings."""
+    text = str(message)
+    for _ in range(2):
+        if any(ch in text for ch in ("Ã", "Â", "â")):
+            try:
+                repaired = text.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+            except Exception:
+                break
+            if repaired and repaired != text:
+                text = repaired
+                continue
+        break
+    replacements = {
+        "✅": "[OK]",
+        "⚠": "[WARN]",
+        "❌": "[FAIL]",
+        "🚀": "",
+        "🔍": "[INFO]",
+        "📂": "[LOAD]",
+        "📁": "[LOAD]",
+        "📊": "[ANALYZE]",
+        "📈": "[EVAL]",
+        "💾": "[SAVE]",
+        "🎯": "[GOAL]",
+        "🔧": "[SETUP]",
+        "…": "...",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return " ".join(text.split())
+
+def print(*args, **kwargs):
+    """Module-local print wrapper that sanitizes legacy evaluation output."""
+    cleaned = [
+        _sanitize_console_text(arg) if isinstance(arg, str) else arg
+        for arg in args
+    ]
+    return _builtins.print(*cleaned, **kwargs)
+
 def print_progress(message: str, step: int = None, total: int = None):
     """Print progress message with optional step counter."""
+    message = _sanitize_console_text(message)
     timestamp = datetime.now().strftime("%H:%M:%S")
     if step is not None and total is not None:
         progress = f"[{step}/{total}]"
@@ -83,15 +127,146 @@ def print_progress(message: str, step: int = None, total: int = None):
 def print_section_header(title: str):
     """Print a formatted section header."""
     print("\n" + "="*80)
-    print(f"🎯 {title}")
+    print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ {title}")
     print("="*80)
     sys.stdout.flush()
 
+
+def _print_eval_loop_progress(
+    completed_steps: int,
+    total_steps: int,
+    portfolio_values: list,
+    rewards_by_agent: Dict[str, list],
+    successful_inference_actions: Optional[int] = None,
+    total_inference_attempts: Optional[int] = None,
+):
+    """
+    Emit a live evaluation progress line.
+
+    Progress is reported on completed-step boundaries so the console shows
+    `1000/10000`, `2000/10000`, ... instead of only logging at step 0.
+    """
+    if total_steps <= 0:
+        return
+
+    current_portfolio = portfolio_values[-1] if portfolio_values else 800_000_000
+    portfolio_change = ((current_portfolio / 800_000_000) - 1) * 100
+    total_reward = sum(sum(rewards_by_agent[agent]) for agent in rewards_by_agent)
+
+    msg = (
+        f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Progress: {completed_steps}/{total_steps} "
+        f"({completed_steps / total_steps * 100:.1f}%) | "
+        f"NAV: ${current_portfolio/1e6:.1f}M ({portfolio_change:+.2f}%) | "
+        f"Total Reward: {total_reward:.1f}"
+    )
+
+    if successful_inference_actions is not None and total_inference_attempts is not None:
+        success_rate = (
+            successful_inference_actions / total_inference_attempts
+            if total_inference_attempts > 0 else 0.0
+        )
+        msg += f" | Inference: {success_rate*100:.1f}%"
+
+    print_progress(msg)
+
+
+# Clean ASCII overrides for the legacy console helpers above.
+def _sanitize_console_text(message: str) -> str:
+    """Normalize evaluation console output to simple ASCII."""
+    text = str(message)
+    for _ in range(2):
+        if any(ch in text for ch in ("Ã", "Â", "â")):
+            try:
+                repaired = text.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+            except Exception:
+                break
+            if repaired and repaired != text:
+                text = repaired
+                continue
+        break
+    replacements = {
+        "âœ…": "[OK]",
+        "âš ": "[WARN]",
+        "âŒ": "[FAIL]",
+        "ðŸ”": "[INFO]",
+        "ðŸ“‚": "[LOAD]",
+        "ðŸ“": "[LOAD]",
+        "ðŸ“Š": "[ANALYZE]",
+        "ðŸ“ˆ": "[EVAL]",
+        "ðŸ’¾": "[SAVE]",
+        "ðŸŽ¯": "[GOAL]",
+        "ðŸ”§": "[SETUP]",
+        "â€¦": "...",
+        "→": "->",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    text = text.encode("ascii", errors="ignore").decode("ascii", errors="ignore")
+    return " ".join(text.split())
+
+
+def print(*args, **kwargs):
+    """Module-local print wrapper that sanitizes evaluation output."""
+    cleaned = [
+        _sanitize_console_text(arg) if isinstance(arg, str) else arg
+        for arg in args
+    ]
+    return _builtins.print(*cleaned, **kwargs)
+
+
+def print_progress(message: str, step: int = None, total: int = None):
+    """Print progress message with optional step counter."""
+    message = _sanitize_console_text(message)
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    if step is not None and total is not None:
+        progress = f"[{step}/{total}]"
+        print(f"[{timestamp}] {progress} {message}")
+    else:
+        print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
+
+
+def print_section_header(title: str):
+    """Print a formatted section header."""
+    print("\n" + "=" * 80)
+    print(f"{title}")
+    print("=" * 80)
+    sys.stdout.flush()
+
+
+def _print_eval_loop_progress(
+    completed_steps: int,
+    total_steps: int,
+    portfolio_values: list,
+    rewards_by_agent: Dict[str, list],
+    successful_inference_actions: Optional[int] = None,
+    total_inference_attempts: Optional[int] = None,
+):
+    """Emit a live ASCII evaluation progress line."""
+    if total_steps <= 0:
+        return
+
+    current_portfolio = portfolio_values[-1] if portfolio_values else 800_000_000
+    portfolio_change = ((current_portfolio / 800_000_000) - 1) * 100
+    total_reward = sum(sum(rewards_by_agent[agent]) for agent in rewards_by_agent)
+    msg = (
+        f"Progress: {completed_steps}/{total_steps} "
+        f"({completed_steps / total_steps * 100:.1f}%) | "
+        f"NAV: ${current_portfolio/1e6:.1f}M ({portfolio_change:+.2f}%) | "
+        f"Total Reward: {total_reward:.1f}"
+    )
+    if successful_inference_actions is not None and total_inference_attempts is not None:
+        success_rate = (
+            successful_inference_actions / total_inference_attempts
+            if total_inference_attempts > 0 else 0.0
+        )
+        msg += f" | Inference: {success_rate*100:.1f}%"
+    print_progress(msg)
+
 # Import project modules (no side effects / no prints at import time).
-from main import load_energy_data
 from environment import RenewableMultiAgentEnv
 from metacontroller import MultiESGAgent
-from generator import MultiHorizonForecastGenerator
+from generator import MultiHorizonForecastGenerator, load_energy_data
 
 # Portfolio analysis imports
 try:
@@ -100,7 +275,7 @@ try:
     HAS_PLOTTING = True
 except ImportError:
     HAS_PLOTTING = False
-    print("⚠️ Matplotlib/Seaborn not available - plotting disabled")
+    print("ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Matplotlib/Seaborn not available - plotting disabled")
 
 
 class EvaluationConfig:
@@ -114,10 +289,13 @@ class EvaluationConfig:
         self.multithreading = True
         self.agent_policies = [
             {"mode": "PPO"},  # investor_0
-            {"mode": "PPO"},  # battery_operator_0
-            {"mode": "PPO"},  # risk_controller_0
-            {"mode": "SAC"},  # meta_controller_0
+            {"mode": "DQN"},  # battery_operator_0
+            {"mode": "RULE"},  # risk_controller_0
+            {"mode": "RULE"},  # meta_controller_0
         ]
+        self.battery_action_mode = "discrete"
+        self.battery_discrete_action_levels = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        self.battery_initial_soc = 0.50
 
 
 class PortfolioAnalysisConfig:
@@ -165,7 +343,7 @@ class PortfolioAnalyzer:
 
     def analyze_performance(self, make_plots: bool = False, save_plots: bool = False, output_dir: str = "evaluation_results") -> Dict[str, Any]:
         """Perform comprehensive portfolio performance analysis."""
-        print("\n📊 PERFORMING PORTFOLIO ANALYSIS")
+        print("\nÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  PERFORMING PORTFOLIO ANALYSIS")
         print("=" * 50)
 
         analysis = {}
@@ -192,7 +370,7 @@ class PortfolioAnalyzer:
         analysis['summary'] = self._generate_analysis_summary(analysis)
 
         self.analysis_results = analysis
-        print("✅ Portfolio analysis completed")
+        print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Portfolio analysis completed")
 
         return analysis
 
@@ -249,111 +427,6 @@ class PortfolioAnalyzer:
 
         return risk_analysis
 
-    def _analyze_economic_model(self) -> Dict[str, Any]:
-        """Analyze economic model performance."""
-        economic = {}
-
-        # Fund structure analysis
-        initial_pv = self.results.get('initial_portfolio_value', 0.0)
-        final_pv = self.results.get('final_portfolio_value', 0.0)
-
-        economic['fund_size_initial'] = initial_pv
-        economic['fund_size_final'] = final_pv
-        economic['fund_growth'] = final_pv - initial_pv if initial_pv > 0 else 0.0
-        economic['fund_growth_percentage'] = SafeDivision.div(economic['fund_growth'], initial_pv, 0.0) * 100
-
-        # Asset allocation efficiency
-        physical_target = self.config.physical_allocation
-        economic['target_physical_allocation'] = physical_target * 100
-        economic['target_trading_allocation'] = (1 - physical_target) * 100
-
-        # Revenue analysis
-        total_rewards = self.results.get('total_rewards', 0.0)
-        economic['total_rewards'] = total_rewards
-        economic['reward_efficiency'] = SafeDivision.div(total_rewards, initial_pv, 0.0) if initial_pv > 0 else 0.0
-
-        return economic
-
-    def _analyze_ai_performance(self) -> Dict[str, Any]:
-        """Analyze AI-specific performance improvements."""
-        ai_analysis = {}
-
-        # Model inference reliability
-        inference_rate = _extract_action_inference_success_rate(self.results)
-        if inference_rate is not None:
-            ai_analysis['action_inference_success_rate'] = inference_rate * 100
-            ai_analysis['action_inference_reliability'] = (
-                'excellent' if inference_rate > 0.9 else
-                'good' if inference_rate > 0.7 else
-                'moderate'
-            )
-
-        # Agent performance
-        agent_rewards = {}
-        total_agent_rewards = 0
-        for key, value in self.results.items():
-            if '_total_reward' in key:
-                agent_name = key.replace('_total_reward', '')
-                agent_rewards[agent_name] = value
-                total_agent_rewards += value
-
-        ai_analysis['agent_rewards'] = agent_rewards
-        ai_analysis['total_agent_rewards'] = total_agent_rewards
-
-        # AI enhancement assessment
-        actual_return = self.results.get('total_return', 0.0)
-        baseline_target = self.config.target_baseline_return
-        ai_target = self.config.target_ai_return
-
-        if actual_return > baseline_target:
-            ai_analysis['ai_enhancement'] = actual_return - baseline_target
-            ai_analysis['enhancement_percentage'] = SafeDivision.div(ai_analysis['ai_enhancement'], baseline_target, 0.0) * 100
-        else:
-            ai_analysis['ai_enhancement'] = 0.0
-            ai_analysis['enhancement_percentage'] = 0.0
-
-        ai_analysis['ai_effectiveness'] = (
-            'highly_effective' if actual_return > ai_target else
-            'effective' if actual_return > baseline_target else
-            'needs_improvement'
-        )
-
-        return ai_analysis
-
-    def _analyze_statistical_confidence(self) -> Dict[str, Any]:
-        """Analyze statistical confidence in results."""
-        confidence = {}
-
-        # Evaluation steps and data quality
-        eval_steps = self.results.get('evaluation_steps', 0)
-        confidence['evaluation_steps'] = eval_steps
-        confidence['data_points'] = eval_steps
-
-        # Estimate confidence based on data size
-        if eval_steps >= 10000:
-            confidence['confidence_level'] = 'high'
-            confidence['confidence_score'] = 0.95
-        elif eval_steps >= 5000:
-            confidence['confidence_level'] = 'moderate'
-            confidence['confidence_score'] = 0.80
-        elif eval_steps >= 1000:
-            confidence['confidence_level'] = 'low'
-            confidence['confidence_score'] = 0.65
-        else:
-            confidence['confidence_level'] = 'very_low'
-            confidence['confidence_score'] = 0.50
-
-        # Time period analysis (assuming 10-minute intervals)
-        minutes_of_data = eval_steps * 10
-        hours_of_data = minutes_of_data / 60
-        days_of_data = hours_of_data / 24
-
-        confidence['hours_of_data'] = hours_of_data
-        confidence['days_of_data'] = days_of_data
-        confidence['months_of_data'] = days_of_data / 30
-
-        return confidence
-
     def _create_performance_plots(self, save_plots: bool = False, output_dir: str = "evaluation_results") -> Dict[str, str]:
         """Create performance visualization plots."""
         if not HAS_PLOTTING:
@@ -362,32 +435,25 @@ class PortfolioAnalyzer:
         plots_created = {}
 
         try:
-            # Create figure with subplots
             fig, axes = plt.subplots(2, 2, figsize=(15, 12))
             fig.suptitle(self.config.plot_title, fontsize=16, fontweight='bold')
 
-            # Plot 1: Performance Summary
             ax1 = axes[0, 0]
             metrics = ['Total Return', 'Sharpe Ratio', 'Volatility', 'Max Drawdown']
             values = [
                 self.results.get('total_return', 0) * 100,
                 self.results.get('sharpe_ratio', 0),
                 self.results.get('volatility', 0) * 100,
-                self.results.get('max_drawdown', 0) * 100
+                self.results.get('max_drawdown', 0) * 100,
             ]
-
             bars = ax1.bar(metrics, values, color=['green', 'blue', 'orange', 'red'])
             ax1.set_title('Key Performance Metrics')
             ax1.set_ylabel('Value (%)')
             ax1.tick_params(axis='x', rotation=45)
-
-            # Add value labels on bars
             for bar, value in zip(bars, values):
                 height = bar.get_height()
-                ax1.text(bar.get_x() + bar.get_width()/2., height,
-                        f'{value:.2f}%', ha='center', va='bottom')
+                ax1.text(bar.get_x() + bar.get_width() / 2.0, height, f'{value:.2f}%', ha='center', va='bottom')
 
-            # Plot 2: Agent Performance
             ax2 = axes[0, 1]
             agent_rewards = {}
             for key, value in self.results.items():
@@ -402,46 +468,35 @@ class PortfolioAnalyzer:
                 ax2.set_title('Agent Performance (Total Rewards)')
                 ax2.set_ylabel('Total Reward')
                 ax2.tick_params(axis='x', rotation=45)
-
-                # Add value labels
                 for bar, reward in zip(bars, rewards):
                     height = bar.get_height()
-                    ax2.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{reward:.1f}', ha='center', va='bottom')
+                    ax2.text(bar.get_x() + bar.get_width() / 2.0, height, f'{reward:.1f}', ha='center', va='bottom')
 
-            # Plot 3: Risk Analysis
             ax3 = axes[1, 0]
             risk_metrics = ['Avg Risk', 'Max Risk', 'Volatility']
             risk_values = [
                 self.results.get('average_risk', 0),
                 self.results.get('max_risk', 0),
-                self.results.get('volatility', 0)
+                self.results.get('volatility', 0),
             ]
-
-            bars = ax3.bar(risk_metrics, risk_values, color='coral')
+            ax3.bar(risk_metrics, risk_values, color='coral')
             ax3.set_title('Risk Metrics')
             ax3.set_ylabel('Risk Level')
 
-            # Plot 4: Performance vs Targets
             ax4 = axes[1, 1]
             targets = ['Baseline Target', 'AI Target', 'Actual Return']
             target_values = [
                 self.config.target_baseline_return * 100,
                 self.config.target_ai_return * 100,
-                self.results.get('total_return', 0) * 100
+                self.results.get('total_return', 0) * 100,
             ]
-
-            colors = ['gray', 'lightblue', 'green']
-            bars = ax4.bar(targets, target_values, color=colors)
+            bars = ax4.bar(targets, target_values, color=['gray', 'lightblue', 'green'])
             ax4.set_title('Performance vs Targets')
             ax4.set_ylabel('Return (%)')
             ax4.tick_params(axis='x', rotation=45)
-
-            # Add value labels
             for bar, value in zip(bars, target_values):
                 height = bar.get_height()
-                ax4.text(bar.get_x() + bar.get_width()/2., height,
-                        f'{value:.2f}%', ha='center', va='bottom')
+                ax4.text(bar.get_x() + bar.get_width() / 2.0, height, f'{value:.2f}%', ha='center', va='bottom')
 
             plt.tight_layout()
 
@@ -451,14 +506,14 @@ class PortfolioAnalyzer:
                 plot_path = os.path.join(output_dir, f"performance_analysis_{timestamp}.png")
                 plt.savefig(plot_path, dpi=300, bbox_inches='tight')
                 plots_created['performance_plot'] = plot_path
-                print(f"📊 Performance plot saved: {plot_path}")
+                print(f"Performance plot saved: {plot_path}")
             else:
                 plt.show()
 
             plt.close()
 
         except Exception as e:
-            print(f"⚠️ Error creating plots: {e}")
+            print(f"Error creating plots: {e}")
             plots_created['error'] = str(e)
 
         return plots_created
@@ -616,165 +671,6 @@ class PortfolioAnalyzer:
         confidence['months_of_data'] = days_of_data / 30
 
         return confidence
-
-    def _create_performance_plots(self, save_plots: bool = False, output_dir: str = "evaluation_results") -> Dict[str, str]:
-        """Create performance visualization plots."""
-        if not HAS_PLOTTING:
-            return {'error': 'Plotting libraries not available'}
-
-        plots_created = {}
-
-        try:
-            # Create figure with subplots
-            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-            fig.suptitle(self.config.plot_title, fontsize=16, fontweight='bold')
-
-            # Plot 1: Performance Summary
-            ax1 = axes[0, 0]
-            metrics = ['Total Return', 'Sharpe Ratio', 'Volatility', 'Max Drawdown']
-            values = [
-                self.results.get('total_return', 0) * 100,
-                self.results.get('sharpe_ratio', 0),
-                self.results.get('volatility', 0) * 100,
-                self.results.get('max_drawdown', 0) * 100
-            ]
-
-            bars = ax1.bar(metrics, values, color=['green', 'blue', 'orange', 'red'])
-            ax1.set_title('Key Performance Metrics')
-            ax1.set_ylabel('Value (%)')
-            ax1.tick_params(axis='x', rotation=45)
-
-            # Add value labels on bars
-            for bar, value in zip(bars, values):
-                height = bar.get_height()
-                ax1.text(bar.get_x() + bar.get_width()/2., height,
-                        f'{value:.2f}%', ha='center', va='bottom')
-
-            # Plot 2: Agent Performance
-            ax2 = axes[0, 1]
-            agent_rewards = {}
-            for key, value in self.results.items():
-                if '_total_reward' in key:
-                    agent_name = key.replace('_total_reward', '').replace('_0', '')
-                    agent_rewards[agent_name] = value
-
-            if agent_rewards:
-                agents = list(agent_rewards.keys())
-                rewards = list(agent_rewards.values())
-                bars = ax2.bar(agents, rewards, color='skyblue')
-                ax2.set_title('Agent Performance (Total Rewards)')
-                ax2.set_ylabel('Total Reward')
-                ax2.tick_params(axis='x', rotation=45)
-
-                # Add value labels
-                for bar, reward in zip(bars, rewards):
-                    height = bar.get_height()
-                    ax2.text(bar.get_x() + bar.get_width()/2., height,
-                            f'{reward:.1f}', ha='center', va='bottom')
-
-            # Plot 3: Risk Analysis
-            ax3 = axes[1, 0]
-            risk_metrics = ['Avg Risk', 'Max Risk', 'Volatility']
-            risk_values = [
-                self.results.get('average_risk', 0),
-                self.results.get('max_risk', 0),
-                self.results.get('volatility', 0)
-            ]
-
-            bars = ax3.bar(risk_metrics, risk_values, color='coral')
-            ax3.set_title('Risk Metrics')
-            ax3.set_ylabel('Risk Level')
-
-            # Plot 4: Performance vs Targets
-            ax4 = axes[1, 1]
-            targets = ['Baseline Target', 'AI Target', 'Actual Return']
-            target_values = [
-                self.config.target_baseline_return * 100,
-                self.config.target_ai_return * 100,
-                self.results.get('total_return', 0) * 100
-            ]
-
-            colors = ['gray', 'lightblue', 'green']
-            bars = ax4.bar(targets, target_values, color=colors)
-            ax4.set_title('Performance vs Targets')
-            ax4.set_ylabel('Return (%)')
-            ax4.tick_params(axis='x', rotation=45)
-
-            # Add value labels
-            for bar, value in zip(bars, target_values):
-                height = bar.get_height()
-                ax4.text(bar.get_x() + bar.get_width()/2., height,
-                        f'{value:.2f}%', ha='center', va='bottom')
-
-            plt.tight_layout()
-
-            if save_plots:
-                os.makedirs(output_dir, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                plot_path = os.path.join(output_dir, f"performance_analysis_{timestamp}.png")
-                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-                plots_created['performance_plot'] = plot_path
-                print(f"📊 Performance plot saved: {plot_path}")
-            else:
-                plt.show()
-
-            plt.close()
-
-        except Exception as e:
-            print(f"⚠️ Error creating plots: {e}")
-            plots_created['error'] = str(e)
-
-        return plots_created
-
-    def _generate_analysis_summary(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate executive summary of analysis."""
-        summary = {}
-
-        # Overall performance assessment
-        total_return = self.results.get('total_return', 0.0)
-        ai_target = self.config.target_ai_return
-
-        if total_return >= ai_target:
-            summary['overall_assessment'] = 'EXCELLENT'
-            summary['performance_grade'] = 'A'
-        elif total_return >= self.config.target_baseline_return:
-            summary['overall_assessment'] = 'GOOD'
-            summary['performance_grade'] = 'B'
-        elif total_return >= 0:
-            summary['overall_assessment'] = 'MODERATE'
-            summary['performance_grade'] = 'C'
-        else:
-            summary['overall_assessment'] = 'POOR'
-            summary['performance_grade'] = 'D'
-
-        # Key highlights
-        summary['key_metrics'] = {
-            'total_return_pct': f"{total_return * 100:.2f}%",
-            'sharpe_ratio': f"{self.results.get('sharpe_ratio', 0):.3f}",
-            'max_drawdown_pct': f"{self.results.get('max_drawdown', 0) * 100:.2f}%",
-            'confidence_level': analysis.get('confidence_analysis', {}).get('confidence_level', 'unknown')
-        }
-
-        # Recommendations
-        recommendations = []
-
-        if total_return < ai_target:
-            recommendations.append("Consider optimizing AI model parameters")
-
-        if self.results.get('volatility', 0) > 0.2:
-            recommendations.append("Implement additional risk management measures")
-
-        inference_rate = analysis.get('ai_analysis', {}).get('action_inference_success_rate', None)
-        if inference_rate is not None and inference_rate < 80:
-            recommendations.append("Investigate policy inference failures during evaluation")
-
-        if not recommendations:
-            recommendations.append("Maintain current strategy - performance is satisfactory")
-
-        summary['recommendations'] = recommendations
-
-        return summary
-
 
 def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[str, Any]:
     """
@@ -789,7 +685,7 @@ def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[st
     import pandas as pd
     import numpy as np
 
-    print("🏗️ Creating Buy-and-Hold baseline (passive cash/bonds strategy)...")
+    print("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Creating Buy-and-Hold baseline (passive cash/bonds strategy)...")
 
     # Load data
     data = pd.read_csv(eval_data_path)
@@ -843,7 +739,7 @@ def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[st
 
 def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: str, timesteps: int, output_dir: str = "evaluation_results") -> Tuple[bool, Optional[Dict]]:
     """Run a single baseline and return success status and results."""
-    print(f"🚀 Running {baseline_name}...")
+    print(f"ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Running {baseline_name}...")
 
     # Create baseline-specific subdirectory within the main evaluation results folder
     baseline_output = os.path.join(output_dir, f"baseline_{baseline_name.lower().replace(' ', '_')}")
@@ -858,12 +754,12 @@ def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: s
 
     script_name = script_map.get(baseline_name)
     if not script_name:
-        print(f"❌ Unknown baseline: {baseline_name}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Unknown baseline: {baseline_name}")
         return False, None
 
     script_path = os.path.join(baseline_dir, script_name)
     if not os.path.exists(script_path):
-        print(f"❌ Script not found: {script_path}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Script not found: {script_path}")
         return False, None
 
     cmd = [
@@ -879,7 +775,7 @@ def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: s
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding='ascii', errors='ignore')
 
         if result.returncode == 0:
-            print(f"✅ {baseline_name} completed successfully")
+            print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ {baseline_name} completed successfully")
 
             # Try to load results
             results_file = os.path.join(baseline_output, "evaluation_results.json")
@@ -903,7 +799,7 @@ def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: s
                         'status': 'completed'
                     }
             else:
-                print(f"⚠️ No results found for {baseline_name}")
+                print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â No results found for {baseline_name}")
                 return True, {
                     'method': baseline_name,
                     'total_return': 0.0,
@@ -911,20 +807,20 @@ def run_single_baseline(baseline_name: str, baseline_dir: str, eval_data_path: s
                     'status': 'completed_no_results'
                 }
         else:
-            print(f"❌ {baseline_name} failed: {result.stderr}")
+            print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ {baseline_name} failed: {result.stderr}")
             return False, {'error': result.stderr}
 
     except subprocess.TimeoutExpired:
-        print(f"⏰ {baseline_name} timed out")
+        print(f"ÃƒÂ¢Ã‚ÂÃ‚Â° {baseline_name} timed out")
         return False, {'error': 'timeout'}
     except Exception as e:
-        print(f"❌ {baseline_name} error: {str(e)}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ {baseline_name} error: {str(e)}")
         return False, {'error': str(e)}
 
 
 def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000, output_dir: str = "evaluation_results") -> Dict[str, Any]:
     """Run traditional baseline methods and return results."""
-    print("🏛️ Running traditional baseline methods...")
+    print("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬ÂºÃƒÂ¯Ã‚Â¸Ã‚Â Running traditional baseline methods...")
 
     baseline_results = {}
 
@@ -935,7 +831,7 @@ def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000, outpu
         ("Buy-and-Hold Strategy", "Baseline3_BuyAndHold")
     ]
 
-    print("🚀 Executing traditional baselines...")
+    print("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Executing traditional baselines...")
 
     for i, (baseline_name, baseline_dir) in enumerate(baselines, 1):
         # Run traditional baseline via subprocess
@@ -949,10 +845,10 @@ def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000, outpu
                 initial_val = results['initial_value_usd']
                 final_val = results['final_value_usd']
                 return_pct = ((final_val - initial_val) / initial_val * 100) if initial_val > 0 else 0
-                print_progress(f"   💰 {baseline_name}: ${final_val/1e6:.1f}M (${initial_val/1e6:.1f}M → {return_pct:+.2f}%)")
+                print_progress(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â° {baseline_name}: ${final_val/1e6:.1f}M (${initial_val/1e6:.1f}M ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {return_pct:+.2f}%)")
             elif 'total_return' in results:
                 return_pct = results['total_return']
-                print_progress(f"   📈 {baseline_name}: Total return {return_pct:+.2f}%")
+                print_progress(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‹â€  {baseline_name}: Total return {return_pct:+.2f}%")
         else:
             baseline_results[baseline_key] = {
                 'method': baseline_name,
@@ -963,21 +859,21 @@ def run_traditional_baselines(eval_data_path: str, timesteps: int = 10000, outpu
     # Check if any baselines succeeded
     successful_baselines = [k for k, v in baseline_results.items() if v.get('status') != 'failed']
     if successful_baselines:
-        print_progress(f"✅ Traditional baselines completed: {len(successful_baselines)}/3 successful")
+        print_progress(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Traditional baselines completed: {len(successful_baselines)}/3 successful")
 
         # Summary of baseline performance
-        print_progress("📊 Baseline Performance Summary:")
+        print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Baseline Performance Summary:")
         for key, result in baseline_results.items():
             if result.get('status') != 'failed':
                 method = result.get('method', 'Unknown')
                 if 'final_value_usd' in result:
                     final_val = result['final_value_usd']
-                    print_progress(f"   • {method}: ${final_val/1e6:.1f}M final value")
+                    print_progress(f"   ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ {method}: ${final_val/1e6:.1f}M final value")
                 elif 'total_return' in result:
                     return_pct = result['total_return']
-                    print_progress(f"   • {method}: {return_pct:+.2f}% total return")
+                    print_progress(f"   ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ {method}: {return_pct:+.2f}% total return")
     else:
-        print_progress("❌ All traditional baselines failed")
+        print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ All traditional baselines failed")
 
     return baseline_results
 
@@ -994,21 +890,19 @@ def find_latest_checkpoint(checkpoint_base_dir: str = "normal/checkpoints") -> O
         required_files = [
             "investor_0_policy.zip",
             "battery_operator_0_policy.zip",
-            "risk_controller_0_policy.zip",
-            "meta_controller_0_policy.zip"
         ]
 
         all_files_exist = all(os.path.exists(os.path.join(final_models_dir, f)) for f in required_files)
 
         if all_files_exist:
-            print(f"🎯 Found final models directory: {final_models_dir}")
+            print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Found final models directory: {final_models_dir}")
             return final_models_dir
         else:
-            print(f"⚠️ Final models directory exists but missing some policy files")
+            print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Final models directory exists but missing some policy files")
 
     # Fallback to checkpoint detection
     if not os.path.exists(checkpoint_base_dir):
-        print(f"❌ Checkpoint directory not found: {checkpoint_base_dir}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Checkpoint directory not found: {checkpoint_base_dir}")
         return None
 
     # Find all checkpoint directories
@@ -1016,7 +910,7 @@ def find_latest_checkpoint(checkpoint_base_dir: str = "normal/checkpoints") -> O
     checkpoints = glob.glob(checkpoint_pattern)
 
     if not checkpoints:
-        print(f"❌ No checkpoints found in {checkpoint_base_dir}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ No checkpoints found in {checkpoint_base_dir}")
         return None
 
     # Sort by checkpoint number (extract number from checkpoint_XXXXX)
@@ -1029,13 +923,13 @@ def find_latest_checkpoint(checkpoint_base_dir: str = "normal/checkpoints") -> O
     latest_checkpoint = max(checkpoints, key=get_checkpoint_number)
     checkpoint_num = get_checkpoint_number(latest_checkpoint)
 
-    print(f"🔍 Found latest checkpoint: {os.path.basename(latest_checkpoint)} (step {checkpoint_num})")
+    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â Found latest checkpoint: {os.path.basename(latest_checkpoint)} (step {checkpoint_num})")
     return latest_checkpoint
 
 
 def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
     """Load models from checkpoint using Stable Baselines3."""
-    print(f"🔥 Loading models from checkpoint: {checkpoint_dir}")
+    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â¥ Loading models from checkpoint: {checkpoint_dir}")
     
     try:
         # ------------------------------------------------------------------
@@ -1064,14 +958,32 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
             # Never block evaluation due to a best-effort compatibility shim.
             print(f"Warning: NumPy compatibility shim skipped: {shim_error}")
 
-        from stable_baselines3 import PPO, SAC
-        print("✅ Successfully imported stable-baselines3")
-        
+        from stable_baselines3 import PPO, SAC, TD3, DQN
+        from policy import BetaActorCriticPolicy
+        print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Successfully imported stable-baselines3")
+
+        algo_map = {"PPO": PPO, "SAC": SAC, "TD3": TD3, "DQN": DQN}
+        agent_modes = {
+            "investor_0": "PPO",
+            "battery_operator_0": "DQN",
+        }
+        config_path = os.path.join(checkpoint_dir, "training_config.json")
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                final_cfg = saved.get("final_config", {}) or {}
+                saved_policies = final_cfg.get("agent_policies", None)
+                if isinstance(saved_policies, list) and len(saved_policies) >= 2:
+                    agent_modes["investor_0"] = str((saved_policies[0] or {}).get("mode", agent_modes["investor_0"]))
+                    agent_modes["battery_operator_0"] = str((saved_policies[1] or {}).get("mode", agent_modes["battery_operator_0"]))
+            except Exception as e:
+                print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Could not read training_config.json for algo detection: {e}")
+
+        _ = BetaActorCriticPolicy
         model_configs = [
-            ("investor_0_policy.zip", PPO),
-            ("battery_operator_0_policy.zip", PPO),
-            ("risk_controller_0_policy.zip", PPO),
-            ("meta_controller_0_policy.zip", SAC)
+            ("investor_0_policy.zip", algo_map.get(agent_modes["investor_0"], PPO)),
+            ("battery_operator_0_policy.zip", algo_map.get(agent_modes["battery_operator_0"], DQN)),
         ]
         
         loaded_models = {}
@@ -1082,31 +994,37 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
             
             if os.path.exists(model_path):
                 try:
-                    print(f"🔧 Loading {model_file} with {model_class.__name__}...")
+                    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â§ Loading {model_file} with {model_class.__name__}...")
                     model = model_class.load(model_path)
                     loaded_models[agent_name] = model
-                    print(f"✅ SUCCESS: Loaded {agent_name} from checkpoint!")
+                    print(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ SUCCESS: Loaded {agent_name} from checkpoint!")
                 except Exception as e:
-                    print(f"❌ Failed to load {model_file}: {e}")
+                    print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to load {model_file}: {e}")
                     loaded_models[agent_name] = None
             else:
-                print(f"❌ Model file not found: {model_path}")
+                print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Model file not found: {model_path}")
                 loaded_models[agent_name] = None
         
         return loaded_models
         
     except ImportError as e:
-        print(f"❌ Cannot import stable-baselines3: {e}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Cannot import stable-baselines3: {e}")
         return {}
     except Exception as e:
-        print(f"❌ Error loading checkpoint models: {e}")
+        print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Error loading checkpoint models: {e}")
         return {}
 
 
-def _load_eval_forecast_paths_episode20(forecast_base_dir: str = "forecast_models") -> Dict[str, str]:
+def _load_eval_forecast_paths_episode20(
+    forecast_base_dir: str = "forecast_models",
+    config: Optional[EnhancedConfig] = None,
+) -> Dict[str, str]:
     """
-    Evaluation on unseen data uses the evaluation-reserved forecast models (Episode 20).
-    No training should happen in evaluation.
+    Resolve the evaluation-reserved Episode-20 forecast stack.
+
+    If the reserved expert bank is missing, build it once and then validate the
+    canonical episode_20 paths so deployed Tier-2 evaluation stays aligned with
+    the current expert-bank contract.
     """
     def _validate_forecast_paths(paths: Dict[str, str], source: str) -> Dict[str, str]:
         required = ("model_dir", "scaler_dir", "metadata_dir")
@@ -1123,9 +1041,18 @@ def _load_eval_forecast_paths_episode20(forecast_base_dir: str = "forecast_model
         return paths
 
     try:
-        from episode_forecast_integration import get_evaluation_forecast_paths
+        from forecast_engine import get_evaluation_forecast_paths, check_episode_models_exist, train_evaluation_forecasts
+        cfg = config or EnhancedConfig()
+        if not check_episode_models_exist(20, forecast_base_dir=forecast_base_dir, config=cfg):
+            train_evaluation_forecasts(
+                episode_num=20,
+                forecast_training_dataset_dir="forecast_training_dataset",
+                forecast_base_dir=forecast_base_dir,
+                force_retrain=False,
+                config=cfg,
+            )
         resolved = get_evaluation_forecast_paths(forecast_base_dir=forecast_base_dir)
-        return _validate_forecast_paths(resolved, "episode_forecast_integration")
+        return _validate_forecast_paths(resolved, "forecast_engine")
     except Exception as e:
         # Fallback to the conventional folder layout (validated, else fatal).
         ep_dir = os.path.join(forecast_base_dir, "episode_20")
@@ -1142,21 +1069,11 @@ def _load_eval_forecast_paths_episode20(forecast_base_dir: str = "forecast_model
                 f"(primary error: {e}; fallback error: {fallback_exc})"
             ) from fallback_exc
 
-def _infer_enhancer_feature_dim_from_weights_path(enh_weights_path: Optional[str]) -> int:
-    """Infer enhancer feature dimensionality from the weights filename."""
-    weights_name = os.path.basename(str(enh_weights_path or "")).strip().lower()
-    import re
-
-    match = re.search(r"(\d+)d(?=\.|_|$)", weights_name)
-    if match:
-        try:
-            return int(match.group(1))
-        except Exception:
-            return 0
-    return 0
-
-
-def _resolve_reserved_eval_forecast_context(args, output_dir: Optional[str] = None) -> Dict[str, Any]:
+def _resolve_reserved_eval_forecast_context(
+    args,
+    output_dir: Optional[str] = None,
+    config: Optional[EnhancedConfig] = None,
+) -> Dict[str, Any]:
     """
     Resolve the canonical evaluation forecaster context.
 
@@ -1164,7 +1081,8 @@ def _resolve_reserved_eval_forecast_context(args, output_dir: Optional[str] = No
     stack rather than ad-hoc model/scaler paths.
     """
     forecast_base = str(getattr(args, "forecast_base_dir", "forecast_models") or "forecast_models")
-    forecast_paths = _load_eval_forecast_paths_episode20(forecast_base_dir=forecast_base)
+    cfg = config or _build_eval_config(args)
+    forecast_paths = _load_eval_forecast_paths_episode20(forecast_base_dir=forecast_base, config=cfg)
 
     cache_root = str(getattr(args, "forecast_cache_dir", "forecast_cache") or "forecast_cache")
     cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025", "forecast_cache_eval_episode20_2025-full")
@@ -1180,40 +1098,14 @@ def _resolve_reserved_eval_forecast_context(args, output_dir: Optional[str] = No
     }
 
 
-def _expected_enhancer_weight_names(variant: Optional[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """Return expected and incompatible enhancer checkpoint names for a tier variant."""
-    from config import TIER2_ENHANCER_FEATURE_DIM, TIER2_ENHANCER_ABLATED_FEATURE_DIM
-
-    variant_name = str(variant or "").strip().lower()
-    full_compatible_names = (f"dl_enhancer_{int(TIER2_ENHANCER_FEATURE_DIM)}d.h5",)
-    ablated_name = f"dl_enhancer_{int(TIER2_ENHANCER_ABLATED_FEATURE_DIM)}d.h5"
-    legacy_names = (
-        "dl_enhancer_29d_short_mem.h5",
-        "dl_enhancer_5d.h5",
-        "dl_enhancer_11d_shadow_cf.h5",
-        "dl_enhancer_11d.h5",
-        "dl_enhancer_9d.h5",
-        "dl_enhancer_15d.h5",
-        "dl_enhancer_24d.h5",
-    )
-    if variant_name == "tier2":
-        return (
-            full_compatible_names,
-            (ablated_name,) + legacy_names,
-        )
-    if variant_name == "tier2_ablated":
-        return (
-            (ablated_name,),
-            full_compatible_names + legacy_names,
-        )
-    return (
-        full_compatible_names + (ablated_name,),
-        legacy_names,
-    )
+def _expected_cv_weight_names(variant: Optional[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Return expected and incompatible Tier-2 checkpoint names."""
+    expected = ("tier2_routed_overlay.h5", "dl_control_variate.h5")
+    return (expected, ())
 
 
-def _collect_enhancer_weight_candidates(final_models_dir: str, tier_dir: str, names: Tuple[str, ...]) -> list[str]:
-    """Collect enhancer checkpoint candidates from final_models/ and episode checkpoints."""
+def _collect_cv_weight_candidates(final_models_dir: str, tier_dir: str, names: Tuple[str, ...]) -> list[str]:
+    """Collect Tier-2 checkpoint candidates from final_models/ and episode checkpoints."""
     import re
 
     candidates = [os.path.join(final_models_dir, name) for name in names]
@@ -1227,7 +1119,7 @@ def _collect_enhancer_weight_candidates(final_models_dir: str, tier_dir: str, na
                     ep_dirs.append((int(m.group(1)), os.path.join(ckpt_root, name)))
         except Exception as e:
             raise RuntimeError(
-                f"[EVAL_ENHANCER_WEIGHTS_FATAL] Failed to list checkpoint directory {ckpt_root}: {e}"
+                f"[EVAL_CV_WEIGHTS_FATAL] Failed to list checkpoint directory {ckpt_root}: {e}"
             ) from e
         for _, ep_path in sorted(ep_dirs, key=lambda x: x[0], reverse=True):
             for name in names:
@@ -1235,59 +1127,36 @@ def _collect_enhancer_weight_candidates(final_models_dir: str, tier_dir: str, na
     return candidates
 
 
-def _resolve_enhancer_weights(final_models_dir: str, tier_dir: str, variant: Optional[str] = None) -> Optional[str]:
-    """Resolve the exact enhancer weights required for a tier variant."""
-    expected_names, incompatible_names = _expected_enhancer_weight_names(variant)
-    candidates = _collect_enhancer_weight_candidates(final_models_dir, tier_dir, expected_names)
+def _resolve_cv_weights(final_models_dir: str, tier_dir: str, variant: Optional[str] = None) -> Optional[str]:
+    """Resolve the exact Tier-2 weights required for a tier variant."""
+    expected_names, incompatible_names = _expected_cv_weight_names(variant)
+    candidates = _collect_cv_weight_candidates(final_models_dir, tier_dir, expected_names)
     for p in candidates:
         if p and os.path.exists(p):
             return p
 
-    incompatible_candidates = _collect_enhancer_weight_candidates(final_models_dir, tier_dir, incompatible_names)
+    incompatible_candidates = _collect_cv_weight_candidates(final_models_dir, tier_dir, incompatible_names)
     found_incompatible = [p for p in incompatible_candidates if p and os.path.exists(p)]
     if found_incompatible:
         variant_name = str(variant or "").strip().lower() or "tier2"
         raise RuntimeError(
-            f"Found incompatible enhancer weights for '{variant_name}': "
+            f"Found incompatible Tier-2 weights for '{variant_name}': "
             f"{os.path.basename(found_incompatible[0])}. Expected one of {list(expected_names)}."
         )
     return None
 
 
-def _resolve_enhancer_weights_from_models_dir(models_dir: str) -> Optional[str]:
-    """Resolve enhancer weights from a generic models directory (current full or 5D ablated)."""
-    from config import TIER2_ENHANCER_FEATURE_DIM, TIER2_ENHANCER_ABLATED_FEATURE_DIM
-
-    full_compatible_names = (f"dl_enhancer_{int(TIER2_ENHANCER_FEATURE_DIM)}d.h5",)
-    ablated_name = f"dl_enhancer_{int(TIER2_ENHANCER_ABLATED_FEATURE_DIM)}d.h5"
-    candidates = []
+def _resolve_cv_weights_from_models_dir(models_dir: str) -> Optional[str]:
+    """Resolve Tier-2 weights from a generic models directory."""
+    candidate_names = ("tier2_routed_overlay.h5", "dl_control_variate.h5")
     roots = [models_dir, os.path.join(models_dir, "final_models")]
     for root in roots:
         if not root:
             continue
-        for name in full_compatible_names:
-            candidates.append(os.path.join(root, name))
-        candidates.append(os.path.join(root, ablated_name))
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-    legacy_candidates = []
-    for root in roots:
-        if not root:
-            continue
-        legacy_candidates.append(os.path.join(root, "dl_enhancer_11d_shadow_cf.h5"))
-        legacy_candidates.append(os.path.join(root, "dl_enhancer_11d.h5"))
-        legacy_candidates.append(os.path.join(root, "dl_enhancer_9d.h5"))
-        legacy_candidates.append(os.path.join(root, "dl_enhancer_15d.h5"))
-        legacy_candidates.append(os.path.join(root, "dl_enhancer_24d.h5"))
-    for p in legacy_candidates:
-        if p and os.path.exists(p):
-            raise RuntimeError(
-                f"Found legacy enhancer checkpoint '{os.path.basename(p)}' in '{os.path.dirname(p)}'. "
-                "Legacy enhancer checkpoints are no longer supported; "
-                f"re-train Tier-2 with the current {int(TIER2_ENHANCER_FEATURE_DIM)}D live full model "
-                f"or {int(TIER2_ENHANCER_ABLATED_FEATURE_DIM)}D ablation."
-            )
+        for name in candidate_names:
+            p = os.path.join(root, name)
+            if p and os.path.exists(p):
+                return p
     return None
 
 
@@ -1306,19 +1175,68 @@ def _build_eval_config(args):
     return cfg
 
 
+def _hydrate_eval_config_from_training_config(cfg, final_models_dir: str):
+    """Load Tier-specific evaluation overrides from the saved training_config.json."""
+    config_path = os.path.join(final_models_dir, "training_config.json")
+    if not os.path.isfile(config_path):
+        return cfg
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception:
+        return cfg
+
+    final_cfg = saved.get("final_config", {}) or {}
+    enhanced = saved.get("enhanced_features", {}) or {}
+    keys = [
+        "tier2_feature_dim",
+        "cv_forecast_dim",
+        "tier2_cv_architecture",
+        "tier2_cv_memory_steps",
+        "tier2_mape_window",
+        "tier2_mape_reference",
+        "tier2_runtime_overlay_enable",
+        "tier2_runtime_gain",
+        "tier2_runtime_mc_samples",
+        "tier2_runtime_sigma_scale",
+        "tier2_runtime_conformal_margin",
+        "tier2_cv_delta_max",
+        "tier2_cv_target_scale",
+        "tier2_cv_confidence_loss_weight",
+        "tier2_cv_route_loss_weight",
+        "tier2_cv_override_loss_weight",
+        "tier2_cv_decision_horizon",
+        "tier2_cv_decision_scale",
+        "tier2_cv_decision_downside_weight",
+        "tier2_cv_decision_vol_weight",
+        "tier2_cv_decision_stability_penalty",
+        "tier2_cv_route_grid_points",
+        "tier2_cv_conformal_alpha",
+        "tier2_cv_conformal_scale",
+        "tier2_cv_sharpe_improvement_scale",
+    ]
+    for key in keys:
+        if key in final_cfg and hasattr(cfg, key):
+            setattr(cfg, key, final_cfg[key])
+
+    if "tier2_ablated" in enhanced:
+        cfg.tier2_cv_ablate_forecast_features = bool(enhanced.get("tier2_ablated", False))
+    return cfg
+
+
 def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     """Tier-suite evaluation on unseen data.
 
     Compares active training regimes under identical Tier-1 environment dynamics and
     observation spaces (no forecast-derived observations):
 
-      - baseline:   Tier-1 MARL (no forecast backend)
-      - tier2:      Tier-1 MARL trained with the full Tier-2 DL enhancer
-      - tier2_ablated: Tier-1 MARL trained with the 5D Tier-2 enhancer ablation
+      - baseline:   Tier-1 hybrid RL baseline (no forecast backend)
+      - tier2:      Tier-1 hybrid RL baseline with the Tier-2 short-horizon residual-aware defer-and-route layer
+      - tier2_ablated: Tier-1 hybrid RL baseline with the Tier-2 forecast-nullified ablation
 
     IMPORTANT:
       - In paper mode, forecasts are NOT enabled and evaluation stays policy-only.
-      - In deployed mode, only Tier-2 variants enable runtime forecasting + enhancer weights.
+      - In deployed mode, only Tier-2 variants enable runtime forecasting + Tier-2 weights.
     """
     results: Dict[str, Any] = {
         "evaluation_mode": "tiers",
@@ -1346,7 +1264,7 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         is_ablated_variant = (name == "tier2_ablated")
 
         # Start from the same base evaluation config, then enable Tier-2 runtime extras only when requested.
-        cfg = _build_eval_config(args)
+        cfg = _hydrate_eval_config_from_training_config(_build_eval_config(args), final_models_dir)
         dl_weights_path = None
 
         if not deployed:
@@ -1362,10 +1280,10 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 fail_fast=True,
             )
         else:
-            # Deployed/system evaluation: attach the runtime forecaster + DL enhancer only
+            # Deployed/system evaluation: attach the runtime forecaster + Tier-2 routed overlay only
             # for Tier-2 variants. Baseline remains forecast-free even in deployed mode.
-            wants_enhancer = is_tier2_variant
-            enable_forecasting = bool(wants_enhancer)
+            wants_cv = is_tier2_variant
+            enable_forecasting = bool(wants_cv)
             model_dir = "forecast_models/episode_20/models"
             scaler_dir = "forecast_models/episode_20/scalers"
             metadata_dir = None
@@ -1374,7 +1292,10 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
             if enable_forecasting:
                 try:
                     forecast_base = str(getattr(args, "forecast_base_dir", "forecast_models") or "forecast_models")
-                    forecast_paths = _load_eval_forecast_paths_episode20(forecast_base_dir=forecast_base)
+                    forecast_paths = _load_eval_forecast_paths_episode20(
+                        forecast_base_dir=forecast_base,
+                        config=cfg,
+                    )
                 except Exception as e:
                     raise RuntimeError(
                         f"Deployed tier evaluation requires valid forecast paths, but loading failed: {e}"
@@ -1390,15 +1311,15 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 if not os.path.isdir(cache_dir):
                     cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
 
-                dl_weights_path = _resolve_enhancer_weights(final_models_dir, run_dir, variant=name)
+                dl_weights_path = _resolve_cv_weights(final_models_dir, run_dir, variant=name)
                 if not dl_weights_path:
                     raise RuntimeError(
-                        f"Deployed tier evaluation for '{name}' requires enhancer weights, but none were found in "
+                        f"Deployed tier evaluation for '{name}' requires Tier-2 routed overlay weights, but none were found in "
                         f"'{final_models_dir}' or checkpoints under '{run_dir}'."
                     )
 
             cfg.forecast_baseline_enable = bool(enable_forecasting and dl_weights_path)
-            cfg.tier2_enhancer_ablate_forecast_features = bool(is_ablated_variant and dl_weights_path)
+            cfg.tier2_cv_ablate_forecast_features = bool(is_ablated_variant and dl_weights_path)
 
             env, _ = create_evaluation_environment(
                 eval_data,
@@ -1406,7 +1327,7 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 model_dir=model_dir,
                 scaler_dir=scaler_dir,
                 metadata_dir=metadata_dir,
-                enhancer_weights_path=dl_weights_path,
+                cv_weights_path=dl_weights_path,
                 output_dir=tier_out,
                 investment_freq=args.investment_freq,
                 config=cfg,
@@ -1443,9 +1364,16 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         tier_metrics["variant"] = name
         tier_metrics["tiers_eval_mode"] = eval_mode
         tier_metrics["deployed_enable_forecasting"] = bool(deployed and is_tier2_variant)
-        tier_metrics["deployed_enhancer_weights_path"] = dl_weights_path or ""
-        tier_metrics["deployed_enhancer_enabled"] = bool(deployed and is_tier2_variant and dl_weights_path)
-        tier_metrics["deployed_enhancer_feature_dim"] = _infer_enhancer_feature_dim_from_weights_path(dl_weights_path)
+        tier_metrics["deployed_tier2_weights_path"] = dl_weights_path or ""
+        tier_metrics["deployed_tier2_enabled"] = bool(deployed and is_tier2_variant and dl_weights_path)
+        tier_metrics["deployed_tier2_feature_dim"] = int(
+            getattr(cfg, "tier2_feature_dim", getattr(cfg, "cv_forecast_dim", 0)) or 0
+        )
+        tier_metrics["deployed_cv_weights_path"] = dl_weights_path or ""
+        tier_metrics["deployed_cv_enabled"] = bool(deployed and is_tier2_variant and dl_weights_path)
+        tier_metrics["deployed_cv_feature_dim"] = int(
+            getattr(cfg, "tier2_feature_dim", getattr(cfg, "cv_forecast_dim", 0)) or 0
+        )
         return tier_metrics
 
     print_section_header("Tier Suite Evaluation (Unseen 2025 Full Year)")
@@ -1462,11 +1390,11 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     if _wants("baseline", "tier1", include_in_all=True):
         results["tiers"]["baseline"] = _tier_eval("baseline", args.tier1_dir)
 
-    # Tier-2 full DL enhancer
+    # Tier-2 full routed residual-aware overlay
     if _wants("tier2", "tier2", include_in_all=True):
         results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir)
 
-    # Tier-2 sole ablation: forecast-feature ablated (5D enhancer, no forecast features)
+    # Tier-2 sole ablation: forecast-feature ablated (nullified forecast features)
     if _wants("tier2_ablated", "tier2_ablated", include_in_all=True):
         results["tiers"]["tier2_ablated"] = _tier_eval("tier2_ablated", args.tier2_ablated_dir)
 
@@ -1659,9 +1587,9 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
             "status": r.get("status", "unknown"),
             "tiers_eval_mode": str(r.get("tiers_eval_mode", "unknown") or "unknown"),
             "deployed_enable_forecasting": bool(r.get("deployed_enable_forecasting", False)),
-            "deployed_enhancer_enabled": bool(r.get("deployed_enhancer_enabled", False)),
-            "deployed_enhancer_feature_dim": int(r.get("deployed_enhancer_feature_dim", 0) or 0),
-            "deployed_enhancer_weights_path": r.get("deployed_enhancer_weights_path", ""),
+            "deployed_tier2_enabled": bool(r.get("deployed_tier2_enabled", r.get("deployed_cv_enabled", False))),
+            "deployed_tier2_feature_dim": int(r.get("deployed_tier2_feature_dim", r.get("deployed_cv_feature_dim", 0)) or 0),
+            "deployed_tier2_weights_path": r.get("deployed_tier2_weights_path", r.get("deployed_cv_weights_path", "")),
             "final_portfolio_value_usd": float(r.get("final_portfolio_value", 0.0)),
             "initial_portfolio_value_usd": float(r.get("initial_portfolio_value", 0.0)),
             "total_return_pct": _pct(r.get("total_return", 0.0)),
@@ -1708,30 +1636,34 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         f.write(f"- Output CSV: `{os.path.basename(csv_path)}`\n\n")
 
         f.write("### Summary Table\n\n")
-        f.write("| Variant | Status | Mode | Forecasting | Enhancer | Final (USD) | Return % | Sharpe | Max DD % | Vol |\n")
-        f.write("|---|---|---|---|---|---:|---:|---:|---:|---:|\n")
+        f.write("| Variant | Status | Mode | Forecasting | Tier-2 Overlay | Final (USD) | Return % | Sharpe | Max DD % | Trading Sharpe | Trading Max DD % |\n")
+        f.write("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|\n")
         for _, row in df.iterrows():
-            enhancer_label = "off"
-            if bool(row["deployed_enhancer_enabled"]):
-                enh_dim = int(row.get("deployed_enhancer_feature_dim", 0) or 0)
-                enhancer_label = f"on ({enh_dim}D)" if enh_dim > 0 else "on"
+            cv_label = "off"
+            if bool(row.get("deployed_tier2_enabled", False)):
+                cv_dim = int(row.get("deployed_tier2_feature_dim", 0) or 0)
+                cv_label = f"on ({cv_dim}D)" if cv_dim > 0 else "on"
             f.write(
                 f"| {row['variant']} | {row['status']} | {row['tiers_eval_mode']} | "
-                f"{'on' if bool(row['deployed_enable_forecasting']) else 'off'} | {enhancer_label} | "
+                f"{'on' if bool(row['deployed_enable_forecasting']) else 'off'} | {cv_label} | "
                 f"{row['final_portfolio_value_usd']:.2f} | {row['total_return_pct']:.3f} | "
-                f"{row['sharpe_ratio']:.4f} | {row['max_drawdown_pct']:.3f} | {row['volatility']:.6f} |\n"
+                f"{row['sharpe_ratio']:.4f} | {row['max_drawdown_pct']:.3f} | "
+                f"{row['trading_sharpe']:.4f} | {row['trading_max_dd_pct']:.3f} |\n"
             )
+
+        f.write("\nTotal-NAV Sharpe/DD can be compressed by the physical operating sleeve.\n")
+        f.write("Trading-sleeve Sharpe/DD are shown above for a cleaner baseline trading read.\n")
 
         f.write("\n### Evaluation Inputs / Runtime\n\n")
         for _, row in df.iterrows():
             f.write(f"- {row['variant']}:\n")
             f.write(f"  - eval_mode: `{row['tiers_eval_mode']}`\n")
             f.write(f"  - forecasting: `{'on' if bool(row['deployed_enable_forecasting']) else 'off'}`\n")
-            f.write(f"  - enhancer: `{'on' if bool(row['deployed_enhancer_enabled']) else 'off'}`\n")
-            if bool(row["deployed_enhancer_enabled"]):
-                f.write(f"  - enhancer_feature_dim: `{int(row.get('deployed_enhancer_feature_dim', 0) or 0)}D`\n")
-            if str(row.get('deployed_enhancer_weights_path', '')).strip() != "":
-                f.write(f"  - enhancer_weights: `{row['deployed_enhancer_weights_path']}`\n")
+            f.write(f"  - tier2_overlay: `{'on' if bool(row.get('deployed_tier2_enabled', False)) else 'off'}`\n")
+            if bool(row.get("deployed_tier2_enabled", False)):
+                f.write(f"  - tier2_feature_dim: `{int(row.get('deployed_tier2_feature_dim', 0) or 0)}D`\n")
+            if str((row.get('deployed_tier2_weights_path', '') or '')).strip():
+                f.write(f"  - tier2_weights: `{row.get('deployed_tier2_weights_path', '')}`\n")
             f.write(f"  - final_models: `{row['final_models_dir']}`\n")
             if str(row.get('run_dir', '')).strip() != "":
                 f.write(f"  - run_dir: `{row['run_dir']}`\n")
@@ -1740,12 +1672,13 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         f.write("Total NAV includes physical book value, which can compress volatility/drawdown.\n")
         f.write("This section splits gains into the operating sleeve (physical + ops revenue) and\n")
         f.write("the trading sleeve (cash + MTM).\n\n")
-        f.write("| Variant | Trading Gain (USD) | Operating Gain (USD) | Trading Share | Trading Return % | Mean |Exposure| (DKK) |\n")
-        f.write("|---|---:|---:|---:|---:|---:|\n")
+        f.write("| Variant | Trading Gain (USD) | Operating Gain (USD) | Trading Share | Trading Return % | Mean |Exposure| (DKK) | Avg Risk |\n")
+        f.write("|---|---:|---:|---:|---:|---:|---:|\n")
         for _, row in df.iterrows():
             f.write(
                 f"| {row['variant']} | {row['trading_gain_usd']:.2f} | {row['operating_gain_usd']:.2f} | "
-                f"{row['trading_gain_share']:.3f} | {row['trading_return_pct']:.2f} | {row['mean_abs_exposure_dkk']:.2f} |\n"
+                f"{row['trading_gain_share']:.3f} | {row['trading_return_pct']:.2f} | "
+                f"{row['mean_abs_exposure_dkk']:.2f} | {row['average_risk']:.3f} |\n"
             )
 
     return csv_path, md_path
@@ -1754,7 +1687,7 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
 def load_agent_system(trained_agents_dir: str, eval_env, enhanced: bool = False) -> Optional[Any]:
     """Load MultiESGAgent system from directory."""
     model_type = "enhanced" if enhanced else "standard"
-    print(f"🤖 Loading {model_type} agent system from: {trained_agents_dir}")
+    print(f"Loading {model_type} agent system from: {trained_agents_dir}")
 
     try:
         config = EvaluationConfig()
@@ -1768,101 +1701,101 @@ def load_agent_system(trained_agents_dir: str, eval_env, enhanced: bool = False)
 
         # Load policies from disk
         loaded_count = agent_system.load_policies(trained_agents_dir)
-        print(f"✅ Loaded {loaded_count} agent policies")
+        print(f"Loaded {loaded_count} agent policies")
 
         if loaded_count == 0:
-            print("❌ No agent policies loaded successfully")
+            print("No agent policies loaded successfully")
             return None
 
         return agent_system
 
     except Exception as e:
-        print(f"❌ Error loading agent system: {e}")
+        print(f"Error loading agent system: {e}")
         return None
 
-
 def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[Any]:
-    """Load enhanced MultiESGAgent system with forecasting and the Tier-2 DL enhancer."""
-    print(f"🚀 Loading enhanced agent system from: {enhanced_models_dir}")
+    """Load enhanced MultiESGAgent system with forecasting and the Tier-2 routed overlay."""
+    print(f"Loading enhanced agent system from: {enhanced_models_dir}")
 
-    # Check if this directory has enhanced features
     config_file = os.path.join(enhanced_models_dir, "training_config.json")
     if os.path.exists(config_file):
         try:
-            with open(config_file, 'r') as f:
+            with open(config_file, "r") as f:
                 config = json.load(f)
 
-            enhanced_features = config.get('enhanced_features', {})
+            enhanced_features = config.get("enhanced_features", {})
             forecasting_enabled = bool(
-                enhanced_features.get('forecasting_enabled', False)
-                or enhanced_features.get('dl_enhancer_enabled', False)
-                or enhanced_features.get('enhancer_enabled', False)
+                enhanced_features.get("forecasting_enabled", False)
+                or enhanced_features.get("tier2_enabled", False)
+                or enhanced_features.get("tier2_routed_overlay_enabled", False)
+                or enhanced_features.get("dl_cv_enabled", False)
+                or enhanced_features.get("cv_enabled", False)
             )
-            enhancer_enabled = bool(
-                enhanced_features.get('enhancer_enabled', False)
-                or enhanced_features.get('dl_enhancer_enabled', False)
+            cv_enabled = bool(
+                enhanced_features.get("tier2_enabled", False)
+                or enhanced_features.get("tier2_routed_overlay_enabled", False)
+                or enhanced_features.get("cv_enabled", False)
+                or enhanced_features.get("dl_cv_enabled", False)
             )
-            has_enhancer_weights = bool(
-                enhanced_features.get('has_enhancer_weights', False)
+            has_cv_weights = bool(
+                enhanced_features.get("has_tier2_weights", False)
+                or enhanced_features.get("has_routed_overlay_weights", False)
+                or enhanced_features.get("has_cv_weights", False)
             )
 
-            print(f"   📊 Enhanced features detected:")
-            print(f"      Forecasting: {'✅' if forecasting_enabled else '❌'}")
-            print(f"      DL Enhancer: {'✅' if enhancer_enabled else '❌'}")
-            print(f"      Enhancer Weights: {'✅' if has_enhancer_weights else '❌'}")
+            print("   Enhanced features detected:")
+            print(f"      Forecasting: {'yes' if forecasting_enabled else 'no'}")
+            print(f"      Tier-2 Routed Overlay: {'yes' if cv_enabled else 'no'}")
+            print(f"      Tier-2 Weights: {'yes' if has_cv_weights else 'no'}")
 
-            if has_enhancer_weights:
-                dl_weights_path = _resolve_enhancer_weights_from_models_dir(enhanced_models_dir)
+            if has_cv_weights:
+                dl_weights_path = _resolve_cv_weights_from_models_dir(enhanced_models_dir)
                 if dl_weights_path and os.path.exists(dl_weights_path):
-                    print(f"   💾 DL enhancer weights found: {dl_weights_path}")
+                    print(f"   Tier-2 routed overlay weights found: {dl_weights_path}")
                 else:
-                    print("   ⚠️ DL enhancer weights missing")
-
+                    print("   Tier-2 routed overlay weights missing")
         except Exception as e:
-            print(f"   ⚠️ Could not read training config: {e}")
+            print(f"   Could not read training config: {e}")
 
     return load_agent_system(enhanced_models_dir, eval_env, enhanced=True)
 
 
-def create_evaluation_enhancer_adapter(enh_weights_path: str, config=None, strict_load: bool = False):
-    """Create the DL enhancer adapter for evaluation (current full or 5D ablated)."""
+def create_evaluation_cv_adapter(cv_weights_path: str, obs_dim: int, config=None, strict_load: bool = False):
+    """Create the Tier-2 routed overlay adapter for evaluation. Loads weights if path exists."""
     try:
-        from config import (
-            TIER2_ENHANCER_FEATURE_DIM,
-            TIER2_ENHANCER_ABLATED_FEATURE_DIM,
-        )
-        from dl_enhancer import EnhancerAdapter
+        from tier2_routed_overlay import Tier2RoutedOverlayAdapter, TIER2_ROUTED_OVERLAY_FEATURE_DIM
 
-        # Infer feature dim from path (e.g. dl_enhancer_29d.h5 vs dl_enhancer_5d.h5).
-        feature_dim = _infer_enhancer_feature_dim_from_weights_path(enh_weights_path)
-        if feature_dim not in (int(TIER2_ENHANCER_FEATURE_DIM), int(TIER2_ENHANCER_ABLATED_FEATURE_DIM)):
-            raise ValueError(
-                f"Enhancer weights {os.path.basename(enh_weights_path)} ({feature_dim}D) not supported. "
-                f"Expected {TIER2_ENHANCER_FEATURE_DIM}D full or {TIER2_ENHANCER_ABLATED_FEATURE_DIM}D ablated."
+        forecast_dim = int(
+            getattr(
+                config,
+                "tier2_feature_dim",
+                getattr(config, "cv_forecast_dim", TIER2_ROUTED_OVERLAY_FEATURE_DIM),
             )
-        adapter = EnhancerAdapter(
-            feature_dim=feature_dim,
-            delta_max=float(getattr(config, "tier2_enhancer_delta_max", 0.35) or 0.35),
-            seed=42,
-            uncertainty_discount=float(getattr(config, "tier2_enhancer_uncertainty_discount", 1.10) or 1.10),
+            or TIER2_ROUTED_OVERLAY_FEATURE_DIM
         )
-        if os.path.exists(enh_weights_path):
-            # Keras subclassed models must create variables before loading HDF5 weights.
-            if not adapter.model.built:
-                dummy = np.zeros((1, int(feature_dim)), dtype=np.float32)
-                _ = adapter.model(dummy, training=False)
-            adapter.model.load_weights(enh_weights_path)
-            print_progress("✅ DL enhancer weights loaded successfully")
+        adapter = Tier2RoutedOverlayAdapter(
+            obs_dim=obs_dim,
+            forecast_dim=forecast_dim,
+            memory_steps=int(getattr(config, "tier2_cv_memory_steps", 2) or 2),
+            seed=42,
+        )
+        if os.path.exists(cv_weights_path):
+            if adapter.load_weights(cv_weights_path):
+                print_progress("Tier-2 routed overlay weights loaded successfully")
+            else:
+                if strict_load:
+                    raise RuntimeError(f"Failed to load Tier-2 routed overlay weights from {cv_weights_path}")
+                print_progress(f"Could not load Tier-2 routed overlay weights from {cv_weights_path}")
         else:
-            msg = "DL enhancer weights file not found"
+            msg = "Tier-2 routed overlay weights file not found"
             if strict_load:
                 raise FileNotFoundError(msg)
-            print_progress(f"⚠️ {msg} (continuing with untrained enhancer)")
+            print_progress(f"{msg} (continuing without Tier-2 overlay)")
         return adapter
     except Exception as e:
         if strict_load:
-            raise RuntimeError(f"Failed to create DL enhancer adapter: {e}") from e
-        print_progress(f"⚠️ Failed to create DL enhancer adapter: {e}")
+            raise RuntimeError(f"Failed to create Tier-2 routed overlay adapter: {e}") from e
+        print_progress(f"Failed to create Tier-2 routed overlay adapter: {e}")
         return None
 
 
@@ -1873,7 +1806,7 @@ def create_evaluation_environment(
     scaler_dir: str = "saved_scalers",
     metadata_dir: Optional[str] = None,
     log_path: Optional[str] = None,
-    enhancer_weights_path: Optional[str] = None,
+    cv_weights_path: Optional[str] = None,
     output_dir: str = "evaluation_results",
     investment_freq: int = 6,
     config=None,
@@ -1884,13 +1817,18 @@ def create_evaluation_environment(
     fail_fast: bool = True,
 ) -> Tuple[Any, Optional[Any]]:
     """Create evaluation environment with optional forecasting (Tier-aligned)."""
-    print_progress("🏗️ Setting up evaluation environment...")
-    inferred_enhancer_dim = _infer_enhancer_feature_dim_from_weights_path(enhancer_weights_path)
+    print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Setting up evaluation environment...")
+
+    if config is not None and cv_weights_path:
+        try:
+            config = _hydrate_eval_config_from_training_config(config, os.path.dirname(cv_weights_path))
+        except Exception:
+            pass
 
     # Setup forecaster
     forecaster = None
     if enable_forecasting:
-        print_progress("🔮 Loading forecaster models and scalers...")
+        print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â® Loading forecaster models and scalers...")
         try:
             # Auto-detect metadata directory if caller did not provide it
             if metadata_dir is None:
@@ -1903,30 +1841,39 @@ def create_evaluation_environment(
                 model_dir=model_dir,
                 scaler_dir=scaler_dir,
                 metadata_dir=metadata_dir,  # NEW: Auto-detected metadata directory
-                look_back=24,  # IMPROVED: Default to 24 (will be overridden by metadata if available)
+                look_back=int(getattr(config, "forecast_look_back", 24) or 24),
+                expert_refresh_stride=int(getattr(config, "investment_freq", 6) or 6),
                 verbose=False,
                 fallback_mode=False,
+                config=config,
             )
             stats = forecaster.get_loading_stats()
             models_loaded = int(stats.get("models_loaded", 0) or 0)
             models_attempted = int(stats.get("models_attempted", 0) or 0)
             scalers_loaded = int(stats.get("scalers_loaded", 0) or 0)
             scalers_attempted = int(stats.get("scalers_attempted", 0) or 0)
-            print_progress(
-                "✅ Forecaster loaded successfully "
-                f"({models_loaded}/{models_attempted} models, {scalers_loaded}/{scalers_attempted} scalers)"
+            experts_loaded = int(stats.get("price_short_experts_loaded", 0) or 0)
+            experts_expected = int(stats.get("price_short_experts_expected", 0) or 0)
+            if bool(stats.get("expert_only_mode", False)):
+                print_progress(
+                    "Forecaster loaded successfully "
+                    f"({experts_loaded}/{experts_expected} short-price experts, "
+                    f"{scalers_loaded}/{scalers_attempted} scalers)"
+                )
+            else:
+                print_progress(
+                "ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Forecaster loaded successfully "
+                f"({models_loaded}/{models_attempted} models, "
+                f"{scalers_loaded}/{scalers_attempted} scalers, "
+                f"{experts_loaded}/{experts_expected} price experts)"
             )
-            if (
-                bool(stats.get("fallback_mode", False))
-                or models_loaded <= 0
-                or models_loaded != models_attempted
-                or scalers_loaded != scalers_attempted
-            ):
+            if not bool(getattr(forecaster, "is_complete_stack", lambda: False)()):
                 raise RuntimeError(
                     "Evaluation forecaster failed strict validation: "
                     f"fallback_mode={bool(stats.get('fallback_mode', False))}, "
                     f"models={models_loaded}/{models_attempted}, "
-                    f"scalers={scalers_loaded}/{scalers_attempted}."
+                    f"scalers={scalers_loaded}/{scalers_attempted}, "
+                    f"price_experts={experts_loaded}/{experts_expected}."
                 )
 
             # Optional: build/load an offline cache for the entire evaluation dataset.
@@ -1935,30 +1882,30 @@ def create_evaluation_environment(
                 try:
                     cache_dir = forecast_cache_dir or os.path.join(output_dir, "forecast_cache_eval")
                     os.makedirs(cache_dir, exist_ok=True)
-                    print_progress(f"🧊 Precomputing/loading forecast cache for evaluation (batch_size={int(precompute_batch_size)})...")
+                    print_progress(f"ÃƒÂ°Ã…Â¸Ã‚Â§Ã…Â  Precomputing/loading forecast cache for evaluation (batch_size={int(precompute_batch_size)})...")
                     forecaster.precompute_offline(
                         df=data,
                         timestamp_col="timestamp",
                         batch_size=max(1, int(precompute_batch_size)),
                         cache_dir=cache_dir,
                     )
-                    print_progress(f"✅ Evaluation forecast cache ready: {cache_dir}")
+                    print_progress(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Evaluation forecast cache ready: {cache_dir}")
                 except Exception as e:
                     msg = f"Forecast cache precompute failed: {e}"
                     if fail_fast:
                         raise RuntimeError(msg) from e
-                    print_progress(f"⚠️ {msg} (continuing with on-the-fly forecasts)")
+                    print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â {msg} (continuing with on-the-fly forecasts)")
         except Exception as e:
             if fail_fast:
                 raise RuntimeError(f"Failed to load forecaster: {e}") from e
-            print_progress(f"❌ Failed to load forecaster: {e}")
-            print_progress("🚫 Continuing without forecasting...")
+            print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to load forecaster: {e}")
+            print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã‚Â« Continuing without forecasting...")
     else:
-        print_progress("🚫 Forecasting disabled (baseline evaluation)")
+        print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã‚Â« Forecasting disabled (baseline evaluation)")
     
     # Create base environment
     try:
-        print_progress("🌍 Creating base environment...")
+        print_progress("ÃƒÂ°Ã…Â¸Ã…â€™Ã‚Â Creating base environment...")
 
         # Create base environment without forecaster for training-compatible mode
         if enable_forecasting:
@@ -1969,7 +1916,7 @@ def create_evaluation_environment(
                 config=config,
                 log_dir=env_log_dir,
             )
-            print_progress("✅ Enhanced base environment created")
+            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Enhanced base environment created")
         else:
             # Create basic environment without forecaster for training compatibility
             base_env = RenewableMultiAgentEnv(
@@ -1979,25 +1926,16 @@ def create_evaluation_environment(
                 config=config,
                 log_dir=env_log_dir,
             )
-            print_progress("✅ Basic base environment created")
+            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Basic base environment created")
 
         active_cfg = getattr(base_env, "config", config)
         if active_cfg is not None:
-            from config import (
-                TIER2_ENHANCER_FEATURE_DIM,
-                TIER2_ENHANCER_ABLATED_FEATURE_DIM,
-            )
-
-            active_cfg.forecast_baseline_enable = False
-            if inferred_enhancer_dim == int(TIER2_ENHANCER_ABLATED_FEATURE_DIM):
-                active_cfg.tier2_enhancer_ablate_forecast_features = True
-            elif inferred_enhancer_dim == int(TIER2_ENHANCER_FEATURE_DIM):
-                active_cfg.tier2_enhancer_ablate_forecast_features = False
+            active_cfg.forecast_baseline_enable = bool(cv_weights_path and os.path.exists(cv_weights_path))
 
         # Tier-2 eval trust: mirror training by initializing CalibrationTracker when forecasts are enabled.
         if enable_forecasting and active_cfg is not None:
             try:
-                from dl_enhancer import CalibrationTracker
+                from tier2_routed_overlay import CalibrationTracker
 
                 base_env.calibration_tracker = CalibrationTracker(
                     window_size=getattr(active_cfg, "forecast_trust_window", 500),
@@ -2008,62 +1946,61 @@ def create_evaluation_environment(
                     trust_boost=getattr(active_cfg, "forecast_trust_boost", 0.0),
                     fail_fast=bool(fail_fast),
                 )
-                print_progress("✅ CalibrationTracker initialized for evaluation (forecast trust)")
+                print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ CalibrationTracker initialized for evaluation (forecast trust)")
             except Exception as e:
                 base_env.calibration_tracker = None
                 if fail_fast:
                     raise RuntimeError(f"CalibrationTracker init failed: {e}") from e
-                print_progress(f"⚠️ CalibrationTracker init failed: {e}")
+                print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â CalibrationTracker init failed: {e}")
 
-        # Setup DL enhancer if weights are provided
-        if enhancer_weights_path and os.path.exists(enhancer_weights_path):
+        # Setup Tier-2 layer if weights are provided.
+        # When Tier-2 is enabled and not ablated, the environment also activates
+        # the short-horizon runtime residual overlay on top of investor exposure.
+        if cv_weights_path and os.path.exists(cv_weights_path):
             try:
-                print_progress(f"🚀 Loading DL enhancer weights: {os.path.basename(enhancer_weights_path)}")
-                enhancer_adapter = create_evaluation_enhancer_adapter(
-                    enhancer_weights_path,
+                print_progress(f"Loading Tier-2 routed overlay weights: {os.path.basename(cv_weights_path)}")
+                obs_dim = int(base_env.observation_spaces["investor_0"].shape[0])
+                cv_adapter = create_evaluation_cv_adapter(
+                    cv_weights_path,
+                    obs_dim=obs_dim,
                     config=config,
                     strict_load=bool(fail_fast),
                 )
-                if enhancer_adapter:
-                    from config import ENHANCER_BASE_FEATURE_DIM
-                    base_env.enhancer_adapter = enhancer_adapter
-                    base_env.feature_dim = ENHANCER_BASE_FEATURE_DIM
-                    base_env.enhancer_feature_dim = int(enhancer_adapter.feature_dim)
+                if cv_adapter:
+                    base_env.control_variate_adapter = cv_adapter
+                    base_env.tier2_overlay_adapter = cv_adapter
                     if getattr(base_env, "config", None) is not None:
                         base_env.config.forecast_baseline_enable = True
-                        base_env.config.tier2_enhancer_ablate_forecast_features = bool(
-                            int(enhancer_adapter.feature_dim) == 5
-                        )
-                    print_progress("✅ DL enhancer attached to evaluation environment")
+                    print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Tier-2 layer attached to evaluation environment")
                 else:
                     if fail_fast:
-                        raise RuntimeError("Failed to create DL enhancer adapter")
-                    print_progress("⚠️ Failed to create DL enhancer adapter")
+                        raise RuntimeError("Failed to create Tier-2 routed overlay adapter")
+                    print_progress("Failed to create Tier-2 routed overlay adapter")
             except Exception as e:
                 if fail_fast:
-                    raise RuntimeError(f"Failed to load DL enhancer weights: {e}") from e
-                print_progress(f"⚠️ Failed to load DL enhancer weights: {e}")
-                print_progress("   Continuing evaluation without DL enhancer...")
-        elif enhancer_weights_path and fail_fast:
-            raise FileNotFoundError(f"DL enhancer weights path does not exist: {enhancer_weights_path}")
+                    raise RuntimeError(f"Failed to load Tier-2 routed overlay weights: {e}") from e
+                print_progress(f"Failed to load Tier-2 routed overlay weights: {e}")
+                print_progress("   Continuing evaluation without the Tier-2 overlay...")
+        elif cv_weights_path and fail_fast:
+            raise FileNotFoundError(f"Tier-2 routed overlay weights path does not exist: {cv_weights_path}")
 
         # Wrap with forecasting if enabled
         if forecaster is not None and enable_forecasting:
-            print_progress("🔄 Wrapping environment with forecasting...")
+            print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Wrapping environment with forecasting...")
             # We rely on the base env's log_dir instead.
             # No wrapper: keep Tier-1 observation spaces fixed for a fair comparison.
             eval_env = base_env
-            print_progress("✅ Environment created with forecasting wrapper")
+            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Environment created with forecasting wrapper")
         else:
             eval_env = base_env
-            print_progress("✅ Environment created (training-compatible baseline mode)")
+            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Environment created (training-compatible baseline mode)")
 
         return eval_env, forecaster
 
     except Exception as e:
         if fail_fast:
             raise
-        print_progress(f"❌ Error creating environment: {e}")
+        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Error creating environment: {e}")
         return None, None
 
 
@@ -2136,7 +2073,7 @@ def calculate_performance_metrics(portfolio_values: list,
         metrics['evaluation_timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
     except Exception as e:
-        print(f"⚠️ Error calculating performance metrics: {e}")
+        print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Error calculating performance metrics: {e}")
         metrics['error'] = str(e)
     
     return metrics
@@ -2147,18 +2084,19 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
                             data: pd.DataFrame,
                             evaluation_steps: int = 8000) -> Optional[Dict[str, Any]]:
     """Run evaluation using checkpoint models (Stable Baselines3)."""
-    print("🚀 Starting checkpoint model evaluation...")
+    print("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Starting checkpoint model evaluation...")
 
     if not models or not eval_env:
-        print("❌ No models or environment available")
+        print("ÃƒÂ¢Ã‚ÂÃ…â€™ No models or environment available")
         return None
 
     # Count loaded models
     loaded_count = sum(1 for m in models.values() if m is not None)
-    print(f"🎯 Checkpoint models loaded: {loaded_count}/4")
+    model_total = max(1, len(models))
+    print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Checkpoint models loaded: {loaded_count}/{model_total}")
 
     if loaded_count == 0:
-        print("❌ No checkpoint models loaded successfully")
+        print("ÃƒÂ¢Ã‚ÂÃ…â€™ No checkpoint models loaded successfully")
         return None
 
     # Run evaluation
@@ -2172,19 +2110,9 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
     successful_inference_actions = 0
     total_inference_attempts = 0
 
-    print(f"🧪 Running evaluation for {steps} steps...")
+    print(f"ÃƒÂ°Ã…Â¸Ã‚Â§Ã‚Âª Running evaluation for {steps} steps...")
 
     for step in range(steps):
-        if step % 1000 == 0:
-            current_portfolio = portfolio_values[-1] if portfolio_values else 800_000_000
-            portfolio_change = ((current_portfolio / 800_000_000) - 1) * 100
-            total_reward = sum(sum(rewards_by_agent[agent]) for agent in rewards_by_agent)
-            success_rate = (
-                successful_inference_actions / total_inference_attempts
-                if total_inference_attempts > 0 else 0.0
-            )
-            print(f"📊 Progress: {step}/{steps} ({step/steps*100:.1f}%) | Portfolio: ${current_portfolio/1e6:.1f}M ({portfolio_change:+.2f}%) | Reward: {total_reward:.1f} | Inference: {success_rate*100:.1f}%")
-
         actions = {}
 
         # Get actions from checkpoint models
@@ -2202,11 +2130,16 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
                     actions[agent] = action
                     successful_inference_actions += 1
                 except Exception as e:
-                    print(f"⚠️ Prediction error for {agent}: {e}")
-                    actions[agent] = eval_env.action_space(agent).sample()
+                    print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Prediction error for {agent}: {e}")
+                    if hasattr(eval_env, "get_rule_based_agent_action"):
+                        actions[agent] = eval_env.get_rule_based_agent_action(agent, obs[agent])
+                    else:
+                        actions[agent] = eval_env.action_space(agent).sample()
             else:
-                # Fallback to random action
-                actions[agent] = eval_env.action_space(agent).sample()
+                if hasattr(eval_env, "get_rule_based_agent_action"):
+                    actions[agent] = eval_env.get_rule_based_agent_action(agent, obs[agent])
+                else:
+                    actions[agent] = eval_env.action_space(agent).sample()
 
         # Execute step
         try:
@@ -2264,20 +2197,31 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
 
             # Debug output for first step
             if step == 0:
-                print(f"🔍 Portfolio value extraction: {portfolio_value_dkk/1e9:.2f}B DKK → ${portfolio_value_usd/1e6:.1f}M USD using method '{extraction_method}'")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â Portfolio value extraction: {portfolio_value_dkk/1e9:.2f}B DKK ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${portfolio_value_usd/1e6:.1f}M USD using method '{extraction_method}'")
 
             if hasattr(eval_env, 'get_risk_level'):
                 risk_levels.append(eval_env.get_risk_level())
+
+            completed_steps = step + 1
+            if completed_steps % 1000 == 0 or completed_steps == steps:
+                _print_eval_loop_progress(
+                    completed_steps=completed_steps,
+                    total_steps=steps,
+                    portfolio_values=portfolio_values,
+                    rewards_by_agent=rewards_by_agent,
+                    successful_inference_actions=successful_inference_actions,
+                    total_inference_attempts=total_inference_attempts,
+                )
 
             # Handle episode termination
             if any(dones.values()) or any(truncs.values()):
                 obs, _ = eval_env.reset()
 
         except Exception as e:
-            print(f"⚠️ Step execution error: {e}")
+            print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Step execution error: {e}")
             break
 
-    print("✅ Checkpoint evaluation completed")
+    print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Checkpoint evaluation completed")
 
     # Calculate metrics
     success_rate = (
@@ -2299,19 +2243,19 @@ def run_agent_evaluation(agent_system,
                         data: pd.DataFrame,
                         evaluation_steps: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Run evaluation using MultiESGAgent system."""
-    print_progress("🚀 Starting agent system evaluation...")
+    print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Starting agent system evaluation...")
 
     if not agent_system or not eval_env:
-        print_progress("❌ No agent system or environment available")
+        print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ No agent system or environment available")
         return None
 
     # Run evaluation
-    print_progress("🔄 Resetting evaluation environment...")
+    print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Resetting evaluation environment...")
     try:
         obs, _ = eval_env.reset()
-        print_progress("✅ Environment reset successful")
+        print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Environment reset successful")
     except Exception as e:
-        print_progress(f"❌ Environment reset failed: {e}")
+        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Environment reset failed: {e}")
         return None
 
     # Pick evaluation length
@@ -2319,7 +2263,7 @@ def run_agent_evaluation(agent_system,
         evaluation_steps = min(len(data) - 1, 10_000)
     evaluation_steps = int(max(1, evaluation_steps))
 
-    print_progress(f"📏 Evaluating for {evaluation_steps} steps")
+    print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â Evaluating for {evaluation_steps} steps")
 
     # Initialize PPO buffer if needed
     if hasattr(agent_system, 'policies'):
@@ -2339,26 +2283,16 @@ def run_agent_evaluation(agent_system,
     risk_levels = []
     actions_taken = {agent: [] for agent in eval_env.possible_agents}
 
-    print_progress("🔄 Starting evaluation loop...")
+    print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Starting evaluation loop...")
 
     for step in range(evaluation_steps):
-        if step % 1000 == 0:
-            current_portfolio = portfolio_values[-1] if portfolio_values else 800_000_000
-            portfolio_change = ((current_portfolio / 800_000_000) - 1) * 100
-            total_reward = sum(sum(rewards_by_agent[agent]) for agent in rewards_by_agent)
-            print_progress(f"📊 Progress: {step}/{evaluation_steps} ({step/evaluation_steps*100:.1f}%) | Portfolio: ${current_portfolio/1e6:.1f}M ({portfolio_change:+.2f}%) | Total Reward: {total_reward:.1f}")
-
-            # Debug: Show portfolio value extraction method used
-            if step == 0 and portfolio_values:
-                print_progress(f"🔍 Portfolio value extraction method working: ${current_portfolio/1e6:.1f}M")
-
         if step == 0:
-            print_progress("🔄 Processing first step...")
+            print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Processing first step...")
 
         actions = {}
 
         if step == 0:
-            print_progress("🔄 Getting actions from agents...")
+            print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Getting actions from agents...")
 
         # Get actions from agent system
         for i, agent in enumerate(eval_env.possible_agents):
@@ -2367,17 +2301,17 @@ def run_agent_evaluation(agent_system,
 
             try:
                 if step == 0:
-                    print_progress(f"🔄 Processing agent {agent} (obs shape: {np.array(obs[agent]).shape})")
+                    print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Processing agent {agent} (obs shape: {np.array(obs[agent]).shape})")
 
                 agent_obs = np.array(obs[agent], dtype=np.float32).reshape(1, -1)
                 policy = agent_system.policies[i]
 
                 if hasattr(policy, "predict"):
                     if step == 0:
-                        print_progress(f"🔄 Getting prediction from {agent}...")
+                        print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Getting prediction from {agent}...")
                     act, _ = policy.predict(agent_obs, deterministic=True)
                     if step == 0:
-                        print_progress(f"✅ Got prediction from {agent}")
+                        print_progress(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Got prediction from {agent}")
                 else:
                     act = eval_env.action_space(agent).sample()
 
@@ -2386,17 +2320,17 @@ def run_agent_evaluation(agent_system,
                 actions_taken[agent].append(np.array(act).copy() if hasattr(act, 'copy') else act)
 
             except Exception as e:
-                print_progress(f"⚠️ Action prediction error for {agent}: {e}")
+                print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Action prediction error for {agent}: {e}")
                 actions[agent] = eval_env.action_space(agent).sample()
 
         if step == 0:
-            print_progress("🔄 Executing first environment step...")
+            print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Executing first environment step...")
 
         # Execute step
         try:
             obs, rewards, dones, truncs, infos = eval_env.step(actions)
             if step == 0:
-                print_progress("✅ First environment step completed")
+                print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ First environment step completed")
 
             # Track metrics
             for agent, reward in rewards.items():
@@ -2442,15 +2376,24 @@ def run_agent_evaluation(agent_system,
             if hasattr(eval_env, 'get_risk_level'):
                 risk_levels.append(eval_env.get_risk_level())
 
+            completed_steps = step + 1
+            if completed_steps % 1000 == 0 or completed_steps == evaluation_steps:
+                _print_eval_loop_progress(
+                    completed_steps=completed_steps,
+                    total_steps=evaluation_steps,
+                    portfolio_values=portfolio_values,
+                    rewards_by_agent=rewards_by_agent,
+                )
+
             # Handle episode termination
             if any(dones.values()) or any(truncs.values()):
                 obs, _ = eval_env.reset()
 
         except Exception as e:
-            print(f"⚠️ Step execution error: {e}")
+            print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Step execution error: {e}")
             break
 
-    print("✅ Agent evaluation completed")
+    print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Agent evaluation completed")
 
     # Calculate metrics
     metrics = calculate_performance_metrics(portfolio_values, rewards_by_agent, risk_levels, evaluation_steps)
@@ -2462,7 +2405,7 @@ def run_agent_evaluation(agent_system,
 def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     """Run comprehensive evaluation comparing all configurations with separate environments."""
     print_section_header("COMPREHENSIVE EVALUATION: All Configurations")
-    print_progress("🚀 Starting comprehensive evaluation of 5 systems...")
+    print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Starting comprehensive evaluation of 5 systems...")
 
     comprehensive_results = {
         'evaluation_type': 'comprehensive',
@@ -2473,25 +2416,25 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
     }
 
     # 1. Evaluate Baselines (use basic environment)
-    print_progress("📊 [1/3] EVALUATING BASELINES...", 1, 3)
+    print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  [1/3] EVALUATING BASELINES...", 1, 3)
     try:
         baseline_results = run_traditional_baselines(args.eval_data, args.eval_steps or 8000, args.output_dir)
         if baseline_results:
             comprehensive_results['configurations']['baselines'] = baseline_results
-            print_progress("✅ Baseline evaluation completed")
+            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Baseline evaluation completed")
         else:
-            print_progress("❌ Baseline evaluation failed")
+            print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Baseline evaluation failed")
             comprehensive_results['configurations']['baselines'] = {'error': 'Baseline evaluation failed'}
     except Exception as e:
-        print_progress(f"❌ Baseline evaluation error: {e}")
+        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Baseline evaluation error: {e}")
         comprehensive_results['configurations']['baselines'] = {'error': str(e)}
 
-    # 2. Evaluate Normal Models (no forecasts, no DL enhancer) - Create basic environment
-    print_progress("🤖 [2/3] EVALUATING NORMAL MODELS (No Forecasts/DL Enhancer)...", 2, 3)
+    # 2. Evaluate Normal Models (no forecasts, no Tier-2 overlay) - Create basic environment
+    print_progress("ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ [2/3] EVALUATING NORMAL MODELS (No Forecasts/Tier-2)...", 2, 3)
     try:
         if os.path.exists(args.normal_models):
             # Create basic environment for normal models (no forecasting)
-            print_progress("🏗️ Creating basic environment for normal models...")
+            print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Creating basic environment for normal models...")
             normal_eval_env, _ = create_evaluation_environment(
                 eval_data,
                 enable_forecasting=False,  # No forecasting for normal models
@@ -2505,39 +2448,39 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
 
             if normal_eval_env:
                 # Load normal models without enhanced features
-                print_progress("🔄 Loading normal agent system...")
+                print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Loading normal agent system...")
                 normal_agent_system = load_agent_system(args.normal_models, normal_eval_env, enhanced=False)
                 if normal_agent_system:
-                    print_progress("🔄 Running normal agent evaluation...")
+                    print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Running normal agent evaluation...")
                     normal_results = run_agent_evaluation(normal_agent_system, normal_eval_env, eval_data, args.eval_steps)
                     if normal_results:
                         normal_results['model_type'] = 'normal'
-                        normal_results['features'] = {'forecasting': False, 'enhancer': False}
+                        normal_results['features'] = {'forecasting': False, 'cv': False}
                         comprehensive_results['configurations']['normal_agents'] = normal_results
-                        print_progress("✅ Normal agent evaluation completed")
+                        print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Normal agent evaluation completed")
                     else:
-                        print_progress("❌ Normal agent evaluation failed")
+                        print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Normal agent evaluation failed")
                         comprehensive_results['configurations']['normal_agents'] = {'error': 'Normal agent evaluation failed'}
                 else:
-                    print_progress("❌ Failed to load normal agent system")
+                    print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to load normal agent system")
                     comprehensive_results['configurations']['normal_agents'] = {'error': 'Failed to load normal agent system'}
             else:
-                print_progress("❌ Failed to create basic evaluation environment")
+                print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to create basic evaluation environment")
                 comprehensive_results['configurations']['normal_agents'] = {'error': 'Failed to create basic evaluation environment'}
         else:
-            print_progress(f"❌ Normal models directory not found: {args.normal_models}")
+            print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Normal models directory not found: {args.normal_models}")
             comprehensive_results['configurations']['normal_agents'] = {'error': f'Directory not found: {args.normal_models}'}
     except Exception as e:
-        print_progress(f"❌ Normal agent evaluation error: {e}")
+        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Normal agent evaluation error: {e}")
         comprehensive_results['configurations']['normal_agents'] = {'error': str(e)}
 
-    # 3. Evaluate Full Models (with forecasts and the DL enhancer) - Create enhanced environment
-    print_progress("🚀 [3/3] EVALUATING FULL MODELS (With Forecasts + DL Enhancer)...", 3, 3)
+    # 3. Evaluate Full Models (with forecasts and the Tier-2 routed overlay) - Create enhanced environment
+    print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ [3/3] EVALUATING FULL MODELS (With Forecasts + Tier-2 Routed Overlay)...", 3, 3)
     try:
         if os.path.exists(args.full_models):
-            # Create enhanced evaluation environment with the DL enhancer
-            print_progress("🏗️ Creating enhanced environment for full models...")
-            dl_weights_path = _resolve_enhancer_weights_from_models_dir(args.full_models)
+            # Create enhanced evaluation environment with the Tier-2 routed overlay
+            print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Creating enhanced environment for full models...")
+            dl_weights_path = _resolve_cv_weights_from_models_dir(args.full_models)
             forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
             enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                 eval_data,
@@ -2545,7 +2488,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                 model_dir=forecast_ctx["model_dir"],
                 scaler_dir=forecast_ctx["scaler_dir"],
                 metadata_dir=forecast_ctx["metadata_dir"],
-                enhancer_weights_path=dl_weights_path,
+                cv_weights_path=dl_weights_path,
                 output_dir=args.output_dir,
                 investment_freq=args.investment_freq,
                 config=_build_eval_config(args),
@@ -2555,33 +2498,33 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
 
             if enhanced_eval_env:
                 # Load enhanced models with all features
-                print_progress("🔄 Loading enhanced agent system...")
+                print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Loading enhanced agent system...")
                 full_agent_system = load_enhanced_agent_system(args.full_models, enhanced_eval_env)
                 if full_agent_system:
-                    print_progress("🔄 Running full agent evaluation...")
+                    print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Running full agent evaluation...")
                     full_results = run_agent_evaluation(full_agent_system, enhanced_eval_env, eval_data, args.eval_steps)
                     if full_results:
                         full_results['model_type'] = 'enhanced'
-                        full_results['features'] = {'forecasting': True, 'enhancer': True}
+                        full_results['features'] = {'forecasting': True, 'cv': True}
                         comprehensive_results['configurations']['full_agents'] = full_results
-                        print_progress("✅ Full agent evaluation completed")
+                        print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Full agent evaluation completed")
                     else:
-                        print_progress("❌ Full agent evaluation failed")
+                        print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Full agent evaluation failed")
                         comprehensive_results['configurations']['full_agents'] = {'error': 'Full agent evaluation failed'}
                 else:
-                    print_progress("❌ Failed to load full agent system")
+                    print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to load full agent system")
                     comprehensive_results['configurations']['full_agents'] = {'error': 'Failed to load full agent system'}
             else:
-                print_progress("❌ Failed to create enhanced evaluation environment")
+                print_progress("ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to create enhanced evaluation environment")
                 comprehensive_results['configurations']['full_agents'] = {'error': 'Failed to create enhanced evaluation environment'}
         else:
-            print_progress(f"❌ Full models directory not found: {args.full_models}")
+            print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Full models directory not found: {args.full_models}")
             comprehensive_results['configurations']['full_agents'] = {'error': f'Directory not found: {args.full_models}'}
     except Exception as e:
-        print_progress(f"❌ Full agent evaluation error: {e}")
+        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Full agent evaluation error: {e}")
         comprehensive_results['configurations']['full_agents'] = {'error': str(e)}
 
-    print_progress("🎉 Comprehensive evaluation completed!")
+    print_progress("ÃƒÂ°Ã…Â¸Ã…Â½Ã¢â‚¬Â° Comprehensive evaluation completed!")
     return comprehensive_results
 
     return comprehensive_results
@@ -2596,7 +2539,7 @@ def save_results(results: Dict[str, Any], output_dir: str, mode: str, analysis: 
     results_file = os.path.join(output_dir, f"evaluation_{mode}_{timestamp}.json")
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"💾 Results saved to: {results_file}")
+    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â¾ Results saved to: {results_file}")
 
     # Save analysis if provided
     analysis_file = None
@@ -2604,14 +2547,14 @@ def save_results(results: Dict[str, Any], output_dir: str, mode: str, analysis: 
         analysis_file = os.path.join(output_dir, f"analysis_{mode}_{timestamp}.json")
         with open(analysis_file, 'w') as f:
             json.dump(analysis, f, indent=2)
-        print(f"📊 Analysis saved to: {analysis_file}")
+        print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Analysis saved to: {analysis_file}")
 
     return results_file, analysis_file
 
 
 def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze comprehensive evaluation results across all configurations."""
-    print("\n📊 COMPREHENSIVE ANALYSIS")
+    print("\nÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  COMPREHENSIVE ANALYSIS")
     print("="*50)
 
     analysis = {
@@ -2627,17 +2570,17 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
     performance_data = {}
 
     # ========================================
-    # 📊 FINAL PORTFOLIO VALUES TABLE
+    # ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  FINAL PORTFOLIO VALUES TABLE
     # ========================================
     print("\n" + "=" * 80)
-    print("📊 FINAL PORTFOLIO VALUES - ALL CONFIGURATIONS")
+    print("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  FINAL PORTFOLIO VALUES - ALL CONFIGURATIONS")
     print("=" * 80)
     print(f"{'Rank':<4} {'Configuration':<25} {'Final Value':<15} {'Return':<10} {'Sharpe':<8} {'Features':<20}")
     print("-" * 80)
 
     for config_name, config_results in configurations.items():
         if 'error' in config_results:
-            print(f"⚠️ {config_name}: {config_results['error']}")
+            print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â {config_name}: {config_results['error']}")
             continue
 
         # Extract key metrics
@@ -2679,7 +2622,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
                     'initial_value_usd': initial_value,
                     'type': 'agent',
                     'forecasting': features.get('forecasting', False),
-                    'enhancer': features.get('enhancer', False)
+                    'cv': features.get('cv', False)
                 }
 
     # Sort by final portfolio value for the main table
@@ -2695,13 +2638,13 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
         if metrics['type'] == 'agent':
             features = []
             if metrics.get('forecasting'): features.append("Forecasting")
-            if metrics.get('enhancer'): features.append("DL Enhancer")
+            if metrics.get('cv', False): features.append("DL Control Variate")
             features_str = ', '.join(features) if features else 'Basic RL'
         else:
             features_str = 'Traditional'
 
         # Color coding for top performers
-        rank_symbol = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        rank_symbol = "ÃƒÂ°Ã…Â¸Ã‚Â¥Ã¢â‚¬Â¡" if i == 1 else "ÃƒÂ°Ã…Â¸Ã‚Â¥Ã‹â€ " if i == 2 else "ÃƒÂ°Ã…Â¸Ã‚Â¥Ã¢â‚¬Â°" if i == 3 else f"{i}."
 
         print(f"{rank_symbol:<4} {config_name:<25} ${final_value/1e6:>10.1f}M {return_pct:>+7.2f}% {metrics['sharpe_ratio']:>6.3f} {features_str:<20}")
 
@@ -2716,13 +2659,13 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
     # Rank by Sharpe ratio for detailed analysis
     ranked_configs = sorted(performance_data.items(), key=lambda x: x[1]['sharpe_ratio'], reverse=True)
 
-    print("\n🏆 PERFORMANCE RANKING (by Sharpe Ratio):")
+    print("\nÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬Â  PERFORMANCE RANKING (by Sharpe Ratio):")
     for i, (config_name, metrics) in enumerate(ranked_configs, 1):
         features_str = ""
         if metrics['type'] == 'agent':
             features = []
             if metrics.get('forecasting'): features.append("Forecasting")
-            if metrics.get('enhancer'): features.append("DL Enhancer")
+            if metrics.get('cv', False): features.append("DL Control Variate")
             features_str = f" ({', '.join(features) if features else 'Basic'})"
 
         print(f"   {i}. {config_name}{features_str}")
@@ -2732,7 +2675,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
 
     # Feature impact analysis
     if len([x for x in performance_data.values() if x['type'] == 'agent']) >= 2:
-        print("\n🔬 FEATURE IMPACT ANALYSIS:")
+        print("\nÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â¬ FEATURE IMPACT ANALYSIS:")
 
         # Find normal vs full agents
         normal_metrics = None
@@ -2740,16 +2683,16 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
 
         for config_name, metrics in performance_data.items():
             if metrics['type'] == 'agent':
-                if not metrics.get('forecasting') and not metrics.get('enhancer'):
+                if not metrics.get('forecasting') and not metrics.get('cv', False):
                     normal_metrics = metrics
-                elif metrics.get('forecasting') and metrics.get('enhancer'):
+                elif metrics.get('forecasting') and metrics.get('cv', False):
                     full_metrics = metrics
 
         if normal_metrics and full_metrics:
             return_improvement = full_metrics['total_return'] - normal_metrics['total_return']
             sharpe_improvement = full_metrics['sharpe_ratio'] - normal_metrics['sharpe_ratio']
 
-            print(f"   📈 Enhanced Features Impact:")
+            print("   Enhanced Features Impact:")
             print(f"      Return Improvement: {return_improvement:+.2f}%")
             print(f"      Sharpe Improvement: {sharpe_improvement:+.3f}")
 
@@ -2768,7 +2711,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
             'metrics': best_config[1]
         }
 
-        print(f"\n🥇 BEST PERFORMER: {best_config[0]}")
+        print(f"\nÃƒÂ°Ã…Â¸Ã‚Â¥Ã¢â‚¬Â¡ BEST PERFORMER: {best_config[0]}")
         print(f"   Sharpe Ratio: {best_config[1]['sharpe_ratio']:.3f}")
         print(f"   Total Return: {best_config[1]['total_return']:.2f}%")
 
@@ -2778,7 +2721,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
 def main():
     """Main evaluation function."""
     setup_console_encoding()
-    print_progress("🚀 Starting Comprehensive Evaluation System")
+    print_progress("Starting Comprehensive Evaluation System")
     parser = argparse.ArgumentParser(description="Unified Evaluation Script")
 
     # Mode selection
@@ -2807,24 +2750,24 @@ def main():
 
     # Forecasting options
     parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models",
-                       help="Forecast model directory (NEW: Updated to Forecast_ANN structure)")
+                       help="Legacy standalone forecast compatibility path; tiered evaluation uses --forecast_base_dir episode expert-bank artifacts instead.")
     parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers",
-                       help="Forecast scaler directory (NEW: Updated to Forecast_ANN structure)")
+                       help="Legacy standalone forecast compatibility path; tiered evaluation uses episode expert-bank scalers instead.")
     parser.add_argument("--no_forecast", action="store_true",
                        help="Disable forecasting for baseline comparison")
 
 
     # Enhanced model support
     parser.add_argument("--enhanced_models", type=str, default=None,
-                       help="Directory with enhanced models (forecasting + DL enhancer enabled)")
+                       help="Directory with enhanced models (forecasting + Tier-2 routed overlay enabled)")
     parser.add_argument("--force_forecasting", action="store_true",
                        help="Force enable forecasting for enhanced models")
 
     # Comprehensive evaluation paths
     parser.add_argument("--normal_models", type=str, default="normal/final_models",
-                       help="Directory with normal models (agents without forecasts/DL enhancer)")
+                       help="Directory with normal models (agents without forecasts/Tier-2 overlay)")
     parser.add_argument("--full_models", type=str, default="full/final_models",
-                       help="Directory with full models (agents with forecasts and the DL enhancer)")
+                       help="Directory with full models (agents with forecasts and the Tier-2 routed overlay)")
 
     # Evaluation options
     parser.add_argument("--eval_steps", type=int, default=None,
@@ -2849,9 +2792,9 @@ def main():
     parser.add_argument("--tier1_dir", type=str, default="tier1_seed789",
                        help="Baseline run directory containing final_models/")
     parser.add_argument("--tier2_dir", type=str, default="tier2_seed789",
-                       help="Tier-2 full DL-enhancer run directory containing final_models/")
+                       help="Tier-2 full routed overlay run directory containing final_models/")
     parser.add_argument("--tier2_ablated_dir", type=str, default="tier2_ablated_seed789",
-                       help="Tier-2 ablation run directory (5D enhancer, no forecast features)")
+                       help="Tier-2 ablation run directory (nullified forecast features)")
     parser.add_argument(
         "--tiers_only",
         type=str,
@@ -2874,9 +2817,9 @@ def main():
         choices=["paper", "deployed"],
         help=(
             "In --mode tiers: "
-            "'paper' evaluates the learned SB3 policies only (forecasts+DL enhancer disabled; paper-fair). "
-            "'deployed' enables forecasting and loads DL enhancer .h5 weights for Tier-2 variants (system-level evaluation; NOT paper-fair). "
-            "In deployed mode, forecast-enabled tiers now fail fast on forecast/enhancer setup errors."
+            "'paper' evaluates the learned SB3 policies only (forecasts+Tier-2 overlay disabled; paper-fair). "
+            "'deployed' enables forecasting and loads Tier-2 routed overlay .h5 weights for Tier-2 variants (system-level evaluation; NOT paper-fair). "
+            "In deployed mode, forecast-enabled tiers now fail fast on forecast/cv setup errors."
         ),
     )
     parser.add_argument(
@@ -2923,7 +2866,7 @@ def main():
             cfg_snapshot = _build_eval_config(args)
         except Exception as snapshot_error:
             print_progress(
-                f"⚠️  Could not build config snapshot for evaluation manifest: {snapshot_error}"
+                f"Could not build config snapshot for evaluation manifest: {snapshot_error}"
             )
             cfg_snapshot = None
         manifest_path = write_run_manifest(
@@ -2934,11 +2877,11 @@ def main():
             extra={"entrypoint": "evaluation.py", "mode": getattr(args, "mode", None)},
             filename_prefix="eval_manifest",
         )
-        print_progress(f"🧾 Wrote evaluation run manifest: {manifest_path}")
+        print_progress(f"Wrote evaluation run manifest: {manifest_path}")
     except Exception as e:
-        print_progress(f"⚠️  Failed to write evaluation run manifest: {e}")
+        print_progress(f"Failed to write evaluation run manifest: {e}")
 
-    print_progress("📋 Parsing arguments and validating paths...")
+    print_progress("Parsing arguments and validating paths...")
 
     # Auto-detect trained agents for agents mode if not specified
     if args.mode == "agents" and args.trained_agents is None and args.enhanced_models is None:
@@ -2955,7 +2898,6 @@ def main():
             if os.path.exists(candidate):
                 required_files = [
                     "investor_0_policy.zip", "battery_operator_0_policy.zip",
-                    "risk_controller_0_policy.zip", "meta_controller_0_policy.zip"
                 ]
                 if all(os.path.exists(os.path.join(candidate, f)) for f in required_files):
                     # Check if this is an enhanced model directory
@@ -2974,39 +2916,44 @@ def main():
                             enhanced_features = config.get('enhanced_features', {})
                             if (
                                 enhanced_features.get('forecasting_enabled')
-                                or enhanced_features.get('enhancer_enabled')
-                                or enhanced_features.get('dl_enhancer_enabled')
+                                or enhanced_features.get('tier2_enabled')
+                                or enhanced_features.get('tier2_routed_overlay_enabled')
+                                or enhanced_features.get('forecast_routed_overlay_features')
+                                or enhanced_features.get('cv_enabled')
+                                or enhanced_features.get('dl_cv_enabled')
+                                or enhanced_features.get('tier2_control_variate_enabled')
+                                or enhanced_features.get('forecast_control_variate_features')
                             ):
                                 is_enhanced = True
                         except Exception as e:
-                            print(f"⚠️ Could not parse training config for auto-detection ({config_file}): {e}")
+                            print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Could not parse training config for auto-detection ({config_file}): {e}")
 
                     if is_enhanced:
                         args.enhanced_models = candidate
-                        print(f"🎯 Auto-detected enhanced models: {candidate}")
+                        print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Auto-detected enhanced models: {candidate}")
                     else:
                         args.trained_agents = candidate
-                        print(f"🎯 Auto-detected trained agents: {candidate}")
+                        print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Auto-detected trained agents: {candidate}")
                     break
 
         if args.trained_agents is None and args.enhanced_models is None:
-            print("❌ --trained_agents or --enhanced_models is required when using 'agents' mode")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ --trained_agents or --enhanced_models is required when using 'agents' mode")
             print("   Searched locations: normal/final_models, enhanced/final_models, training_agent_results/final_models")
             sys.exit(1)
 
-    print(f"🔥 UNIFIED EVALUATION - MODE: {args.mode.upper()}")
+    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â¥ UNIFIED EVALUATION - MODE: {args.mode.upper()}")
     print("=" * 60)
 
     # Load evaluation data
-    print_progress(f"📊 Loading evaluation data from: {args.eval_data}")
+    print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Loading evaluation data from: {args.eval_data}")
     try:
         eval_data = load_energy_data(args.eval_data)
-        print_progress(f"✅ Loaded evaluation data: {eval_data.shape}")
+        print_progress(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Loaded evaluation data: {eval_data.shape}")
         if "timestamp" in eval_data.columns and eval_data["timestamp"].notna().any():
             ts = eval_data["timestamp"].dropna()
-            print_progress(f"📅 Date range: {ts.iloc[0]} → {ts.iloc[-1]}")
+            print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Â¦ Date range: {ts.iloc[0]} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {ts.iloc[-1]}")
     except Exception as e:
-        print_progress(f"❌ Error loading evaluation data: {e}")
+        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Error loading evaluation data: {e}")
         sys.exit(1)
 
     # Tier suite mode evaluates one or more tier variants on unseen data using final_models/
@@ -3027,11 +2974,11 @@ def main():
                 analysis = analyze_comprehensive_results({"configurations": results.get("tiers", {})})
 
             save_results(results, args.output_dir, mode="tiers", analysis=analysis)
-            print_progress(f"📄 Tier report written: {md_path}")
-            print_progress(f"📄 Tier report CSV written: {csv_path}")
+            print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Å¾ Tier report written: {md_path}")
+            print_progress(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Å¾ Tier report CSV written: {csv_path}")
             return
         except Exception as e:
-            print_progress(f"❌ Tier suite evaluation failed: {e}")
+            print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Tier suite evaluation failed: {e}")
             raise
 
     # Create evaluation environment for other modes
@@ -3049,7 +2996,7 @@ def main():
     )
 
     if eval_env is None:
-        print("❌ Failed to create evaluation environment")
+        print("ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to create evaluation environment")
         sys.exit(1)
 
     # Run evaluation based on mode
@@ -3059,12 +3006,12 @@ def main():
         # Checkpoint mode: find latest checkpoint and load SB3 models
         latest_checkpoint = find_latest_checkpoint(args.checkpoint_dir)
         if latest_checkpoint is None:
-            print("❌ No checkpoints found")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ No checkpoints found")
             sys.exit(1)
 
         checkpoint_models = load_checkpoint_models(latest_checkpoint)
         if not checkpoint_models or not any(m is not None for m in checkpoint_models.values()):
-            print("❌ No checkpoint models loaded successfully")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ No checkpoint models loaded successfully")
             sys.exit(1)
 
         results = run_checkpoint_evaluation(
@@ -3083,13 +3030,13 @@ def main():
         # Determine which model type to load
         if args.enhanced_models:
             if not os.path.exists(args.enhanced_models):
-                print(f"❌ Enhanced models directory not found: {args.enhanced_models}")
+                print(f"Enhanced models directory not found: {args.enhanced_models}")
                 sys.exit(1)
 
-            print("🚀 Loading enhanced models with forecasting and the DL enhancer...")
+            print("Loading enhanced models with forecasting and the Tier-2 routed overlay...")
 
-            # Create enhanced evaluation environment with the DL enhancer
-            dl_weights_path = _resolve_enhancer_weights_from_models_dir(args.enhanced_models)
+            # Create enhanced evaluation environment with the Tier-2 routed overlay
+            dl_weights_path = _resolve_cv_weights_from_models_dir(args.enhanced_models)
             if dl_weights_path and os.path.exists(dl_weights_path):
                 forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
@@ -3098,7 +3045,7 @@ def main():
                     model_dir=forecast_ctx["model_dir"],
                     scaler_dir=forecast_ctx["scaler_dir"],
                     metadata_dir=forecast_ctx["metadata_dir"],
-                    enhancer_weights_path=dl_weights_path,
+                    cv_weights_path=dl_weights_path,
                     output_dir=args.output_dir,
                     investment_freq=args.investment_freq,
                     config=_build_eval_config(args),
@@ -3111,14 +3058,14 @@ def main():
             model_path = args.enhanced_models
         else:
             if not os.path.exists(args.trained_agents):
-                print(f"❌ Trained agents directory not found: {args.trained_agents}")
+                print(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Trained agents directory not found: {args.trained_agents}")
                 sys.exit(1)
 
             agent_system = load_agent_system(args.trained_agents, eval_env)
             model_path = args.trained_agents
 
         if agent_system is None:
-            print("❌ Failed to load agent system")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to load agent system")
             sys.exit(1)
 
         results = run_agent_evaluation(
@@ -3134,7 +3081,7 @@ def main():
 
     elif args.mode == "baselines":
         # Baselines mode: run traditional baseline methods
-        print("🏛️ Running traditional baseline evaluation...")
+        print("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬ÂºÃƒÂ¯Ã‚Â¸Ã‚Â Running traditional baseline evaluation...")
 
         baseline_results = run_traditional_baselines(
             args.eval_data,
@@ -3150,20 +3097,20 @@ def main():
                 'eval_steps': args.eval_steps or 8000
             }
         else:
-            print("❌ Traditional baseline evaluation failed")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ Traditional baseline evaluation failed")
             sys.exit(1)
 
     elif args.mode == "compare":
         # Compare mode: run both AI and traditional baselines
-        print("🔄 Running comprehensive comparison...")
+        print("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Running comprehensive comparison...")
 
         # Initialize ai_results
         ai_results = None
 
         # Run AI evaluation first (enhanced or standard models)
         if args.enhanced_models:
-            # Use enhanced models with the DL enhancer
-            dl_weights_path = _resolve_enhancer_weights_from_models_dir(args.enhanced_models)
+            # Use enhanced models with the Tier-2 routed overlay
+            dl_weights_path = _resolve_cv_weights_from_models_dir(args.enhanced_models)
             if dl_weights_path and os.path.exists(dl_weights_path):
                 forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
@@ -3172,7 +3119,7 @@ def main():
                     model_dir=forecast_ctx["model_dir"],
                     scaler_dir=forecast_ctx["scaler_dir"],
                     metadata_dir=forecast_ctx["metadata_dir"],
-                    enhancer_weights_path=dl_weights_path,
+                    cv_weights_path=dl_weights_path,
                     output_dir=args.output_dir,
                     investment_freq=args.investment_freq,
                     config=_build_eval_config(args),
@@ -3211,7 +3158,7 @@ def main():
                 if checkpoint_models:
                     ai_results = run_checkpoint_evaluation(checkpoint_models, eval_env, eval_data, args.eval_steps or 8000)
             else:
-                print("❌ No AI models found for comparison")
+                print("ÃƒÂ¢Ã‚ÂÃ…â€™ No AI models found for comparison")
 
         # Run traditional baselines with same steps as AI agents
         baseline_results = run_traditional_baselines(args.eval_data, args.eval_steps or 10000, args.output_dir)
@@ -3226,28 +3173,28 @@ def main():
                 'eval_steps': args.eval_steps or 8000
             }
         elif ai_results and 'error' in baseline_results:
-            print("⚠️ Traditional baselines failed, showing AI results only")
+            print("ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Traditional baselines failed, showing AI results only")
             results = ai_results
             results['baseline_error'] = baseline_results.get('error', 'Unknown error')
         elif baseline_results and 'error' not in baseline_results and not ai_results:
-            print("⚠️ AI evaluation failed, showing baseline results only")
+            print("ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â AI evaluation failed, showing baseline results only")
             results = {
                 'evaluation_type': 'baselines_only',
                 'baseline_results': baseline_results,
                 'ai_error': 'AI evaluation failed'
             }
         else:
-            print("❌ Both AI and baseline evaluations failed")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ Both AI and baseline evaluations failed")
             sys.exit(1)
 
     elif args.mode == "comprehensive":
         # Comprehensive mode: evaluate all configurations
-        print("🎯 Running comprehensive evaluation of all configurations...")
+        print("ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Running comprehensive evaluation of all configurations...")
 
         results = run_comprehensive_evaluation(eval_data, args)
 
         if not results or not results.get('configurations'):
-            print("❌ Comprehensive evaluation failed")
+            print("ÃƒÂ¢Ã‚ÂÃ…â€™ Comprehensive evaluation failed")
             sys.exit(1)
 
     # Save and display results
@@ -3260,7 +3207,7 @@ def main():
         # Perform analysis if requested
         analysis_results = None
         if args.analyze:
-            print("\n📊 PERFORMING COMPREHENSIVE ANALYSIS...")
+            print("\nÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  PERFORMING COMPREHENSIVE ANALYSIS...")
 
             # Handle different result types
             if results.get('evaluation_type') == 'comprehensive':
@@ -3298,7 +3245,7 @@ def main():
         results_file, analysis_file = save_results(results, args.output_dir, args.mode, analysis_results)
 
         # Display summary
-        print(f"\n🎉 EVALUATION SUCCESS!")
+        print(f"\nÃƒÂ°Ã…Â¸Ã…Â½Ã¢â‚¬Â° EVALUATION SUCCESS!")
 
         # Handle different result types for display
         if results.get('evaluation_type') == 'comprehensive':
@@ -3306,19 +3253,19 @@ def main():
             if analysis_results and 'summary' in analysis_results:
                 best_performer = analysis_results['summary'].get('best_performer', {})
                 if best_performer:
-                    print(f"🥇 BEST PERFORMER: {best_performer['name']}")
+                    print(f"ÃƒÂ°Ã…Â¸Ã‚Â¥Ã¢â‚¬Â¡ BEST PERFORMER: {best_performer['name']}")
                     metrics = best_performer['metrics']
-                    print(f"   📈 Return: {metrics['total_return']:.2f}%")
-                    print(f"   ⚡ Sharpe: {metrics['sharpe_ratio']:.3f}")
-                    print(f"   📉 Drawdown: {metrics['max_drawdown']:.2f}%")
+                    print(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‹â€  Return: {metrics['total_return']:.2f}%")
+                    print(f"   ÃƒÂ¢Ã…Â¡Ã‚Â¡ Sharpe: {metrics['sharpe_ratio']:.3f}")
+                    print(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Â° Drawdown: {metrics['max_drawdown']:.2f}%")
 
                 if 'feature_impact' in analysis_results:
                     impact = analysis_results['feature_impact']
-                    print(f"\n🔬 ENHANCED FEATURES IMPACT:")
-                    print(f"   📈 Return Improvement: {impact['return_improvement_pct']:+.2f}%")
-                    print(f"   ⚡ Sharpe Improvement: {impact['sharpe_improvement']:+.3f}")
+                    print(f"\nÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â¬ ENHANCED FEATURES IMPACT:")
+                    print(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‹â€  Return Improvement: {impact['return_improvement_pct']:+.2f}%")
+                    print(f"   ÃƒÂ¢Ã…Â¡Ã‚Â¡ Sharpe Improvement: {impact['sharpe_improvement']:+.3f}")
             else:
-                print("📊 Comprehensive evaluation completed - see detailed results in JSON file")
+                print("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Comprehensive evaluation completed - see detailed results in JSON file")
 
         elif results.get('evaluation_type') == 'comprehensive_comparison':
             # For comparison results, show AI results
@@ -3326,20 +3273,20 @@ def main():
             baseline_results = results.get('baseline_results', {})
 
             if ai_results:
-                print(f"🤖 AI AGENTS PERFORMANCE:")
-                print(f"📈 Final Return: {ai_results.get('total_return', 0):+.2%}")
-                print(f"⚡ Sharpe Ratio: {ai_results.get('sharpe_ratio', 0):.3f}")
-                print(f"📊 Total Rewards: {ai_results.get('total_rewards', 0):.2f}")
+                print(f"ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ AI AGENTS PERFORMANCE:")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‹â€  Final Return: {ai_results.get('total_return', 0):+.2%}")
+                print(f"ÃƒÂ¢Ã…Â¡Ã‚Â¡ Sharpe Ratio: {ai_results.get('sharpe_ratio', 0):.3f}")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Total Rewards: {ai_results.get('total_rewards', 0):.2f}")
 
                 if 'initial_portfolio_value' in ai_results and 'final_portfolio_value' in ai_results:
                     initial = ai_results['initial_portfolio_value']
                     final = ai_results['final_portfolio_value']
-                    print(f"💰 Portfolio: ${initial/1e6:.1f}M → ${final/1e6:.1f}M (${(final-initial)/1e6:+.1f}M)")
-                    print(f"📊 Volatility: {ai_results.get('volatility', 0)*100:.2f}%")
-                    print(f"📉 Max Drawdown: {ai_results.get('max_drawdown', 0)*100:.2f}%")
+                    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â° Portfolio: ${initial/1e6:.1f}M ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${final/1e6:.1f}M (${(final-initial)/1e6:+.1f}M)")
+                    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Volatility: {ai_results.get('volatility', 0)*100:.2f}%")
+                    print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Â° Max Drawdown: {ai_results.get('max_drawdown', 0)*100:.2f}%")
 
             if baseline_results:
-                print(f"\n🏛️ BASELINE COMPARISON:")
+                print(f"\nÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬ÂºÃƒÂ¯Ã‚Â¸Ã‚Â BASELINE COMPARISON:")
                 for baseline_name, baseline_data in baseline_results.items():
                     if isinstance(baseline_data, dict) and 'total_return' in baseline_data:
                         method = baseline_data.get('method', baseline_name)
@@ -3348,44 +3295,44 @@ def main():
                         print(f"   {method}: {return_pct:+.2f}% return, {sharpe:.2f} Sharpe")
         else:
             # For regular results
-            print(f"📈 Final Return: {results.get('total_return', 0):+.2%}")
-            print(f"⚡ Sharpe Ratio: {results.get('sharpe_ratio', 0):.3f}")
-            print(f"📊 Total Rewards: {results.get('total_rewards', 0):.2f}")
-            print(f"🎯 Average Risk: {results.get('average_risk', 0):.3f}")
+            print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‹â€  Final Return: {results.get('total_return', 0):+.2%}")
+            print(f"ÃƒÂ¢Ã…Â¡Ã‚Â¡ Sharpe Ratio: {results.get('sharpe_ratio', 0):.3f}")
+            print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Total Rewards: {results.get('total_rewards', 0):.2f}")
+            print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Average Risk: {results.get('average_risk', 0):.3f}")
 
             # Portfolio performance details
             if 'initial_portfolio_value' in results and 'final_portfolio_value' in results:
                 initial = results['initial_portfolio_value']
                 final = results['final_portfolio_value']
-                print(f"💰 Portfolio: ${initial/1e6:.1f}M → ${final/1e6:.1f}M (${(final-initial)/1e6:+.1f}M)")
-                print(f"📊 Volatility: {results.get('volatility', 0)*100:.2f}%")
-                print(f"📉 Max Drawdown: {results.get('max_drawdown', 0)*100:.2f}%")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â° Portfolio: ${initial/1e6:.1f}M ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${final/1e6:.1f}M (${(final-initial)/1e6:+.1f}M)")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Volatility: {results.get('volatility', 0)*100:.2f}%")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Â° Max Drawdown: {results.get('max_drawdown', 0)*100:.2f}%")
 
         inference_rate = _extract_action_inference_success_rate(results)
         if inference_rate is not None:
-            print(f"🎯 Action Inference Success: {inference_rate:.1%}")
+            print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ Action Inference Success: {inference_rate:.1%}")
         if 'models_loaded' in results:
-            print(f"🤖 Models Loaded: {results['models_loaded']}/4")
+            print(f"ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ Models Loaded: {results['models_loaded']}")
 
         # Display analysis summary if available
         if analysis_results and 'summary' in analysis_results:
             summary = analysis_results['summary']
-            print(f"\n📊 ANALYSIS SUMMARY:")
-            print(f"🏆 Overall Assessment: {summary.get('overall_assessment', 'N/A')}")
-            print(f"📝 Performance Grade: {summary.get('performance_grade', 'N/A')}")
+            print(f"\nÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  ANALYSIS SUMMARY:")
+            print(f"ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬Â  Overall Assessment: {summary.get('overall_assessment', 'N/A')}")
+            print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â Performance Grade: {summary.get('performance_grade', 'N/A')}")
 
             if 'recommendations' in summary:
-                print(f"💡 Recommendations:")
+                print(f"ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â¡ Recommendations:")
                 for i, rec in enumerate(summary['recommendations'], 1):
                     print(f"   {i}. {rec}")
 
-        print(f"\n💾 Files saved:")
-        print(f"   📄 Results: {results_file}")
+        print(f"\nÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â¾ Files saved:")
+        print(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Å¾ Results: {results_file}")
         if analysis_file:
-            print(f"   📊 Analysis: {analysis_file}")
+            print(f"   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Analysis: {analysis_file}")
 
     else:
-        print("❌ Evaluation failed")
+        print("ÃƒÂ¢Ã‚ÂÃ…â€™ Evaluation failed")
         sys.exit(1)
 
 

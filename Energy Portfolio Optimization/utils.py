@@ -4,11 +4,11 @@ UNIFIED UTILITIES MODULE (COMPREHENSIVE)
 
 Consolidates all utility functions and classes into a single, organized module:
 - safe_utils.py (SafeDivision, safe_clip, safe_mean, safe_std, sanitize_array, ensure_finite)
-- enhancer-base utilities (clear_tf_session, configure_tf_memory)
+- Tier-2 routed-overlay utilities (clear_tf_session, configure_tf_memory)
 - error_handling.py (ErrorHandler, safe_operation, validation functions, ContextualLogger)
 - memory_manager.py (UnifiedMemoryManager)
 - observation_validator.py (UnifiedObservationValidator)
-- dl_enhancer.py (CalibrationTracker, EnhancerAdapter, EnhancerTrainer)
+- tier2_routed_overlay.py (CalibrationTracker, Tier2RoutedOverlayAdapter, Tier2RoutedOverlayTrainer)
 
 Single source of truth for all utility operations across the entire codebase.
 """
@@ -745,9 +745,9 @@ class UnifiedObservationValidator:
 
 
 # ============================================================================
-# TIER-2 DL ENHANCER SYSTEM
+# TIER-2 DL CONTROL VARIATE SYSTEM
 # ============================================================================
-# NOTE: Tier-2 DL logic (CalibrationTracker, EnhancerAdapter, etc.) is in dl_enhancer.py.
+# NOTE: Tier-2 routed-overlay logic (CalibrationTracker, Tier2RoutedOverlayAdapter, etc.) is in tier2_routed_overlay.py.
 
 
 # ============================================================================
@@ -769,7 +769,7 @@ def determine_tier(
 
     Tier meanings in the paper refactor:
     - TIER_1: MARL baseline (no forecast backend)
-    - TIER_2: MARL + Tier-2 DL enhancer backend
+    - TIER_2: MARL + Tier-2 short-horizon price-expert routed overlay backend
     """
     if forecast_baseline_enable:
         return TIER_2
@@ -780,7 +780,7 @@ def get_expected_observation_dims(tier: str, agent_name: str) -> int:
     base_dims = {
         'investor_0': 6,
         'battery_operator_0': 4,
-        'risk_controller_0': 9,
+        'risk_controller_0': 11,
         'meta_controller_0': 11,
     }
     # Observation shapes are fixed (Tier-1) across baseline and Tier-2 variants.
@@ -797,14 +797,14 @@ def get_tier_from_env(env) -> str:
         return TIER_1
     config = env.config
     forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
-    has_enhancer = hasattr(env, 'enhancer_adapter') and env.enhancer_adapter is not None
-    return determine_tier(forecast_baseline_enable or has_enhancer)
+    has_cv = hasattr(env, 'control_variate_adapter') and env.control_variate_adapter is not None
+    return determine_tier(forecast_baseline_enable or has_cv)
 
 
 def get_tier_description(tier: str) -> str:
     descriptions = {
         TIER_1: "MARL baseline (no forecast backend; no extra observations)",
-        TIER_2: "MARL + Tier-2 DL enhancer backend (no extra observations)",
+        TIER_2: "MARL + Tier-2 short-horizon price-expert routed overlay backend (no extra observations)",
     }
     return descriptions.get(tier, f"Unknown tier: {tier}")
 
@@ -813,7 +813,7 @@ __all__ = [
     'SafeDivision', 'safe_clip', 'safe_mean', 'safe_std', 'safe_percentile',
     'sanitize_array', 'ensure_finite',
 
-    # Tier-2 enhancer utilities
+    # Tier-2 routed-overlay utilities
     'clear_tf_session', 'configure_tf_memory',
 
     # Error handling

@@ -126,6 +126,84 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+def set_console_logging_level(level: int):
+    """
+    Update non-file console handler levels without touching file logging.
+
+    Returns a list of (handler, previous_level) entries that can be passed to
+    `restore_console_logging_levels`.
+    """
+    saved_levels = []
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            continue
+        if isinstance(handler, logging.StreamHandler):
+            saved_levels.append((handler, handler.level))
+            handler.setLevel(level)
+    return saved_levels
+
+
+def restore_console_logging_levels(saved_levels) -> None:
+    """Restore console handler levels captured by `set_console_logging_level`."""
+    for handler, previous_level in saved_levels or []:
+        try:
+            handler.setLevel(previous_level)
+        except Exception:
+            pass
+
+
+def emit_progress_lines(lines) -> None:
+    """
+    Write plain progress lines to both console and file handlers, bypassing
+    normal log levels so training can stay quiet except for explicit snapshots.
+    """
+    if isinstance(lines, str):
+        lines = [lines]
+    else:
+        lines = [str(line) for line in (lines or [])]
+    if not lines:
+        return
+
+    root_logger = logging.getLogger()
+    console_captures_file = False
+    for handler in root_logger.handlers:
+        try:
+            if isinstance(handler, ProgressAwareConsoleHandler):
+                stream = getattr(handler, "stream", None)
+                if stream is not None and stream.__class__.__name__ == "TeeOutput":
+                    console_captures_file = True
+                    break
+        except Exception:
+            continue
+
+    for handler in root_logger.handlers:
+        try:
+            stream = getattr(handler, "stream", None)
+            if stream is None:
+                continue
+
+            if isinstance(handler, ProgressAwareConsoleHandler):
+                try:
+                    from tqdm import tqdm
+                    for line in lines:
+                        tqdm.write(line, file=stream)
+                except Exception:
+                    for line in lines:
+                        stream.write(line + "\n")
+                    handler.flush()
+                continue
+
+            if console_captures_file and isinstance(handler, logging.FileHandler):
+                continue
+
+            for line in lines:
+                stream.write(line + "\n")
+            handler.flush()
+        except Exception:
+            continue
+
+
 # ============================================================================
 # TERMINAL OUTPUT TEE (for capturing print statements)
 # ============================================================================
@@ -247,11 +325,47 @@ class RewardLogger:
 
         # Track unknown-field warnings so we only log each unknown field once
         self._warned_unknown_fields = set()
+        self.investor_health_fields = [
+            'inv_mean_clip_hit',
+            'inv_mean_clip_hit_rate',
+            'inv_mu_abs_roll',
+            'inv_mu_sign_consistency',
+            'inv_mu_raw',
+            'inv_sigma_raw',
+            'inv_a_raw',
+            'inv_tanh_mu',
+            'inv_tanh_a',
+            'inv_sat_mean',
+            'inv_sat_sample',
+            'inv_sat_noise_only',
+            'inv_reward_step',
+            'inv_value',
+            'inv_value_next',
+            'inv_td_error',
+        ]
+        self.investor_health_context_fields = [
+            'episode',
+            'timestep',
+            'training_global_step',
+            'decision_step',
+            'exposure_exec',
+            'position_exposure',
+            'action_sign',
+            'trade_signal_active',
+            'trade_signal_sign',
+            'investor_reward',
+            'fund_nav_usd',
+            'fund_nav_dkk',
+            'price_return_1step',
+            'price_return_forecast',
+            'investor_action',
+        ]
         
         # CSV file for step-by-step logging (will be set per episode)
         self.csv_file = None
         self.csv_writer = None
         self.csv_file_handle = None
+        self.episode_investor_health_rows = []
         
         # Category-specific CSV writers (portfolio, forecast, rewards, positions)
         self.category_writers = {}
@@ -268,7 +382,7 @@ class RewardLogger:
                 'fund_nav_dkk', 'trading_cash_dkk', 'physical_book_value_dkk',
                 'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
                 'depreciation_ratio', 'years_elapsed',
-                # NAV attribution drivers
+                # NAV attribution drivers (per-step fund NAV, not trading cash)
                 'nav_start', 'nav_end', 'pnl_total', 'pnl_battery', 'pnl_generation', 'pnl_hedge', 'cash_delta_ops',
                 # Battery dispatch metrics (FIX #5)
                 'battery_decision', 'battery_intensity', 'battery_spread', 'battery_adjusted_hurdle', 'battery_volatility_adj',
@@ -281,28 +395,40 @@ class RewardLogger:
                 'wind_pos_norm', 'solar_pos_norm', 'hydro_pos_norm',
                 'decision_step', 'exposure_exec', 'action_sign',
                 'trade_signal_active', 'trade_signal_sign',
-                'risk_multiplier', 'vol_brake_mult', 'strategy_multiplier',
-                'combined_multiplier', 'tradeable_capital', 'mtm_exit_count',
+                'risk_multiplier', 'tradeable_capital', 'mtm_exit_count',
                 'investor_action', 'battery_action',
-                'tier2_enhancer_enabled', 'tier2_enhancer_delta', 'tier2_enhancer_pred_sigma', 'tier2_enhancer_reliability',
-                'tier2_enhancer_mape',
-                'tier2_enhancer_alignment', 'tier2_enhancer_forecast_signal',
-                'tier2_enhancer_forecast_edge_signal', 'tier2_enhancer_forecast_consensus_signal',
-                'tier2_enhancer_forecast_curvature_signal', 'tier2_enhancer_uncertainty_quality',
-                'tier2_enhancer_metadata_skill', 'tier2_enhancer_physical_pressure_signal',
-                'tier2_enhancer_context_strength', 'tier2_enhancer_realized_gain_signal',
-                'tier2_enhancer_target_delta', 'tier2_enhancer_sharpe_signal',
-                'tier2_enhancer_sharpe_before', 'tier2_enhancer_sharpe_after',
-                'tier2_enhancer_sharpe_delta',
+                'tier2_overlay_enabled', 'tier2_overlay_delta', 'tier2_overlay_pred_sigma', 'tier2_overlay_reliability',
+                'tier2_overlay_gain', 'tier2_overlay_forecast_trust',
+                'tier2_overlay_mape_quality',
+                'tier2_overlay_alignment', 'tier2_overlay_forecast_signal',
+                'tier2_overlay_edge_signal', 'tier2_overlay_consensus_signal',
+                'tier2_overlay_curvature_signal', 'tier2_overlay_uncertainty_quality',
+                'tier2_overlay_metadata_skill', 'tier2_overlay_imbalance_signal',
+                'tier2_overlay_context_strength', 'tier2_overlay_realized_gain_signal',
+                'tier2_overlay_target_delta', 'tier2_overlay_delta_prediction', 'tier2_overlay_sharpe_signal',
+                'tier2_overlay_sharpe_before', 'tier2_overlay_sharpe_after',
+                'tier2_overlay_sharpe_delta',
+                'tier2_cv_enabled', 'tier2_cv_delta', 'tier2_cv_pred_sigma', 'tier2_cv_reliability',
+                'tier2_cv_overlay_gain', 'tier2_cv_forecast_trust_component',
+                'tier2_cv_mape',
+                'tier2_cv_alignment', 'tier2_cv_forecast_signal',
+                'tier2_cv_forecast_edge_signal', 'tier2_cv_forecast_consensus_signal',
+                'tier2_cv_forecast_curvature_signal', 'tier2_cv_uncertainty_quality',
+                'tier2_cv_metadata_skill', 'tier2_cv_physical_pressure_signal',
+                'tier2_cv_context_strength', 'tier2_cv_realized_gain_signal',
+                'tier2_cv_target_delta', 'tier2_cv_delta_prediction', 'tier2_cv_sharpe_signal',
+                'tier2_cv_sharpe_before', 'tier2_cv_sharpe_after',
+                'tier2_cv_sharpe_delta',
                 'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw', 'inv_tanh_mu', 'inv_tanh_a',
-                'inv_mu_abs_roll', 'inv_mu_sign_consistency', 'inv_pen_mean_collapse',
+                'inv_mean_clip_hit', 'inv_mean_clip_hit_rate',
+                'inv_mu_abs_roll', 'inv_mu_sign_consistency',
                 'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
                 'inv_reward_step', 'inv_value', 'inv_value_next', 'inv_td_error'
                 , 'probe_r2_base', 'probe_r2_base_plus_signal', 'probe_delta_r2'
             ],
              'forecast': ['episode', 'timestep', 'z_short', 'z_medium', 'z_long', 'z_combined',
-                          'forecast_confidence', 'forecast_mape', 'forecast_trust',
-                          'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason', 'agent_followed_forecast', 'forecast_usage_bonus', 'investor_strategy_multiplier',
+                          'tier2_expert_confidence', 'forecast_confidence', 'forecast_mape', 'forecast_trust',
+                          'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason', 'agent_followed_forecast',
                           'mape_short', 'mape_medium', 'mape_long',
                           'obs_trade_signal'],
             'rewards': ['episode', 'timestep', 'base_reward', 'investor_reward', 'battery_reward',
@@ -312,6 +438,10 @@ class RewardLogger:
         # Track episode-level aggregates
         self.episode_data = []
         self.current_episode = 0
+        self.category_fields['positions'] = [
+            field for field in self.category_fields['positions']
+            if field not in self.investor_health_fields
+        ]
         
     def start_episode(self, episode_num: int):
         """Initialize logging for a new episode - creates a new CSV file per episode"""
@@ -329,6 +459,7 @@ class RewardLogger:
         self.category_writers.clear()
         
         self.current_episode = episode_num
+        self.episode_investor_health_rows = []
         
         # Create new CSV file for this episode (renamed from _reward_debug_ to _debug_)
         # Single canonical file name per episode.
@@ -372,6 +503,7 @@ class RewardLogger:
                  timestep: int,
                  # Portfolio metrics (logged at every timestep)
                  portfolio_value_usd_millions: float = 0.0,
+                 fund_nav_usd: float = 0.0,
                  cash_dkk: float = 0.0,
                  trading_gains_usd_thousands: float = 0.0,
                  operating_gains_usd_thousands: float = 0.0,
@@ -389,6 +521,7 @@ class RewardLogger:
                  z_medium: float = 0.0,
                  z_long: float = 0.0,
                  z_combined: float = 0.0,
+                 tier2_expert_confidence: float = 0.0,
                  forecast_confidence: float = 0.0,
                  forecast_trust: float = 0.0,
                  # OBSERVATION-LEVEL forecast signals (what the policy sees after warmup/ablation)
@@ -406,9 +539,6 @@ class RewardLogger:
                  trade_signal_active: float = 0.0,
                  trade_signal_sign: float = 0.0,
                  risk_multiplier: float = 1.0,
-                 vol_brake_mult: float = 1.0,
-                 strategy_multiplier: float = 1.0,
-                 combined_multiplier: float = 1.0,
                  tradeable_capital: float = 0.0,
                  mtm_exit_count: float = 0.0,
                  # Price data (for forward-looking accuracy analysis)
@@ -481,15 +611,6 @@ class RewardLogger:
                  forecast_gate_passed: bool = False,
                  forecast_used: bool = False,
                  forecast_not_used_reason: str = '',
-                 # NOVEL: Investor strategy fields
-                 investor_strategy: str = 'none',
-                 investor_position_scale: float = 0.0,
-                 investor_signal_strength: float = 0.0,
-                 investor_consensus: bool = False,
-                 investor_direction: int = 0,
-                 investor_strategy_bonus: float = 0.0,
-                 investor_strategy_multiplier: float = 1.0,
-                 forecast_usage_bonus: float = 0.0,
                  # NEW: Position alignment diagnostics (Bug #1 fix tracking)
                  position_alignment_status: str = 'no_strategy',
                  investor_position_ratio: float = 0.0,
@@ -539,7 +660,7 @@ class RewardLogger:
                  forecast_error_medium_pct: float = 0.0,
                  forecast_error_long_pct: float = 0.0,
                  agent_followed_forecast: bool = False,
-                 # NEW: NAV attribution drivers (per-step financial breakdown)
+                 # NEW: NAV attribution drivers (per-step fund NAV breakdown)
                  nav_start: float = 0.0,
                  nav_end: float = 0.0,
                  pnl_total: float = 0.0,
@@ -562,36 +683,37 @@ class RewardLogger:
                  battery_degradation_cost: float = 0.0,
                  battery_eta_charge: float = 0.0,
                  battery_eta_discharge: float = 0.0,
-                 # NEW (anti-collapse verification): penalty diagnostics
+                 # Investor health diagnostics
                  training_global_step: int = 0,
-                 inv_penalty_warm: float = 0.0,
-                 inv_pen_boundary: float = 0.0,
-                 inv_pen_exposure: float = 0.0,
-                 inv_pen_exposure_stuck: float = 0.0,
-                 inv_pen_mean_collapse: float = 0.0,
+                 inv_mean_clip_hit: float = 0.0,
+                 inv_mean_clip_hit_rate: float = 0.0,
                  inv_mu_abs_roll: float = 0.0,
                  inv_mu_sign_consistency: float = 0.0,
-                 # Tier-2 enhancer diagnostics (forecast-conditioned residual audit)
-                 tier2_enhancer_enabled: float = 0.0,
-                 tier2_enhancer_delta: float = 0.0,
-                 tier2_enhancer_pred_sigma: float = 0.0,
-                 tier2_enhancer_reliability: float = 1.0,
-                 tier2_enhancer_mape: float = 1.0,
-                 tier2_enhancer_alignment: float = 0.0,
-                 tier2_enhancer_forecast_signal: float = 0.0,
-                 tier2_enhancer_forecast_edge_signal: float = 0.0,
-                 tier2_enhancer_forecast_consensus_signal: float = 0.0,
-                 tier2_enhancer_forecast_curvature_signal: float = 0.0,
-                 tier2_enhancer_uncertainty_quality: float = 1.0,
-                 tier2_enhancer_metadata_skill: float = 0.5,
-                 tier2_enhancer_physical_pressure_signal: float = 0.0,
-                 tier2_enhancer_context_strength: float = 0.0,
-                 tier2_enhancer_realized_gain_signal: float = 0.0,
-                 tier2_enhancer_target_delta: float = 0.0,
-                 tier2_enhancer_sharpe_signal: float = 0.0,
-                 tier2_enhancer_sharpe_before: float = 0.0,
-                 tier2_enhancer_sharpe_after: float = 0.0,
-                 tier2_enhancer_sharpe_delta: float = 0.0,
+                 # Tier-2 routed residual-aware overlay diagnostics.
+                 # Legacy tier2_cv_* parameter names are retained for caller compatibility.
+                 tier2_cv_enabled: float = 0.0,
+                 tier2_cv_delta: float = 0.0,
+                 tier2_cv_pred_sigma: float = 0.0,
+                 tier2_cv_reliability: float = 1.0,
+                 tier2_cv_overlay_gain: float = 0.0,
+                 tier2_cv_forecast_trust_component: float = 0.0,
+                 tier2_cv_mape: float = 1.0,
+                 tier2_cv_alignment: float = 0.0,
+                 tier2_cv_forecast_signal: float = 0.0,
+                 tier2_cv_forecast_edge_signal: float = 0.0,
+                 tier2_cv_forecast_consensus_signal: float = 0.0,
+                 tier2_cv_forecast_curvature_signal: float = 0.0,
+                 tier2_cv_uncertainty_quality: float = 1.0,
+                 tier2_cv_metadata_skill: float = 0.5,
+                 tier2_cv_physical_pressure_signal: float = 0.0,
+                 tier2_cv_context_strength: float = 0.0,
+                 tier2_cv_realized_gain_signal: float = 0.0,
+                 tier2_cv_target_delta: float = 0.0,
+                 tier2_cv_delta_prediction: float = 0.0,
+                 tier2_cv_sharpe_signal: float = 0.0,
+                 tier2_cv_sharpe_before: float = 0.0,
+                 tier2_cv_sharpe_after: float = 0.0,
+                 tier2_cv_sharpe_delta: float = 0.0,
                  inv_mu_raw: float = 0.0,
                  inv_sigma_raw: float = 0.0,
                  inv_a_raw: float = 0.0,
@@ -633,9 +755,6 @@ class RewardLogger:
         aligned = is_aligned
         align_status = alignment_status if alignment_status else 'NEUTRAL'
 
-        # Convert boolean to int for CSV (0 or 1)
-        investor_consensus_int = 1 if investor_consensus else 0
-        
         row = {
             # ===================================================================
             # COMMON COLUMNS (Tier 1 & Tier 2) - First columns
@@ -644,7 +763,7 @@ class RewardLogger:
             'episode': self.current_episode,
             'timestep': timestep,
             'portfolio_value_usd_millions': portfolio_value_usd_millions,
-            'fund_nav_usd': portfolio_value_usd_millions,
+            'fund_nav_usd': fund_nav_usd,
             'cash_dkk': cash_dkk,
             'trading_gains_usd_thousands': trading_gains_usd_thousands,
             'operating_gains_usd_thousands': operating_gains_usd_thousands,
@@ -670,9 +789,6 @@ class RewardLogger:
             'trade_signal_active': trade_signal_active,
             'trade_signal_sign': trade_signal_sign,
             'risk_multiplier': risk_multiplier,
-            'vol_brake_mult': vol_brake_mult,
-            'strategy_multiplier': strategy_multiplier,
-            'combined_multiplier': combined_multiplier,
             'tradeable_capital': tradeable_capital,
             'mtm_exit_count': mtm_exit_count,
             # Price data (for forward-looking accuracy analysis)
@@ -694,36 +810,60 @@ class RewardLogger:
             'base_reward': base_reward,
             'investor_reward': investor_reward,
             'battery_reward': battery_reward,
-            # Penalty diagnostics (for episode-boundary collapse debugging)
+            # Investor health diagnostics
             'training_global_step': int(training_global_step),
-            'inv_penalty_warm': float(inv_penalty_warm),
-            'inv_pen_boundary': float(inv_pen_boundary),
-            'inv_pen_exposure': float(inv_pen_exposure),
-            'inv_pen_exposure_stuck': float(inv_pen_exposure_stuck),
-            'inv_pen_mean_collapse': float(inv_pen_mean_collapse),
+            'inv_mean_clip_hit': float(inv_mean_clip_hit),
+            'inv_mean_clip_hit_rate': float(inv_mean_clip_hit_rate),
             'inv_mu_abs_roll': float(inv_mu_abs_roll),
             'inv_mu_sign_consistency': float(inv_mu_sign_consistency),
-            # Tier-2 enhancer diagnostics (forecast-conditioned residual audit)
-            'tier2_enhancer_enabled': float(tier2_enhancer_enabled),
-            'tier2_enhancer_delta': float(tier2_enhancer_delta),
-            'tier2_enhancer_pred_sigma': float(tier2_enhancer_pred_sigma),
-            'tier2_enhancer_reliability': float(tier2_enhancer_reliability),
-            'tier2_enhancer_mape': float(tier2_enhancer_mape),
-            'tier2_enhancer_alignment': float(tier2_enhancer_alignment),
-            'tier2_enhancer_forecast_signal': float(tier2_enhancer_forecast_signal),
-            'tier2_enhancer_forecast_edge_signal': float(tier2_enhancer_forecast_edge_signal),
-            'tier2_enhancer_forecast_consensus_signal': float(tier2_enhancer_forecast_consensus_signal),
-            'tier2_enhancer_forecast_curvature_signal': float(tier2_enhancer_forecast_curvature_signal),
-            'tier2_enhancer_uncertainty_quality': float(tier2_enhancer_uncertainty_quality),
-            'tier2_enhancer_metadata_skill': float(tier2_enhancer_metadata_skill),
-            'tier2_enhancer_physical_pressure_signal': float(tier2_enhancer_physical_pressure_signal),
-            'tier2_enhancer_context_strength': float(tier2_enhancer_context_strength),
-            'tier2_enhancer_realized_gain_signal': float(tier2_enhancer_realized_gain_signal),
-            'tier2_enhancer_target_delta': float(tier2_enhancer_target_delta),
-            'tier2_enhancer_sharpe_signal': float(tier2_enhancer_sharpe_signal),
-            'tier2_enhancer_sharpe_before': float(tier2_enhancer_sharpe_before),
-            'tier2_enhancer_sharpe_after': float(tier2_enhancer_sharpe_after),
-            'tier2_enhancer_sharpe_delta': float(tier2_enhancer_sharpe_delta),
+            # Tier-2 routed residual-aware overlay diagnostics
+            'tier2_overlay_enabled': float(tier2_cv_enabled),
+            'tier2_overlay_delta': float(tier2_cv_delta),
+            'tier2_overlay_pred_sigma': float(tier2_cv_pred_sigma),
+            'tier2_overlay_reliability': float(tier2_cv_reliability),
+            'tier2_overlay_gain': float(tier2_cv_overlay_gain),
+            'tier2_overlay_forecast_trust': float(tier2_cv_forecast_trust_component),
+            'tier2_overlay_mape_quality': float(tier2_cv_mape),
+            'tier2_overlay_alignment': float(tier2_cv_alignment),
+            'tier2_overlay_forecast_signal': float(tier2_cv_forecast_signal),
+            'tier2_overlay_edge_signal': float(tier2_cv_forecast_edge_signal),
+            'tier2_overlay_consensus_signal': float(tier2_cv_forecast_consensus_signal),
+            'tier2_overlay_curvature_signal': float(tier2_cv_forecast_curvature_signal),
+            'tier2_overlay_uncertainty_quality': float(tier2_cv_uncertainty_quality),
+            'tier2_overlay_metadata_skill': float(tier2_cv_metadata_skill),
+            'tier2_overlay_imbalance_signal': float(tier2_cv_physical_pressure_signal),
+            'tier2_overlay_context_strength': float(tier2_cv_context_strength),
+            'tier2_overlay_realized_gain_signal': float(tier2_cv_realized_gain_signal),
+            'tier2_overlay_target_delta': float(tier2_cv_target_delta),
+            'tier2_overlay_delta_prediction': float(tier2_cv_delta_prediction),
+            'tier2_overlay_sharpe_signal': float(tier2_cv_sharpe_signal),
+            'tier2_overlay_sharpe_before': float(tier2_cv_sharpe_before),
+            'tier2_overlay_sharpe_after': float(tier2_cv_sharpe_after),
+            'tier2_overlay_sharpe_delta': float(tier2_cv_sharpe_delta),
+            # Legacy Tier-2 aliases retained for backward compatibility
+            'tier2_cv_enabled': float(tier2_cv_enabled),
+            'tier2_cv_delta': float(tier2_cv_delta),
+            'tier2_cv_pred_sigma': float(tier2_cv_pred_sigma),
+            'tier2_cv_reliability': float(tier2_cv_reliability),
+            'tier2_cv_overlay_gain': float(tier2_cv_overlay_gain),
+            'tier2_cv_forecast_trust_component': float(tier2_cv_forecast_trust_component),
+            'tier2_cv_mape': float(tier2_cv_mape),
+            'tier2_cv_alignment': float(tier2_cv_alignment),
+            'tier2_cv_forecast_signal': float(tier2_cv_forecast_signal),
+            'tier2_cv_forecast_edge_signal': float(tier2_cv_forecast_edge_signal),
+            'tier2_cv_forecast_consensus_signal': float(tier2_cv_forecast_consensus_signal),
+            'tier2_cv_forecast_curvature_signal': float(tier2_cv_forecast_curvature_signal),
+            'tier2_cv_uncertainty_quality': float(tier2_cv_uncertainty_quality),
+            'tier2_cv_metadata_skill': float(tier2_cv_metadata_skill),
+            'tier2_cv_physical_pressure_signal': float(tier2_cv_physical_pressure_signal),
+            'tier2_cv_context_strength': float(tier2_cv_context_strength),
+            'tier2_cv_realized_gain_signal': float(tier2_cv_realized_gain_signal),
+            'tier2_cv_target_delta': float(tier2_cv_target_delta),
+            'tier2_cv_delta_prediction': float(tier2_cv_delta_prediction),
+            'tier2_cv_sharpe_signal': float(tier2_cv_sharpe_signal),
+            'tier2_cv_sharpe_before': float(tier2_cv_sharpe_before),
+            'tier2_cv_sharpe_after': float(tier2_cv_sharpe_after),
+            'tier2_cv_sharpe_delta': float(tier2_cv_sharpe_delta),
             # Position breakdown
             'wind_pos_norm': wind_pos_norm,
             'solar_pos_norm': solar_pos_norm,
@@ -741,6 +881,7 @@ class RewardLogger:
             'z_medium': z_medium,
             'z_long': z_long,
             'z_combined': z_combined,
+            'tier2_expert_confidence': tier2_expert_confidence,
             'forecast_confidence': forecast_confidence,
             'forecast_trust': forecast_trust,
             # OBSERVATION-LEVEL forecast signals (policy-visible; post-ablation)
@@ -790,14 +931,6 @@ class RewardLogger:
             'forecast_not_used_reason': forecast_not_used_reason,
             'agent_followed_forecast': 1.0 if agent_followed_forecast else 0.0,
             # NOVEL: Investor strategy fields
-            'investor_strategy': investor_strategy,
-            'investor_position_scale': investor_position_scale,
-            'investor_signal_strength': investor_signal_strength,
-            'investor_consensus': investor_consensus_int,
-            'investor_direction': investor_direction,
-            'investor_strategy_bonus': investor_strategy_bonus,
-            'investor_strategy_multiplier': investor_strategy_multiplier,
-            'forecast_usage_bonus': forecast_usage_bonus,
             # NEW: Position alignment diagnostics (Bug #1 fix tracking)
             'position_alignment_status': position_alignment_status,
             'investor_position_ratio': investor_position_ratio,
@@ -847,7 +980,7 @@ class RewardLogger:
             'forecast_error_medium_pct': forecast_error_medium_pct,
             'forecast_error_long_pct': forecast_error_long_pct,
             'agent_followed_forecast': int(agent_followed_forecast),
-            # NEW: NAV attribution drivers (per-step financial breakdown)
+            # NEW: NAV attribution drivers (per-step fund NAV breakdown)
             'nav_start': nav_start,
             'nav_end': nav_end,
             'pnl_total': pnl_total,
@@ -947,8 +1080,19 @@ class RewardLogger:
         # Preserve raw JSON actions for category-specific logs
         row['investor_action'] = serialize_action(investor_action)
         row['battery_action'] = serialize_action(battery_action)
+
+        investor_health_row = {
+            field: row.get(field, '')
+            for field in self.investor_health_context_fields
+            if field in row
+        }
+        for field in self.investor_health_fields:
+            if field in row:
+                investor_health_row[field] = row.pop(field, '')
+        if investor_health_row:
+            self.episode_investor_health_rows.append(investor_health_row)
         
-        # NEW: NAV attribution drivers (per-step financial breakdown)
+        # NEW: NAV attribution drivers (per-step fund NAV breakdown)
         row['nav_start'] = nav_start
         row['nav_end'] = nav_end
         row['pnl_total'] = pnl_total
@@ -1087,8 +1231,7 @@ class RewardLogger:
             # Position info (common to both tiers)
             'position_signed', 'position_exposure', 'decision_step', 'exposure_exec', 'action_sign',
             'trade_signal_active', 'trade_signal_sign',
-            'risk_multiplier', 'vol_brake_mult', 'strategy_multiplier',
-            'combined_multiplier', 'tradeable_capital', 'mtm_exit_count',
+            'risk_multiplier', 'tradeable_capital', 'mtm_exit_count',
             # Price data (for forward-looking accuracy analysis)
             'price_current',  # Raw price at current timestep (DKK/MWh)
             # Price returns (common to both tiers)
@@ -1099,20 +1242,34 @@ class RewardLogger:
             'weight_operational', 'weight_risk', 'weight_hedging', 'weight_nav',
             # Final rewards (common to both tiers)
             'base_reward', 'investor_reward', 'battery_reward',
-            # Penalty diagnostics (for episode-boundary collapse debugging)
-            'training_global_step', 'inv_penalty_warm', 'inv_pen_boundary', 'inv_pen_exposure', 'inv_pen_exposure_stuck', 'inv_pen_mean_collapse',
+            # Investor health diagnostics
+            'training_global_step',
+            'inv_mean_clip_hit', 'inv_mean_clip_hit_rate',
             'inv_mu_abs_roll', 'inv_mu_sign_consistency',
-            # Tier-2 enhancer diagnostics (action scaling audit)
-            'tier2_enhancer_enabled', 'tier2_enhancer_delta', 'tier2_enhancer_reliability',
-            'tier2_enhancer_mape',
-            'tier2_enhancer_alignment', 'tier2_enhancer_forecast_signal',
-            'tier2_enhancer_forecast_edge_signal', 'tier2_enhancer_forecast_consensus_signal',
-            'tier2_enhancer_forecast_curvature_signal', 'tier2_enhancer_context_strength',
-            'tier2_enhancer_pred_sigma', 'tier2_enhancer_uncertainty_quality',
-            'tier2_enhancer_metadata_skill', 'tier2_enhancer_physical_pressure_signal',
-            'tier2_enhancer_realized_gain_signal', 'tier2_enhancer_target_delta',
-            'tier2_enhancer_sharpe_signal', 'tier2_enhancer_sharpe_before',
-            'tier2_enhancer_sharpe_after', 'tier2_enhancer_sharpe_delta',
+            # Tier-2 routed residual-aware overlay diagnostics
+            'tier2_overlay_enabled', 'tier2_overlay_delta', 'tier2_overlay_reliability',
+            'tier2_overlay_gain', 'tier2_overlay_forecast_trust',
+            'tier2_overlay_mape_quality',
+            'tier2_overlay_alignment', 'tier2_overlay_forecast_signal',
+            'tier2_overlay_edge_signal', 'tier2_overlay_consensus_signal',
+            'tier2_overlay_curvature_signal', 'tier2_overlay_context_strength',
+            'tier2_overlay_pred_sigma', 'tier2_overlay_uncertainty_quality',
+            'tier2_overlay_metadata_skill', 'tier2_overlay_imbalance_signal',
+            'tier2_overlay_realized_gain_signal', 'tier2_overlay_target_delta', 'tier2_overlay_delta_prediction',
+            'tier2_overlay_sharpe_signal', 'tier2_overlay_sharpe_before',
+            'tier2_overlay_sharpe_after', 'tier2_overlay_sharpe_delta',
+            # Legacy aliases retained for backward compatibility with old analysis code
+            'tier2_cv_enabled', 'tier2_cv_delta', 'tier2_cv_reliability',
+            'tier2_cv_overlay_gain', 'tier2_cv_forecast_trust_component',
+            'tier2_cv_mape',
+            'tier2_cv_alignment', 'tier2_cv_forecast_signal',
+            'tier2_cv_forecast_edge_signal', 'tier2_cv_forecast_consensus_signal',
+            'tier2_cv_forecast_curvature_signal', 'tier2_cv_context_strength',
+            'tier2_cv_pred_sigma', 'tier2_cv_uncertainty_quality',
+            'tier2_cv_metadata_skill', 'tier2_cv_physical_pressure_signal',
+            'tier2_cv_realized_gain_signal', 'tier2_cv_target_delta', 'tier2_cv_delta_prediction',
+            'tier2_cv_sharpe_signal', 'tier2_cv_sharpe_before',
+            'tier2_cv_sharpe_after', 'tier2_cv_sharpe_delta',
             # Investor policy distribution diagnostics (pre-tanh / pre-postprocess)
             'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw', 'inv_tanh_mu', 'inv_tanh_a',
             'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
@@ -1132,7 +1289,7 @@ class RewardLogger:
             # FORECAST-RELATED COLUMNS (Tier 2 only) - At the END
             # ===================================================================
             # Forecast signals (0.0 for Tier 1, populated for Tier 2)
-            'z_short', 'z_medium', 'z_long', 'z_combined', 'forecast_confidence', 'forecast_trust',
+            'z_short', 'z_medium', 'z_long', 'z_combined', 'tier2_expert_confidence', 'forecast_confidence', 'forecast_trust',
             # OBSERVATION-LEVEL forecast signals (what the policy actually sees after ablations/warmup)
             # These are critical for proving forecast usage and for causal ablations.
             'obs_z_short', 'obs_z_long',
@@ -1155,9 +1312,6 @@ class RewardLogger:
             'adaptive_forecast_weight',
             # Forecast utilization flag (0.0 for Tier 1, 1.0 for Tier 2)
             'enable_forecast_util', 'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason',
-            # NOVEL: Investor strategy fields (Tier 2 only)
-            'investor_strategy', 'investor_position_scale', 'investor_signal_strength',
-            'investor_consensus', 'investor_direction', 'investor_strategy_bonus', 'investor_strategy_multiplier', 'forecast_usage_bonus',
             # NEW: Position alignment diagnostics (Bug #1 fix tracking)
             'position_alignment_status', 'investor_position_ratio', 'investor_position_direction',
             'investor_total_position', 'investor_exploration_bonus',
@@ -1206,7 +1360,7 @@ class RewardLogger:
                 deduped.append(required)
                 seen.add(required)
 
-        return deduped
+        return [name for name in deduped if name not in self.investor_health_fields]
     
     def close(self):
         """Close log files"""

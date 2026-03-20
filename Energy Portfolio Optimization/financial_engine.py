@@ -677,7 +677,9 @@ class FinancialEngine:
         Calculate Mark-to-Market P&L given *exposures* (not position values).
 
         IMPORTANT:
-        - `financial_exposures` represents notional exposure in DKK for each sleeve.
+        - `financial_exposures` represents notional exposure in DKK for each bookkeeping sleeve.
+        - In the current Tier-1 design, all three sleeves load on the same energy-price factor,
+          so they share the same realized `price_return`.
         - This function does NOT update the exposure (exposure changes only on trades).
         - Per-asset MTM P&L is returned so the caller can accumulate true MTM value separately.
         """
