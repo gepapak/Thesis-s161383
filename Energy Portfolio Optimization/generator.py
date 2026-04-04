@@ -71,7 +71,6 @@ def _convert_to_raw_mw_values(df: pd.DataFrame, config=None, mw_scale_overrides=
                 df_converted[col] = df[col] * capacity
                 new_range = f"[{df_converted[col].min():.1f}, {df_converted[col].max():.1f}] MW"
                 logger.info("  %s: %s -> %s", col, original_range, new_range)
-            else:
                 logger.info("  %s: %s (kept as-is; already looks like MW)", col, original_range)
 
     if "price" in df_converted.columns:
@@ -121,80 +120,6 @@ def load_energy_data(csv_path: str, convert_to_raw_units: bool = True, config=No
         logger.info("[INFO] Data already in raw MW units - ready for direct forecasting")
 
     return df
-
-def get_gpu_memory_info():
-    """Get available GPU memory information."""
-    try:
-        import tensorflow as tf
-        gpus = tf.config.list_physical_devices('GPU')
-        if not gpus:
-            return None
-
-        # Get memory info for the first GPU
-        gpu_details = tf.config.experimental.get_device_details(gpus[0])
-        if 'device_name' in gpu_details:
-            # Try to get memory info from nvidia-ml-py if available
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                return {
-                    'total_mb': info.total // (1024 * 1024),
-                    'free_mb': info.free // (1024 * 1024),
-                    'used_mb': info.used // (1024 * 1024)
-                }
-            except ImportError:
-                # Fallback: assume common GPU memory sizes
-                return {'total_mb': 8192, 'free_mb': 6144, 'used_mb': 2048}
-        return None
-    except Exception:
-        return None
-
-def fix_tensorflow_gpu_setup(use_gpu=True):
-    """Enhanced TF GPU config with dynamic memory allocation."""
-    try:
-        import tensorflow as tf  # noqa
-
-        if not use_gpu:
-            # Force CPU-only mode
-            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-            print("TensorFlow configured for CPU-only mode")
-            tf.get_logger().setLevel('ERROR')
-            return tf
-
-        # GPU mode setup
-        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
-        os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-        os.environ.setdefault("TF_MEMORY_GROWTH", "true")
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            print(f"Found {len(gpus)} GPU(s)")
-
-            # Get memory information
-            memory_info = get_gpu_memory_info()
-
-            for i, gpu in enumerate(gpus):
-                try:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                    print(f"[OK] Enabled memory growth for GPU {i}")
-                except Exception as e:
-                    print(f"[WARNING] Failed to set memory growth for GPU {i}: {e}")
-
-            # HIGH: Fix GPU Initialization Conflict - avoid setting memory_limit after memory_growth
-            # Rely solely on memory_growth or cuda_malloc_async for dynamic GPU memory allocation
-            print(f"[OK] Using dynamic GPU memory allocation (memory_growth=True)")
-            print(f"[INFO] Skipping fixed memory_limit to prevent OOM errors on modern HPC environments")
-        else:
-            print("No GPUs found, using CPU")
-
-        tf.get_logger().setLevel('ERROR')
-        return tf
-    except Exception as e:
-        print(f"❌ TensorFlow GPU setup failed: {e}")
-        return None
 
 # LAZY TensorFlow initialization (use _get_tf() from utils)
 # Suppress TensorFlow warnings globally
@@ -504,6 +429,7 @@ class MultiHorizonForecastGenerator:
         self._loaded_cache_metadata: Dict[str, Any] = {}
         self._price_short_expert_bank: Optional[PriceShortExpertBank] = None
         self._precomputed_price_short_experts: Dict[str, np.ndarray] = {}
+        self._precomputed_price_short_expert_features: Dict[str, Dict[str, np.ndarray]] = {}
 
         # caches (LRU-based for better memory management)
         # Use config as single source of truth for cache sizing so memory can be tuned centrally.
@@ -600,13 +526,14 @@ class MultiHorizonForecastGenerator:
         self._model_available.clear()
         self._price_short_expert_bank = None
         self._precomputed_price_short_experts.clear()
+        self._precomputed_price_short_expert_features.clear()
         self._initialize_history()
         self._preallocate_buffers()
         if self.verbose:
             print("[OK] Fallback mode enabled (forecasts will use history/defaults)")
 
     def _load_price_short_expert_bank(self, model_dir: str) -> None:
-        """Load the real short-horizon price expert bank when present."""
+        """Load the ANN short-horizon price forecast bank when present."""
         try:
             episode_dir = os.path.dirname(str(model_dir).rstrip("\\/"))
             bank = PriceShortExpertBank(
@@ -622,11 +549,11 @@ class MultiHorizonForecastGenerator:
             else:
                 self._price_short_expert_bank = None
                 self.loading_stats["loading_errors"].append(
-                    "price_short_expert_bank incomplete"
+                    "ann_short_forecast_bank incomplete"
                 )
         except Exception as e:
             self._price_short_expert_bank = None
-            self.loading_stats["loading_errors"].append(f"price_short_expert_bank: {e}")
+            self.loading_stats["loading_errors"].append(f"ann_short_forecast_bank: {e}")
 
     def _load_models_and_scalers(self, model_dir: str, scaler_dir: str, metadata_dir: Optional[str] = None):
         """
@@ -1271,14 +1198,8 @@ class MultiHorizonForecastGenerator:
         try:
             import gc
 
-            # 1. Clear TensorFlow session if available
-            if self.tf is not None:
-                try:
-                    self.tf.keras.backend.clear_session()
-                except Exception:
-                    pass
-
-            # 2. Clear model prediction caches
+            # Clear model prediction caches without touching the global TF session.
+            # The training loop keeps long-lived Tier-2 state alive across episodes.
             for model_key, model in self.models.items():
                 if hasattr(model, '_prediction_cache'):
                     model._prediction_cache.clear()
@@ -1366,13 +1287,6 @@ class MultiHorizonForecastGenerator:
             except Exception:
                 pass
 
-            # TensorFlow session cleanup (CPU or GPU)
-            try:
-                if self.tf is not None:
-                    self.tf.keras.backend.clear_session()
-            except Exception:
-                pass
-
             # Final GC passes
             for _ in range(3):
                 gc.collect()
@@ -1413,36 +1327,6 @@ class MultiHorizonForecastGenerator:
             except (ValueError, TypeError):
                 # ignore bad values
                 pass
-
-    def reset_history(self):
-        for t in self.targets:
-            self.history[t].clear()
-        if self.verbose:
-            print("[OK] history cleared")
-
-    def initialize_history(self, data: pd.DataFrame, start_idx: int = 0):
-        """Initialize history with sufficient data for predictions.
-
-        Args:
-            data: DataFrame with historical data
-            start_idx: Starting index in data to begin history initialization
-        """
-        if self.verbose:
-            print(f"[INFO] Initializing forecaster history from data...")
-
-        # Pre-populate history with look_back worth of data
-        end_idx = min(start_idx + self.look_back, len(data))
-
-        for i in range(start_idx, end_idx):
-            row = data.iloc[i]
-            self.update(row)
-
-        if self.verbose:
-            print(f"[OK] History initialized with {end_idx - start_idx} data points")
-            for target in self.targets:
-                if target in self.history:
-                    hist_len = len(self.history[target])
-                    print(f"   {target}: {hist_len} items")
 
     # -------- predict (fast paths) --------
 
@@ -1589,6 +1473,15 @@ class MultiHorizonForecastGenerator:
             expert_preds = self._predict_price_short_experts(t)
             for method, pred in expert_preds.items():
                 results[f"price_short_expert_{method}"] = float(pred)
+                details = self._predict_price_short_expert_details(method, t)
+                for key, value in details.items():
+                    if key == "pred_price":
+                        continue
+                    results[f"price_short_expert_{method}_{key}"] = float(value)
+                if method == "ann" and "uncertainty" in details:
+                    results["price_uncertainty_short"] = float(np.clip(details["uncertainty"], 0.0, 1.0))
+                    results["price_lower95_short"] = float(forecast_value - 1.96 * results["price_uncertainty_short"])
+                    results["price_upper95_short"] = float(forecast_value + 1.96 * results["price_uncertainty_short"])
 
             results["forecast_inference_time_ms"] = float(self._predict_accumulator)
 
@@ -1622,6 +1515,11 @@ class MultiHorizonForecastGenerator:
         expert_preds = self._predict_price_short_experts(t)
         for method, pred in expert_preds.items():
             results[f"price_short_expert_{method}"] = float(pred)
+            details = self._predict_price_short_expert_details(method, t)
+            for key, value in details.items():
+                if key == "pred_price":
+                    continue
+                results[f"price_short_expert_{method}_{key}"] = float(value)
 
         # Include timing summary for full-horizon predictions
         results['forecast_inference_time_ms'] = float(self._predict_accumulator)
@@ -1646,6 +1544,9 @@ class MultiHorizonForecastGenerator:
         """
         try:
             if self.is_expert_only_mode() and target == "price" and horizon == "short":
+                ann_details = self._predict_price_short_expert_details("ann", int(timestep))
+                if "uncertainty" in ann_details:
+                    return float(np.clip(ann_details["uncertainty"], 0.01, 0.5))
                 expert_preds = self._predict_price_short_experts(int(timestep))
                 if expert_preds:
                     preds = np.asarray(list(expert_preds.values()), dtype=np.float32)
@@ -1768,10 +1669,6 @@ class MultiHorizonForecastGenerator:
             and self.has_price_short_expert_bank()
         )
 
-    def get_price_short_expert_methods(self) -> Tuple[str, ...]:
-        if not self.has_price_short_expert_bank():
-            return tuple()
-        return self._price_short_expert_bank.methods()
 
     def get_price_short_expert_metadata_quality(self, method: str) -> float:
         if not self.has_price_short_expert_bank():
@@ -1782,6 +1679,29 @@ class MultiHorizonForecastGenerator:
         if not self.has_price_short_expert_bank():
             return {}
         return self._price_short_expert_bank.get_metadata_metrics(method)
+
+    def _predict_price_short_expert_details(self, method: str, timestep: int) -> Dict[str, float]:
+        method_key = str(method).strip().lower()
+        feature_map = self._precomputed_price_short_expert_features.get(method_key, {}) or {}
+        t = int(max(timestep, 0))
+        if feature_map:
+            out: Dict[str, float] = {}
+            for key, series in feature_map.items():
+                arr = np.asarray(series, dtype=np.float32).reshape(-1)
+                if 0 <= t < len(arr):
+                    out[str(key)] = float(arr[t])
+            if out:
+                return out
+        if not self.has_price_short_expert_bank():
+            return {}
+        window = self._prepare_input_buffer("price").reshape(-1)
+        try:
+            return {
+                str(k): float(v)
+                for k, v in self._price_short_expert_bank.predict_details_from_window(method_key, window).items()
+            }
+        except Exception:
+            return {}
 
     def _combine_price_short_expert_predictions(self, expert_preds: Dict[str, float]) -> float:
         if not expert_preds:
@@ -2317,7 +2237,11 @@ class MultiHorizonForecastGenerator:
         if self.has_price_short_expert_bank() and 'price' in df.columns:
             try:
                 price_series = df['price'].to_numpy(dtype=np.float32, copy=False)
-                self._precomputed_price_short_experts = self._price_short_expert_bank.precompute_for_series(price_series)
+                self._precomputed_price_short_expert_features = self._price_short_expert_bank.precompute_details_for_series(price_series)
+                self._precomputed_price_short_experts = {
+                    str(method): np.asarray(details.get("pred_price", np.zeros(T, dtype=np.float32)), dtype=np.float32)
+                    for method, details in self._precomputed_price_short_expert_features.items()
+                }
                 if self.is_expert_only_mode():
                     expert_methods = tuple(self._price_short_expert_bank.methods())
                     if expert_methods:
@@ -2343,10 +2267,11 @@ class MultiHorizonForecastGenerator:
                         self._precomputed[("price", "short")] = np.asarray(combined, dtype=np.float32)
             except Exception as e:
                 self._precomputed_price_short_experts = {}
+                self._precomputed_price_short_expert_features = {}
                 if self.is_expert_only_mode() and not self.fallback_mode:
-                    raise RuntimeError(f"Failed to precompute price-short expert bank: {e}") from e
+                    raise RuntimeError(f"Failed to precompute ANN short-forecast bank: {e}") from e
                 if self.verbose:
-                    print(f"Failed to precompute price-short expert bank: {e}")
+                    print(f"Failed to precompute ANN short-forecast bank: {e}")
 
         if self.verbose:
             total_forecasts = len(self.targets) * len(self.horizons)
@@ -2435,6 +2360,7 @@ class MultiHorizonForecastGenerator:
                         self._precomputed[(target, hname)] = series
 
             self._precomputed_price_short_experts = {}
+            self._precomputed_price_short_expert_features = {}
             if self.has_price_short_expert_bank():
                 for method in self._price_short_expert_bank.methods():
                     col_name = f"price_short_expert_{method}"
@@ -2443,6 +2369,23 @@ class MultiHorizonForecastGenerator:
                             print(f"Missing column {col_name} in cache, recomputing...")
                         return False
                     self._precomputed_price_short_experts[method] = cached_df[col_name].values.astype(np.float32)
+                    feature_map: Dict[str, np.ndarray] = {"pred_price": self._precomputed_price_short_experts[method]}
+                    extra_cols = {
+                        "pred_return": f"price_short_expert_{method}_pred_return",
+                        "direction_prob": f"price_short_expert_{method}_direction_prob",
+                        "direction_margin": f"price_short_expert_{method}_direction_margin",
+                        "uncertainty": f"price_short_expert_{method}_uncertainty",
+                        "quality": f"price_short_expert_{method}_quality",
+                        "latent_norm": f"price_short_expert_{method}_latent_norm",
+                    }
+                    for key, feature_col in extra_cols.items():
+                        if feature_col in cached_df.columns:
+                            feature_map[key] = cached_df[feature_col].values.astype(np.float32)
+                    for latent_idx in range(4):
+                        feature_col = f"price_short_expert_{method}_latent_{latent_idx}"
+                        if feature_col in cached_df.columns:
+                            feature_map[f"latent_{latent_idx}"] = cached_df[feature_col].values.astype(np.float32)
+                    self._precomputed_price_short_expert_features[method] = feature_map
 
             # Store minimal series for bounded debiasing (avoid copying the full dataframe).
             try:
@@ -2626,6 +2569,7 @@ class MultiHorizonForecastGenerator:
 
             self._precomputed.clear()
             self._precomputed_price_short_experts.clear()
+            self._precomputed_price_short_expert_features.clear()
             self._loaded_cache_metadata = {}
 
             if self.verbose:
@@ -2691,6 +2635,15 @@ class MultiHorizonForecastGenerator:
                     if series is None:
                         series = np.full(len(df), self._default_for_target('price'), dtype=np.float32)
                     forecast_data[col_name] = np.asarray(series, dtype=np.float32)
+                    feature_map = self._precomputed_price_short_expert_features.get(method, {}) or {}
+                    for key in ("pred_return", "direction_prob", "direction_margin", "uncertainty", "quality", "latent_norm"):
+                        feature_series = feature_map.get(key)
+                        if feature_series is not None:
+                            forecast_data[f"price_short_expert_{method}_{key}"] = np.asarray(feature_series, dtype=np.float32)
+                    for latent_idx in range(4):
+                        feature_series = feature_map.get(f"latent_{latent_idx}")
+                        if feature_series is not None:
+                            forecast_data[f"price_short_expert_{method}_latent_{latent_idx}"] = np.asarray(feature_series, dtype=np.float32)
 
             # Save to CSV
             forecast_df = pd.DataFrame(forecast_data)
@@ -2743,56 +2696,7 @@ class MultiHorizonForecastGenerator:
             if self.verbose:
                 print(f"Failed to save cached forecasts: {e}")
 
-    def _create_trend_forecasts(self, series: np.ndarray, target: str, hname: str, T: int) -> np.ndarray:
-        """Create simple trend-based forecasts as fallback."""
-        forecasts = np.zeros(T, dtype=np.float32)
-
-        # Simple moving average with slight trend
-        window = min(24, len(series) // 4) if len(series) > 4 else len(series)
-
-        for t in range(T):
-            if t == 0:
-                forecasts[t] = self._default_for_target(target)
-            elif t < window:
-                # Use available history
-                forecasts[t] = np.mean(series[:t])
-            else:
-                # Use recent window with slight trend
-                recent = series[t-window:t]
-                base_forecast = np.mean(recent)
-
-                # Add small trend component
-                if len(recent) > 1:
-                    trend = (recent[-1] - recent[0]) / len(recent)
-                    base_forecast += trend * 0.1  # Damped trend
-
-                forecasts[t] = base_forecast
-
-            # Apply constraints
-            forecasts[t] = self._constrain_target(target, forecasts[t])
-
-        return forecasts
-
-    def _create_fallback_precomputed(self, T: int) -> None:
-        """Create fallback forecasts when data is missing."""
-        for target in self.targets:
-            for hname in self.horizons.keys():
-                key = (target, hname)
-                # Simple constant forecasts
-                default_val = self._default_for_target(target)
-                self._precomputed[key] = np.full(T, default_val, dtype=np.float32)
-
     # -------- diagnostics & metadata --------
-
-    def get_agent_forecast_dims(self) -> Dict[str, int]:
-        dims = {}
-        for agent in self.agent_horizons:
-            if agent == "risk_controller_0":
-                # Risk controller uses enhanced risk metrics instead of forecasts
-                dims[agent] = 0
-            else:
-                dims[agent] = len(self.agent_targets.get(agent, [])) * len(self.agent_horizons.get(agent, []))
-        return dims
 
     def get_loading_stats(self) -> Dict[str, Any]:
         expert_only_mode = bool(self.is_expert_only_mode())
@@ -2819,128 +2723,6 @@ class MultiHorizonForecastGenerator:
             "expert_only_mode": expert_only_mode,
         }
 
-    def get_clip_stats(self) -> Dict[str, Dict[str, int]]:
-        """Return pre-clip hit rates per renewable/load target."""
-        return {t: dict(v) for t, v in self._clip_stats.items() if t in {"wind", "solar", "hydro", "load"}}
-
-    def get_forecast_summary(self):
-        print("\n=== Multi-Horizon Forecast Generator Summary ===")
-        print(f"look_back={self.look_back}, horizons={self.horizons}")
-        print(f"targets={self.targets}")
-        stats = self.get_loading_stats()
-        if stats.get("expert_only_mode", False):
-            print(
-                "price_short_experts: "
-                f"{stats['price_short_experts_loaded']}/{stats['price_short_experts_expected']} "
-                f"(success {stats['success_rate']:.1f}%)"
-            )
-        else:
-            print(f"models: {stats['models_loaded']}/{stats['models_attempted']} (success {stats['success_rate']:.1f}%)")
-        print(f"fallback: {'yes' if stats['fallback_mode'] else 'no'}")
-        print("\nAgent assignments:")
-        for a in self.agent_horizons:
-            Ts = self.agent_targets.get(a, [])
-            Hs = self.agent_horizons.get(a, [])
-            if a == "risk_controller_0":
-                print(f"  {a}: no forecasts (enhanced risk)")
-            else:
-                print(f"  {a}: {Ts} × {Hs} = {len(Ts)*len(Hs)}")
-        print("\nModel availability:")
-        for t in self.targets:
-            avail = [h for h in self.horizons if self._model_available.get(f"{t}_{h}", False)]
-            badge = "[OK]" if avail else "[MISSING]"
-            print(f"  {t}: {badge} {avail}")
-        if self.loading_stats["loading_errors"]:
-            print(f"\n[WARNING] {len(self.loading_stats['loading_errors'])} loading errors (showing up to 5):")
-            for e in self.loading_stats["loading_errors"][:5]:
-                print(f"  • {e}")
-
-        # Clip diagnostics summary (if any samples)
-        cs = self.get_clip_stats()
-        if any(v["total"] > 0 for v in cs.values()):
-            print("\nClip diagnostics (renewables/load):")
-            for t, d in cs.items():
-                tot = max(1, d.get("total", 0))
-                hi = SafeDivision.div(d.get("high", 0) * 100.0, tot)
-                lo = SafeDivision.div(d.get("low", 0) * 100.0, tot)
-                print(f"  {t:6s}: total={tot}, high@1.0={hi:.1f}%, low@0.0={lo:.1f}%")
-
-        print("=" * 60 + "\n")
-
-    def get_enhanced_agent_info(self) -> Dict[str, Any]:
-        info = {
-            "forecast_agents": {},
-            "risk_agent": {
-                "risk_controller_0": {
-                    "forecasts": 0,
-                    "enhanced_metrics": 6,
-                    "risk_dimensions": [
-                        "market_risk", "operational_risk", "portfolio_risk",
-                        "liquidity_risk", "regulatory_risk", "overall_risk"
-                    ],
-                    "description": "Uses comprehensive risk assessment instead of forecasts",
-                }
-            },
-            "loading_stats": self.get_loading_stats(),
-        }
-        for a in self.agent_horizons:
-            if a == "risk_controller_0":
-                continue
-            Ts = self.agent_targets.get(a, [])
-            Hs = self.agent_horizons.get(a, [])
-            required = len(Ts) * len(Hs)
-            available = sum(1 for t in Ts for h in Hs if self._model_available.get(f"{t}_{h}", False))
-            info["forecast_agents"][a] = {
-                "targets": Ts,
-                "horizons": Hs,
-                "total_forecasts": required,
-                "available_models": available,
-                "model_availability": (available / max(1, required)) * 100.0,
-                "forecast_keys": [f"{t}_forecast_{h}" for t in Ts for h in Hs],
-            }
-        return info
-
-    def get_system_status(self) -> Dict[str, Any]:
-        return {
-            "tensorflow_available": self.tf is not None,
-            "models_loaded": len(self.models),
-            "scalers_loaded": len(self.scalers),
-            "targets_tracked": len(self.targets),
-            "history_status": {t: len(self.history[t]) for t in self.targets},
-            "loading_stats": self.get_loading_stats(),
-            "fallback_mode": len(self.models) == 0,
-            "agent_forecast_dims": self.get_agent_forecast_dims(),
-            "agent_refresh_stride": self.agent_refresh_stride,
-            "clip_stats": self.get_clip_stats(),
-            "cache_sizes": {
-                "global": len(self._global_cache),
-                "agent": len(self._agent_cache),
-            }
-        }
-
-    def validate_system_integrity(self) -> bool:
-        issues = []
-        if self.tf is None:
-            issues.append("TensorFlow not available")
-        if len(self.models) == 0:
-            issues.append("No models loaded (fallback mode)")
-        for a in self.agent_horizons:
-            if a == "risk_controller_0":
-                continue
-            Ts = self.agent_targets.get(a, [])
-            Hs = self.agent_horizons.get(a, [])
-            req = len(Ts) * len(Hs)
-            have = sum(1 for t in Ts for h in Hs if self._model_available.get(f"{t}_{h}", False))
-            if have < req:
-                issues.append(f"{a}: {have}/{req} models available")
-        if issues:
-            print("[WARNING] Integrity issues:")
-            for m in issues:
-                print("  •", m)
-            return False
-        print("[OK] System integrity OK")
-        return True
-
     def __str__(self):
         s = self.get_loading_stats()
         return (f"MultiHorizonForecastGenerator("
@@ -2951,51 +2733,3 @@ class MultiHorizonForecastGenerator:
 
     __repr__ = __str__
 
-
-# =========================
-# Quick self-test
-# =========================
-
-def test_forecast_generator():
-    print("🧪 Testing per-agent forecaster…")
-    gen = MultiHorizonForecastGenerator(
-        model_dir="non_existent_models",
-        scaler_dir="non_existent_scalers",
-        look_back=24,  # IMPROVED: Increased from 6 to 24 (must match retrained models)
-        verbose=True,
-        fallback_mode=True,
-        agent_refresh_stride=3,  # demonstrate throttle (every 3 steps per agent)
-    )
-
-    # feed a few rows
-    for _ in range(8):
-        gen.update({"wind": 0.5, "solar": 0.3, "hydro": 0.7, "price": 60.0, "load": 0.65})
-
-    # per-agent predictions (should cache + throttle)
-    for t in range(6):
-        for a in ["investor_0", "battery_operator_0", "meta_controller_0", "risk_controller_0"]:
-            out = gen.predict_for_agent(a, timestep=t)
-            if a != "risk_controller_0":
-                # Account for forecast_confidence being added to the output
-                expected_forecasts = len(gen.agent_targets[a]) * len(gen.agent_horizons[a])
-                expected_total = expected_forecasts + 1  # +1 for forecast_confidence
-                assert len(out) == expected_total, f"{a}: got {len(out)}, expected {expected_total}"
-            else:
-                assert out == {}
-        # global log forecasts once in a while
-        if t % 2 == 0:
-            full = gen.predict_all_horizons(timestep=t)
-            # ensure immediate keys exist
-            for k in ["wind", "solar", "price", "load", "hydro"]:
-                assert f"{k}_forecast_immediate" in full
-
-    # check clip stats structure
-    cs = gen.get_clip_stats()
-    assert isinstance(cs, dict)
-
-    print("🎉 per-agent forecaster OK")
-    return True
-
-
-if __name__ == "__main__":
-    test_forecast_generator()

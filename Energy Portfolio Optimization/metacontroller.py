@@ -254,7 +254,7 @@ class MultiESGAgent:
         - Learning rate schedules
         - Buffer states
         - Episode tracking variables
-        - Legacy control-variate buffers (CRITICAL for OOM prevention)
+        - Legacy Tier-2 buffers (CRITICAL for OOM prevention)
 
         CRITICAL: Does NOT reset total_steps - this must be preserved for learning continuity!
         """
@@ -1359,6 +1359,10 @@ class MultiESGAgent:
             policy for policy in self.policies
             if getattr(policy, "mode", None) in LEARNING_MODES
         ]
+        if bool(getattr(self.config, "forecast_baseline_enable", False)):
+            self.logger.info(
+                "[TIER2] Joint training active: Tier-2 RL policies learn together with the forecast-guided Tier-2 layer."
+            )
         saved_console_levels = set_console_logging_level(logging.WARNING)
 
         try:
@@ -1618,6 +1622,9 @@ class MultiESGAgent:
 
         while steps_collected < max_steps_per_rollout:
             try:
+                if self._check_buffers_full():
+                    break
+
                 if self._last_obs is None:
                     self._initialize_environment_enhanced()
                     continue
@@ -1634,10 +1641,10 @@ class MultiESGAgent:
 
                 steps_collected += 1
 
-                # PHASE 5.6 FIX: Don't exit early during episode training
-                # During episode training, continue collecting steps until max_steps_per_rollout
-                is_episode_training = getattr(self.env, '_episode_training_mode', False)
-                if not is_episode_training and self._check_buffers_full():
+                # Stop immediately when PPO rollout buffers are ready. This must hold even during
+                # episode training: overflow is fatal, and Tier-2 uses this same PPO buffer cadence
+                # to trigger rollout finalization and online Tier-2 updates.
+                if self._check_buffers_full():
                     break
 
                 if steps_collected % 80 == 0:
@@ -1787,19 +1794,41 @@ class MultiESGAgent:
                                             sig0 = float(std_val[0]) if isinstance(std_val, np.ndarray) and std_val.size else 0.0
                                             a0 = float(raw_np[0]) if raw_np.size else 0.0
 
-                                            tanh_mu0 = float(np.tanh(mu0))
-                                            tanh_a0 = float(np.tanh(a0))
+                                            action_dist = getattr(policy.policy, "action_dist", None)
+                                            is_beta_policy = bool(
+                                                action_dist is not None
+                                                and action_dist.__class__.__name__ == "BetaDistribution"
+                                            )
+                                            if is_beta_policy:
+                                                # Beta mean/std live on [0, 1]; convert them to the
+                                                # deployed investor action space [-1, 1].
+                                                action_mean0 = float(np.clip((2.0 * mu0) - 1.0, -1.0, 1.0))
+                                                action_sigma0 = float(max(2.0 * sig0, 0.0))
+                                            else:
+                                                if bool(getattr(self.config, "enable_action_tanh_squash", False)):
+                                                    action_mean0 = float(np.tanh(mu0))
+                                                else:
+                                                    action_mean0 = float(np.clip(mu0, -1.0, 1.0))
+                                                action_sigma0 = float(max(sig0, 0.0))
+
+                                            action_sample0 = float(proc_np[0]) if proc_np.size else float(
+                                                np.clip(a0, -1.0, 1.0)
+                                            )
 
                                             sat_thr = float(getattr(self.config, "investor_saturation_threshold", 0.99))
-                                            mean_sat = 1.0 if abs(tanh_mu0) >= sat_thr else 0.0
-                                            samp_sat = 1.0 if abs(tanh_a0) >= sat_thr else 0.0
+                                            mean_sat = 1.0 if abs(action_mean0) >= sat_thr else 0.0
+                                            samp_sat = 1.0 if abs(action_sample0) >= sat_thr else 0.0
                                             noise_only_sat = 1.0 if (samp_sat > 0.0 and mean_sat <= 0.0) else 0.0
 
                                             target_env._inv_mu_raw = mu0
                                             target_env._inv_sigma_raw = sig0
                                             target_env._inv_a_raw = a0
-                                            target_env._inv_tanh_mu = tanh_mu0
-                                            target_env._inv_tanh_a = tanh_a0
+                                            target_env._inv_action_mean = action_mean0
+                                            target_env._inv_action_sigma = action_sigma0
+                                            target_env._inv_action_sample = action_sample0
+                                            # Legacy aliases kept for downstream compatibility.
+                                            target_env._inv_tanh_mu = action_mean0
+                                            target_env._inv_tanh_a = action_sample0
                                             target_env._inv_sat_mean = float(mean_sat)
                                             target_env._inv_sat_sample = float(samp_sat)
                                             target_env._inv_sat_noise_only = float(noise_only_sat)
@@ -1935,13 +1964,18 @@ class MultiESGAgent:
                                 f"NAV: ${float(snap.get('total_nav_usd_m', 0.0)):.2f}M = "
                                 f"Cash ${float(snap.get('cash_usd_m', 0.0)):.2f}M + "
                                 f"Physical ${float(snap.get('physical_book_usd_m', 0.0)):.2f}M + "
-                                f"Op ${float(snap.get('operating_usd_m', 0.0)):.2f}M + "
+                                f"Op ${float(snap.get('operating_revenue_usd_m', 0.0)):.2f}M + "
                                 f"MTM ${float(snap.get('mtm_usd_m', 0.0)):.2f}M"
                             ),
                             (
-                                f"Gains: Trading {self._format_progress_usd(float(snap.get('trading_gains_usd_m', 0.0)))} | "
-                                f"Battery {self._format_progress_usd(float(snap.get('battery_gains_usd_m', 0.0)))} | "
-                                f"Operating {self._format_progress_usd(float(snap.get('operating_usd_m', 0.0)))}"
+                                f"Sleeve: Trading {self._format_progress_usd(float(snap.get('trading_sleeve_usd_m', 0.0)))} = "
+                                f"Cash {self._format_progress_usd(float(snap.get('cash_usd_m', 0.0)))} + "
+                                f"MTM {self._format_progress_usd(float(snap.get('mtm_usd_m', 0.0)))}"
+                            ),
+                            (
+                                f"Cash: Trading Core {self._format_progress_usd(float(snap.get('trading_cash_core_usd_m', snap.get('cash_usd_m', 0.0))))} + "
+                                f"Battery {self._format_progress_usd(float(snap.get('battery_cash_contribution_usd_m', 0.0)))} = "
+                                f"Cash {self._format_progress_usd(float(snap.get('cash_usd_m', 0.0)))}"
                             ),
                         ]
                     )
@@ -2162,40 +2196,88 @@ class MultiESGAgent:
             base_env = getattr(self.env, "base_env", getattr(self.env, "env", self.env))
             if hasattr(base_env, "env"):
                 base_env = getattr(base_env, "env", base_env)
-            cv_adapter = getattr(base_env, "control_variate_adapter", None)
-            cv_buffer = getattr(base_env, "cv_experience_buffer", None)
+            tier2_value_adapter = getattr(base_env, "tier2_value_adapter", None)
+            tier2_value_buffer = getattr(base_env, "tier2_value_buffer", None)
             fgb_enabled = bool(getattr(self.config, "forecast_baseline_enable", False))
             if (
                 agent_name == "investor_0"
                 and fgb_enabled
-                and cv_adapter is not None
+                and tier2_value_adapter is not None
                 and infos is not None
             ):
                 info_inv = infos.get("investor_0", infos) if isinstance(infos, dict) else {}
-                cv_features = info_inv.get("cv_features")
-                if cv_features is not None and cv_buffer is not None:
+                tier2_features = info_inv.get("tier2_features")
+                if tier2_features is not None and tier2_value_buffer is not None:
                     obs = data.get("obs")
                     if obs is not None:
                         obs_np = np.asarray(obs, dtype=np.float32).flatten()
-                        is_decision_step = bool(obs_np.size > 5 and float(obs_np[5]) > 0.5)
+                        decision_step_flag = info_inv.get("decision_step", None)
+                        if decision_step_flag is None and info_inv.get("is_decision_step", None) is not None:
+                            decision_step_flag = info_inv.get("is_decision_step", None)
+                            legacy_count = int(getattr(self, "_tier2_legacy_decision_step_count", 0)) + 1
+                            self._tier2_legacy_decision_step_count = legacy_count
+                            if legacy_count in (1, 5, 20, 100):
+                                self.logger.warning(
+                                    "[TIER2_DECISION_STEP_LEGACY] using legacy info['is_decision_step']; "
+                                    "prefer explicit info['decision_step']"
+                                )
+                        if decision_step_flag is None:
+                            missing_count = int(getattr(self, "_tier2_missing_decision_step_count", 0)) + 1
+                            self._tier2_missing_decision_step_count = missing_count
+                            if missing_count in (1, 5, 20, 100):
+                                self.logger.warning(
+                                    "[TIER2_DECISION_STEP_MISSING] missing explicit decision_step in info; "
+                                    "skipping Tier-2 sample collection instead of falling back to obs layout"
+                                )
+                            obs_np = None
+                        obs_decision_step = float(obs_np[5]) if (obs_np is not None and obs_np.size > 5) else None
+                        if decision_step_flag is not None and obs_decision_step is not None:
+                            try:
+                                info_decision_step = float(decision_step_flag)
+                                if abs(info_decision_step - obs_decision_step) > 0.5:
+                                    mismatch_count = int(getattr(self, "_tier2_decision_step_mismatch_count", 0)) + 1
+                                    self._tier2_decision_step_mismatch_count = mismatch_count
+                                    if mismatch_count in (1, 5, 20, 100):
+                                        self.logger.warning(
+                                            "[TIER2_DECISION_STEP_MISMATCH] info decision_step=%.3f obs[5]=%.3f; "
+                                            "using info decision_step as source of truth",
+                                            info_decision_step,
+                                            obs_decision_step,
+                                        )
+                            except Exception:
+                                pass
+                        is_decision_step = bool(float(decision_step_flag) > 0.5) if decision_step_flag is not None else False
                         if not is_decision_step:
                             obs_np = None
                         if obs_np is None:
                             pass
                         else:
-                            cv_features = np.asarray(cv_features, dtype=np.float32).flatten()
-                            realized_return = float(info_inv.get("realized_investor_return", 0.0) or 0.0)
+                            tier2_features = np.asarray(tier2_features, dtype=np.float32).flatten()
+                            realized_return = float(
+                                info_inv.get(
+                                    "tier2_training_return",
+                                    info_inv.get(
+                                        "price_return_invfreq",
+                                        info_inv.get("price_return_1step", info_inv.get("realized_investor_return", 0.0)),
+                                    ),
+                                ) or 0.0
+                            )
+                            return_horizon_steps = int(
+                                max(info_inv.get("tier2_training_horizon_steps", info_inv.get("investment_freq", 1)) or 1, 1)
+                            )
                             executed_exposure = info_inv.get("executed_investor_exposure", None)
-                            if executed_exposure is None and cv_features.size > 0:
-                                executed_exposure = float(cv_features[0])
+                            if executed_exposure is None and tier2_features.size > 0:
+                                executed_exposure = float(tier2_features[0])
                             env_step = int(info_inv.get("timestep", info_inv.get("step_in_episode", -1)) or -1)
-                            cv_buffer.add(
+                            tier2_value_buffer.add(
                                 obs_np,
-                                cv_features,
+                                tier2_features,
                                 realized_return=realized_return,
                                 executed_exposure=executed_exposure,
                                 rollout_pos=current_pos,
                                 env_step=env_step,
+                                return_horizon_steps=return_horizon_steps,
+                                decision_step_sampled=True,
                             )
 
             # --- obs -> numpy (CPU, float32, shape (obs_dim,)) ---
@@ -2628,50 +2710,109 @@ class MultiESGAgent:
                                 base_env = getattr(self.env, "base_env", getattr(self.env, "env", self.env))
                                 if hasattr(base_env, "env"):
                                     base_env = getattr(base_env, "env", base_env)
-                                cv_trainer = getattr(base_env, "cv_trainer", None)
-                                cv_buffer = getattr(base_env, "cv_experience_buffer", None)
-                                if cv_trainer is not None and cv_buffer is not None and cv_buffer.size() > 0:
+                                tier2_value_trainer = getattr(base_env, "tier2_value_trainer", None)
+                                tier2_value_buffer = getattr(base_env, "tier2_value_buffer", None)
+                                if tier2_value_trainer is not None and tier2_value_buffer is not None and tier2_value_buffer.size() > 0:
                                     try:
-                                        current_rollout = cv_buffer.get_current_rollout()
-                                        cv_train_every = max(
+                                        current_rollout = tier2_value_buffer.get_current_rollout()
+                                        tier2_value_train_every = max(
                                             1,
-                                            int(getattr(self.config, "tier2_cv_train_every", 100) or 100),
+                                            int(getattr(self.config, "tier2_value_train_every", 100) or 100),
                                         )
-                                        last_cv_train_step = int(getattr(self, "_last_cv_train_step", -10**12))
-                                        should_train = int(getattr(self, "total_steps", 0)) - last_cv_train_step >= cv_train_every
+                                        last_tier2_train_step = int(getattr(self, "_last_tier2_train_step", -10**12))
+                                        should_train = int(getattr(self, "total_steps", 0)) - last_tier2_train_step >= tier2_value_train_every
                                         if should_train:
                                             if len(current_rollout) >= 8:
-                                                cv_trainer.train_continuous(current_rollout, None, cv_buffer)
-                                                self._last_cv_train_step = int(getattr(self, "total_steps", 0))
+                                                tier2_value_result = tier2_value_trainer.train_continuous(current_rollout, None, tier2_value_buffer, training_step=int(getattr(self, "total_steps", 0)))
+                                                self._last_tier2_train_step = int(getattr(self, "total_steps", 0))
+                                                if isinstance(tier2_value_result, dict):
+                                                    status = str(tier2_value_result.get("status", "unknown"))
+                                                    if status == "ok":
+                                                        self.logger.info(
+                                                            "[TIER2_VALUE_TRAIN] step=%s rollout=%s loss=%.6f action_target=%.4f "
+                                                            "decision=%.6f value_pred=%.6f uplift_pred=%.6f uplift_lcb=%.6f "
+                                                            "nav_pred=%.6f nav_lcb=%.6f ret_floor=%.6f floor_lcb=%.6f "
+                                                            "tail_risk=%.6f factor=%.6f lambda=%.4f tail_lambda=%.4f "
+                                                            "nav_delta=%.6f value_loss=%.6f gate=%.4f active=%.4f conf=%.4f "
+                                                            "teacher_adv=%.6f teacher_gate=%.4f teacher_pos=%.4f "
+                                                            "ann_q=%.4f trust=%.4f mix_base=%.3f mix_trend=%.3f mix_rev=%.3f mix_def=%.3f mix_ent=%.3f "
+                                                            "q_anchor=%.6f t_anchor=%.6f mix_loss=%.6f winner_loss=%.6f "
+                                                            "trade_cost=%.6f replay_loss=%.6f",
+                                                            int(getattr(self, "total_steps", 0)),
+                                                            len(current_rollout),
+                                                            float(tier2_value_result.get("loss", 0.0)),
+                                                            float(tier2_value_result.get("action_target_mean", 0.0)),
+                                                            float(tier2_value_result.get("decision_improvement_mean", 0.0)),
+                                                            float(tier2_value_result.get("value_prediction_mean", 0.0)),
+                                                            float(tier2_value_result.get("uplift_prediction_mean", 0.0)),
+                                                            float(tier2_value_result.get("uplift_certified_lcb_mean", 0.0)),
+                                                            float(tier2_value_result.get("nav_prediction_mean", 0.0)),
+                                                            float(tier2_value_result.get("nav_certified_lcb_mean", 0.0)),
+                                                            float(tier2_value_result.get("return_floor_prediction_mean", 0.0)),
+                                                            float(tier2_value_result.get("return_floor_certified_lcb_mean", 0.0)),
+                                                            float(tier2_value_result.get("tail_risk_prediction_mean", 0.0)),
+                                                            float(tier2_value_result.get("factor_opportunity_mean", 0.0)),
+                                                            float(tier2_value_result.get("return_constraint_lambda", 0.0)),
+                                                            float(tier2_value_result.get("tail_risk_constraint_lambda", 0.0)),
+                                                            float(tier2_value_result.get("nav_return_delta_mean", 0.0)),
+                                                            float(tier2_value_result.get("value_loss", 0.0)),
+                                                            float(tier2_value_result.get("gate_probability_mean", 0.0)),
+                                                            float(tier2_value_result.get("action_active_prob", 0.0)),
+                                                            float(tier2_value_result.get("confidence_mean", 0.0)),
+                                                            float(tier2_value_result.get("teacher_advantage_mean", 0.0)),
+                                                            float(tier2_value_result.get("teacher_gate_target_mean", 0.0)),
+                                                            float(tier2_value_result.get("teacher_positive_rate", 0.0)),
+                                                            float(tier2_value_result.get("ann_quality_mean", 0.0)),
+                                                            float(tier2_value_result.get("forecast_trust_mean", 0.0)),
+                                                            float(tier2_value_result.get("base_internal_weight_mean", 0.0)),
+                                                            float(tier2_value_result.get("trend_internal_weight_mean", 0.0)),
+                                                            float(tier2_value_result.get("reversion_internal_weight_mean", 0.0)),
+                                                            float(tier2_value_result.get("defensive_internal_weight_mean", 0.0)),
+                                                            float(tier2_value_result.get("expert_weight_entropy_mean", 0.0)),
+                                                            float(tier2_value_result.get("quality_anchor_loss", 0.0)),
+                                                            float(tier2_value_result.get("trust_anchor_loss", 0.0)),
+                                                            float(tier2_value_result.get("expert_mix_loss", 0.0)),
+                                                            float(tier2_value_result.get("expert_winner_loss", 0.0)),
+                                                            float(tier2_value_result.get("trade_cost_mean", 0.0)),
+                                                            float(tier2_value_result.get("replay_loss", 0.0)),
+                                                        )
+                                                    else:
+                                                        self.logger.info(
+                                                            "[TIER2_VALUE_TRAIN_SKIP] step=%s rollout=%s status=%s",
+                                                            int(getattr(self, "total_steps", 0)),
+                                                            len(current_rollout),
+                                                            status,
+                                                        )
                                             else:
                                                 self.logger.debug(
-                                                    "[CV_TRAIN_SKIP_SHORT] rollout=%s",
+                                                    "[TIER2_VALUE_TRAIN_SKIP_SHORT] rollout=%s",
                                                     len(current_rollout),
                                                 )
-                                                cv_buffer.clear_rollout()
+                                                tier2_value_buffer.clear_rollout()
                                         else:
                                             # Keep the CV buffer scoped to one completed rollout.
                                             # If this rollout is not trained now, drop it instead of
                                             # carrying stale experiences into a later return target.
-                                            cv_buffer.clear_rollout()
-                                    except Exception as cv_err:
-                                        cv_error_signature = f"{type(cv_err).__name__}: {cv_err}"
-                                        cv_error_count = int(getattr(self, "_cv_train_error_count", 0)) + 1
-                                        last_cv_error_signature = getattr(self, "_last_cv_train_error_signature", None)
-                                        self._cv_train_error_count = cv_error_count
-                                        self._last_cv_train_error_signature = cv_error_signature
-                                        if cv_error_signature != last_cv_error_signature or cv_error_count in (1, 5, 20, 100):
+                                            tier2_value_buffer.clear_rollout()
+                                    except Exception as tier2_err:
+                                        tier2_error_signature = f"{type(tier2_err).__name__}: {tier2_err}"
+                                        tier2_error_count = int(getattr(self, "_tier2_train_error_count", 0)) + 1
+                                        last_tier2_error_signature = getattr(self, "_last_tier2_train_error_signature", None)
+                                        self._tier2_train_error_count = tier2_error_count
+                                        self._last_tier2_train_error_signature = tier2_error_signature
+                                        if tier2_error_signature != last_tier2_error_signature or tier2_error_count in (1, 5, 20, 100):
                                             self.logger.warning(
-                                                "[CV_TRAIN_ERROR] step=%s count=%s error=%s",
+                                                "[TIER2_VALUE_TRAIN_ERROR] step=%s count=%s error=%s",
                                                 int(getattr(self, "total_steps", 0)),
-                                                cv_error_count,
-                                                cv_error_signature,
+                                                tier2_error_count,
+                                                tier2_error_signature,
                                             )
                                         if bool(getattr(self.config, "fgb_fail_fast", False)):
                                             raise RuntimeError(
                                                 f"Tier-2 training failed at step {int(getattr(self, 'total_steps', 0))}"
-                                            ) from cv_err
-                                        cv_buffer.clear_rollout()
+                                            ) from tier2_err
+                                        tier2_value_buffer.clear_rollout()
+
                         except Exception as gae_error:
                             error_str = str(gae_error)
                             if 'clone' in error_str.lower():

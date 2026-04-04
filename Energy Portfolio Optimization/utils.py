@@ -4,11 +4,11 @@ UNIFIED UTILITIES MODULE (COMPREHENSIVE)
 
 Consolidates all utility functions and classes into a single, organized module:
 - safe_utils.py (SafeDivision, safe_clip, safe_mean, safe_std, sanitize_array, ensure_finite)
-- Tier-2 routed-overlay utilities (clear_tf_session, configure_tf_memory)
+- Tier-2 policy-improvement utilities (clear_tf_session, configure_tf_memory)
 - error_handling.py (ErrorHandler, safe_operation, validation functions, ContextualLogger)
 - memory_manager.py (UnifiedMemoryManager)
 - observation_validator.py (UnifiedObservationValidator)
-- tier2_routed_overlay.py (CalibrationTracker, Tier2RoutedOverlayAdapter, Tier2RoutedOverlayTrainer)
+- tier2.py unified Tier-2 public runtime helpers
 
 Single source of truth for all utility operations across the entire codebase.
 """
@@ -747,7 +747,7 @@ class UnifiedObservationValidator:
 # ============================================================================
 # TIER-2 DL CONTROL VARIATE SYSTEM
 # ============================================================================
-# NOTE: Tier-2 routed-overlay logic (CalibrationTracker, Tier2RoutedOverlayAdapter, etc.) is in tier2_routed_overlay.py.
+# NOTE: Tier-2 policy-improvement public logic now lives in tier2.py.
 
 
 # ============================================================================

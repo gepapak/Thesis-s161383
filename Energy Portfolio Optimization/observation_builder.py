@@ -103,28 +103,28 @@ class ObservationBuilder:
         local_drawdown: float = 0.0,
     ) -> None:
         """
-        REFACTORED: Build investor agent observations.
+        Build investor agent 9D observations.
         
         Direct trading investor over a single effective financial factor.
-        Uses price momentum plus realized-volatility regime context instead of
-        the older per-sleeve bookkeeping positions.
+        Uses price momentum plus realized-volatility regime context.
+        Observation space is always 9D for both Tier-1 and Tier-2 variants;
+        the Tier-2 DL overlay communicates with the RL policy exclusively
+        through the exposure delta (unidirectional DL→RL).
         
         Args:
-            obs_array: Observation array to fill (modified in-place)
-            price_momentum: Normalized price return/momentum in [-1, 1] (replaces price level)
+            obs_array: Observation array to fill (modified in-place). Always 9D.
+            price_momentum: Normalized price return/momentum in [-1, 1]
             realized_volatility: Normalized recent realized volatility in [0, 1]
             budget: Current budget
             init_budget: Initial budget
             financial_positions: Dict with wind/solar/hydro instrument values
             max_position_size: Maximum position size multiplier
             capital_allocation_fraction: Capital allocation fraction
-            cumulative_mtm_pnl: Cumulative mark-to-market PnL for sleeve profitability signal
+            cumulative_mtm_pnl: Cumulative mark-to-market PnL
             is_decision_step: 1.0 on investor decision steps else 0.0
-            current_exposure_norm: Optional current normalized exposure from the
-                live execution contract. If provided, this is preferred over the
-                older static normalization formula.
-            risk_exposure_cap: Live risk-controller exposure cap seen by the investor.
-            local_drawdown: Investor-sleeve local drawdown used by the reward.
+            current_exposure_norm: Optional current normalized exposure
+            risk_exposure_cap: Live risk-controller exposure cap
+            local_drawdown: Investor-sleeve local drawdown
         """
         try:
             # Normalize budget to [0, 1]
@@ -160,7 +160,7 @@ class ObservationBuilder:
             obs_array[6] = float(np.clip(capital_allocation_fraction, 0.0, 1.0))
             obs_array[7] = float(np.clip(risk_exposure_cap, 0.0, 1.0))
             obs_array[8] = float(np.clip(local_drawdown, 0.0, 1.0))
-                
+
         except Exception as e:
             raise RuntimeError(f"[OBS_INVESTOR_FATAL] Investor observation building failed: {e}") from e
     

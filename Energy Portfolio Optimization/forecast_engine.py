@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Unified forecast engine for expert-only mode (price short-horizon expert bank).
+Unified forecast engine for expert-only mode (ANN short-horizon price forecast bank).
 
 This module handles:
-- episode-specific forecast training via train_price_short_expert_bank (ANN, LSTM, SVR, RF)
+- episode-specific ANN forecast training
 - reserved evaluation forecast training (episode 20)
 - offline forecast cache precompute for training/evaluation datasets
 - forecast path/integration helpers used by main.py and evaluation.py
@@ -67,9 +67,9 @@ def train_episode_forecasts(
     output_base_dir: str = "forecast_models",
     config: Optional[EnhancedConfig] = None,
 ) -> Dict[str, Any]:
-    """Train price short-horizon expert bank (ANN, LSTM, SVR, RF) for one episode."""
+    """Train the ANN short-horizon forecast bank for one episode."""
     print("=" * 80)
-    print(f"TRAINING PRICE SHORT-EXPERT BANK FOR EPISODE {episode_num}")
+    print(f"TRAINING ANN SHORT-FORECAST BANK FOR EPISODE {episode_num}")
     print("=" * 80)
     print(f"Forecast Episode: {episode_num}")
     print(f"Data file: {episode_data_path}")
@@ -153,14 +153,14 @@ def get_episode_forecast_dirs(
 
 
 def _validate_forecast_dirs(paths: Dict[str, str], label: str) -> Dict[str, str]:
-    """Validate episode_dir and expert bank exist. Ensure compat dirs for generator."""
+    """Validate episode_dir and ANN forecast bank exist. Ensure compat dirs for generator."""
     episode_dir = paths.get("episode_dir")
     if not episode_dir or not os.path.isdir(episode_dir):
         raise FileNotFoundError(f"Missing {label} episode dir: {episode_dir}")
 
     if not price_short_expert_bank_exists(episode_dir):
         raise FileNotFoundError(
-            f"Price short expert bank incomplete for {label}. "
+            f"ANN short forecast bank incomplete for {label}. "
             f"Run: python forecast_engine.py train-episode --episode_num {label.split('_')[-1]}"
         )
 
@@ -197,7 +197,7 @@ def check_episode_models_exist(
     forecast_base_dir: str = "forecast_models",
     config: Optional[EnhancedConfig] = None,
 ) -> bool:
-    """Validate whether an episode price-short expert bank is complete and loadable."""
+    """Validate whether an episode ANN short-horizon forecast bank is complete and loadable."""
     try:
         paths = get_episode_forecast_dirs(episode_num, forecast_base_dir)
         if not price_short_expert_bank_exists(paths["episode_dir"]):
@@ -230,14 +230,14 @@ def ensure_episode_forecasts_ready(
     config: Optional[EnhancedConfig] = None,
 ) -> tuple[bool, dict]:
     """
-    Validate that prebuilt forecast expert bank exists for this episode and return canonical paths.
-    If missing, auto-trains the expert bank and retries.
+    Validate that the prebuilt ANN short-horizon forecast bank exists for this episode and return canonical paths.
+    If missing, auto-trains the bank and retries.
     """
     del cache_base_dir
     models_exist = check_episode_models_exist(episode_num, forecast_base_dir, config=config)
     if not models_exist:
         logger.info(
-            "   [FORECAST] Episode %s expert bank not found - training now from %s",
+            "   [FORECAST] Episode %s ANN forecast bank not found - training now from %s",
             episode_num,
             episode_data_path,
         )
@@ -251,12 +251,12 @@ def ensure_episode_forecasts_ready(
         models_exist = check_episode_models_exist(episode_num, forecast_base_dir, config=config)
         if not models_exist:
             logger.error(
-                "   [FORECAST] Episode %s expert bank training failed.",
+                "   [FORECAST] Episode %s ANN forecast bank training failed.",
                 episode_num,
             )
             return False, {}
     else:
-        logger.info("   [FORECAST] Episode %s expert bank already exists - skipping training", episode_num)
+        logger.info("   [FORECAST] Episode %s ANN forecast bank already exists - skipping training", episode_num)
     return True, get_episode_forecast_paths(episode_num, forecast_base_dir)
 
 
@@ -267,7 +267,7 @@ def train_episode_forecasts_for_episode(
     force_retrain: bool = False,
     config: Optional[EnhancedConfig] = None,
 ) -> Dict[str, Any]:
-    """Train price short expert bank for one episode."""
+    """Train the ANN short-horizon forecast bank for one episode."""
     _clean_episode_dir(episode_num, forecast_base_dir, force_retrain)
     return train_episode_forecasts(
         episode_num=int(episode_num),
@@ -284,7 +284,7 @@ def train_episode_forecasts_batch(
     force_retrain: bool = False,
     config: Optional[EnhancedConfig] = None,
 ) -> List[Dict[str, Any]]:
-    """Train a batch of rolling episode-specific expert banks."""
+    """Train a batch of rolling episode-specific ANN forecast banks."""
     results: List[Dict[str, Any]] = []
     for episode_num in [int(ep) for ep in episodes]:
         scenario_path = resolve_forecast_scenario_path(
@@ -413,18 +413,18 @@ def precompute_evaluation_forecasts(
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Forecast engine (expert-only): train price short expert bank and precompute cache"
+        description="Forecast engine (expert-only): train ANN short-horizon forecast bank and precompute cache"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_train_episode = sub.add_parser("train-episode", help="Train one episode price short expert bank")
+    p_train_episode = sub.add_parser("train-episode", help="Train one episode ANN short-horizon forecast bank")
     p_train_episode.add_argument("--episode_num", type=int, required=True)
     p_train_episode.add_argument("--forecast_training_dataset_dir", type=str, default="forecast_training_dataset")
     p_train_episode.add_argument("--forecast_base_dir", type=str, default="forecast_models")
     p_train_episode.add_argument("--scenario_path", type=str, default=None)
     p_train_episode.add_argument("--force_retrain", action="store_true")
 
-    p_train_batch = sub.add_parser("train-batch", help="Train multiple episode expert banks")
+    p_train_batch = sub.add_parser("train-batch", help="Train multiple episode ANN forecast banks")
     p_train_batch.add_argument("--episodes", type=int, nargs="+", default=None)
     p_train_batch.add_argument("--all", action="store_true")
     p_train_batch.add_argument("--forecast_training_dataset_dir", type=str, default="forecast_training_dataset")

@@ -9,18 +9,28 @@ logger = logging.getLogger(__name__)
 # These constants ensure consistent configuration across all modes and code paths
 
 BASE_FEATURE_DIM = 18  # Base observation feature dimension (policy obs space)
-# Tier-2 routed real-expert overlay (forecast-backed short-horizon investor layer):
-# Real-expert 34D = 4D core + 2 memory steps x 15 short-horizon channels
-#            Core (4D):
-#              [proposed_exposure, gross_exposure_ratio,
-#               tradeable_capital_ratio, realized_volatility_regime]
-#            Per-memory-step channels (15 with 4 experts; 18 with CEEMDAN):
-#              ann/lstm/svr/rf signals, qualities, conformal risks,
-#              expert_consensus_signal, expert_disagreement, short_imbalance_signal
-TIER2_CV_MEMORY_STEPS = 2
-TIER2_CV_MEMORY_CHANNELS = 15  # 4 experts * 3 + 3 (CEEMDAN deactivated)
-TIER2_CV_FEATURE_DIM = 34     # 4 + 2*15 (4D core + 2 memory steps x 15 channels)
-TIER2_CV_ABLATED_FEATURE_DIM = 4  # Effective nonforecast core; forecast block is zeroed during ablation
+# Tier-2 value overlay (forecast-backed short-horizon investor layer):
+# Clean-room forecast-guided baseline over:
+# - 8D frozen Tier-1 state core
+# - 8-step raw market + ANN forecast memory
+# Core (8D):
+#   [proposed_exposure, abs_proposed_exposure, gross_exposure_ratio,
+#    tradeable_capital_ratio, realized_volatility_regime,
+#    investor_local_quality, investor_local_quality_delta,
+#    investor_local_drawdown]
+# Per-memory-step channels (22):
+#   ann_signal, ann_quality, ann_conformal_risk,
+#   expert_consensus_signal, expert_disagreement, short_imbalance_signal,
+#   ann_return_signal, ann_abs_return, ann_price_level_signal,
+#   ann_direction_margin, ann_direction_accuracy,
+#   ann_latent_0, ann_latent_1, ann_latent_2, ann_latent_3,
+#   ann_latent_norm,
+#   price_level_signal, price_return_signal,
+#   wind_level_signal, solar_level_signal, hydro_level_signal, load_level_signal
+TIER2_VALUE_CORE_DIM = 11  # 8 base + 3 ACRP feedback (trust_radius, advantage_strength, deployment_scale)
+TIER2_VALUE_MEMORY_STEPS = 8
+TIER2_VALUE_MEMORY_CHANNELS = 22
+TIER2_VALUE_FEATURE_DIM = TIER2_VALUE_CORE_DIM + TIER2_VALUE_MEMORY_STEPS * TIER2_VALUE_MEMORY_CHANNELS
 
 # Price normalization constants
 PRICE_MEAN = 250.0          # Historical mean price (DKK/MWh)
@@ -268,7 +278,10 @@ class EnhancedConfig:
         # exposure cap inside the trading sleeve, not a leverage multiplier.
         self.risk_exposure_cap_min = 0.25
         self.risk_exposure_cap_max = 1.00
-        self.no_trade_threshold = 0.01  # 1% of target position - trades below this are ignored
+        # Backward-compatible contract:
+        # - values in [0, 1] are treated as a fraction of max position notional
+        # - values > 1 are treated as a raw DKK threshold
+        self.no_trade_threshold = 0.01
 
         # Battery operational parameters (batt_eta_charge * batt_eta_discharge = round-trip efficiency)
 
@@ -524,10 +537,9 @@ class EnhancedConfig:
         self.forecast_baseline_enable = False  # Default OFF; enabled explicitly for Tier-2 runs
 
         # === Tier-2 learned forecast controller ===
-        self.cv_learning_rate = 1e-3
-        self.cv_l2_reg = 1e-4
-        self.tier2_feature_dim = int(TIER2_CV_FEATURE_DIM)
-        self.cv_forecast_dim = int(self.tier2_feature_dim)  # Backward-compatible alias
+        # Canonical Tier-2 regularizer name for the active policy-improvement path.
+        self.tier2_l2_reg = 1e-4
+        self.tier2_feature_dim = int(TIER2_VALUE_FEATURE_DIM)
 
         # === Forecast Trust Calibration ===
         # Rolling window for online calibration of forecast trust (Ï„â‚œ)
@@ -540,6 +552,8 @@ class EnhancedConfig:
         self.forecast_trust_scale_max = 1.5    # Maximum trust scale
         # Optional multiplicative trust optimism boost. Keep 0.0 by default for unbiased calibration.
         self.forecast_trust_boost = 0.0
+        # Weight for blending runtime trust with pre-computed metadata quality (0.0 = runtime only, 1.0 = metadata only)
+        self.forecast_metadata_quality_weight = 0.3
         # RATIONALE: directional accuracy is often more actionable than magnitude error in trading-style decisions,
         # so "hitrate" is a sensible default for trust calibration.
 
@@ -585,7 +599,7 @@ class EnhancedConfig:
         self.forecast_return_tanh_scale = 1.5         # lower tanh scale for smoother signal
         self.forecast_return_denom_floor = 0.25       # lower floor to keep calibrated trade_signal visible
 
-        self.fgb_lambda_max = 0.8             # Legacy control-variate lambda ceiling
+        self.fgb_lambda_max = 0.8             # Legacy forecast-baseline lambda ceiling
         # NOTE: This clips the *per-step advantage correction* (delta A_t) in advantage units.
         # It is NOT a return/bps unit. (Kept small to avoid distorting PPO advantage ranking.)
         self.fgb_clip_adv = 0.10
@@ -596,7 +610,7 @@ class EnhancedConfig:
         # Safer default: keep lambda* nonnegative unless explicitly overridden by CLI.
         # This trades some theoretical variance-optimality for more stable cross-seed behavior.
         self.fgb_allow_negative_lambda = False
-        # Rolling calibration of control-variate scale against realized investor dNAV return.
+        # Rolling calibration of forecast-baseline scale against realized investor dNAV return.
         self.fgb_cv_calib_beta = 0.10
         self.fgb_cv_gain_min = 0.10
         self.fgb_cv_gain_max = 1.50
@@ -609,52 +623,137 @@ class EnhancedConfig:
         # expected_dnav blend weights (pred_reward + mwdir). Kept explicit for reproducible tuning.
         self.fgb_expected_dnav_pred_weight = 0.85
         self.fgb_expected_dnav_mwdir_weight = 0.15
-        # === Tier-2 short-horizon forecast real-expert controller ===
+        # === Tier-2 short-horizon forecast controller ===
         # Full model:
-        # - 34D Tier-2 state = 4D core context + flattened 2x15 short-memory block
-        # - short-horizon conformal decision-focused defer-and-route controller
-        # - active short-memory channels:
-        #   ann/lstm/svr/rf signals,
-        #   ann/lstm/svr/rf qualities,
-        #   ann/lstm/svr/rf conformal risks,
-        #   expert_consensus_signal, expert_disagreement, short_imbalance_signal
-        # - normalized override head + intervention-confidence head
+        # - clean 8D investor-state core + flattened 8x21 ANN-cache memory block
+        # - ANN-primary short-horizon cross-attention policy-improvement model
+        # - no trust or handcrafted forecast summary features in the active path
         # Ablation:
-        # - routed overlay keeps the same controller/runtime path
-        # - only the forecast-memory block is zeroed
+        # - keeps the same controller/runtime path
+        # - neutralizes the full Tier-2 forecast-memory block
         self.tier2_mape_window = 10
         self.tier2_mape_reference = 0.25
-        self.tier2_cv_delta_max = 0.20
-        self.tier2_cv_target_scale = 0.01  # Investor sleeve return scale; 1% realized return -> tanh(1)
-        self.tier2_cv_lr = 3e-3
-        self.tier2_cv_train_every = 100
-        self.tier2_cv_batch_size = 64
-        self.tier2_cv_train_epochs = 2
-        self.tier2_cv_memory_steps = int(TIER2_CV_MEMORY_STEPS)
-        self.tier2_cv_route_loss_weight = 0.35
-        self.tier2_cv_override_loss_weight = 0.25
-        self.tier2_cv_confidence_loss_weight = 0.15
-        self.tier2_cv_decision_loss_weight = 0.35
-        self.tier2_cv_decision_horizon = 4
-        self.tier2_cv_decision_scale = 0.05
-        self.tier2_cv_decision_downside_weight = 0.75
-        self.tier2_cv_decision_vol_weight = 0.25
-        self.tier2_cv_decision_stability_penalty = 0.12
-        self.tier2_cv_route_grid_points = 11
-        self.tier2_cv_conformal_alpha = 0.10
-        self.tier2_cv_conformal_scale = 1.0
-        # Tier-2 uses only the short price horizon.
-        # The routed expert bank is a real short-price expert family:
-        # ANN / LSTM / SVR / RF.
-        self.tier2_cv_sharpe_improvement_scale = 0.05
-        self.tier2_cv_ablate_forecast_features = False  # If True: zero only the forecast-memory block while keeping the same controller path
-        self.tier2_cv_architecture = "short_horizon_real_price_expert_conformal_decision_focused_defer_and_route_controller"
+        self.tier2_value_delta_max = 0.20
+        self.tier2_value_target_scale = 0.01  # Investor sleeve return scale; 1% realized return -> tanh(1)
+        # Current Tier-2 continuous actor-value training learns too slowly at
+        # 3e-4 early in the run and becomes unstable/overreactive at 3e-3.
+        # Use 1e-3 as the default middle-ground unless explicitly overridden.
+        self.tier2_value_lr = 1e-3
+        self.tier2_value_train_every = 256
+        self.tier2_value_batch_size = 64
+        self.tier2_value_train_epochs = 1
+        self.tier2_value_memory_steps = int(TIER2_VALUE_MEMORY_STEPS)
+        # Continuous Tier-2 uses explicit residual-delta supervision weight.
+        self.tier2_value_delta_loss_weight = 0.05
+        # Keep aleatoric delta uncertainty calibrated by default; this was
+        # previously enabled accidentally via `or` fallbacks, so make the
+        # intended default explicit while still allowing an explicit 0.0
+        # override in config/CLI if needed.
+        self.tier2_value_confidence_loss_weight = 0.04
+        self.tier2_value_policy_loss_weight = 1.00
+        self.tier2_value_value_loss_weight = 0.75
+        self.tier2_value_quantile_loss_weight = 0.35
+        # Tier-2 now uses setup-specific regime supervision so the internal
+        # experts specialize around forecasted trend, mean-reversion,
+        # defensive risk-off, and neutral base conditions seen in the trading sleeve.
+        self.tier2_value_expert_mix_loss_weight = 0.08
+        self.tier2_value_expert_winner_loss_weight = 0.06
+        self.tier2_value_quality_anchor_weight = 0.05
+        self.tier2_value_trust_anchor_weight = 0.0
+        self.tier2_value_expert_temperature = 0.35
+        # Active under the current sparse gate teacher: controls what fraction
+        # of samples are labeled gate-positive per batch.
+        self.tier2_value_gate_top_fraction = 0.30
+        # Intervene classification is auxiliary but ACTIVE. This scales BCE loss
+        # for intervention selection (gate_target vs deployment_scale).
+        self.tier2_value_intervene_loss_weight = 0.05
+        self.tier2_value_lower_quantile = 0.25
+        self.tier2_value_upper_quantile = 0.75
+        # Enforce that Tier-2 must at least preserve a small positive return
+        # delta versus frozen Tier-1 on average, rather than winning purely by
+        # de-risking into lower volatility. The hard floor itself is blended
+        # with risk-adjusted sleeve utility so the no-harm gate is aligned with
+        # Sharpe improvement instead of pure raw-return dominance.
+        self.tier2_value_return_floor_margin = 5e-5
+        self.tier2_value_return_floor_return_mix = 0.35
+        # The deployed conformal return-floor radius can exceed 2x target
+        # scale late in training. Give the auxiliary heads enough dynamic range
+        # that positive certified lower bounds remain expressible at eval time.
+        self.tier2_value_nav_head_scale = 3.0
+        self.tier2_value_return_floor_head_scale = 4.0
+        # The factor-opportunity head is auxiliary only; keep it off by
+        # default so the core delta/gate/value heads dominate learning.
+        self.tier2_value_factor_loss_weight = 0.0
+        self.tier2_value_dual_lr = 0.03
+        self.tier2_value_tail_dual_lr = 0.02
+        self.tier2_value_tail_risk_budget = 0.10
+        # Penalize overly wide auxiliary quantile bands. The return-floor head
+        # had become so conservative that it blocked forecast-positive actions
+        # even when its mean prediction was comfortably positive.
+        self.tier2_value_return_floor_interval_penalty = 0.10
+        self.tier2_value_nav_interval_penalty = 0.05
+        # Keep routed Tier2 decision utility on the same short horizon used by
+        # the deployed short-price expert bank.
+        self.tier2_value_decision_horizon = 6
+        # Runtime/train decision improvements for the routed overlay now live in
+        # the ~1e-4 to 1e-2 range after moving Tier-2 to cadence-aligned,
+        # exposure-independent return targets. The old 0.05 scale crushed the
+        # learned gate to near-zero even on clearly certified interventions.
+        self.tier2_value_decision_scale = 7.5e-4
+        # Tier-2 rollouts are already sampled on investor decision steps, so a
+        # multiplier of 1.0 keeps the teacher aligned with the live 1-hour
+        # forecast contract instead of stretching labels across multiple
+        # decision intervals.
+        self.tier2_value_path_horizon_mult = 1.0
+        self.tier2_value_decision_downside_weight = 0.75
+        self.tier2_value_decision_drawdown_weight = 0.60
+        self.tier2_value_decision_vol_weight = 0.75
+        # The continuous counterfactual overlay remained too willing to take
+        # large deltas in clean directional regimes at 0.22. Raise the
+        # quadratic size penalty so Tier-2 must earn interior actions more
+        # selectively.
+        self.tier2_value_decision_stability_penalty = 0.18
+        self.tier2_value_baseline_quality_margin_scale = 0.0
+        self.tier2_value_conformal_alpha = 0.10
+        self.tier2_value_conformal_scale = 1.0
+        # Tier-2 uses only the short price horizon from the ANN forecaster.
+        self.tier2_value_sharpe_improvement_scale = 0.05
+        self.tier2_value_ablate_forecast_features = False  # If True: neutralize the full Tier-2 forecast-memory block for the no-forecast ablation
+        self.tier2_policy_family = "conservative_actor_critic"
+        self.tier2_policy_objective = "conservative_actor_critic_advantage"
+        self.tier2_value_architecture = "ann_cache_cross_attention_cleanroom_actor_critic"
+        self.tier2_primary_expert = "ann"
+        self.tier2_non_primary_mode = "context_only"
+        # Let the distributional value target teach when not to act. The ANN
+        # overlay no longer applies a second teacher-side improvement veto.
+        self.tier2_value_min_certified_improvement = 0.0
+        self.tier2_value_min_route_margin = 0.0
+        # Keep the training target as close as possible to the solved value
+        # objective rather than filtering it with fixed context thresholds.
+        self.tier2_value_min_intervention_context = 0.0
         self.tier2_runtime_overlay_enable = True
-        self.tier2_runtime_gain = 0.65
-        self.tier2_runtime_mc_samples = 3
+        self.tier2_runtime_gain = 1.0
+        self.tier2_runtime_mc_samples = 7
         self.tier2_runtime_sigma_scale = 0.015
         self.tier2_runtime_conformal_margin = 0.05
-        self.cv_learning_rate = float(self.tier2_cv_lr)
+        # Tier-2 deployment is continuous and learned end-to-end. Runtime now
+        # follows the model's own gate/confidence/tail-risk heads rather than
+        # an external rule wrapper; keep only a tiny execution rail for near-zero deltas.
+        self.tier2_runtime_min_abs_delta = 0.005
+        self.tier2_runtime_delta_scale = 1.0
+        # Keep the NAV/stability head as a soft auxiliary critic rather than a
+        # co-primary actor objective. This head should shape smoother actions
+        # and flag unstable proposals, but not drown out forecast-uplift and
+        # no-harm return-floor learning.
+        self.tier2_value_nav_actor_weight = 0.20
+        self.tier2_value_nav_lcb_actor_weight = 0.25
+        self.tier2_value_tail_loss_weight = 0.50
+        self.tier2_value_nav_confidence_weight = 0.04
+        self.tier2_value_nav_drag_weight = 0.04
+        # Weight for calibrating raw gate-head probability toward deployed
+        # intervention strength (policy_scale) to reduce confidence drift.
+        self.tier2_value_gate_calibration_weight = 0.10
+
 
         # === Legacy Forecast-Reward Compatibility (unused in paper setup) ===
         # Reward shaping by forecast quality is disabled (forecast reward weight = 0).
@@ -1146,7 +1245,7 @@ class EnhancedConfig:
 # =====================================================================
 # PAPER MODES (baseline vs Tier-2 routed overlay)
 # =====================================================================
-# Baseline: forecast_baseline_enable=False
-# Tier-2 routed overlay: forecast_baseline_enable=True (no extra observations)
-# Tier-2 ablation: tier2_cv_ablate_forecast_features=True (same controller, zeroed forecast-memory block)
-# Tier-2 full uses 34D temporal features: 4D core + flattened 2x15 real price-expert short-memory block.
+# Baseline: forecast_baseline_enable=False → investor_0 = 9D
+# Tier-2 routed overlay: forecast_baseline_enable=True → investor_0 = 9D (same as baseline; DL↔RL via exposure delta only)
+# Tier-2 ablation: tier2_value_ablate_forecast_features=True (same controller, full forecast-memory ablation)
+# Tier-2 full uses 176D temporal features: 8D investor core + flattened 8x21 ANN-cache short-memory block.

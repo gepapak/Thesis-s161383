@@ -15,8 +15,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.layers import Dense, Dropout, LSTM
-from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, Dropout, LSTM, LayerNormalization, Activation, Concatenate
+from tensorflow.keras.models import Sequential, load_model, Model
 
 try:
     from PyEMD import CEEMDAN
@@ -28,10 +28,6 @@ logger = logging.getLogger(__name__)
 
 PRICE_SHORT_EXPERT_METHODS: Tuple[str, ...] = (
     "ann",
-    "lstm",
-    "svr",
-    "rf",
-    # "ceemdan_lstm",  # DEACTIVATED: slow training; uncomment to re-enable
 )
 
 PRICE_SHORT_EXPERT_LABELS: Dict[str, str] = {
@@ -42,10 +38,11 @@ PRICE_SHORT_EXPERT_LABELS: Dict[str, str] = {
     # "ceemdan_lstm": "CEEMDAN_LSTM",  # DEACTIVATED
 }
 
-PRICE_SHORT_EXPERT_VERSION = "1.1.0"
+PRICE_SHORT_EXPERT_VERSION = "2.0.0"
 PRICE_SHORT_EXPERT_TARGET = "price"
 PRICE_SHORT_EXPERT_HORIZON = "short"
 PRICE_SHORT_EXPERT_DENOM_FLOOR = 50.0
+PRICE_SHORT_EXPERT_ANN_LATENT_DIM = 4
 PRICE_SHORT_EXPERT_CEEMDAN_MAX_IMFS = 4
 PRICE_SHORT_EXPERT_CEEMDAN_CHANNELS = PRICE_SHORT_EXPERT_CEEMDAN_MAX_IMFS + 1
 PRICE_SHORT_EXPERT_SAMPLE_LIMITS = {
@@ -323,19 +320,62 @@ def _fit_standard_scalers(
     )
 
 
-def _build_ann_model(input_dim: int) -> Sequential:
-    model = Sequential(
-        [
-            tf.keras.Input(shape=(int(input_dim),)),
-            Dense(256, activation="relu"),
-            Dropout(0.15),
-            Dense(128, activation="relu"),
-            Dropout(0.10),
-            Dense(1),
-        ]
-    )
-    model.compile(loss="mse", optimizer=tf.keras.optimizers.Adam(learning_rate=8e-4))
+def _compile_keras_forecast_model(model: Any) -> Any:
+    output_names = [str(name) for name in list(getattr(model, "output_names", []) or [])]
+    if {"price", "direction", "uncertainty"}.issubset(set(output_names)):
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=8e-4),
+            loss={
+                "price": "mse",
+                "direction": "binary_crossentropy",
+                "uncertainty": "mse",
+            },
+            loss_weights={
+                "price": 1.0,
+                "direction": 0.18,
+                "uncertainty": 0.12,
+            },
+        )
+    else:
+        model.compile(loss="mse", optimizer=tf.keras.optimizers.Adam(learning_rate=8e-4))
     return model
+
+
+def _build_ann_model(input_dim: int) -> Model:
+    inp = tf.keras.Input(shape=(int(input_dim),), name="ann_window")
+    x = Dense(256, activation="gelu", name="ann_stem")(inp)
+    x = Dropout(0.08, name="ann_stem_do")(x)
+    for idx in range(3):
+        residual = Dense(256, activation="gelu", name=f"ann_block_{idx}_d1")(x)
+        residual = Dropout(0.06, name=f"ann_block_{idx}_do")(residual)
+        residual = Dense(256, name=f"ann_block_{idx}_d2")(residual)
+        x = LayerNormalization(epsilon=1e-6, name=f"ann_block_{idx}_ln")(x + residual)
+        x = Activation("gelu", name=f"ann_block_{idx}_act")(x)
+    trunk = Dense(128, activation="gelu", name="ann_trunk")(x)
+    latent_hidden = Dense(32, activation="gelu", name="ann_latent_hidden")(trunk)
+    latent = Dense(PRICE_SHORT_EXPERT_ANN_LATENT_DIM, activation="tanh", name="latent")(latent_hidden)
+    shared = Concatenate(name="ann_shared_concat")([trunk, latent])
+
+    price_hidden = Dense(64, activation="gelu", name="ann_price_hidden")(shared)
+    price_out = Dense(1, name="price")(price_hidden)
+
+    direction_hidden = Dense(48, activation="gelu", name="ann_direction_hidden")(shared)
+    direction_out = Dense(1, activation="sigmoid", name="direction")(direction_hidden)
+
+    uncertainty_hidden = Dense(48, activation="gelu", name="ann_uncertainty_hidden")(shared)
+    uncertainty_out = Dense(1, activation="softplus", name="uncertainty")(uncertainty_hidden)
+
+    model = Model(
+        inputs=inp,
+        outputs={
+            "price": price_out,
+            "direction": direction_out,
+            "uncertainty": uncertainty_out,
+            "latent": latent,
+        },
+        name="price_short_ann_multitask",
+    )
+    return _compile_keras_forecast_model(model)
 
 
 def _build_lstm_model(look_back: int, channels: int = 1) -> Sequential:
@@ -397,16 +437,44 @@ def _fit_keras_model(
     )
     with open(history_path, "w", encoding="utf-8") as fh:
         json.dump(
-            {
-                "loss": [float(v) for v in history.history.get("loss", [])],
-                "val_loss": [float(v) for v in history.history.get("val_loss", [])],
-            },
+            {k: [float(v) for v in vals] for k, vals in history.history.items()},
             fh,
             indent=2,
         )
     best_model = load_model(model_path, compile=False)
-    best_model.compile(loss="mse", optimizer=tf.keras.optimizers.Adam(learning_rate=8e-4))
+    _compile_keras_forecast_model(best_model)
     return best_model
+
+
+def _unpack_model_predictions(
+    model: Any,
+    raw_pred: Any,
+) -> Dict[str, np.ndarray]:
+    if isinstance(raw_pred, dict):
+        out = {
+            str(k): np.asarray(v, dtype=np.float32).reshape((len(v), -1)) if np.asarray(v).ndim > 1 else np.asarray(v, dtype=np.float32).reshape(-1, 1)
+            for k, v in raw_pred.items()
+        }
+    elif isinstance(raw_pred, (list, tuple)):
+        names = [str(name) for name in list(getattr(model, "output_names", []) or [])]
+        out = {}
+        for idx, value in enumerate(raw_pred):
+            key = names[idx] if idx < len(names) else f"output_{idx}"
+            arr = np.asarray(value, dtype=np.float32)
+            out[key] = arr.reshape((arr.shape[0], -1)) if arr.ndim > 1 else arr.reshape(-1, 1)
+    else:
+        arr = np.asarray(raw_pred, dtype=np.float32)
+        out = {"price": arr.reshape((arr.shape[0], -1)) if arr.ndim > 1 else arr.reshape(-1, 1)}
+    if "price" not in out and out:
+        first_key = next(iter(out))
+        out["price"] = np.asarray(out[first_key], dtype=np.float32)
+    if "direction" not in out:
+        out["direction"] = np.full_like(out["price"], 0.5, dtype=np.float32)
+    if "uncertainty" not in out:
+        out["uncertainty"] = np.zeros_like(out["price"], dtype=np.float32)
+    if "latent" not in out:
+        out["latent"] = np.zeros((int(out["price"].shape[0]), PRICE_SHORT_EXPERT_ANN_LATENT_DIM), dtype=np.float32)
+    return out
 
 
 def _decompose_window_ceemdan(window: np.ndarray, max_imfs: int = PRICE_SHORT_EXPERT_CEEMDAN_MAX_IMFS) -> np.ndarray:
@@ -520,7 +588,7 @@ class ExpertArtifacts:
 
 
 class PriceShortExpertBank:
-    """Real short-horizon price expert bank used by Tier-2 routing."""
+    """ANN-only short-horizon price forecast bank used by the active Tier-2 path."""
 
     def __init__(
         self,
@@ -574,7 +642,7 @@ class PriceShortExpertBank:
             )
         if self.verbose:
             logger.info(
-                "Loaded %s/%s price-short experts from %s",
+                "Loaded %s/%s ANN short-forecast artifacts from %s",
                 len(self.artifacts),
                 len(PRICE_SHORT_EXPERT_METHODS),
                 self.episode_dir,
@@ -611,8 +679,80 @@ class PriceShortExpertBank:
             }
         return info
 
+    def _build_series_windows(self, series: np.ndarray) -> np.ndarray:
+        values = np.asarray(series, dtype=np.float32).reshape(-1)
+        t_count = int(values.size)
+        if t_count <= 0:
+            return np.zeros((0, self.look_back), dtype=np.float32)
+        windows = np.zeros((t_count, self.look_back), dtype=np.float32)
+        mean_val = float(np.mean(values)) if values.size > 0 else 0.0
+        for t in range(t_count):
+            if t == 0:
+                windows[t, :] = mean_val
+                continue
+            start = max(0, t + 1 - self.look_back)
+            hist = values[start : t + 1]
+            if hist.size <= 0:
+                windows[t, :] = mean_val
+            elif hist.size < self.look_back:
+                windows[t, : self.look_back - hist.size] = float(np.mean(hist))
+                windows[t, self.look_back - hist.size :] = hist
+            else:
+                windows[t, :] = hist[-self.look_back :]
+        return windows
+
+    def _predict_ann_details_batch(self, windows: np.ndarray) -> Dict[str, np.ndarray]:
+        art = self.artifacts["ann"]
+        model_input = _build_method_input_view(windows, "ann", metadata=art.metadata)
+        x_scaled = art.scaler_x.transform(model_input).astype(np.float32)
+        raw_outputs = _unpack_model_predictions(art.model, art.model.predict(x_scaled, verbose=0))
+        price_scaled = np.asarray(raw_outputs.get("price"), dtype=np.float32).reshape(-1)
+        pred_price = art.scaler_y.inverse_transform(price_scaled.reshape(-1, 1))[:, 0].astype(np.float32)
+        last_price = np.asarray(windows[:, -1], dtype=np.float32).reshape(-1)
+        denom = np.maximum(np.abs(last_price), PRICE_SHORT_EXPERT_DENOM_FLOOR)
+        pred_return = np.clip((pred_price - last_price) / denom, -0.25, 0.25).astype(np.float32)
+        direction_prob = np.clip(
+            np.asarray(raw_outputs.get("direction"), dtype=np.float32).reshape(-1),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        uncertainty = np.clip(
+            np.asarray(raw_outputs.get("uncertainty"), dtype=np.float32).reshape(-1),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        direction_margin = np.clip(2.0 * direction_prob - 1.0, -1.0, 1.0).astype(np.float32)
+        latent = np.asarray(raw_outputs.get("latent"), dtype=np.float32)
+        latent = latent.reshape((len(pred_price), -1))
+        if latent.shape[1] < PRICE_SHORT_EXPERT_ANN_LATENT_DIM:
+            latent = np.pad(latent, ((0, 0), (0, PRICE_SHORT_EXPERT_ANN_LATENT_DIM - latent.shape[1])))
+        elif latent.shape[1] > PRICE_SHORT_EXPERT_ANN_LATENT_DIM:
+            latent = latent[:, :PRICE_SHORT_EXPERT_ANN_LATENT_DIM]
+        latent_norm = np.clip(
+            np.linalg.norm(latent, axis=1) / max(np.sqrt(float(PRICE_SHORT_EXPERT_ANN_LATENT_DIM)), 1e-6),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        quality = np.clip(
+            0.60 * (1.0 - uncertainty) + 0.40 * np.abs(direction_margin),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        return {
+            "pred_price": pred_price,
+            "pred_return": pred_return,
+            "direction_prob": direction_prob,
+            "direction_margin": direction_margin,
+            "uncertainty": uncertainty,
+            "quality": quality,
+            "latent": latent.astype(np.float32),
+            "latent_norm": latent_norm,
+        }
+
     def _predict_non_ceemdan_batch(self, method: str, windows: np.ndarray) -> np.ndarray:
         art = self.artifacts[method]
+        if method == "ann":
+            return self._predict_ann_details_batch(windows).get("pred_price", np.zeros(len(windows), dtype=np.float32))
         model_input = _build_method_input_view(windows, method, metadata=art.metadata)
         x_scaled = art.scaler_x.transform(model_input)
         if method == "lstm":
@@ -652,54 +792,76 @@ class PriceShortExpertBank:
             pred = self._predict_non_ceemdan_batch(method_key, windows)[0]
         return float(pred)
 
+    def predict_details_from_window(self, method: str, window: np.ndarray) -> Dict[str, float]:
+        values = np.asarray(window, dtype=np.float32).reshape(-1)
+        if values.size != self.look_back:
+            raise ValueError(f"Expected window length {self.look_back}, got {values.size}")
+        method_key = str(method).strip().lower()
+        if method_key not in self.artifacts:
+            raise KeyError(f"Price-short expert not loaded: {method_key}")
+        windows = values.reshape(1, -1)
+        if method_key != "ann":
+            pred_price = self.predict_from_window(method_key, values)
+            return {
+                "pred_price": float(pred_price),
+            }
+        details = self._predict_ann_details_batch(windows)
+        out: Dict[str, float] = {
+            "pred_price": float(details["pred_price"][0]),
+            "pred_return": float(details["pred_return"][0]),
+            "direction_prob": float(details["direction_prob"][0]),
+            "direction_margin": float(details["direction_margin"][0]),
+            "uncertainty": float(details["uncertainty"][0]),
+            "quality": float(details["quality"][0]),
+            "latent_norm": float(details["latent_norm"][0]),
+        }
+        latent = np.asarray(details["latent"][0], dtype=np.float32).reshape(-1)
+        for idx in range(min(latent.size, PRICE_SHORT_EXPERT_ANN_LATENT_DIM)):
+            out[f"latent_{idx}"] = float(np.clip(latent[idx], -1.0, 1.0))
+        return out
+
     def predict_all_from_window(self, window: np.ndarray) -> Dict[str, float]:
         out: Dict[str, float] = {}
         for method in self.methods():
             out[method] = self.predict_from_window(method, window)
         return out
 
-    def precompute_for_series(self, series: np.ndarray) -> Dict[str, np.ndarray]:
+    def precompute_details_for_series(self, series: np.ndarray) -> Dict[str, Dict[str, np.ndarray]]:
         values = np.asarray(series, dtype=np.float32).reshape(-1)
-        t_count = int(values.size)
-        if t_count <= 0:
-            return {method: np.zeros(0, dtype=np.float32) for method in self.methods()}
-        windows = np.zeros((t_count, self.look_back), dtype=np.float32)
-        mean_val = float(np.mean(values)) if values.size > 0 else 0.0
-        for t in range(t_count):
-            if t == 0:
-                windows[t, :] = mean_val
-                continue
-            # Include price at t so forecast[t] predicts price[t+horizon_steps] (matches env expectation)
-            start = max(0, t + 1 - self.look_back)
-            hist = values[start : t + 1]
-            if hist.size <= 0:
-                windows[t, :] = mean_val
-            elif hist.size < self.look_back:
-                windows[t, : self.look_back - hist.size] = float(np.mean(hist))
-                windows[t, self.look_back - hist.size :] = hist
-            else:
-                windows[t, :] = hist[-self.look_back :]
-        outputs: Dict[str, np.ndarray] = {}
+        windows = self._build_series_windows(values)
+        if windows.shape[0] <= 0:
+            return {
+                method: {"pred_price": np.zeros(0, dtype=np.float32)}
+                for method in self.methods()
+            }
+        details: Dict[str, Dict[str, np.ndarray]] = {}
         for method in self.methods():
-            if method == "ceemdan_lstm":
-                preds = np.zeros(t_count, dtype=np.float32)
-                step_values = list(range(0, t_count, self.refresh_stride))
-                if step_values[-1] != t_count - 1:
-                    step_values.append(t_count - 1)
-                last_value = float(values[0]) if t_count > 0 else 0.0
-                cursor = 0
-                for step in step_values:
-                    pred_val = float(self.predict_from_window(method, windows[step]))
-                    preds[cursor : step + 1] = last_value
-                    preds[step] = pred_val
-                    last_value = pred_val
-                    cursor = step + 1
-                if cursor < t_count:
-                    preds[cursor:] = last_value
-                outputs[method] = preds
-            else:
-                outputs[method] = self._predict_non_ceemdan_batch(method, windows)
-        return outputs
+            if method != "ann":
+                preds = self._predict_non_ceemdan_batch(method, windows)
+                details[method] = {"pred_price": np.asarray(preds, dtype=np.float32)}
+                continue
+            ann_details = self._predict_ann_details_batch(windows)
+            method_details: Dict[str, np.ndarray] = {
+                "pred_price": np.asarray(ann_details["pred_price"], dtype=np.float32),
+                "pred_return": np.asarray(ann_details["pred_return"], dtype=np.float32),
+                "direction_prob": np.asarray(ann_details["direction_prob"], dtype=np.float32),
+                "direction_margin": np.asarray(ann_details["direction_margin"], dtype=np.float32),
+                "uncertainty": np.asarray(ann_details["uncertainty"], dtype=np.float32),
+                "quality": np.asarray(ann_details["quality"], dtype=np.float32),
+                "latent_norm": np.asarray(ann_details["latent_norm"], dtype=np.float32),
+            }
+            latent = np.asarray(ann_details["latent"], dtype=np.float32)
+            for idx in range(min(latent.shape[1], PRICE_SHORT_EXPERT_ANN_LATENT_DIM)):
+                method_details[f"latent_{idx}"] = np.asarray(latent[:, idx], dtype=np.float32)
+            details[method] = method_details
+        return details
+
+    def precompute_for_series(self, series: np.ndarray) -> Dict[str, np.ndarray]:
+        details = self.precompute_details_for_series(series)
+        return {
+            method: np.asarray(method_details.get("pred_price", np.zeros(0, dtype=np.float32)), dtype=np.float32)
+            for method, method_details in details.items()
+        }
 
 
 def _save_metadata(
@@ -727,6 +889,7 @@ def _save_standard_artifacts(
     history_path: Optional[str] = None,
     feature_scaler: Optional[StandardScaler] = None,
     input_view: Optional[str] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     paths = get_price_short_expert_paths(episode_dir, method)
     if paths["model_path"].endswith(".pkl"):
@@ -759,6 +922,9 @@ def _save_standard_artifacts(
     }
     if history_path and os.path.isfile(history_path):
         metadata["history_path"] = history_path
+    if isinstance(extra_metadata, dict):
+        for key, value in extra_metadata.items():
+            metadata[str(key)] = value
     _save_metadata(paths["metadata_path"], metadata)
     return paths
 
@@ -778,7 +944,6 @@ def _train_ann_expert(
     horizon_steps: int,
     seed: int,
 ) -> Dict[str, Any]:
-    del a_train
     paths = get_price_short_expert_paths(episode_dir, "ann")
     x_train_view = _build_method_input_view(x_train, "ann")
     x_val_view = _build_method_input_view(x_val, "ann")
@@ -787,24 +952,44 @@ def _train_ann_expert(
         x_train_view, y_train, x_val_view, y_val, x_test_view, y_test
     )
     x_test_s = sc_x.transform(x_test_view).astype(np.float32)
+    denom_train = np.maximum(np.abs(a_train), PRICE_SHORT_EXPERT_DENOM_FLOOR)
+    denom_val = np.maximum(np.abs(a_val), PRICE_SHORT_EXPERT_DENOM_FLOOR)
+    dir_train = ((y_train - a_train) > 0.0).astype(np.float32)
+    dir_val = ((y_val - a_val) > 0.0).astype(np.float32)
+    sigma_train = np.clip(np.abs(y_train - a_train) / denom_train, 0.0, 1.0).astype(np.float32)
+    sigma_val = np.clip(np.abs(y_val - a_val) / denom_val, 0.0, 1.0).astype(np.float32)
     _set_deterministic_seed(seed)
     model = _build_ann_model(x_train_view.shape[1])
     best_model = _fit_keras_model(
         model,
         x_train_s,
-        y_train_s,
+        {
+            "price": y_train_s,
+            "direction": dir_train,
+            "uncertainty": sigma_train,
+        },
         x_val_s,
-        y_val_s,
+        {
+            "price": y_val_s,
+            "direction": dir_val,
+            "uncertainty": sigma_val,
+        },
         paths["model_path"],
         paths["history_path"],
         epochs=100,
         batch_size=64,
         patience=10,
     )
-    val_pred = sc_y.inverse_transform(np.ravel(best_model.predict(x_val_s, verbose=0)).reshape(-1, 1))[:, 0]
-    test_pred = sc_y.inverse_transform(np.ravel(best_model.predict(x_test_s, verbose=0)).reshape(-1, 1))[:, 0]
+    val_outputs = _unpack_model_predictions(best_model, best_model.predict(x_val_s, verbose=0))
+    test_outputs = _unpack_model_predictions(best_model, best_model.predict(x_test_s, verbose=0))
+    val_pred = sc_y.inverse_transform(np.ravel(val_outputs["price"]).reshape(-1, 1))[:, 0]
+    test_pred = sc_y.inverse_transform(np.ravel(test_outputs["price"]).reshape(-1, 1))[:, 0]
     val_metrics = _evaluate_forecast(y_val, val_pred, a_val)
     test_metrics = _evaluate_forecast(y_test, test_pred, a_test)
+    val_uncertainty = float(np.mean(np.clip(np.asarray(val_outputs["uncertainty"]).reshape(-1), 0.0, 1.0)))
+    test_uncertainty = float(np.mean(np.clip(np.asarray(test_outputs["uncertainty"]).reshape(-1), 0.0, 1.0)))
+    val_direction_conf = float(np.mean(np.abs(2.0 * np.asarray(val_outputs["direction"]).reshape(-1) - 1.0)))
+    test_direction_conf = float(np.mean(np.abs(2.0 * np.asarray(test_outputs["direction"]).reshape(-1) - 1.0)))
     _save_standard_artifacts(
         "ann",
         episode_dir,
@@ -821,6 +1006,14 @@ def _train_ann_expert(
         horizon_steps,
         history_path=paths["history_path"],
         input_view=_get_method_input_view("ann"),
+        extra_metadata={
+            "architecture": "multitask_residual_ann_forecaster",
+            "ann_latent_dim": int(PRICE_SHORT_EXPERT_ANN_LATENT_DIM),
+            "val_mean_uncertainty": val_uncertainty,
+            "test_mean_uncertainty": test_uncertainty,
+            "val_direction_confidence": val_direction_conf,
+            "test_direction_confidence": test_direction_conf,
+        },
     )
     return {"method": "ann", "success": True, "test_metrics": test_metrics, "val_metrics": val_metrics}
 
@@ -1084,7 +1277,7 @@ def train_price_short_expert_bank(
     _ensure_dir(get_price_short_expert_root(episode_dir))
 
     if PRICE_SHORT_EXPERT_TARGET not in data_filtered.columns:
-        raise ValueError(f"'{PRICE_SHORT_EXPERT_TARGET}' column not found for price expert bank training.")
+        raise ValueError(f"'{PRICE_SHORT_EXPERT_TARGET}' column not found for ANN short-forecast training.")
 
     series = np.asarray(data_filtered[PRICE_SHORT_EXPERT_TARGET].astype(np.float32).values, dtype=np.float32)
     if "Date" in data_filtered.columns:
@@ -1098,7 +1291,7 @@ def train_price_short_expert_bank(
     x_val, y_val, a_val = _create_horizon_windows(val_series, look_back, horizon_steps)
     x_test, y_test, a_test = _create_horizon_windows(test_series, look_back, horizon_steps)
     if min(x_train.shape[0], x_val.shape[0], x_test.shape[0]) <= 0:
-        raise ValueError("Insufficient price data to train the short-horizon expert bank.")
+        raise ValueError("Insufficient price data to train the ANN short-horizon forecast bank.")
 
     results = []
     n_total = len(series)

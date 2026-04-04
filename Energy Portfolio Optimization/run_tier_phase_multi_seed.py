@@ -5,14 +5,14 @@ Run canonical tier phases across multiple seeds.
 Phase ordering per seed:
 - tier1_tier2:
   1) Tier 1 hybrid RL baseline
-  2) Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller
+  2) Tier 2 forecast-guided enhanced MARL baseline
 - tier1_enhancer:
   1) Tier 1 hybrid RL baseline
-  2) Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller
+  2) Tier 2 forecast-guided enhanced MARL baseline
 
 For each run: train via main.py, evaluate via evaluation.py --mode tiers.
 The runner forwards an explicit tier evaluation mode so suites can validate the
-deployed Tier-2 residual path or stay in paper-only policy evaluation.
+deployed Tier-2 path or stay in paper-only policy evaluation.
 """
 
 import argparse
@@ -26,58 +26,58 @@ from datetime import datetime
 
 
 VARIANT_TRAIN_SPECS = {
-    "tier1_basic_marl": {
+    "tier1": {
         "name": "Tier 1 hybrid RL baseline",
-        "slug": "tier1_basic_marl",
+        "slug": "tier1",
         "extra": [],
     },
-    "tier2_forecast_cv": {
-        "name": "Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller (full)",
-        "slug": "tier2_forecast_cv",
+    "tier2": {
+        "name": "Tier 2 forecast-guided enhanced MARL baseline",
+        "slug": "tier2",
         "extra": [
             "--forecast_baseline_enable",
         ],
     },
-    "tier2_forecast_cv_ablated": {
-        "name": "Tier 2 short-horizon conformal residual-aware decision-focused defer-and-route controller (forecast-nullified ablation)",
-        "slug": "tier2_forecast_cv_ablated",
+    "tier2_ablated": {
+        "name": "Tier 2 forecast-ablated enhanced MARL control run",
+        "slug": "tier2_ablated",
         "extra": [
             "--forecast_baseline_enable",
-            "--tier2_cv_ablate_forecast_features",
+            "--tier2_value_ablate_forecast_features",
         ],
     },
 }
 
 PHASE_VARIANTS = {
     "tier1_tier2": [
-        "tier1_basic_marl",
-        "tier2_forecast_cv",
+        "tier1",
+        "tier2",
     ],
     # Legacy alias kept only for backward compatibility with existing scripts/suite dirs.
     "tier1_enhancer": [
-        "tier1_basic_marl",
-        "tier2_forecast_cv",
+        "tier1",
+        "tier2",
     ],
-    "tier2_only": ["tier2_forecast_cv"],
+    "tier2_only": ["tier2"],
     "tier1_tier2_full_ablated": [
-        "tier1_basic_marl",
-        "tier2_forecast_cv",
-        "tier2_forecast_cv_ablated",
+        "tier1",
+        "tier2",
+        "tier2_ablated",
     ],
 }
 
 EVAL_DIR_ARG_BY_VARIANT = {
-    "tier1_basic_marl": "--tier1_dir",
-    "tier2_forecast_cv": "--tier2_dir",
-    "tier2_forecast_cv_ablated": "--tier2_ablated_dir",
+    "tier1": "--tier1_dir",
+    "tier2": "--tier2_dir",
+    "tier2_ablated": "--tier2_ablated_dir",
 }
 
-# evaluation.py --tiers_only accepts:
-# all, baseline, tier2, tier1, tier2_ablated
+# evaluation.py --tiers_only accepts canonical tier names, with "baseline" as
+# a legacy alias for tier1.
 EVAL_TIERS_ONLY_BY_VARIANT = {
-    "tier1_basic_marl": "tier1",
-    "tier2_forecast_cv": "tier2",
-    "tier2_forecast_cv_ablated": "tier2_ablated",
+    "tier1": "tier1",
+    "tier2": "tier2",
+    "tier2_ablated": "tier2_ablated",
 }
 
 
@@ -158,10 +158,29 @@ def extract_eval_metrics(json_path: str, canonical_variant: str = None) -> dict:
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            for k, v in data.items():
+        if not isinstance(data, dict):
+            return out
+
+        source = data
+        if canonical_variant and isinstance(data.get("tiers"), dict):
+            tier_entry = data.get("tiers", {}).get(canonical_variant, {})
+            if isinstance(tier_entry, dict):
+                source = tier_entry
+
+        if isinstance(source, dict):
+            for k, v in source.items():
                 if isinstance(v, (int, float, str, bool)):
                     out[k] = v
+            sleeve = source.get("sleeve_metrics", {})
+            if isinstance(sleeve, dict):
+                for k, v in sleeve.items():
+                    if isinstance(v, (int, float, str, bool)):
+                        out[k] = v
+
+        for k in ("tier_report_scope", "tier_comparison_csv", "tier_comparison_md"):
+            v = data.get(k)
+            if isinstance(v, (int, float, str, bool)):
+                out[k] = v
         return out
     except Exception:
         return out
@@ -306,6 +325,10 @@ def main():
                         help="Pinned PPO learning rate for canonical seed-suite runs.")
     parser.add_argument("--ent_coef", type=float, default=0.03,
                         help="Pinned PPO entropy coefficient for canonical seed-suite runs.")
+    parser.add_argument("--tier2_value_lr", type=float, default=1e-3,
+                        help="Explicit Tier-2 optimizer learning rate forwarded to main.py for Tier-2 runs.")
+    parser.add_argument("--dl_train_every", type=int, default=128,
+                        help="Explicit Tier-2 online training frequency forwarded to main.py for Tier-2 runs.")
     parser.add_argument("--ppo_log_std_init", type=float, default=None,
                         help="Pinned PPO log_std_init for canonical seed-suite runs.")
     parser.add_argument("--enable_ppo_use_sde", action="store_true",
@@ -372,7 +395,10 @@ def main():
         "--forecast_base_dir", args.forecast_base_dir,
         "--forecast_cache_dir", args.forecast_cache_dir,
     ]
-    cv_policy_args = []
+    tier2_policy_args = [
+        "--tier2_value_lr", str(args.tier2_value_lr),
+        "--dl_train_every", str(args.dl_train_every),
+    ]
     protocol_path = os.path.join(suite_dir, "phase_protocol.json")
     if str(args.suite_dir).strip():
         existing_protocol = _load_existing_protocol(protocol_path)
@@ -385,6 +411,8 @@ def main():
                 "meta_freq_max": int(args.meta_freq_max),
                 "ppo_use_sde": bool(args.enable_ppo_use_sde),
                 "ppo_log_std_init": None if args.ppo_log_std_init is None else float(args.ppo_log_std_init),
+                "tier2_value_lr": float(args.tier2_value_lr),
+                "dl_train_every": int(args.dl_train_every),
             }
             for key, expected in compatibility_checks.items():
                 actual = existing_protocol.get(key)
@@ -405,19 +433,22 @@ def main():
             "meta_freq_max": int(args.meta_freq_max),
             "ppo_use_sde": bool(args.enable_ppo_use_sde),
             "ppo_log_std_init": None if args.ppo_log_std_init is None else float(args.ppo_log_std_init),
+            "tier2_value_lr": float(args.tier2_value_lr),
+            "dl_train_every": int(args.dl_train_every),
             "tiers_eval_mode": str(args.tiers_eval_mode),
             "tiers_precompute_forecasts": bool(args.tiers_precompute_forecasts),
             "tiers_precompute_batch_size": int(args.tiers_precompute_batch_size),
             "shared_training_args": common_args,
             "tier1_policy_args": baseline_policy_args,
             "forecast_args_for_tier2": forecast_args,
-            "tier2_policy_args": cv_policy_args,
+            "tier2_policy_args": tier2_policy_args,
             "documentation": (
-                "Tier 1 uses the hybrid RL baseline. Tier 2 variants train from scratch on the same investor-only "
-                "base trading policy while adding a short-horizon residual-aware forecast-backed decision-focused defer-and-route "
-                "controller that is validated in deployed evaluation."
+                "Tier 1 uses the hybrid RL baseline. Tier 2 is an independent forecast-guided enhanced MARL "
+                "baseline that trains its own RL policies together with its own ANN-primary short-horizon "
+                "forecast-conditioned Tier-2 layer. Tier 2 ablated keeps the same training contract but removes "
+                "the full Tier-2 forecast-memory block."
             ),
-            "tier2_training_contract": "short_horizon_conformal_residual_aware_decision_focused_defer_and_route_controller",
+            "tier2_training_contract": "independent_forecast_guided_enhanced_marl_baseline",
         },
     )
     # Build full run plan with deterministic global numbering.
@@ -482,11 +513,16 @@ def main():
         spec = VARIANT_TRAIN_SPECS[canonical]
         save_dir = str(plan["save_dir"])
         eval_out = str(plan["eval_output_dir"])
+        current_seed_dir = os.path.join(suite_dir, f"seed{seed}")
+        current_tier1_dir = os.path.join(
+            current_seed_dir,
+            f"{VARIANT_TRAIN_SPECS['tier1']['slug']}_seed{seed}",
+        )
 
         extra = list(spec["extra"])
         train_extra_args = []
-        if canonical != "tier1_basic_marl":
-            train_extra_args = forecast_args + cv_policy_args
+        if canonical != "tier1":
+            train_extra_args = list(baseline_policy_args) + forecast_args + tier2_policy_args
         else:
             train_extra_args = list(baseline_policy_args)
         label = f"[Run {run_no}/{total_runs}] {spec['name']} (seed={seed}, order={idx})"
@@ -516,6 +552,7 @@ def main():
             eval_cmd = [
                 py, "evaluation.py", "--mode", "tiers", "--tiers_only", tiers_only_val,
                 eval_dir_arg, save_dir,
+                "--tier1_dir", current_tier1_dir,
                 "--eval_data", args.eval_data,
                 "--eval_steps", str(eval_steps),
                 "--output_dir", eval_out,
@@ -532,6 +569,11 @@ def main():
             eval_label = f"[Run {run_no}/{total_runs}] Eval {canonical} (seed={seed})"
             eval_result = run_command(eval_cmd, eval_label)
             row["evaluation_success"] = eval_result.get("success", False)
+            if row["evaluation_success"]:
+                eval_json_path = find_latest_file(eval_out, "evaluation_tiers_*.json")
+                if eval_json_path:
+                    row["evaluation_results_json"] = eval_json_path
+                    row.update(extract_eval_metrics(eval_json_path, canonical))
 
         summary_rows = upsert_summary_row(summary_rows, row)
         write_seed_summary_csv(summary_rows, summary_csv)

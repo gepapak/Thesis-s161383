@@ -1098,13 +1098,18 @@ def _resolve_reserved_eval_forecast_context(
     }
 
 
-def _expected_cv_weight_names(variant: Optional[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+def _expected_tier2_weight_names(variant: Optional[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     """Return expected and incompatible Tier-2 checkpoint names."""
-    expected = ("tier2_routed_overlay.h5", "dl_control_variate.h5")
+    try:
+        from tier2 import get_tier2_weight_filenames
+
+        expected = tuple(get_tier2_weight_filenames())
+    except Exception:
+        expected = ("tier2_policy_improvement.pkl", "tier2_policy_improvement.h5")
     return (expected, ())
 
 
-def _collect_cv_weight_candidates(final_models_dir: str, tier_dir: str, names: Tuple[str, ...]) -> list[str]:
+def _collect_tier2_weight_candidates(final_models_dir: str, tier_dir: str, names: Tuple[str, ...]) -> list[str]:
     """Collect Tier-2 checkpoint candidates from final_models/ and episode checkpoints."""
     import re
 
@@ -1119,7 +1124,7 @@ def _collect_cv_weight_candidates(final_models_dir: str, tier_dir: str, names: T
                     ep_dirs.append((int(m.group(1)), os.path.join(ckpt_root, name)))
         except Exception as e:
             raise RuntimeError(
-                f"[EVAL_CV_WEIGHTS_FATAL] Failed to list checkpoint directory {ckpt_root}: {e}"
+                f"[EVAL_TIER2_WEIGHTS_FATAL] Failed to list checkpoint directory {ckpt_root}: {e}"
             ) from e
         for _, ep_path in sorted(ep_dirs, key=lambda x: x[0], reverse=True):
             for name in names:
@@ -1127,15 +1132,15 @@ def _collect_cv_weight_candidates(final_models_dir: str, tier_dir: str, names: T
     return candidates
 
 
-def _resolve_cv_weights(final_models_dir: str, tier_dir: str, variant: Optional[str] = None) -> Optional[str]:
+def _resolve_tier2_weights(final_models_dir: str, tier_dir: str, variant: Optional[str] = None) -> Optional[str]:
     """Resolve the exact Tier-2 weights required for a tier variant."""
-    expected_names, incompatible_names = _expected_cv_weight_names(variant)
-    candidates = _collect_cv_weight_candidates(final_models_dir, tier_dir, expected_names)
+    expected_names, incompatible_names = _expected_tier2_weight_names(variant)
+    candidates = _collect_tier2_weight_candidates(final_models_dir, tier_dir, expected_names)
     for p in candidates:
         if p and os.path.exists(p):
             return p
 
-    incompatible_candidates = _collect_cv_weight_candidates(final_models_dir, tier_dir, incompatible_names)
+    incompatible_candidates = _collect_tier2_weight_candidates(final_models_dir, tier_dir, incompatible_names)
     found_incompatible = [p for p in incompatible_candidates if p and os.path.exists(p)]
     if found_incompatible:
         variant_name = str(variant or "").strip().lower() or "tier2"
@@ -1146,9 +1151,14 @@ def _resolve_cv_weights(final_models_dir: str, tier_dir: str, variant: Optional[
     return None
 
 
-def _resolve_cv_weights_from_models_dir(models_dir: str) -> Optional[str]:
+def _resolve_tier2_weights_from_models_dir(models_dir: str) -> Optional[str]:
     """Resolve Tier-2 weights from a generic models directory."""
-    candidate_names = ("tier2_routed_overlay.h5", "dl_control_variate.h5")
+    try:
+        from tier2 import get_tier2_weight_filenames
+
+        candidate_names = tuple(get_tier2_weight_filenames())
+    except Exception:
+        candidate_names = ("tier2_policy_improvement.pkl", "tier2_policy_improvement.h5")
     roots = [models_dir, os.path.join(models_dir, "final_models")]
     for root in roots:
         if not root:
@@ -1158,7 +1168,6 @@ def _resolve_cv_weights_from_models_dir(models_dir: str) -> Optional[str]:
             if p and os.path.exists(p):
                 return p
     return None
-
 
 def _build_eval_config(args):
     from config import EnhancedConfig
@@ -1188,39 +1197,16 @@ def _hydrate_eval_config_from_training_config(cfg, final_models_dir: str):
 
     final_cfg = saved.get("final_config", {}) or {}
     enhanced = saved.get("enhanced_features", {}) or {}
-    keys = [
-        "tier2_feature_dim",
-        "cv_forecast_dim",
-        "tier2_cv_architecture",
-        "tier2_cv_memory_steps",
-        "tier2_mape_window",
-        "tier2_mape_reference",
-        "tier2_runtime_overlay_enable",
-        "tier2_runtime_gain",
-        "tier2_runtime_mc_samples",
-        "tier2_runtime_sigma_scale",
-        "tier2_runtime_conformal_margin",
-        "tier2_cv_delta_max",
-        "tier2_cv_target_scale",
-        "tier2_cv_confidence_loss_weight",
-        "tier2_cv_route_loss_weight",
-        "tier2_cv_override_loss_weight",
-        "tier2_cv_decision_horizon",
-        "tier2_cv_decision_scale",
-        "tier2_cv_decision_downside_weight",
-        "tier2_cv_decision_vol_weight",
-        "tier2_cv_decision_stability_penalty",
-        "tier2_cv_route_grid_points",
-        "tier2_cv_conformal_alpha",
-        "tier2_cv_conformal_scale",
-        "tier2_cv_sharpe_improvement_scale",
-    ]
-    for key in keys:
-        if key in final_cfg and hasattr(cfg, key):
-            setattr(cfg, key, final_cfg[key])
+
+    for key, value in dict(final_cfg).items():
+        if value is None:
+            continue
+        normalized_key = str(key)
+        if hasattr(cfg, normalized_key):
+            setattr(cfg, normalized_key, value)
 
     if "tier2_ablated" in enhanced:
-        cfg.tier2_cv_ablate_forecast_features = bool(enhanced.get("tier2_ablated", False))
+        cfg.tier2_value_ablate_forecast_features = bool(enhanced.get("tier2_ablated", False))
     return cfg
 
 
@@ -1230,9 +1216,9 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
     Compares active training regimes under identical Tier-1 environment dynamics and
     observation spaces (no forecast-derived observations):
 
-      - baseline:   Tier-1 hybrid RL baseline (no forecast backend)
-      - tier2:      Tier-1 hybrid RL baseline with the Tier-2 short-horizon residual-aware defer-and-route layer
-      - tier2_ablated: Tier-1 hybrid RL baseline with the Tier-2 forecast-nullified ablation
+      - tier1:      Tier-1 hybrid RL baseline (no forecast backend)
+      - tier2:      Independent Tier-2 forecast-guided enhanced MARL baseline
+      - tier2_ablated: Independent Tier-2 enhanced MARL baseline with forecast-memory ablation
 
     IMPORTANT:
       - In paper mode, forecasts are NOT enabled and evaluation stays policy-only.
@@ -1254,17 +1240,23 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
         env_log_dir = os.path.join(tier_out, "env_logs")
         os.makedirs(env_log_dir, exist_ok=True)
 
-        # Load SB3 policies
-        final_models_dir = os.path.join(run_dir, "final_models")
-        models = load_checkpoint_models(final_models_dir)
-
         eval_mode = str(getattr(args, "tiers_eval_mode", "paper") or "paper").strip().lower()
         deployed = (eval_mode == "deployed")
         is_tier2_variant = name in ("tier2", "tier2_ablated")
         is_ablated_variant = (name == "tier2_ablated")
 
+        # Each tier variant is evaluated from its own trained policy checkpoint.
+        # Tier-2 is an independent forecast-guided baseline, not a Tier-1 overlay
+        # checkpoint swap, so its RL policies and Tier-2 weights both come from
+        # the same run directory.
+        policy_run_dir = run_dir
+        policy_final_models_dir = os.path.join(run_dir, "final_models")
+
+        # Load SB3 policies
+        models = load_checkpoint_models(policy_final_models_dir)
+
         # Start from the same base evaluation config, then enable Tier-2 runtime extras only when requested.
-        cfg = _hydrate_eval_config_from_training_config(_build_eval_config(args), final_models_dir)
+        cfg = _hydrate_eval_config_from_training_config(_build_eval_config(args), policy_final_models_dir)
         dl_weights_path = None
 
         if not deployed:
@@ -1280,7 +1272,7 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 fail_fast=True,
             )
         else:
-            # Deployed/system evaluation: attach the runtime forecaster + Tier-2 routed overlay only
+            # Deployed/system evaluation: attach the runtime forecaster + Tier-2 policy-improvement layer only
             # for Tier-2 variants. Baseline remains forecast-free even in deployed mode.
             wants_cv = is_tier2_variant
             enable_forecasting = bool(wants_cv)
@@ -1311,15 +1303,15 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 if not os.path.isdir(cache_dir):
                     cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
 
-                dl_weights_path = _resolve_cv_weights(final_models_dir, run_dir, variant=name)
+                dl_weights_path = _resolve_tier2_weights(policy_final_models_dir, run_dir, variant=name)
                 if not dl_weights_path:
                     raise RuntimeError(
-                        f"Deployed tier evaluation for '{name}' requires Tier-2 routed overlay weights, but none were found in "
-                        f"'{final_models_dir}' or checkpoints under '{run_dir}'."
+                        f"Deployed tier evaluation for '{name}' requires Tier-2 policy-improvement weights, but none were found in "
+                        f"'{policy_final_models_dir}' or checkpoints under '{run_dir}'."
                     )
 
             cfg.forecast_baseline_enable = bool(enable_forecasting and dl_weights_path)
-            cfg.tier2_cv_ablate_forecast_features = bool(is_ablated_variant and dl_weights_path)
+            cfg.tier2_value_ablate_forecast_features = bool(is_ablated_variant and dl_weights_path)
 
             env, _ = create_evaluation_environment(
                 eval_data,
@@ -1327,7 +1319,7 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 model_dir=model_dir,
                 scaler_dir=scaler_dir,
                 metadata_dir=metadata_dir,
-                cv_weights_path=dl_weights_path,
+                tier2_weights_path=dl_weights_path,
                 output_dir=tier_out,
                 investment_freq=args.investment_freq,
                 config=cfg,
@@ -1359,20 +1351,20 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
 
         tier_metrics["status"] = "completed"
         tier_metrics["run_dir"] = run_dir
-        tier_metrics["final_models_dir"] = final_models_dir
+        tier_metrics["final_models_dir"] = policy_final_models_dir
+        tier_metrics["base_policy_run_dir"] = policy_run_dir
+        tier_metrics["base_policy_models_dir"] = policy_final_models_dir
         tier_metrics["evaluation_mode"] = "tiers"
         tier_metrics["variant"] = name
         tier_metrics["tiers_eval_mode"] = eval_mode
         tier_metrics["deployed_enable_forecasting"] = bool(deployed and is_tier2_variant)
         tier_metrics["deployed_tier2_weights_path"] = dl_weights_path or ""
         tier_metrics["deployed_tier2_enabled"] = bool(deployed and is_tier2_variant and dl_weights_path)
-        tier_metrics["deployed_tier2_feature_dim"] = int(
-            getattr(cfg, "tier2_feature_dim", getattr(cfg, "cv_forecast_dim", 0)) or 0
+        tier_metrics["deployed_tier2_policy_family"] = str(
+            getattr(cfg, "tier2_policy_family", "conservative_actor_critic") or "conservative_actor_critic"
         )
-        tier_metrics["deployed_cv_weights_path"] = dl_weights_path or ""
-        tier_metrics["deployed_cv_enabled"] = bool(deployed and is_tier2_variant and dl_weights_path)
-        tier_metrics["deployed_cv_feature_dim"] = int(
-            getattr(cfg, "tier2_feature_dim", getattr(cfg, "cv_forecast_dim", 0)) or 0
+        tier_metrics["deployed_tier2_feature_dim"] = int(
+            getattr(cfg, "tier2_feature_dim", 0) or 0
         )
         return tier_metrics
 
@@ -1386,15 +1378,15 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
             return bool(include_in_all)
         return sel in (key, legacy_key)
 
-    # Baseline (legacy: tier1)
-    if _wants("baseline", "tier1", include_in_all=True):
-        results["tiers"]["baseline"] = _tier_eval("baseline", args.tier1_dir)
+    # Tier 1 baseline (legacy alias: baseline)
+    if _wants("tier1", "baseline", include_in_all=True):
+        results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir)
 
-    # Tier-2 full routed residual-aware overlay
+    # Tier-2 full forecast-guided enhanced baseline
     if _wants("tier2", "tier2", include_in_all=True):
         results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir)
 
-    # Tier-2 sole ablation: forecast-feature ablated (nullified forecast features)
+    # Tier-2 sole ablation: full forecast-memory ablation with the same controller
     if _wants("tier2_ablated", "tier2_ablated", include_in_all=True):
         results["tiers"]["tier2_ablated"] = _tier_eval("tier2_ablated", args.tier2_ablated_dir)
 
@@ -1570,7 +1562,7 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
 
     rows = []
     preferred_order = [
-        "baseline",
+        "tier1",
         "tier2",
         "tier2_ablated",
     ]
@@ -1587,9 +1579,9 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
             "status": r.get("status", "unknown"),
             "tiers_eval_mode": str(r.get("tiers_eval_mode", "unknown") or "unknown"),
             "deployed_enable_forecasting": bool(r.get("deployed_enable_forecasting", False)),
-            "deployed_tier2_enabled": bool(r.get("deployed_tier2_enabled", r.get("deployed_cv_enabled", False))),
-            "deployed_tier2_feature_dim": int(r.get("deployed_tier2_feature_dim", r.get("deployed_cv_feature_dim", 0)) or 0),
-            "deployed_tier2_weights_path": r.get("deployed_tier2_weights_path", r.get("deployed_cv_weights_path", "")),
+            "deployed_tier2_enabled": bool(r.get("deployed_tier2_enabled", False)),
+            "deployed_tier2_feature_dim": int(r.get("deployed_tier2_feature_dim", 0) or 0),
+            "deployed_tier2_weights_path": r.get("deployed_tier2_weights_path", ""),
             "final_portfolio_value_usd": float(r.get("final_portfolio_value", 0.0)),
             "initial_portfolio_value_usd": float(r.get("initial_portfolio_value", 0.0)),
             "total_return_pct": _pct(r.get("total_return", 0.0)),
@@ -1639,13 +1631,13 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         f.write("| Variant | Status | Mode | Forecasting | Tier-2 Overlay | Final (USD) | Return % | Sharpe | Max DD % | Trading Sharpe | Trading Max DD % |\n")
         f.write("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|\n")
         for _, row in df.iterrows():
-            cv_label = "off"
+            tier2_label = "off"
             if bool(row.get("deployed_tier2_enabled", False)):
-                cv_dim = int(row.get("deployed_tier2_feature_dim", 0) or 0)
-                cv_label = f"on ({cv_dim}D)" if cv_dim > 0 else "on"
+                tier2_dim = int(row.get("deployed_tier2_feature_dim", 0) or 0)
+                tier2_label = f"on ({tier2_dim}D)" if tier2_dim > 0 else "on"
             f.write(
                 f"| {row['variant']} | {row['status']} | {row['tiers_eval_mode']} | "
-                f"{'on' if bool(row['deployed_enable_forecasting']) else 'off'} | {cv_label} | "
+                f"{'on' if bool(row['deployed_enable_forecasting']) else 'off'} | {tier2_label} | "
                 f"{row['final_portfolio_value_usd']:.2f} | {row['total_return_pct']:.3f} | "
                 f"{row['sharpe_ratio']:.4f} | {row['max_drawdown_pct']:.3f} | "
                 f"{row['trading_sharpe']:.4f} | {row['trading_max_dd_pct']:.3f} |\n"
@@ -1714,7 +1706,7 @@ def load_agent_system(trained_agents_dir: str, eval_env, enhanced: bool = False)
         return None
 
 def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[Any]:
-    """Load enhanced MultiESGAgent system with forecasting and the Tier-2 routed overlay."""
+    """Load enhanced MultiESGAgent system with forecasting and the Tier-2 policy-improvement layer."""
     print(f"Loading enhanced agent system from: {enhanced_models_dir}")
 
     config_file = os.path.join(enhanced_models_dir, "training_config.json")
@@ -1727,75 +1719,85 @@ def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[A
             forecasting_enabled = bool(
                 enhanced_features.get("forecasting_enabled", False)
                 or enhanced_features.get("tier2_enabled", False)
-                or enhanced_features.get("tier2_routed_overlay_enabled", False)
-                or enhanced_features.get("dl_cv_enabled", False)
-                or enhanced_features.get("cv_enabled", False)
+                or enhanced_features.get("tier2_policy_improvement_enabled", False)
             )
-            cv_enabled = bool(
+            tier2_enabled = bool(
                 enhanced_features.get("tier2_enabled", False)
-                or enhanced_features.get("tier2_routed_overlay_enabled", False)
-                or enhanced_features.get("cv_enabled", False)
-                or enhanced_features.get("dl_cv_enabled", False)
+                or enhanced_features.get("tier2_policy_improvement_enabled", False)
             )
-            has_cv_weights = bool(
+            has_tier2_weights = bool(
                 enhanced_features.get("has_tier2_weights", False)
-                or enhanced_features.get("has_routed_overlay_weights", False)
-                or enhanced_features.get("has_cv_weights", False)
+                or enhanced_features.get("has_tier2_policy_improvement_weights", False)
             )
 
             print("   Enhanced features detected:")
             print(f"      Forecasting: {'yes' if forecasting_enabled else 'no'}")
-            print(f"      Tier-2 Routed Overlay: {'yes' if cv_enabled else 'no'}")
-            print(f"      Tier-2 Weights: {'yes' if has_cv_weights else 'no'}")
+            print(f"      Tier-2 Policy Improvement: {'yes' if tier2_enabled else 'no'}")
+            print(f"      Tier-2 Weights: {'yes' if has_tier2_weights else 'no'}")
 
-            if has_cv_weights:
-                dl_weights_path = _resolve_cv_weights_from_models_dir(enhanced_models_dir)
+            if has_tier2_weights:
+                dl_weights_path = _resolve_tier2_weights_from_models_dir(enhanced_models_dir)
                 if dl_weights_path and os.path.exists(dl_weights_path):
-                    print(f"   Tier-2 routed overlay weights found: {dl_weights_path}")
+                    print(f"   Tier-2 policy-improvement weights found: {dl_weights_path}")
                 else:
-                    print("   Tier-2 routed overlay weights missing")
+                    print("   Tier-2 policy-improvement weights missing")
         except Exception as e:
             print(f"   Could not read training config: {e}")
 
     return load_agent_system(enhanced_models_dir, eval_env, enhanced=True)
 
 
-def create_evaluation_cv_adapter(cv_weights_path: str, obs_dim: int, config=None, strict_load: bool = False):
-    """Create the Tier-2 routed overlay adapter for evaluation. Loads weights if path exists."""
+def create_evaluation_tier2_value_adapter(
+    tier2_weights_path: Optional[str],
+    obs_dim: int,
+    config=None,
+    strict_load: bool = False,
+):
+    """Create the Tier-2 policy-improvement adapter for evaluation. Loads weights if path exists."""
     try:
-        from tier2_routed_overlay import Tier2RoutedOverlayAdapter, TIER2_ROUTED_OVERLAY_FEATURE_DIM
+        from tier2 import (
+            TIER2_POLICY_IMPROVEMENT_FEATURE_DIM,
+            Tier2PolicyImprovementAdapter,
+        )
 
         forecast_dim = int(
             getattr(
                 config,
                 "tier2_feature_dim",
-                getattr(config, "cv_forecast_dim", TIER2_ROUTED_OVERLAY_FEATURE_DIM),
+                TIER2_POLICY_IMPROVEMENT_FEATURE_DIM,
             )
-            or TIER2_ROUTED_OVERLAY_FEATURE_DIM
+            or TIER2_POLICY_IMPROVEMENT_FEATURE_DIM
         )
-        adapter = Tier2RoutedOverlayAdapter(
+        adapter = Tier2PolicyImprovementAdapter(
             obs_dim=obs_dim,
             forecast_dim=forecast_dim,
-            memory_steps=int(getattr(config, "tier2_cv_memory_steps", 2) or 2),
+            policy_family=getattr(config, "tier2_policy_family", None),
+            memory_steps=int(getattr(config, "tier2_value_memory_steps", 2) or 2),
+            value_target_scale=float(
+                getattr(config, "tier2_value_target_scale", 0.01) or 0.01
+            ),
+            runtime_min_abs_delta=float(getattr(config, "tier2_runtime_min_abs_delta", 0.0)),
+            nav_head_scale=float(getattr(config, "tier2_value_nav_head_scale", 3.0) or 3.0),
+            return_floor_head_scale=float(getattr(config, "tier2_value_return_floor_head_scale", 4.0) or 4.0),
             seed=42,
         )
-        if os.path.exists(cv_weights_path):
-            if adapter.load_weights(cv_weights_path):
-                print_progress("Tier-2 routed overlay weights loaded successfully")
+        if tier2_weights_path and os.path.exists(tier2_weights_path):
+            if adapter.load_weights(tier2_weights_path):
+                print_progress("Tier-2 policy-improvement weights loaded successfully")
             else:
                 if strict_load:
-                    raise RuntimeError(f"Failed to load Tier-2 routed overlay weights from {cv_weights_path}")
-                print_progress(f"Could not load Tier-2 routed overlay weights from {cv_weights_path}")
+                    raise RuntimeError(f"Failed to load Tier-2 policy-improvement weights from {tier2_weights_path}")
+                print_progress(f"Could not load Tier-2 policy-improvement weights from {tier2_weights_path}")
         else:
-            msg = "Tier-2 routed overlay weights file not found"
+            msg = "Tier-2 policy-improvement weights file not found"
             if strict_load:
                 raise FileNotFoundError(msg)
-            print_progress(f"{msg} (continuing without Tier-2 overlay)")
+            print_progress(f"{msg} (continuing without the Tier-2 layer)")
         return adapter
     except Exception as e:
         if strict_load:
-            raise RuntimeError(f"Failed to create Tier-2 routed overlay adapter: {e}") from e
-        print_progress(f"Failed to create Tier-2 routed overlay adapter: {e}")
+            raise RuntimeError(f"Failed to create Tier-2 policy-improvement adapter: {e}") from e
+        print_progress(f"Failed to create Tier-2 policy-improvement adapter: {e}")
         return None
 
 
@@ -1806,7 +1808,7 @@ def create_evaluation_environment(
     scaler_dir: str = "saved_scalers",
     metadata_dir: Optional[str] = None,
     log_path: Optional[str] = None,
-    cv_weights_path: Optional[str] = None,
+    tier2_weights_path: Optional[str] = None,
     output_dir: str = "evaluation_results",
     investment_freq: int = 6,
     config=None,
@@ -1819,9 +1821,9 @@ def create_evaluation_environment(
     """Create evaluation environment with optional forecasting (Tier-aligned)."""
     print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Setting up evaluation environment...")
 
-    if config is not None and cv_weights_path:
+    if config is not None and tier2_weights_path:
         try:
-            config = _hydrate_eval_config_from_training_config(config, os.path.dirname(cv_weights_path))
+            config = _hydrate_eval_config_from_training_config(config, os.path.dirname(tier2_weights_path))
         except Exception:
             pass
 
@@ -1930,12 +1932,13 @@ def create_evaluation_environment(
 
         active_cfg = getattr(base_env, "config", config)
         if active_cfg is not None:
-            active_cfg.forecast_baseline_enable = bool(cv_weights_path and os.path.exists(cv_weights_path))
+            active_cfg.forecast_baseline_enable = bool(tier2_weights_path and os.path.exists(tier2_weights_path))
 
-        # Tier-2 eval trust: mirror training by initializing CalibrationTracker when forecasts are enabled.
+        # Forecast-trust calibration is compatibility-only diagnostics for the
+        # clean-room Tier-2 path.
         if enable_forecasting and active_cfg is not None:
             try:
-                from tier2_routed_overlay import CalibrationTracker
+                from tier2 import CalibrationTracker
 
                 base_env.calibration_tracker = CalibrationTracker(
                     window_size=getattr(active_cfg, "forecast_trust_window", 500),
@@ -1949,40 +1952,38 @@ def create_evaluation_environment(
                 print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ CalibrationTracker initialized for evaluation (forecast trust)")
             except Exception as e:
                 base_env.calibration_tracker = None
-                if fail_fast:
-                    raise RuntimeError(f"CalibrationTracker init failed: {e}") from e
+                # Diagnostics only; deployed Tier-2 eval remains valid without this helper.
                 print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â CalibrationTracker init failed: {e}")
 
         # Setup Tier-2 layer if weights are provided.
         # When Tier-2 is enabled and not ablated, the environment also activates
-        # the short-horizon runtime residual overlay on top of investor exposure.
-        if cv_weights_path and os.path.exists(cv_weights_path):
+        # the short-horizon runtime Tier-2 layer on top of investor exposure.
+        if tier2_weights_path and os.path.exists(tier2_weights_path):
             try:
-                print_progress(f"Loading Tier-2 routed overlay weights: {os.path.basename(cv_weights_path)}")
+                print_progress(f"Loading Tier-2 policy-improvement weights: {os.path.basename(tier2_weights_path)}")
                 obs_dim = int(base_env.observation_spaces["investor_0"].shape[0])
-                cv_adapter = create_evaluation_cv_adapter(
-                    cv_weights_path,
+                tier2_value_adapter = create_evaluation_tier2_value_adapter(
+                    tier2_weights_path,
                     obs_dim=obs_dim,
                     config=config,
                     strict_load=bool(fail_fast),
                 )
-                if cv_adapter:
-                    base_env.control_variate_adapter = cv_adapter
-                    base_env.tier2_overlay_adapter = cv_adapter
+                if tier2_value_adapter:
+                    base_env.tier2_value_adapter = tier2_value_adapter
                     if getattr(base_env, "config", None) is not None:
                         base_env.config.forecast_baseline_enable = True
                     print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Tier-2 layer attached to evaluation environment")
                 else:
                     if fail_fast:
-                        raise RuntimeError("Failed to create Tier-2 routed overlay adapter")
-                    print_progress("Failed to create Tier-2 routed overlay adapter")
+                        raise RuntimeError("Failed to create Tier-2 policy-improvement adapter")
+                    print_progress("Failed to create Tier-2 policy-improvement adapter")
             except Exception as e:
                 if fail_fast:
-                    raise RuntimeError(f"Failed to load Tier-2 routed overlay weights: {e}") from e
-                print_progress(f"Failed to load Tier-2 routed overlay weights: {e}")
-                print_progress("   Continuing evaluation without the Tier-2 overlay...")
-        elif cv_weights_path and fail_fast:
-            raise FileNotFoundError(f"Tier-2 routed overlay weights path does not exist: {cv_weights_path}")
+                    raise RuntimeError(f"Failed to load Tier-2 policy-improvement weights: {e}") from e
+                print_progress(f"Failed to load Tier-2 policy-improvement weights: {e}")
+                print_progress("   Continuing evaluation without the Tier-2 layer...")
+        elif tier2_weights_path and fail_fast:
+            raise FileNotFoundError(f"Tier-2 policy-improvement weights path does not exist: {tier2_weights_path}")
 
         # Wrap with forecasting if enabled
         if forecaster is not None and enable_forecasting:
@@ -2429,7 +2430,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
         print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Baseline evaluation error: {e}")
         comprehensive_results['configurations']['baselines'] = {'error': str(e)}
 
-    # 2. Evaluate Normal Models (no forecasts, no Tier-2 overlay) - Create basic environment
+    # 2. Evaluate Normal Models (no forecasts, no Tier-2 layer) - Create basic environment
     print_progress("ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ [2/3] EVALUATING NORMAL MODELS (No Forecasts/Tier-2)...", 2, 3)
     try:
         if os.path.exists(args.normal_models):
@@ -2455,7 +2456,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                     normal_results = run_agent_evaluation(normal_agent_system, normal_eval_env, eval_data, args.eval_steps)
                     if normal_results:
                         normal_results['model_type'] = 'normal'
-                        normal_results['features'] = {'forecasting': False, 'cv': False}
+                        normal_results['features'] = {'forecasting': False, 'tier2_policy_improvement': False}
                         comprehensive_results['configurations']['normal_agents'] = normal_results
                         print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Normal agent evaluation completed")
                     else:
@@ -2474,13 +2475,13 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
         print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Normal agent evaluation error: {e}")
         comprehensive_results['configurations']['normal_agents'] = {'error': str(e)}
 
-    # 3. Evaluate Full Models (with forecasts and the Tier-2 routed overlay) - Create enhanced environment
-    print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ [3/3] EVALUATING FULL MODELS (With Forecasts + Tier-2 Routed Overlay)...", 3, 3)
+    # 3. Evaluate Full Models (with forecasts and the Tier-2 policy-improvement layer) - Create enhanced environment
+    print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ [3/3] EVALUATING FULL MODELS (With Forecasts + Tier-2 Policy Improvement)...", 3, 3)
     try:
         if os.path.exists(args.full_models):
-            # Create enhanced evaluation environment with the Tier-2 routed overlay
+            # Create enhanced evaluation environment with the Tier-2 policy-improvement layer
             print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Creating enhanced environment for full models...")
-            dl_weights_path = _resolve_cv_weights_from_models_dir(args.full_models)
+            dl_weights_path = _resolve_tier2_weights_from_models_dir(args.full_models)
             forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
             enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
                 eval_data,
@@ -2488,7 +2489,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                 model_dir=forecast_ctx["model_dir"],
                 scaler_dir=forecast_ctx["scaler_dir"],
                 metadata_dir=forecast_ctx["metadata_dir"],
-                cv_weights_path=dl_weights_path,
+                tier2_weights_path=dl_weights_path,
                 output_dir=args.output_dir,
                 investment_freq=args.investment_freq,
                 config=_build_eval_config(args),
@@ -2505,7 +2506,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                     full_results = run_agent_evaluation(full_agent_system, enhanced_eval_env, eval_data, args.eval_steps)
                     if full_results:
                         full_results['model_type'] = 'enhanced'
-                        full_results['features'] = {'forecasting': True, 'cv': True}
+                        full_results['features'] = {'forecasting': True, 'tier2_policy_improvement': True}
                         comprehensive_results['configurations']['full_agents'] = full_results
                         print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Full agent evaluation completed")
                     else:
@@ -2622,7 +2623,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
                     'initial_value_usd': initial_value,
                     'type': 'agent',
                     'forecasting': features.get('forecasting', False),
-                    'cv': features.get('cv', False)
+                    'tier2_policy_improvement': features.get('tier2_policy_improvement', False)
                 }
 
     # Sort by final portfolio value for the main table
@@ -2638,7 +2639,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
         if metrics['type'] == 'agent':
             features = []
             if metrics.get('forecasting'): features.append("Forecasting")
-            if metrics.get('cv', False): features.append("DL Control Variate")
+            if metrics.get('tier2_policy_improvement', False): features.append("Tier-2 Policy Improvement")
             features_str = ', '.join(features) if features else 'Basic RL'
         else:
             features_str = 'Traditional'
@@ -2665,7 +2666,7 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
         if metrics['type'] == 'agent':
             features = []
             if metrics.get('forecasting'): features.append("Forecasting")
-            if metrics.get('cv', False): features.append("DL Control Variate")
+            if metrics.get('tier2_policy_improvement', False): features.append("Tier-2 Policy Improvement")
             features_str = f" ({', '.join(features) if features else 'Basic'})"
 
         print(f"   {i}. {config_name}{features_str}")
@@ -2683,9 +2684,9 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
 
         for config_name, metrics in performance_data.items():
             if metrics['type'] == 'agent':
-                if not metrics.get('forecasting') and not metrics.get('cv', False):
+                if not metrics.get('forecasting') and not metrics.get('tier2_policy_improvement', False):
                     normal_metrics = metrics
-                elif metrics.get('forecasting') and metrics.get('cv', False):
+                elif metrics.get('forecasting') and metrics.get('tier2_policy_improvement', False):
                     full_metrics = metrics
 
         if normal_metrics and full_metrics:
@@ -2736,7 +2737,7 @@ def main():
             "'baselines' for traditional methods, "
             "'compare' for comprehensive comparison, "
             "'comprehensive' for all configurations, "
-            "'tiers' to evaluate Baseline vs Tier-2 forecast backend (unseen data) using final_models/"
+            "'tiers' to evaluate tier1 vs tier2 vs tier2_ablated on unseen data using final_models/"
         ),
     )
 
@@ -2759,15 +2760,15 @@ def main():
 
     # Enhanced model support
     parser.add_argument("--enhanced_models", type=str, default=None,
-                       help="Directory with enhanced models (forecasting + Tier-2 routed overlay enabled)")
+                       help="Directory with enhanced models (forecasting + Tier-2 policy-improvement layer enabled)")
     parser.add_argument("--force_forecasting", action="store_true",
                        help="Force enable forecasting for enhanced models")
 
     # Comprehensive evaluation paths
     parser.add_argument("--normal_models", type=str, default="normal/final_models",
-                       help="Directory with normal models (agents without forecasts/Tier-2 overlay)")
+                       help="Directory with normal models (agents without forecasts/Tier-2 layer)")
     parser.add_argument("--full_models", type=str, default="full/final_models",
-                       help="Directory with full models (agents with forecasts and the Tier-2 routed overlay)")
+                       help="Directory with full models (agents with forecasts and the Tier-2 policy-improvement layer)")
 
     # Evaluation options
     parser.add_argument("--eval_steps", type=int, default=None,
@@ -2790,24 +2791,24 @@ def main():
 
     # Tier-suite evaluation (paper modes on unseen data)
     parser.add_argument("--tier1_dir", type=str, default="tier1_seed789",
-                       help="Baseline run directory containing final_models/")
+                       help="Tier1 run directory containing final_models/")
     parser.add_argument("--tier2_dir", type=str, default="tier2_seed789",
-                       help="Tier-2 full routed overlay run directory containing final_models/")
+                       help="Tier2 run directory containing its own final_models/ and Tier-2 weights")
     parser.add_argument("--tier2_ablated_dir", type=str, default="tier2_ablated_seed789",
-                       help="Tier-2 ablation run directory (nullified forecast features)")
+                       help="Tier2 ablated run directory containing its own final_models/ and Tier-2 weights")
     parser.add_argument(
         "--tiers_only",
         type=str,
         default="all",
         choices=[
             "all",
+            "tier1",
             "baseline",
             "tier2",
-            "tier1",
             "tier2_ablated",
         ],
         help=(
-            "Run only a subset in --mode tiers. Tier-2 has a single ablation: 'tier2_ablated'."
+            "Run only a subset in --mode tiers. Canonical variants are 'tier1', 'tier2', and 'tier2_ablated'."
         ),
     )
     parser.add_argument(
@@ -2817,9 +2818,9 @@ def main():
         choices=["paper", "deployed"],
         help=(
             "In --mode tiers: "
-            "'paper' evaluates the learned SB3 policies only (forecasts+Tier-2 overlay disabled; paper-fair). "
-            "'deployed' enables forecasting and loads Tier-2 routed overlay .h5 weights for Tier-2 variants (system-level evaluation; NOT paper-fair). "
-            "In deployed mode, forecast-enabled tiers now fail fast on forecast/cv setup errors."
+            "'paper' evaluates the learned SB3 policies only (forecasts+Tier-2 layer disabled; paper-fair). "
+            "'deployed' enables forecasting and loads each Tier-2 variant's own policy-improvement .h5 weights (system-level evaluation; NOT paper-fair). "
+            "In deployed mode, forecast-enabled tiers now fail fast on forecast/Tier-2 setup errors."
         ),
     )
     parser.add_argument(
@@ -2855,31 +2856,6 @@ def main():
                        help="Save plots to files instead of displaying (requires --plot)")
 
     args = parser.parse_args()
-
-    # === RUN MANIFEST (REPRODUCIBILITY) ===
-    # Write a lightweight JSON manifest capturing argv/args + a config snapshot + git hash (if available).
-    # This is research-release hygiene and does not affect evaluation results.
-    try:
-        os.makedirs(args.output_dir, exist_ok=True)
-        from run_manifest import write_run_manifest
-        try:
-            cfg_snapshot = _build_eval_config(args)
-        except Exception as snapshot_error:
-            print_progress(
-                f"Could not build config snapshot for evaluation manifest: {snapshot_error}"
-            )
-            cfg_snapshot = None
-        manifest_path = write_run_manifest(
-            args.output_dir,
-            argv=sys.argv,
-            args=args,
-            config=cfg_snapshot,
-            extra={"entrypoint": "evaluation.py", "mode": getattr(args, "mode", None)},
-            filename_prefix="eval_manifest",
-        )
-        print_progress(f"Wrote evaluation run manifest: {manifest_path}")
-    except Exception as e:
-        print_progress(f"Failed to write evaluation run manifest: {e}")
 
     print_progress("Parsing arguments and validating paths...")
 
@@ -2917,12 +2893,7 @@ def main():
                             if (
                                 enhanced_features.get('forecasting_enabled')
                                 or enhanced_features.get('tier2_enabled')
-                                or enhanced_features.get('tier2_routed_overlay_enabled')
-                                or enhanced_features.get('forecast_routed_overlay_features')
-                                or enhanced_features.get('cv_enabled')
-                                or enhanced_features.get('dl_cv_enabled')
-                                or enhanced_features.get('tier2_control_variate_enabled')
-                                or enhanced_features.get('forecast_control_variate_features')
+                                or enhanced_features.get('tier2_policy_improvement_enabled')
                             ):
                                 is_enhanced = True
                         except Exception as e:
@@ -3033,10 +3004,10 @@ def main():
                 print(f"Enhanced models directory not found: {args.enhanced_models}")
                 sys.exit(1)
 
-            print("Loading enhanced models with forecasting and the Tier-2 routed overlay...")
+            print("Loading enhanced models with forecasting and the Tier-2 policy-improvement layer...")
 
-            # Create enhanced evaluation environment with the Tier-2 routed overlay
-            dl_weights_path = _resolve_cv_weights_from_models_dir(args.enhanced_models)
+            # Create enhanced evaluation environment with the Tier-2 policy-improvement layer
+            dl_weights_path = _resolve_tier2_weights_from_models_dir(args.enhanced_models)
             if dl_weights_path and os.path.exists(dl_weights_path):
                 forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
@@ -3045,7 +3016,7 @@ def main():
                     model_dir=forecast_ctx["model_dir"],
                     scaler_dir=forecast_ctx["scaler_dir"],
                     metadata_dir=forecast_ctx["metadata_dir"],
-                    cv_weights_path=dl_weights_path,
+                    tier2_weights_path=dl_weights_path,
                     output_dir=args.output_dir,
                     investment_freq=args.investment_freq,
                     config=_build_eval_config(args),
@@ -3109,8 +3080,8 @@ def main():
 
         # Run AI evaluation first (enhanced or standard models)
         if args.enhanced_models:
-            # Use enhanced models with the Tier-2 routed overlay
-            dl_weights_path = _resolve_cv_weights_from_models_dir(args.enhanced_models)
+            # Use enhanced models with the Tier-2 policy-improvement layer
+            dl_weights_path = _resolve_tier2_weights_from_models_dir(args.enhanced_models)
             if dl_weights_path and os.path.exists(dl_weights_path):
                 forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
                 enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
@@ -3119,7 +3090,7 @@ def main():
                     model_dir=forecast_ctx["model_dir"],
                     scaler_dir=forecast_ctx["scaler_dir"],
                     metadata_dir=forecast_ctx["metadata_dir"],
-                    cv_weights_path=dl_weights_path,
+                    tier2_weights_path=dl_weights_path,
                     output_dir=args.output_dir,
                     investment_freq=args.investment_freq,
                     config=_build_eval_config(args),

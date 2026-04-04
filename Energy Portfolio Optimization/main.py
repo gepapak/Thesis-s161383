@@ -73,14 +73,61 @@ except Exception:
     from metacontroller import MultiESGAgent
     HyperparameterOptimizer = None
 
-def _tier2_weights_filename() -> str:
-    """Return the canonical Tier-2 routed-overlay checkpoint filename."""
-    return "tier2_routed_overlay.h5"
+def _tier2_weights_filename(config=None) -> str:
+    """Return the canonical Tier-2 policy-improvement checkpoint filename."""
+    try:
+        from tier2 import get_primary_tier2_weight_filename
+
+        family = getattr(config, "tier2_policy_family", None) if config is not None else None
+        return str(get_primary_tier2_weight_filename(family))
+    except Exception:
+        return "tier2_policy_improvement.pkl"
 
 
-def _cv_weights_filename() -> str:
-    """Backward-compatible alias for older Tier-2 helper calls."""
-    return _tier2_weights_filename()
+def _tier2_weight_candidate_filenames(config=None) -> tuple[str, ...]:
+    """Return canonical then compatibility Tier-2 checkpoint filenames."""
+    try:
+        from tier2 import get_tier2_weight_filenames
+
+        family = getattr(config, "tier2_policy_family", None) if config is not None else None
+        return tuple(get_tier2_weight_filenames(family))
+    except Exception:
+        return ("tier2_policy_improvement.pkl", "tier2_policy_improvement.h5")
+
+
+def _resolve_tier2_weights_path(base_dir: str, config=None) -> str:
+    """
+    Resolve an existing Tier-2 weights path inside a directory.
+
+    Returns the canonical save path when no candidate exists yet.
+    """
+    for name in _tier2_weight_candidate_filenames(config):
+        candidate = os.path.join(base_dir, name)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(base_dir, _tier2_weights_filename(config))
+
+def _get_tier2_value_adapter(env):
+    return getattr(env, "tier2_value_adapter", None)
+
+
+def _get_tier2_value_trainer(env):
+    return getattr(env, "tier2_value_trainer", None)
+
+
+def _get_tier2_value_buffer(env):
+    return getattr(env, "tier2_value_buffer", None)
+
+
+def _set_tier2_value_runtime(env, adapter=None, trainer=None, experience_buffer=None) -> None:
+    env.tier2_value_adapter = adapter
+    env.tier2_value_trainer = trainer
+    env.tier2_value_buffer = experience_buffer
+    env.tier2_feature_dim = int(getattr(adapter, "forecast_dim", 0) or 0) if adapter is not None else None
+
+
+def _tier2_continuous_runtime_active(env) -> bool:
+    return _get_tier2_value_adapter(env) is not None or _get_tier2_value_trainer(env) is not None
 
 
 def _capture_rolling_past_state(config) -> dict:
@@ -289,33 +336,44 @@ def print_portfolio_summary(env, step_count):
         if not nav_breakdown:
             fund_nav_dkk = float(base_env._calculate_fund_nav())
             dkk_to_usd = float(getattr(base_env.config, 'dkk_to_usd_rate', 0.145))
+            financial_mtm_dkk = float(
+                sum((getattr(base_env, 'financial_mtm_positions', getattr(base_env, 'financial_positions', {})) or {}).values())
+            )
+            trading_cash_dkk = float(getattr(base_env, 'budget', 0.0))
             nav_breakdown = {
                 'fund_nav_dkk': fund_nav_dkk,
-                'trading_cash_dkk': float(getattr(base_env, 'budget', 0.0)),
+                'trading_cash_dkk': trading_cash_dkk,
+                'trading_cash_core_dkk': trading_cash_dkk,
+                'battery_cash_contribution_dkk': 0.0,
+                'trading_sleeve_value_dkk': float(trading_cash_dkk + financial_mtm_dkk),
                 'physical_book_value_dkk': 0.0,
                 'accumulated_operational_revenue_dkk': float(getattr(base_env, 'accumulated_operational_revenue', 0.0)),
-                'financial_mtm_dkk': float(getattr(base_env, 'cumulative_mtm_pnl', 0.0)),
-                'trading_gains_dkk': float(getattr(base_env, 'cumulative_mtm_pnl', 0.0)),
-                'battery_gains_dkk': float(getattr(base_env, 'cumulative_battery_revenue', 0.0)),
+                'financial_mtm_dkk': financial_mtm_dkk,
+                'trading_mtm_tracker_dkk': float(getattr(base_env, 'cumulative_mtm_pnl', 0.0)),
+                'battery_revenue_tracker_dkk': float(getattr(base_env, 'cumulative_battery_revenue', 0.0)),
             }
         dkk_to_usd = float(getattr(base_env.config, 'dkk_to_usd_rate', 0.145))
 
         fund_nav_usd_m = float(nav_breakdown.get('fund_nav_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
         cash_usd_m = float(nav_breakdown.get('trading_cash_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        trading_cash_core_usd_m = float(nav_breakdown.get('trading_cash_core_dkk', nav_breakdown.get('trading_cash_dkk', 0.0))) * dkk_to_usd / 1_000_000.0
+        battery_cash_contribution_usd_m = float(nav_breakdown.get('battery_cash_contribution_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        trading_sleeve_usd_m = float(nav_breakdown.get('trading_sleeve_value_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
         physical_usd_m = float(nav_breakdown.get('physical_book_value_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
-        operating_usd_m = float(nav_breakdown.get('accumulated_operational_revenue_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
+        operating_revenue_usd_m = float(nav_breakdown.get('accumulated_operational_revenue_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
         mtm_usd_m = float(nav_breakdown.get('financial_mtm_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
-        trading_gains_usd_m = float(nav_breakdown.get('trading_gains_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
-        battery_gains_usd_m = float(nav_breakdown.get('battery_gains_dkk', 0.0)) * dkk_to_usd / 1_000_000.0
 
         logger.info(f"\n[STATS] PORTFOLIO SUMMARY - Step {step_count:,} (Env: {current_timestep:,})")
         logger.info(
             f"   NAV: ${fund_nav_usd_m:.2f}M = Cash ${cash_usd_m:.2f}M + "
-            f"Physical ${physical_usd_m:.2f}M + Op ${operating_usd_m:.2f}M + MTM ${mtm_usd_m:.2f}M"
+            f"Physical ${physical_usd_m:.2f}M + Op ${operating_revenue_usd_m:.2f}M + MTM ${mtm_usd_m:.2f}M"
         )
         logger.info(
-            f"   Gains: Trading ${trading_gains_usd_m:+.2f}M | "
-            f"Battery ${battery_gains_usd_m:+.2f}M | Operating ${operating_usd_m:+.2f}M"
+            f"   Sleeve: Trading ${trading_sleeve_usd_m:.2f}M = Cash ${cash_usd_m:.2f}M + MTM ${mtm_usd_m:.2f}M"
+        )
+        logger.info(
+            f"   Cash: Trading Core ${trading_cash_core_usd_m:.2f}M + "
+            f"Battery ${battery_cash_contribution_usd_m:+.2f}M = Cash ${cash_usd_m:.2f}M"
         )
 
     except Exception as e:
@@ -332,15 +390,15 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-def _export_episode_investor_health_excel(
+def _export_episode_investor_health_csv(
     episode_env,
     episode_num: int,
     monitoring_dirs: Dict[str, str],
     investor_health_summary: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
-    Save a separate Excel workbook with investor policy health diagnostics for
-    each completed training episode.
+    Save separate CSV files with investor policy health diagnostics for each
+    completed training episode.
     """
     try:
         debug_tracker = getattr(episode_env, "debug_tracker", None)
@@ -368,13 +426,13 @@ def _export_episode_investor_health_excel(
             df = pd.read_csv(csv_path)
         else:
             logger.warning(
-                f"   [WARN] Investor health Excel export skipped: no investor health dataset found for episode {episode_num}"
+                f"   [WARN] Investor health CSV export skipped: no investor health dataset found for episode {episode_num}"
             )
             return None
 
         if df.empty:
             logger.warning(
-                f"   [WARN] Investor health Excel export skipped: investor health dataset is empty for episode {episode_num}"
+                f"   [WARN] Investor health CSV export skipped: investor health dataset is empty for episode {episode_num}"
             )
             return None
 
@@ -450,8 +508,12 @@ def _export_episode_investor_health_excel(
             "final_mu_sign_consistency": _safe_float(last_row.get("inv_mu_sign_consistency", 0.0)),
             "final_mu_raw": _safe_float(last_row.get("inv_mu_raw", 0.0)),
             "final_sigma_raw": _safe_float(last_row.get("inv_sigma_raw", 0.0)),
-            "final_tanh_mu": _safe_float(last_row.get("inv_tanh_mu", 0.0)),
-            "final_tanh_a": _safe_float(last_row.get("inv_tanh_a", 0.0)),
+            "final_action_mean": _safe_float(last_row.get("inv_action_mean", last_row.get("inv_tanh_mu", 0.0))),
+            "final_action_sigma": _safe_float(last_row.get("inv_action_sigma", last_row.get("inv_sigma_raw", 0.0))),
+            "final_action_sample": _safe_float(last_row.get("inv_action_sample", last_row.get("inv_tanh_a", 0.0))),
+            # Legacy aliases kept in the summary for compatibility with older analysis code.
+            "final_tanh_mu": _safe_float(last_row.get("inv_action_mean", last_row.get("inv_tanh_mu", 0.0))),
+            "final_tanh_a": _safe_float(last_row.get("inv_action_sample", last_row.get("inv_tanh_a", 0.0))),
             "final_exposure_exec": _safe_float(last_row.get("exposure_exec", 0.0)),
             "tail_abs_exposure_mean": float(tail_exposure.abs().mean()) if not tail_exposure.empty else 0.0,
             "tail_signed_exposure_mean": float(tail_exposure.mean()) if not tail_exposure.empty else 0.0,
@@ -490,24 +552,28 @@ def _export_episode_investor_health_excel(
             export_dir = getattr(debug_tracker, "log_dir", monitoring_dirs.get("logs", ""))
             tier_name = getattr(debug_tracker, "tier_name", "training")
             export_basename = f"{tier_name}_debug_ep{episode_num}"
-        export_path = os.path.join(export_dir, f"{export_basename}_investor_health.xlsx")
+        summary_path = os.path.join(export_dir, f"{export_basename}_investor_health_summary.csv")
+        env_summary_path = os.path.join(export_dir, f"{export_basename}_investor_health_env_summary.csv")
+        timeseries_path = os.path.join(export_dir, f"{export_basename}_investor_health_timeseries.csv")
 
-        with pd.ExcelWriter(export_path, engine="openpyxl") as writer:
-            summary_df.to_excel(writer, sheet_name="summary", index=False)
-            env_summary_df.to_excel(writer, sheet_name="env_summary", index=False)
-            timeseries_df.to_excel(writer, sheet_name="timeseries", index=False)
+        summary_df.to_csv(summary_path, index=False)
+        env_summary_df.to_csv(env_summary_path, index=False)
+        timeseries_df.to_csv(timeseries_path, index=False)
 
-        logger.info(f"   [SAVE] Investor health Excel saved: {export_path}")
-        return export_path
+        logger.info(
+            f"   [SAVE] Investor health CSVs saved: "
+            f"{summary_path}, {env_summary_path}, {timeseries_path}"
+        )
+        return timeseries_path
 
     except Exception as e:
-        logger.warning(f"   [WARN] Could not export investor health Excel: {e}")
+        logger.warning(f"   [WARN] Could not export investor health CSVs: {e}")
         return None
 
 # Portfolio metrics are now logged at every timestep in the debug CSV (first columns)
 # No separate checkpoint summary file needed - all data is in the per-episode CSV files
 
-def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, monitoring_dirs: Dict[str, str], callbacks=None, resume_from: str = None, dl_train_every: int = 100, preserve_agent_state: bool = False) -> int:
+def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, monitoring_dirs: Dict[str, str], callbacks=None, resume_from: str = None, dl_train_every: int = 256, preserve_agent_state: bool = False) -> int:
     """
     Train in intervals, but measure *actual* steps each time.
     Works with a meta-controller whose learn(total_timesteps=N) means "do N more steps".
@@ -515,7 +581,7 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
 
     Args:
         agent: MultiESGAgent instance
-        env: Environment (with optional cv_trainer)
+        env: Environment (with optional Tier-2 value trainer)
         timesteps: Total timesteps to train
         checkpoint_freq: Frequency of checkpoints
         monitoring_dirs: Monitoring directories
@@ -571,12 +637,21 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                 checkpoint_count = checkpoint_state.get('checkpoint_count', 0)
                 logger.info(f"[OK] Resuming from step {total_trained:,} (checkpoint {checkpoint_count})")
 
-                # Load Tier-2 routed overlay weights when resuming
-                if hasattr(env, 'control_variate_adapter') and env.control_variate_adapter is not None:
+                # Load Tier-2 policy-improvement weights when resuming
+                tier2_value_adapter = _get_tier2_value_adapter(env)
+                if tier2_value_adapter is not None:
                     clear_tf_session()
-                    cv_path = os.path.join(resume_from, _cv_weights_filename())
-                    if not env.control_variate_adapter.load_weights(cv_path):
-                        logger.warning("[WARN] Could not load Tier-2 routed overlay weights")
+                    tier2_weights_path = _resolve_tier2_weights_path(
+                        resume_from,
+                        getattr(env, "config", None),
+                    )
+                    if os.path.exists(tier2_weights_path):
+                        if not tier2_value_adapter.load_weights(tier2_weights_path):
+                            raise RuntimeError(
+                                f"Incompatible or unreadable Tier-2 policy-improvement weights at resume checkpoint: {tier2_weights_path}"
+                            )
+                    else:
+                        logger.warning(f"[WARN] Tier-2 policy-improvement weights not found at {tier2_weights_path}")
             else:
                 logger.warning("[WARN] No training state found, starting from step 0")
         else:
@@ -665,9 +740,9 @@ def enhanced_training_loop(agent, env, timesteps: int, checkpoint_freq: int, mon
                 if memory_growth > 2000:  # More than 2GB growth
                     logger.warning(f"[WARN]  High memory usage detected ({current_memory:.1f}MB), triggering cleanup...")
                     try:
-                        # Force cleanup on environment if it has the Tier-2 routed overlay
-                        if hasattr(env, 'control_variate_adapter') and env.control_variate_adapter is not None:
-                            pass  # Control variate has no explicit cleanup
+                        # Force cleanup on environment if it has the Tier-2 policy-improvement layer
+                        if _get_tier2_value_adapter(env) is not None:
+                            pass  # Tier-2 value overlay has no explicit cleanup hook
 
                         # Force cleanup on wrapper
                         if hasattr(env, '_cleanup_memory_enhanced'):
@@ -1246,13 +1321,21 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                         logger.warning(f"   [WARN] Agent will start with total_steps=0 (learning continuity may be affected)")
 
                     # Load Tier-2 residual-layer weights from episode checkpoint
-                    if args.forecast_baseline_enable and hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
+                    tier2_value_adapter = _get_tier2_value_adapter(base_env)
+                    if args.forecast_baseline_enable and tier2_value_adapter is not None:
                         clear_tf_session()
-                        cv_path = os.path.join(episode_checkpoint_dir, _cv_weights_filename())
-                        if base_env.control_variate_adapter.load_weights(cv_path):
-                            logger.info(f"   [OK] Loaded Tier-2 routed overlay weights from Episode {args.resume_episode}: {cv_path}")
+                        tier2_weights_path = _resolve_tier2_weights_path(
+                            episode_checkpoint_dir,
+                            getattr(base_env, "config", None),
+                        )
+                        if os.path.exists(tier2_weights_path) and tier2_value_adapter.load_weights(tier2_weights_path):
+                            logger.info(f"   [OK] Loaded Tier-2 policy-improvement weights from Episode {args.resume_episode}: {tier2_weights_path}")
+                        elif os.path.exists(tier2_weights_path):
+                            raise RuntimeError(
+                                f"Incompatible or unreadable Tier-2 policy-improvement weights from Episode {args.resume_episode}: {tier2_weights_path}"
+                            )
                         else:
-                            logger.warning(f"   [WARN] Could not load Tier-2 routed overlay weights from {cv_path}")
+                            logger.warning(f"   [WARN] Could not load Tier-2 policy-improvement weights from {tier2_weights_path}")
 
                     # Adjust start episode to resume from next episode
                     args.start_episode = args.resume_episode + 1
@@ -1328,13 +1411,14 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 1. Clear TensorFlow completely
             # REASON: TensorFlow maintains computation graphs and cached tensors between episodes
             try:
-                import tensorflow as tf
-                tf.keras.backend.clear_session()
-                # Force TF to release GPU memory
-                if hasattr(tf.config, 'experimental') and hasattr(tf.config.experimental, 'reset_memory_growth'):
-                    gpus = tf.config.experimental.list_physical_devices('GPU')
-                    for gpu in gpus:
-                        tf.config.experimental.reset_memory_growth(gpu)
+                if not _tier2_continuous_runtime_active(base_env):
+                    import tensorflow as tf
+                    tf.keras.backend.clear_session()
+                    # Force TF to release GPU memory
+                    if hasattr(tf.config, 'experimental') and hasattr(tf.config.experimental, 'reset_memory_growth'):
+                        gpus = tf.config.experimental.list_physical_devices('GPU')
+                        for gpu in gpus:
+                            tf.config.experimental.reset_memory_growth(gpu)
             except Exception:
                 pass
 
@@ -1420,8 +1504,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 
                     # Clear any lingering TensorFlow sessions
                     try:
-                        import tensorflow as tf
-                        tf.keras.backend.clear_session()
+                        if not _tier2_continuous_runtime_active(base_env):
+                            import tensorflow as tf
+                            tf.keras.backend.clear_session()
                     except Exception:
                         pass
 
@@ -1466,7 +1551,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 1.5. EPISODE-SPECIFIC FORECAST MODEL VALIDATION AND CACHE GENERATION
             # Tier-2 requires prebuilt episode-specific forecast models.
             # We validate that the no-leakage forecast models exist for this episode,
-            # then generate/load the forecast cache used by the Tier-2 routed overlay feature builder.
+            # then generate/load the forecast cache used by the Tier-2 policy-improvement feature builder.
             episode_forecasts_required = bool(args.forecast_baseline_enable)
             if episode_forecasts_required:
                 from forecast_engine import (
@@ -1475,7 +1560,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     get_episode_forecast_paths
                 )
                 
-                logger.info(f"\n   [FORECAST] Preparing Episode {episode_num} forecast models...")
+                logger.info(f"\n   [FORECAST] Preparing Episode {episode_num} ANN forecast bank...")
 
                 # NO-LEAKAGE FORECAST TRAINING (Tier2 only):
                 # - MARL episode 0 (2015H1) uses forecast models trained on forecast_scenario_00 (2014H1+H2)
@@ -1495,7 +1580,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 forecast_base_dir = getattr(args, 'forecast_base_dir', "forecast_models")
                 cache_base_dir = getattr(args, 'forecast_cache_dir', "forecast_cache")
                 
-                # Step 1: Ensure the prebuilt forecast models exist for this episode.
+                # Step 1: Ensure the prebuilt ANN forecast bank exists for this episode.
                 success, forecast_paths = ensure_episode_forecasts_ready(
                     episode_num=episode_num,
                     episode_data_path=forecast_data_path,
@@ -1505,9 +1590,9 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 )
                 
                 if not success:
-                    logger.error(f"   [ERROR] Missing prebuilt forecast models for Episode {episode_num}")
-                    logger.error(f"   [ERROR] Cannot continue - forecast models are required for the Tier-2 routed residual-aware overlay")
-                    raise RuntimeError(f"Episode {episode_num} forecast model validation failed")
+                    logger.error(f"   [ERROR] Missing prebuilt ANN forecast bank for Episode {episode_num}")
+                    logger.error(f"   [ERROR] Cannot continue - the ANN forecast bank is required for the active Tier-2 layer")
+                    raise RuntimeError(f"Episode {episode_num} ANN forecast bank validation failed")
                 
                 # Step 2: Reinitialize forecaster with episode-specific models
                 logger.info(f"   [FORECAST] Reinitializing forecaster with Episode {episode_num} models...")
@@ -1565,7 +1650,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     
                     if bool(stats.get('expert_only_mode', False)):
                         logger.info(
-                            f"   [OK] Forecaster reinitialized with Episode {episode_num} short-price expert bank "
+                            f"   [OK] Forecaster reinitialized with Episode {episode_num} ANN short-forecast bank "
                             f"({experts_loaded}/{experts_expected} experts loaded)"
                         )
                     else:
@@ -1646,15 +1731,15 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 # so _episode_counter resets. We need to set it from the training loop.
                 if hasattr(episode_base_env, '_episode_counter'):
                     episode_base_env._episode_counter = episode_num
-                    if hasattr(episode_base_env, 'debug_tracker'):
-                        episode_base_env.debug_tracker.start_episode(episode_num)
-                        logger.debug(f"   [DEBUG] Set episode counter to {episode_num} for debug logging")
+                    logger.debug(f"   [DEBUG] Set episode counter to {episode_num} for debug logging")
 
-                # CRITICAL FIX: Initialize calibration tracker for episode environment
-                # For episode training, CalibrationTracker must be initialized per-episode with episode-specific forecaster
+                # Forecast-trust calibration is compatibility-only diagnostics for
+                # the clean-room Tier-2 path. The active Tier-2 model does not
+                # depend on these trust features at runtime.
                 if args.forecast_baseline_enable and forecaster is not None:
                     try:
-                        from tier2_routed_overlay import CalibrationTracker
+                        from tier2 import CalibrationTracker
+                        forecast_model_base_dir = f"forecast_models/episode_{episode_num}"
                         episode_base_env.calibration_tracker = CalibrationTracker(
                             window_size=config.forecast_trust_window,
                             trust_metric=config.forecast_trust_metric,
@@ -1663,24 +1748,21 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                             direction_weight=config.forecast_trust_direction_weight,
                             trust_boost=getattr(config, "forecast_trust_boost", 0.0),
                             fail_fast=bool(getattr(config, "fgb_fail_fast", False)),
+                            metadata_quality_path=os.path.join(forecast_model_base_dir, "price_short_experts", "ANN", "ann_metadata.json"),
+                            metadata_quality_weight=getattr(config, "forecast_metadata_quality_weight", 0.3),
                         )
-                        logger.info(f"   [OK] Calibration tracker initialized for episode environment")
+                        logger.info("   [OK] Forecast-trust diagnostics initialized for episode environment")
                     except Exception as e:
-                        err_msg = f"   [ERROR] Failed to initialize CalibrationTracker for episode: {e}"
-                        if bool(getattr(config, "fgb_fail_fast", False)):
-                            raise RuntimeError(err_msg) from e
-                        logger.error(err_msg)
+                        err_msg = f"   [WARN] Forecast-trust diagnostics unavailable for episode: {e}"
+                        logger.warning(err_msg)
                         episode_base_env.calibration_tracker = None
                 else:
                     episode_base_env.calibration_tracker = None
                     if args.forecast_baseline_enable and forecaster is None:
-                        msg = "   [WARN] Tier-2 layer enabled but forecaster is None - CalibrationTracker not initialized"
-                        if bool(getattr(config, "fgb_fail_fast", False)):
-                            raise RuntimeError(msg)
-                        logger.warning(msg)
+                        logger.info("   [INFO] Forecast-trust diagnostics skipped until the episode forecaster is attached")
 
                 logger.debug(f"   [DEBUG] episode_base_env.forecast_generator = {episode_base_env.forecast_generator}")
-                logger.debug(f"   [DEBUG] Tier-2 routed overlay on base_env = {getattr(base_env, 'control_variate_adapter', None) is not None}")
+                logger.debug(f"   [DEBUG] Tier-2 policy-improvement layer on base_env = {_get_tier2_value_adapter(base_env) is not None}")
 
                 # MEMORY FIX: Explicitly clear episode data from memory after env creation
                 # Keep only essential references
@@ -1694,48 +1776,69 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 logger.error(f"   [ERROR] Environment creation failed: {env_error}")
                 raise
 
+            # Pre-link the Tier-2 runtime before the first episode reset so the
+            # environment advertises the correct feature contract from the
+            # start of the episode lifecycle.
+            if args.forecast_baseline_enable:
+                base_tier2_value_adapter = _get_tier2_value_adapter(base_env)
+                if base_tier2_value_adapter is not None:
+                    _set_tier2_value_runtime(
+                        episode_base_env,
+                        adapter=base_tier2_value_adapter,
+                        trainer=_get_tier2_value_trainer(base_env),
+                        experience_buffer=_get_tier2_value_buffer(base_env),
+                    )
+
             # Initialize environment properly
             episode_base_env.reset()
             logger.info(f"   [OK] Episode environment initialized")
 
             # CRITICAL: Initialize Tier-2 layer state for the episode environment.
-            # FIXED: For episode training, reuse the Tier-2 routed overlay from base_env (initialized at startup)
+            # FIXED: For episode training, reuse the Tier-2 policy-improvement layer from base_env (initialized at startup)
             # This prevents dimension changes per-episode, avoiding policy recreation
             if args.forecast_baseline_enable:
                 if args.episode_training:
-                    # EPISODE TRAINING MODE: Reuse the Tier-2 routed overlay from base_env (initialized at startup with correct dimensions)
+                    # EPISODE TRAINING MODE: Reuse the Tier-2 policy-improvement layer from base_env (initialized at startup with correct dimensions)
                     # This ensures episode environments have the same Tier-2 structure, preventing dimension mismatches
-                    if hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
+                    base_tier2_value_adapter = _get_tier2_value_adapter(base_env)
+                    if base_tier2_value_adapter is not None:
                         try:
-                            episode_base_env.control_variate_adapter = getattr(base_env, 'control_variate_adapter', None)
-                            episode_base_env.cv_trainer = getattr(base_env, 'cv_trainer', None)
-                            episode_base_env.cv_experience_buffer = getattr(base_env, 'cv_experience_buffer', None)
+                            _set_tier2_value_runtime(
+                                episode_base_env,
+                                adapter=base_tier2_value_adapter,
+                                trainer=_get_tier2_value_trainer(base_env),
+                                experience_buffer=_get_tier2_value_buffer(base_env),
+                            )
                             # Attach forecaster to episode environment for Tier-2 routed-feature construction
                             if forecaster is not None:
                                 episode_base_env.forecast_generator = forecaster
                             logger.info(
-                                f"   [OK] Tier-2 routed overlay linked from base_env to episode environment"
+                                f"   [OK] Tier-2 policy-improvement layer linked from base_env to episode environment"
                             )
                         except Exception as e:
                             raise RuntimeError(
-                                f"[TIER2_EPISODE_FATAL] Failed to link Tier-2 routed overlay from base_env to episode {episode_num}: {e}"
+                                f"[TIER2_EPISODE_FATAL] Failed to link Tier-2 policy-improvement layer from base_env to episode {episode_num}: {e}"
                             ) from e
                     else:
                         raise RuntimeError(
-                            f"[TIER2_EPISODE_FATAL] Forecast baseline enabled but base_env.control_variate_adapter is missing for episode {episode_num}."
+                            f"[TIER2_EPISODE_FATAL] Forecast baseline enabled but base_env.tier2_value_adapter is missing for episode {episode_num}."
                         )
                 else:
-                    # NON-EPISODE TRAINING MODE: Reuse the same Tier-2 routed overlay from base_env for consistency
-                    if hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
+                    # NON-EPISODE TRAINING MODE: Reuse the same Tier-2 policy-improvement layer from base_env for consistency
+                    base_tier2_value_adapter = _get_tier2_value_adapter(base_env)
+                    if base_tier2_value_adapter is not None:
                         try:
-                            episode_base_env.control_variate_adapter = base_env.control_variate_adapter
-                            episode_base_env.cv_trainer = base_env.cv_trainer
-                            episode_base_env.cv_experience_buffer = base_env.cv_experience_buffer
+                            _set_tier2_value_runtime(
+                                episode_base_env,
+                                adapter=base_tier2_value_adapter,
+                                trainer=_get_tier2_value_trainer(base_env),
+                                experience_buffer=_get_tier2_value_buffer(base_env),
+                            )
                             logger.info(
-                                f"   [OK] Tier-2 routed overlay linked to episode environment"
+                                f"   [OK] Tier-2 policy-improvement layer linked to episode environment"
                             )
                         except Exception as e:
-                            logger.warning(f"Failed to link Tier-2 routed overlay to episode: {e}")
+                            logger.warning(f"Failed to link Tier-2 policy-improvement layer to episode: {e}")
 
             # Forecasts are never appended to agent observations.
             # Use the base environment as-is (Tier-1 observation spaces remain unchanged).
@@ -1747,6 +1850,18 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # 5. Update agent's environment reference to use episode data
             logger.info(f"   [CYCLE] Updating agent environment reference...")
             agent.env = episode_env
+            try:
+                from wrapper import EnhancedObservationValidator
+
+                episode_forecaster = getattr(episode_env, 'forecast_generator', None)
+                agent.obs_validator = EnhancedObservationValidator(
+                    episode_env,
+                    forecaster=episode_forecaster,
+                    debug=getattr(agent, 'debug', False),
+                )
+                logger.debug("   [OBS_VALIDATOR_REBIND] Observation validator rebound to episode environment")
+            except Exception as obs_validator_error:
+                logger.warning(f"   [WARN] Failed to rebind observation validator: {obs_validator_error}")
             
             # ROOT CAUSE FIX: Only reinitialize if observation spaces actually changed.
             # If dimensions are already correct, no recreation is needed.
@@ -1818,31 +1933,53 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 else:
                     logger.warning(f"   [WARN] Previous episode checkpoint not found: {prev_episode_checkpoint_dir}")
             else:
-                logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh policies")
+                if episode_num == args.start_episode and args.resume_from:
+                    logger.info(
+                        f"   [INFO] Episode {episode_num} is first episode in this run; "
+                        "policies will be initialized from --resume_from inside the training loop"
+                    )
+                else:
+                    logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh policies")
 
-            if hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter is not None:
-                # Load Tier-2 routed overlay weights from PREVIOUS episode to continue learning
+            episode_tier2_value_adapter = _get_tier2_value_adapter(episode_base_env)
+            if episode_tier2_value_adapter is not None:
+                # Load Tier-2 policy-improvement weights from PREVIOUS episode to continue learning
                 # CRITICAL FIX: When resuming, the first episode after resume should load from the resume episode
                 if should_load_previous:
                     prev_episode_num = episode_num - 1
                     prev_episode_checkpoint_dir = os.path.join(monitoring_dirs['checkpoints'], f"episode_{prev_episode_num}")
 
                     if os.path.exists(prev_episode_checkpoint_dir):
-                        # Load Tier-2 routed overlay weights from previous episode
-                        if hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter is not None:
-                            cv_path = os.path.join(prev_episode_checkpoint_dir, _cv_weights_filename())
-                            if os.path.exists(cv_path):
+                        # Load Tier-2 policy-improvement weights from previous episode
+                        if episode_tier2_value_adapter is not None:
+                            tier2_weights_path = _resolve_tier2_weights_path(
+                                prev_episode_checkpoint_dir,
+                                getattr(episode_base_env, "config", None),
+                            )
+                            if os.path.exists(tier2_weights_path):
                                 try:
-                                    episode_base_env.control_variate_adapter.load_weights(cv_path)
-                                    logger.info(f"   [OK] Loaded Tier-2 routed overlay weights from Episode {prev_episode_num}")
+                                    if episode_tier2_value_adapter.load_weights(tier2_weights_path):
+                                        logger.info(f"   [OK] Loaded Tier-2 policy-improvement weights from Episode {prev_episode_num}")
+                                    else:
+                                        raise RuntimeError(
+                                            f"Incompatible or unreadable Tier-2 policy-improvement weights from Episode {prev_episode_num}: {tier2_weights_path}"
+                                        )
                                 except Exception as e:
-                                    logger.warning(f"   [WARN] Could not load Tier-2 routed overlay weights: {e}")
+                                    raise RuntimeError(
+                                        f"Failed to load Tier-2 policy-improvement weights from Episode {prev_episode_num}: {e}"
+                                    ) from e
                         else:
-                            logger.info(f"   [INFO] Starting Episode {episode_num} with fresh Tier-2 routed overlay weights - no compatible checkpoint from Episode {prev_episode_num}")
+                            logger.info(f"   [INFO] Starting Episode {episode_num} with fresh Tier-2 policy-improvement weights - no compatible checkpoint from Episode {prev_episode_num}")
                     else:
                         logger.warning(f"   [WARN] Previous episode checkpoint not found: {prev_episode_checkpoint_dir}")
                 else:
-                    logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh Tier-2 routed overlay weights")
+                    if episode_num == args.start_episode and args.resume_from:
+                        logger.info(
+                            f"   [INFO] Episode {episode_num} is first episode in this run; "
+                            "Tier-2 policy-improvement resume handling will be decided inside the training loop"
+                        )
+                    else:
+                        logger.info(f"   [INFO] Episode {episode_num} is first episode, starting with fresh Tier-2 policy-improvement weights")
 
             # CRITICAL FIX: Reset RL agent buffers AND internal state for new episode data
             # FIX: Use comprehensive reset method that handles optimizer states and learning rate schedules
@@ -1857,12 +1994,15 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             # PHASE 5.8 FIX: Clear TensorFlow/PyTorch caches to prevent state leakage
             logger.info(f"   [CLEANUP] Clearing TensorFlow/PyTorch caches...")
             try:
-                import tensorflow as tf
                 import torch
 
-                # Clear TensorFlow session and backend
-                tf.keras.backend.clear_session()
-                logger.info(f"     [OK] Cleared TensorFlow session")
+                # Preserve the long-lived Tier-2 runtime when continuous learning is active.
+                if not _tier2_continuous_runtime_active(base_env):
+                    import tensorflow as tf
+                    tf.keras.backend.clear_session()
+                    logger.info(f"     [OK] Cleared TensorFlow session")
+                else:
+                    logger.info(f"     [SKIP] Preserved TensorFlow session for continuous Tier-2 learning")
 
                 # Clear PyTorch CUDA cache if available
                 if torch.cuda.is_available():
@@ -1897,6 +2037,8 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 checkpoint_freq = episode_timesteps
                 logger.info(f"   [CHECKPOINT] Using episode length ({episode_timesteps:,} steps) as checkpoint frequency")
 
+            initial_resume_from = args.resume_from if episode_num == args.start_episode else None
+
             episode_trained = enhanced_training_loop(
                 agent=agent,
                 env=episode_env,
@@ -1904,7 +2046,7 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 checkpoint_freq=checkpoint_freq,
                 monitoring_dirs=monitoring_dirs,
                 callbacks=callbacks,
-                resume_from=None,  # Each episode starts fresh with data
+                resume_from=initial_resume_from,
                 dl_train_every=args.dl_train_every,  # Pass Tier-2 training frequency
                 preserve_agent_state=preserve_state  # CRITICAL: Preserve learning continuity across episodes
             )
@@ -1944,17 +2086,21 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             os.makedirs(episode_checkpoint_dir, exist_ok=True)
             agent.save_policies(episode_checkpoint_dir)
 
-            # 7.1 CRITICAL: Save Tier-2 routed overlay weights for episode checkpoint
-            cv_env = episode_env if hasattr(episode_env, 'control_variate_adapter') and episode_env.control_variate_adapter else (
-                episode_base_env if 'episode_base_env' in locals() and hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter else None
+            # 7.1 CRITICAL: Save Tier-2 policy-improvement weights for episode checkpoint
+            tier2_env = episode_env if _get_tier2_value_adapter(episode_env) else (
+                episode_base_env if 'episode_base_env' in locals() and _get_tier2_value_adapter(episode_base_env) else None
             )
-            if cv_env is not None and cv_env.control_variate_adapter is not None:
+            tier2_value_adapter = _get_tier2_value_adapter(tier2_env) if tier2_env is not None else None
+            if tier2_env is not None and tier2_value_adapter is not None:
                 try:
-                    cv_path = os.path.join(episode_checkpoint_dir, _cv_weights_filename())
-                    if cv_env.control_variate_adapter.save_weights(cv_path):
-                        logger.info(f"   [SAVE] Tier-2 routed overlay weights saved: {cv_path}")
+                    tier2_weights_path = os.path.join(
+                        episode_checkpoint_dir,
+                        _tier2_weights_filename(getattr(tier2_env, "config", None)),
+                    )
+                    if tier2_value_adapter.save_weights(tier2_weights_path):
+                        logger.info(f"   [SAVE] Tier-2 policy-improvement weights saved: {tier2_weights_path}")
                 except Exception as e:
-                    logger.warning(f"   [WARN] Could not save Tier-2 routed overlay weights: {e}")
+                    logger.warning(f"   [WARN] Could not save Tier-2 policy-improvement weights: {e}")
 
             # 7.2 CRITICAL: Save agent training state (total_steps, etc.)
             try:
@@ -1977,14 +2123,14 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                 logger.warning(f"   [WARN] Could not save agent training state: {e}")
 
             try:
-                _export_episode_investor_health_excel(
+                _export_episode_investor_health_csv(
                     episode_env=episode_env,
                     episode_num=episode_num,
                     monitoring_dirs=monitoring_dirs,
                     investor_health_summary=episode_investor_health,
                 )
             except Exception as e:
-                logger.warning(f"   [WARN] Investor health Excel export failed: {e}")
+                logger.warning(f"   [WARN] Investor health CSV export failed: {e}")
 
             logger.info(f"   [SAVE] Episode checkpoint saved: {episode_checkpoint_dir}")
 
@@ -2080,17 +2226,20 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 
                 # 4. NUCLEAR TENSORFLOW CLEANUP
                 try:
-                    import tensorflow as tf
-                    tf.keras.backend.clear_session()
-                    # Force TF memory release
-                    if hasattr(tf.config, 'experimental'):
-                        gpus = tf.config.experimental.list_physical_devices('GPU')
-                        for gpu in gpus:
-                            try:
-                                tf.config.experimental.reset_memory_growth(gpu)
-                            except Exception:
-                                pass
-                    logger.debug(f"   [NUCLEAR] TensorFlow nuclear cleanup")
+                    if not _tier2_continuous_runtime_active(base_env):
+                        import tensorflow as tf
+                        tf.keras.backend.clear_session()
+                        # Force TF memory release
+                        if hasattr(tf.config, 'experimental'):
+                            gpus = tf.config.experimental.list_physical_devices('GPU')
+                            for gpu in gpus:
+                                try:
+                                    tf.config.experimental.reset_memory_growth(gpu)
+                                except Exception:
+                                    pass
+                        logger.debug(f"   [NUCLEAR] TensorFlow nuclear cleanup")
+                    else:
+                        logger.debug(f"   [NUCLEAR] Skipped TensorFlow session clear to preserve continuous Tier-2 state")
                 except Exception as e:
                     logger.warning(f"   [WARN] TensorFlow cleanup error: {e}")
 
@@ -2174,10 +2323,11 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
                     for _ in range(5):
                         gc.collect()
 
-                    # Clear TensorFlow
+                    # Clear TensorFlow only when no persistent Tier-2 runtime is active.
                     try:
-                        import tensorflow as tf
-                        tf.keras.backend.clear_session()
+                        if not _tier2_continuous_runtime_active(base_env):
+                            import tensorflow as tf
+                            tf.keras.backend.clear_session()
                     except Exception:
                         pass
 
@@ -2200,17 +2350,21 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
             try:
                 agent.save_policies(emergency_dir)
 
-                # Save Tier-2 routed overlay weights for emergency checkpoint
-                cv_env = episode_env if 'episode_env' in locals() and hasattr(episode_env, 'control_variate_adapter') and episode_env.control_variate_adapter else (
-                    episode_base_env if 'episode_base_env' in locals() and hasattr(episode_base_env, 'control_variate_adapter') and episode_base_env.control_variate_adapter else None
+                # Save Tier-2 policy-improvement weights for emergency checkpoint
+                tier2_env = episode_env if 'episode_env' in locals() and _get_tier2_value_adapter(episode_env) else (
+                    episode_base_env if 'episode_base_env' in locals() and _get_tier2_value_adapter(episode_base_env) else None
                 )
-                if cv_env is not None and cv_env.control_variate_adapter is not None:
+                tier2_value_adapter = _get_tier2_value_adapter(tier2_env) if tier2_env is not None else None
+                if tier2_env is not None and tier2_value_adapter is not None:
                     try:
-                        cv_path = os.path.join(emergency_dir, _cv_weights_filename())
-                        if cv_env.control_variate_adapter.save_weights(cv_path):
-                            logger.info(f"   [SAVE] Emergency Tier-2 routed overlay weights saved: {cv_path}")
+                        tier2_weights_path = os.path.join(
+                            emergency_dir,
+                            _tier2_weights_filename(getattr(tier2_env, "config", None)),
+                        )
+                        if tier2_value_adapter.save_weights(tier2_weights_path):
+                            logger.info(f"   [SAVE] Emergency Tier-2 policy-improvement weights saved: {tier2_weights_path}")
                     except Exception as dl_save_error:
-                        logger.warning(f"   [WARN] Emergency Tier-2 routed overlay save failed: {dl_save_error}")
+                        logger.warning(f"   [WARN] Emergency Tier-2 policy-improvement save failed: {dl_save_error}")
 
                 # Save agent training state for emergency checkpoint
                 try:
@@ -2253,150 +2407,288 @@ def run_episode_training(agent, base_env, env, args, monitoring_dirs, config, mw
 # Main
 # =====================================================================
 
-def initialize_tier2_routed_overlay(env: RenewableMultiAgentEnv, config, args) -> bool:
+def initialize_tier2_policy_improvement(env: RenewableMultiAgentEnv, config, args) -> bool:
     """
-    Initialize the Tier-2 short-horizon price-expert routed overlay.
+    Initialize the active Tier-2 forecast-guided enhancement layer.
 
     Called when --forecast_baseline_enable. Uses (state, forecast) to learn a
-    compact short-horizon investor-only controller:
-    - an abstain-or-route head over short-horizon forecast experts
-    - a normalized override head used by the Tier-2 exposure overlay
-    - an intervention-confidence head used for calibration and diagnostics
+    compact short-horizon controller for the independent Tier-2 baseline:
+    - a forecast-conditioned delta head for investor exposure refinement
+    - calibrated utility/risk heads for selective intervention
+    - a meta-aware expert mix for regime routing and diagnostics
     """
     if not bool(getattr(args, "forecast_baseline_enable", False)):
         return False
 
     try:
-        from tier2_routed_overlay import (
-            Tier2RoutedOverlayAdapter,
-            Tier2RoutedOverlayTrainer,
-            Tier2ExperienceBuffer,
-            TIER2_ROUTED_OVERLAY_FEATURE_DIM,
+        from tier2 import (
+            TIER2_POLICY_IMPROVEMENT_FEATURE_DIM,
+            Tier2PolicyImprovementAdapter,
+            Tier2PolicyImprovementBuffer,
+            Tier2PolicyImprovementTrainer,
         )
         obs_dim = int(env.observation_spaces["investor_0"].shape[0])
         forecast_dim = int(
             getattr(
                 config,
                 "tier2_feature_dim",
-                getattr(config, "cv_forecast_dim", TIER2_ROUTED_OVERLAY_FEATURE_DIM),
+                TIER2_POLICY_IMPROVEMENT_FEATURE_DIM,
             )
-            or TIER2_ROUTED_OVERLAY_FEATURE_DIM
+            or TIER2_POLICY_IMPROVEMENT_FEATURE_DIM
         )
         seed = int(getattr(args, "seed", 42))
-        cv_lr = float(
+
+        _missing = object()
+
+        def _cfg_value(*keys_and_default):
+            if len(keys_and_default) < 2:
+                raise ValueError("_cfg_value requires at least one key and a default")
+            *keys, default = keys_and_default
+            for key in keys:
+                value = getattr(config, str(key), _missing)
+                if value is not _missing and value is not None:
+                    return value
+            return default
+
+        tier2_value_lr = float(getattr(config, "tier2_value_lr", 1e-3) or 1e-3)
+        tier2_l2_reg = float(
             getattr(
                 config,
-                "tier2_cv_lr",
-                getattr(config, "cv_learning_rate", 1e-3),
-            ) or 1e-3
+                "tier2_l2_reg",
+                1e-4,
+            )
+            or 1e-4
         )
-        cv_l2 = float(getattr(config, "cv_l2_reg", 1e-4) or 1e-4)
 
-        logger.info(f"[DL] Initializing Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller (obs={obs_dim}, forecast={forecast_dim})")
+        logger.info(
+            "[DL] Initializing Tier-2 forecast-guided enhancement layer "
+            f"(family={getattr(config, 'tier2_policy_family', 'conservative_actor_critic')}, "
+            f"objective={getattr(config, 'tier2_policy_objective', 'conservative_actor_critic_advantage')}, "
+            f"obs={obs_dim}, forecast={forecast_dim})"
+        )
 
         if env.forecast_generator is None:
             episode_training_mode = getattr(args, 'episode_training', False)
             if not episode_training_mode:
-                raise ValueError("Tier-2 routed overlay requires forecast_generator. Forecasts are mandatory.")
-            logger.info("[EPISODE_TRAINING] Tier-2 routed overlay: initializing at startup without forecaster (will be attached per-episode)")
+                raise ValueError("Tier-2 policy-improvement layer requires forecast_generator. Forecasts are mandatory.")
+            logger.info("[EPISODE_TRAINING] Tier-2 policy-improvement layer: initializing at startup without forecaster (will be attached per-episode)")
 
-        cv_adapter = Tier2RoutedOverlayAdapter(
+        tier2_value_adapter = Tier2PolicyImprovementAdapter(
             obs_dim=obs_dim,
             forecast_dim=forecast_dim,
-            memory_steps=int(getattr(config, "tier2_cv_memory_steps", 2) or 2),
-            seed=seed,
-        )
-        cv_trainer = Tier2RoutedOverlayTrainer(
-            model=cv_adapter.model,
-            obs_dim=obs_dim,
-            forecast_dim=forecast_dim,
-            learning_rate=cv_lr,
-            l2_reg=cv_l2,
-            seed=seed,
-            replay_batch_size=int(
-                getattr(config, "tier2_cv_batch_size", 64)
-            ),
-            train_epochs=int(getattr(config, "tier2_cv_train_epochs", 1) or 1),
-            route_loss_weight=float(getattr(config, "tier2_cv_route_loss_weight", 0.35) or 0.35),
-            override_loss_weight=float(getattr(config, "tier2_cv_override_loss_weight", 0.25) or 0.25),
-            decision_weight=float(
-                getattr(
-                    config,
-                    "tier2_cv_decision_loss_weight",
-                    0.35,
-                ) or 0.35
-            ),
-            confidence_weight=float(getattr(config, "tier2_cv_confidence_loss_weight", 0.15) or 0.15),
-            decision_horizon=int(
-                getattr(
-                    config,
-                    "tier2_cv_decision_horizon",
-                    4,
-                ) or 4
-            ),
-            decision_scale=float(
-                getattr(
-                    config,
-                    "tier2_cv_decision_scale",
-                    0.05,
-                ) or 0.05
-            ),
-            decision_downside_weight=float(
-                getattr(
-                    config,
-                    "tier2_cv_decision_downside_weight",
-                    0.75,
-                ) or 0.75
-            ),
-            decision_vol_weight=float(
-                getattr(
-                    config,
-                    "tier2_cv_decision_vol_weight",
-                    0.25,
-                ) or 0.25
-            ),
-            decision_stability_penalty=float(getattr(config, "tier2_cv_decision_stability_penalty", 0.12) or 0.12),
-            magnitude_grid_points=int(getattr(config, "tier2_cv_route_grid_points", 11) or 11),
-            conformal_risk_scale=float(getattr(config, "tier2_cv_conformal_scale", 1.0) or 1.0),
+            policy_family=getattr(config, "tier2_policy_family", None),
+            memory_steps=int(getattr(config, "tier2_value_memory_steps", 8) or 8),
             delta_limit=float(
                 max(
-                    float(getattr(config, "tier2_cv_delta_max", 0.20) or 0.20),
+                    float(getattr(config, "tier2_value_delta_max", 0.20) or 0.20),
                     1e-6,
                 )
             ),
-            runtime_gain=float(
-                np.clip(float(getattr(config, "tier2_runtime_gain", 0.65) or 0.65), 0.0, 1.0)
+            value_target_scale=float(
+                getattr(config, "tier2_value_target_scale", 0.01) or 0.01
             ),
-            runtime_conformal_margin=float(
-                max(getattr(config, "tier2_runtime_conformal_margin", 0.05) or 0.05, 0.0)
-            ),
+            runtime_min_abs_delta=float(getattr(config, "tier2_runtime_min_abs_delta", 0.0)),
+            nav_head_scale=float(getattr(config, "tier2_value_nav_head_scale", 3.0) or 3.0),
+            return_floor_head_scale=float(getattr(config, "tier2_value_return_floor_head_scale", 4.0) or 4.0),
+            seed=seed,
         )
-        cv_buffer = Tier2ExperienceBuffer(max_size=50_000, replay_size=20_000, seed=seed)
+        tier2_value_trainer = Tier2PolicyImprovementTrainer(
+            model=tier2_value_adapter.model,
+            obs_dim=obs_dim,
+            forecast_dim=forecast_dim,
+            policy_family=getattr(config, "tier2_policy_family", None),
+            learning_rate=tier2_value_lr,
+            l2_reg=tier2_l2_reg,
+            seed=seed,
+            replay_batch_size=int(getattr(config, "tier2_value_batch_size", 64) or 64),
+            train_epochs=int(getattr(config, "tier2_value_train_epochs", 1) or 1),
+            delta_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_delta_loss_weight",
+                    0.05,
+                )
+            ),
+            decision_weight=float(
+                _cfg_value(
+                    "tier2_value_policy_loss_weight",
+                    1.00,
+                )
+            ),
+            confidence_weight=float(
+                _cfg_value(
+                    "tier2_value_confidence_loss_weight",
+                    0.04,
+                )
+            ),
+            quality_anchor_weight=float(
+                _cfg_value(
+                    "tier2_value_quality_anchor_weight",
+                    0.0,
+                )
+            ),
+            trust_anchor_weight=float(
+                _cfg_value(
+                    "tier2_value_trust_anchor_weight",
+                    0.0,
+                )
+            ),
+            gate_calibration_weight=float(
+                _cfg_value(
+                    "tier2_value_gate_calibration_weight",
+                    0.0,
+                )
+            ),
+            expert_mix_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_expert_mix_loss_weight",
+                    0.08,
+                )
+            ),
+            expert_winner_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_expert_winner_loss_weight",
+                    0.06,
+                )
+            ),
+            expert_temperature=float(
+                _cfg_value(
+                    "tier2_value_expert_temperature",
+                    0.35,
+                )
+            ),
+            gate_top_fraction=float(
+                _cfg_value(
+                    "tier2_value_gate_top_fraction",
+                    0.30,
+                )
+            ),
+            value_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_value_loss_weight",
+                    0.75,
+                )
+            ),
+            quantile_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_quantile_loss_weight",
+                    0.35,
+                )
+            ),
+            intervene_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_intervene_loss_weight",
+                    0.05,
+                )
+            ),
+            value_target_scale=float(
+                _cfg_value(
+                    "tier2_value_target_scale",
+                    0.01,
+                )
+            ),
+            lower_quantile=float(
+                _cfg_value(
+                    "tier2_value_lower_quantile",
+                    0.25,
+                )
+            ),
+            upper_quantile=float(
+                _cfg_value(
+                    "tier2_value_upper_quantile",
+                    0.75,
+                )
+            ),
+            return_floor_margin=float(
+                _cfg_value(
+                    "tier2_value_return_floor_margin",
+                    5e-5,
+                )
+            ),
+            return_floor_interval_penalty=float(
+                _cfg_value(
+                    "tier2_value_return_floor_interval_penalty",
+                    0.10,
+                )
+            ),
+            nav_interval_penalty=float(
+                _cfg_value(
+                    "tier2_value_nav_interval_penalty",
+                    0.05,
+                )
+            ),
+            decision_downside_weight=float(
+                getattr(config, "tier2_value_decision_downside_weight", 0.75) or 0.75
+            ),
+            decision_drawdown_weight=float(
+                getattr(config, "tier2_value_decision_drawdown_weight", 0.60) or 0.60
+            ),
+            decision_vol_weight=float(
+                getattr(config, "tier2_value_decision_vol_weight", 0.75) or 0.75
+            ),
+            decision_stability_penalty=float(getattr(config, "tier2_value_decision_stability_penalty", 0.18) or 0.18),
+            delta_limit=float(
+                max(
+                    float(getattr(config, "tier2_value_delta_max", 0.20) or 0.20),
+                    1e-6,
+                )
+            ),
+            runtime_min_abs_delta=float(getattr(config, "tier2_runtime_min_abs_delta", 0.0)),
+            max_position_size=float(getattr(config, "max_position_size", 0.35) or 0.35),
+            transaction_cost_bps=float(getattr(config, "transaction_cost_bps", 0.5) or 0.5),
+            transaction_fixed_cost_dkk=float(getattr(config, "transaction_fixed_cost", 0.0) or 0.0),
+            init_budget_dkk=float(getattr(config, "init_budget", 1.0) or 1.0),
+            factor_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_factor_loss_weight",
+                    0.0,
+                )
+            ),
+            tail_risk_budget=float(
+                _cfg_value(
+                    "tier2_value_tail_risk_budget",
+                    0.10,
+                )
+            ),
+            nav_actor_weight=float(
+                _cfg_value(
+                    "tier2_value_nav_actor_weight",
+                    0.20,
+                )
+            ),
+            nav_lcb_actor_weight=float(
+                _cfg_value(
+                    "tier2_value_nav_lcb_actor_weight",
+                    0.25,
+                )
+            ),
+            tail_loss_weight=float(
+                _cfg_value(
+                    "tier2_value_tail_loss_weight",
+                    0.50,
+                )
+            ),
+            nav_head_scale=float(getattr(config, "tier2_value_nav_head_scale", 3.0) or 3.0),
+            return_floor_head_scale=float(getattr(config, "tier2_value_return_floor_head_scale", 4.0) or 4.0),
+        )
+        tier2_value_buffer = Tier2PolicyImprovementBuffer(max_size=50_000, replay_size=20_000, seed=seed)
 
-        env.control_variate_adapter = cv_adapter
-        env.cv_trainer = cv_trainer
-        env.cv_experience_buffer = cv_buffer
-        env.tier2_overlay_adapter = cv_adapter
-        env.tier2_overlay_trainer = cv_trainer
-        env.tier2_experience_buffer = cv_buffer
+        _set_tier2_value_runtime(
+            env,
+            adapter=tier2_value_adapter,
+            trainer=tier2_value_trainer,
+            experience_buffer=tier2_value_buffer,
+        )
         env.tier2_feature_dim = forecast_dim
-        env.cv_feature_dim = forecast_dim  # Backward-compatible alias
         logger.info(
-            f"   [OK] Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller initialized "
-            f"(obs={obs_dim}, forecast={forecast_dim}, lr={cv_lr:.2e}, l2={cv_l2:.2e})"
+            f"   [OK] Tier-2 forecast-guided enhancement layer initialized "
+            f"(obs={obs_dim}, forecast={forecast_dim}, lr={tier2_value_lr:.2e}, l2={tier2_l2_reg:.2e})"
         )
         return True
 
     except Exception as e:
-        logger.error(f"[TIER2_INIT_FATAL] Failed to initialize the Tier-2 routed overlay: {e}")
-        env.control_variate_adapter = None
-        env.cv_trainer = None
-        env.cv_experience_buffer = None
-        env.tier2_overlay_adapter = None
-        env.tier2_overlay_trainer = None
-        env.tier2_experience_buffer = None
-        raise RuntimeError("[TIER2_INIT_FATAL] Tier-2 routed overlay initialization failed") from e
-
+        logger.error(f"[TIER2_INIT_FATAL] Failed to initialize the Tier-2 policy-improvement layer: {e}")
+        _set_tier2_value_runtime(env, adapter=None, trainer=None, experience_buffer=None)
+        raise RuntimeError("[TIER2_INIT_FATAL] Tier-2 policy-improvement initialization failed") from e
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Multi-Agent RL with Hyperparameter Optimization")
@@ -2444,22 +2736,35 @@ def main():
     parser.add_argument("--expert_blend_weight", type=float, default=0.0, help="Expert suggestion blend weight (0.0=pure PPO, 1.0=pure expert, 0.3=30%% expert)")
     parser.add_argument("--expert_blend_mode", type=str, default="none", choices=["none", "fixed", "adaptive", "residual"],
                        help="Expert blending mode: none (passive hints), fixed (constant blend), adaptive (confidence-based), residual (PPO learns corrections)")
-    parser.add_argument("--dl_train_every", type=int, default=100, help="Tier-2 online training frequency in environment steps.")
-    parser.add_argument("--tier2_cv_lr", type=float, default=None,
-                       help="Tier-2 optimizer learning rate (default: config.tier2_cv_lr).")
+    parser.add_argument("--dl_train_every", type=int, default=256, help="Tier-2 online training frequency in environment steps.")
+    parser.add_argument(
+        "--tier2_value_lr",
+        dest="tier2_value_lr",
+        type=float,
+        default=None,
+        help="Tier-2 optimizer learning rate for the forecast-conditioned policy-improvement layer (default: config.tier2_value_lr).",
+    )
+    parser.add_argument(
+        "--tier2_policy_family",
+        type=str,
+        default=None,
+        choices=["conservative_actor_critic"],
+        help="Tier-2 policy-improvement family to run for fresh training/evaluation metadata.",
+    )
 
-    # Forecast backend (Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller)
+    # Forecast backend (Tier-2 forecast-guided enhanced baseline)
     parser.add_argument("--forecast_baseline_enable", action="store_true", default=False,
-                       help="Enable the Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller (keeps Tier-1 observations intact).")
+                       help="Enable the Tier-2 forecast-guided enhanced baseline (keeps Tier-1 observations intact while adding the Tier-2 layer).")
     parser.add_argument("--forecast_trust_window", type=int, default=None, help="Forecast backend: rolling window for trust calibration (default: config.forecast_trust_window).")
     # Default to directional hit-rate for trust calibration. Users can still select "combo" (dir + magnitude).
     parser.add_argument("--forecast_trust_metric", type=str, default="hitrate", choices=["combo", "hitrate", "absdir"], help="Forecast backend: trust computation method (default: hitrate for canonical parity)")
     parser.add_argument("--forecast_trust_boost", type=float, default=None, help="Forecast backend: optional trust optimism boost (default: config.forecast_trust_boost).")
     parser.add_argument(
-        "--tier2_cv_ablate_forecast_features",
+        "--tier2_value_ablate_forecast_features",
+        dest="tier2_value_ablate_forecast_features",
         action="store_true",
         default=False,
-        help="Tier-2 ablation: the routed residual-aware overlay uses nullified (zero) forecast-memory features.",
+        help="Tier-2 ablation: keep the same controller but neutralize the full short-horizon forecast-memory block.",
     )
 
 
@@ -2479,7 +2784,7 @@ def main():
     parser.add_argument("--ppo_log_std_init", type=float, default=None,
                         help="Override PPO policy log_std_init for continuous actions (e.g., -0.3 to increase exploration).")
 
-    # Forecasting control (only used when forecasts are enabled for the Tier-2 routed residual-aware overlay)
+    # Forecasting control (only used when forecasts are enabled for the Tier-2 policy-improvement layer)
     parser.add_argument("--confidence_floor", type=float, default=0.6, help="Minimum confidence floor (0.0-1.0, default 0.6). MAPE-based confidence cannot go below this value.")
     parser.add_argument(
         "--precompute_batch_size",
@@ -2561,7 +2866,7 @@ def main():
         Automatically resolve configuration dependencies for paper-friendly modes:
 
         - Baseline (Tier 1): No forecasts, no Tier-2 layer (observations unchanged).
-        - Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller: --forecast_baseline_enable with forecast backend enabled.
+        - Tier-2 forecast-guided enhanced MARL baseline: --forecast_baseline_enable with forecast backend enabled.
         """
         changes_made = []
 
@@ -2576,9 +2881,9 @@ def main():
 
         # Log mode information
         if args.forecast_baseline_enable:
-            logger.info("[MODE] Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller: Tier-1 observations + investor-only learned routed override")
+            logger.info("[MODE] Tier-2 forecast-guided enhanced MARL baseline: train Tier-2 RL policies with the forecast-conditioned Tier-2 layer enabled")
         else:
-            logger.info("[MODE] Tier-1 hybrid RL baseline: no forecasts, no Tier-2 overlay (Tier-1 observations)")
+            logger.info("[MODE] Tier-1 hybrid RL baseline: no forecasts, no Tier-2 layer (Tier-1 observations)")
 
         return args
 
@@ -2588,16 +2893,21 @@ def main():
     # Seed value first (single source of truth for this run).
     seed_value = int(args.seed)
 
+    tf_thread_budget = 1
+    tf_interop_budget = 1
+    torch_thread_budget = 1
+    torch_interop_budget = 1
+    blas_thread_budget = 1
+
     # CRITICAL: Set deterministic env vars BEFORE TensorFlow/CUDA initialization.
     os.environ['PYTHONHASHSEED'] = str(seed_value)
     os.environ['TF_DETERMINISTIC_OPS'] = '1'
     os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
     # Recommended by PyTorch/CUDA for deterministic GEMM behavior.
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
-    # Pin math threadpools to 1 for stronger determinism.
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+    os.environ['OMP_NUM_THREADS'] = str(blas_thread_budget)
+    os.environ['MKL_NUM_THREADS'] = str(blas_thread_budget)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(blas_thread_budget)
 
     # Safer device selection
     if args.device.lower() == "cuda" and not torch.cuda.is_available():
@@ -2613,11 +2923,11 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     try:
-        torch.set_num_threads(1)
+        torch.set_num_threads(torch_thread_budget)
     except Exception:
         pass
     try:
-        torch.set_num_interop_threads(1)
+        torch.set_num_interop_threads(torch_interop_budget)
     except Exception:
         pass
 
@@ -2633,8 +2943,8 @@ def main():
     if tf is not None:
         tf.random.set_seed(seed_value)
         try:
-            tf.config.threading.set_intra_op_parallelism_threads(1)
-            tf.config.threading.set_inter_op_parallelism_threads(1)
+            tf.config.threading.set_intra_op_parallelism_threads(tf_thread_budget)
+            tf.config.threading.set_inter_op_parallelism_threads(tf_interop_budget)
         except Exception:
             pass
 
@@ -2719,20 +3029,23 @@ def main():
     )
 
     # Apply forecast backend CLI args to config
-    logger.info("\nApplying Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller configuration...")
+    logger.info("\nApplying Tier-2 short-horizon forecast-conditioned policy-improvement configuration...")
     config.forecast_baseline_enable = args.forecast_baseline_enable
     # The manifest reflects the Tier-2 runtime layer directly.
-    # initialize_tier2_routed_overlay() will perform concrete adapter construction when forecast_baseline_enable.
+    # initialize_tier2_policy_improvement() will perform concrete adapter construction when forecast_baseline_enable.
+    if getattr(args, "tier2_policy_family", None):
+        config.tier2_policy_family = str(args.tier2_policy_family)
+        config.tier2_policy_objective = "conservative_actor_critic_advantage"
+        config.tier2_value_architecture = "ann_cache_cross_attention_cleanroom_actor_critic"
     if args.forecast_trust_window is not None:
         config.forecast_trust_window = args.forecast_trust_window
     config.forecast_trust_metric = args.forecast_trust_metric
     if args.forecast_trust_boost is not None:
         config.forecast_trust_boost = float(args.forecast_trust_boost)
-    config.tier2_cv_ablate_forecast_features = bool(getattr(args, "tier2_cv_ablate_forecast_features", False))
-    if getattr(args, "tier2_cv_lr", None) is not None:
-        config.tier2_cv_lr = float(args.tier2_cv_lr)
-        config.cv_learning_rate = float(args.tier2_cv_lr)
-    config.tier2_cv_train_every = int(getattr(args, "dl_train_every", 100) or 100)
+    config.tier2_value_ablate_forecast_features = bool(getattr(args, "tier2_value_ablate_forecast_features", False))
+    if getattr(args, "tier2_value_lr", None) is not None:
+        config.tier2_value_lr = float(args.tier2_value_lr)
+    config.tier2_value_train_every = int(getattr(args, "dl_train_every", 256) or 256)
     if args.global_norm_mode is not None:
         config.use_global_normalization = bool(args.global_norm_mode == "global")
         logger.info(f"[GLOBAL_NORM] global_norm_mode={args.global_norm_mode} -> use_global_normalization={config.use_global_normalization}")
@@ -2740,7 +3053,7 @@ def main():
         config.rolling_past_history_dir = str(args.rolling_past_history_dir)
         logger.info(f"[ROLLING_PAST] history_dir={config.rolling_past_history_dir}")
 
-    # Forecast backend configuration (Tier-2 residual-aware decision-focused controller)
+    # Forecast backend configuration (Tier-2 policy-improvement controller)
     logger.info("\nApplying forecast backend configuration...")
     config.fgb_fail_fast = True
     logger.info(
@@ -2748,37 +3061,35 @@ def main():
         f"trust_boost={getattr(config, 'forecast_trust_boost', 0.0)}"
     )
 
-    # Expert Blending: Apply expert blending CLI args to config
-    logger.info("\nApplying expert blending configuration...")
+    # Expert blending config is retained only for compatibility with old CLI
+    # surfaces; the active Tier-2 path no longer uses expert blending.
     config.expert_blend_mode = args.expert_blend_mode
     config.expert_blend_weight = args.expert_blend_weight
-    logger.info(f"[EXPERT_BLEND] Mode: {config.expert_blend_mode}")
-    if config.expert_blend_mode != 'none':
-        logger.info(f"[EXPERT_BLEND] Weight: {config.expert_blend_weight}")
 
     logger.info(f"\n[TIER2] Enabled: {bool(config.forecast_baseline_enable)}")
     if bool(config.forecast_baseline_enable):
             logger.info(
-                f"[TIER2_CONTRACT] architecture={getattr(config, 'tier2_cv_architecture', 'short_horizon_conformal_residual_aware_decision_focused_defer_and_route_controller')} "
-                f"investor_only_overlay=True "
-                f"delta_max={float(getattr(config, 'tier2_cv_delta_max', 0.20) or 0.20):.3f}"
+                f"[TIER2_CONTRACT] architecture={getattr(config, 'tier2_value_architecture', 'ann_cache_cross_attention_cleanroom_actor_critic')} "
+                f"family={getattr(config, 'tier2_policy_family', 'conservative_actor_critic')} "
+                f"objective={getattr(config, 'tier2_policy_objective', 'conservative_actor_critic_advantage')} "
+                f"independent_rl_baseline=True "
+                f"delta_max={float(getattr(config, 'tier2_value_delta_max', 0.20) or 0.20):.3f}"
             )
 
-    # DEBUG: Verify forecast backend + expert blending config values.
+    # DEBUG: Verify forecast backend + Tier-2 config values.
     logger.info("\n" + "="*70)
-    logger.info("FORECAST BACKEND & EXPERT BLENDING CONFIGURATION VERIFICATION")
+    logger.info("FORECAST BACKEND & TIER2 CONFIGURATION VERIFICATION")
     logger.info("="*70)
     logger.info(f"forecast_baseline_enable:  {config.forecast_baseline_enable}")
     logger.info(f"fgb_fail_fast:             {getattr(config, 'fgb_fail_fast', False)}")
-    logger.info("tier2_mode:                short-horizon conformal residual-aware decision-focused defer-and-route controller")
-    logger.info(f"tier2_lr:            {getattr(config, 'tier2_cv_lr', 3e-3)}")
-    logger.info(f"tier2_train_every:   {getattr(config, 'tier2_cv_train_every', 100)}")
-    logger.info(f"tier2_delta_max:     {getattr(config, 'tier2_cv_delta_max', 0.20)}")
-    logger.info(f"tier2_memory_steps:  {getattr(config, 'tier2_cv_memory_steps', 2)}")
-    logger.info(f"tier2_runtime_gain:  {getattr(config, 'tier2_runtime_gain', 0.65)}")
-    logger.info(f"tier2_mc_samples:    {getattr(config, 'tier2_runtime_mc_samples', 3)}")
-    logger.info(f"expert_blend_mode:         {getattr(config, 'expert_blend_mode', 'NOT SET')}")
-    logger.info(f"expert_blend_weight:       {getattr(config, 'expert_blend_weight', 'NOT SET')}")
+    logger.info("tier2_mode:                forecast-guided enhanced MARL baseline")
+    logger.info(f"tier2_value_lr:      {getattr(config, 'tier2_value_lr', 1e-3)}")
+    logger.info(f"tier2_train_every:   {getattr(config, 'tier2_value_train_every', 256)}")
+    logger.info(f"tier2_delta_max:     {getattr(config, 'tier2_value_delta_max', 0.20)}")
+    logger.info(f"tier2_memory_steps:  {getattr(config, 'tier2_value_memory_steps', 8)}")
+    logger.info(f"tier2_runtime_gain:  {getattr(config, 'tier2_runtime_gain', 1.0)}")
+    logger.info(f"tier2_mc_samples:    {getattr(config, 'tier2_runtime_mc_samples', 7)}")
+    logger.info(f"tier2_delta_scale:   {getattr(config, 'tier2_runtime_delta_scale', 1.0)}")
     logger.info("="*70)
 
     # VALIDATE CONFIGURATION (NEW)
@@ -2791,7 +3102,7 @@ def main():
         logger.error(f"  {e}")
         return
 
-    # Validate forecast configuration - forecasts are needed for the Tier-2 routed residual-aware overlay.
+    # Validate forecast configuration - forecasts are needed for the active Tier-2 layer.
     logger.info("\nValidating forecast configuration...")
     forecast_required = bool(args.forecast_baseline_enable)
 
@@ -2825,28 +3136,6 @@ def main():
             logger.info(f"[OK] Forecast directories validated: model_dir={args.model_dir}, scaler_dir={args.scaler_dir}")
     else:
         logger.info("[TIER 1] Hybrid RL baseline mode - no forecasts required")
-
-    # === RUN MANIFEST (REPRODUCIBILITY) ===
-    # Write a lightweight JSON manifest capturing argv/args/final config + git hash (if available).
-    # This is research-release hygiene and does not affect algorithm behavior.
-    try:
-        from run_manifest import write_run_manifest
-        manifest_path = write_run_manifest(
-            args.save_dir,
-            argv=sys.argv,
-            args=args,
-            config=config,
-            extra={
-                "entrypoint": "main.py",
-                "episode_training": bool(getattr(args, "episode_training", False)),
-                "forecast_required": bool(forecast_required),
-                "forecast_baseline_enable": bool(getattr(args, "forecast_baseline_enable", False)),
-            },
-            filename_prefix="train_manifest",
-        )
-        logger.info(f"[MANIFEST] Wrote run manifest: {manifest_path}")
-    except Exception as e:
-        logger.warning(f"[MANIFEST] Failed to write run manifest: {e}")
 
     # Apply MW scale overrides from CLI arguments
     mw_scale_overrides = {
@@ -2904,8 +3193,8 @@ def main():
     if forecast_required:
         feature_description = []
         if args.forecast_baseline_enable:
-            feature_description.append("Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller")
-            feature_description.append("26D core+memory Tier-2 state + runtime investor overlay")
+            feature_description.append("Tier-2 forecast-guided enhanced MARL baseline")
+            feature_description.append("176D clean-room Tier-2 state + ANN-cache forecast-guided runtime layer")
 
         # CRITICAL: For episode-based training, skip forecaster initialization at startup
         # Forecaster will be initialized per-episode with episode-specific models
@@ -3015,7 +3304,7 @@ def main():
     else:
         logger.info("\n[TIER 1] Hybrid RL baseline mode: Skipping forecaster initialization")
         logger.info("[TIER 1] Investor observations: 9D (price_momentum, realized_vol, budget, exposure, mtm_pnl, decision_step, cap_frac, risk_cap, drawdown)")
-        logger.info("[TIER 1] To enable the Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller, use: --forecast_baseline_enable")
+        logger.info("[TIER 1] To enable the Tier-2 forecast-guided enhanced baseline, use: --forecast_baseline_enable")
 
     # Re-seed using config.seed to ensure consistency with agent init
     # (config.seed was already set from args.seed above)
@@ -3058,17 +3347,19 @@ def main():
             log_dir=bootstrap_logs_dir  # Keep bootstrap logs isolated in episode training
         )
 
-        # Step 2: Initialize the Tier-2 routed residual-aware overlay (shared runtime adapter + trainer)
-        initialize_tier2_routed_overlay(base_env, config, args)
+        # Step 2: Initialize the Tier-2 policy-improvement layer (shared runtime adapter + trainer)
+        initialize_tier2_policy_improvement(base_env, config, args)
 
-        # Initialize CalibrationTracker for forecast trust computation.
-        # CRITICAL: For episode training, CalibrationTracker is initialized per-episode with episode-specific forecaster.
+        # Forecast-trust calibration is compatibility-only diagnostics for the
+        # clean-room Tier-2 path. The active Tier-2 runtime does not depend on it.
         if args.episode_training:
-            logger.info("[EPISODE_TRAINING] Skipping CalibrationTracker initialization at startup (will be initialized per-episode)")
+            logger.info("[EPISODE_TRAINING] Skipping forecast-trust diagnostics initialization at startup (optional per-episode)")
             base_env.calibration_tracker = None
         elif config.forecast_baseline_enable and forecaster is not None:
             try:
-                from tier2_routed_overlay import CalibrationTracker
+                from tier2 import CalibrationTracker
+                # For non-episode training, use episode_20 (evaluation model)
+                forecast_model_base_dir = "forecast_models/episode_20"
                 base_env.calibration_tracker = CalibrationTracker(
                     window_size=config.forecast_trust_window,
                     trust_metric=config.forecast_trust_metric,
@@ -3077,17 +3368,24 @@ def main():
                     direction_weight=config.forecast_trust_direction_weight,  # Weight for directional accuracy (default: 0.7)
                     trust_boost=getattr(config, "forecast_trust_boost", 0.0),
                     fail_fast=bool(getattr(config, "fgb_fail_fast", False)),
+                    metadata_quality_path=os.path.join(forecast_model_base_dir, "price_short_experts", "ANN", "ann_metadata.json"),
+                    metadata_quality_weight=getattr(config, "forecast_metadata_quality_weight", 0.3),
                 )
-                logger.info(f"[FORECAST_TRUST] CalibrationTracker initialized (window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, dir_weight={config.forecast_trust_direction_weight})")
+                logger.info(
+                    f"[FORECAST_TRUST] Optional diagnostics initialized "
+                    f"(window={config.forecast_trust_window}, metric={config.forecast_trust_metric}, "
+                    f"dir_weight={config.forecast_trust_direction_weight})"
+                )
             except Exception as e:
-                # FAIL-FAST: CalibrationTracker is required for forecast utilisation
-                error_msg = f"[ERROR] CalibrationTracker initialization failed but is required for forecast utilisation: {e}"
-                logger.error(error_msg)
-                raise RuntimeError(error_msg)
+                logger.warning(
+                    "[FORECAST_TRUST] Optional diagnostics unavailable; Tier-2 clean-room path remains active: %s",
+                    e,
+                )
+                base_env.calibration_tracker = None
         else:
             base_env.calibration_tracker = None
             if config.forecast_baseline_enable and forecaster is None:
-                logger.warning("[WARN] Tier-2 layer enabled but forecaster not available - CalibrationTracker not initialized")
+                logger.info("[FORECAST_TRUST] Diagnostics skipped because the forecaster is not available yet")
 
         # Forecasts are never appended to agent observations in the paper setup.
         # Use the base environment as-is (Tier-1 observation spaces remain unchanged).
@@ -3135,7 +3433,7 @@ def main():
         
         # Determine active evaluation/training variant (paper modes)
         if args.forecast_baseline_enable:
-            active_variant = "Tier-2 Forecast Residual Layer"
+            active_variant = "Tier-2 Forecast Policy-Improvement Layer"
         else:
             active_variant = "Baseline (Tier-1 hybrid RL)"
         logger.info(f"Active Variant:                 {active_variant}")
@@ -3150,7 +3448,7 @@ def main():
                 forecaster_status = "NO"
         logger.info(f"Forecaster loaded:              {forecaster_status}")
         if args.forecast_baseline_enable:
-            ablate = bool(getattr(config, "tier2_cv_ablate_forecast_features", False))
+            ablate = bool(getattr(config, "tier2_value_ablate_forecast_features", False))
             logger.info(f"Tier-2 layer enabled:          YES (ablated={ablate})")
         else:
             logger.info("Tier-2 layer enabled:          NO")
@@ -3158,7 +3456,7 @@ def main():
         # Only show Tier-2 details if enabled
         if args.forecast_baseline_enable:
             logger.info("  └─ Tier-2 layer:              YES")
-            logger.info("  └─ Mode:                      investor-only learned defer-and-route override + residual-aware forecast memory")
+            logger.info("  └─ Mode:                      independent forecast-guided enhanced MARL baseline")
         else:
             logger.info("Forecast backend mode:          DISABLED")
 
@@ -3170,7 +3468,7 @@ def main():
             if args.forecast_baseline_enable and forecaster is None:
                 validation_errors.append("Forecast-guided baseline enabled but forecaster not loaded!")
         # Validate Tier-2 layer when forecast_baseline_enable
-        if not args.episode_training and args.forecast_baseline_enable and (not hasattr(base_env, 'control_variate_adapter') or base_env.control_variate_adapter is None):
+        if not args.episode_training and args.forecast_baseline_enable and _get_tier2_value_adapter(base_env) is None:
             validation_errors.append("Forecast baseline enabled but Tier-2 layer not initialized!")
 
         if validation_errors:
@@ -3202,7 +3500,7 @@ def main():
             logger.warning(f"Env validation reset failed (continuing): {e}")
 
     if args.forecast_baseline_enable:
-        logger.info("Tier-2 short-horizon conformal residual-aware decision-focused defer-and-route controller active")
+        logger.info("Tier-2 forecast-guided enhanced baseline active")
 
     # 4) (Optional) HPO (best_params already initialized above)
     if args.optimize and not best_params:
@@ -3440,11 +3738,11 @@ def main():
                 'device': args.device,
                 'flags': {
                     'forecast_baseline_enable': bool(getattr(config, 'forecast_baseline_enable', False)),
-                    'tier2_routed_overlay_enabled': bool(getattr(config, 'forecast_baseline_enable', False)),
+                    'tier2_policy_improvement_enabled': bool(getattr(config, 'forecast_baseline_enable', False)),
                     'tier2_runtime_overlay_enabled': bool(
                         getattr(config, 'forecast_baseline_enable', False)
                         and getattr(config, 'tier2_runtime_overlay_enable', True)
-                        and not getattr(config, 'tier2_cv_ablate_forecast_features', False)
+                        and not getattr(config, 'tier2_value_ablate_forecast_features', False)
                     ),
                 },
                 'optimized_params': best_params,
@@ -3452,28 +3750,44 @@ def main():
                 'enhanced_features': {
                     'forecasting_enabled': args.forecast_baseline_enable,
                     'tier2_enabled': args.forecast_baseline_enable,
-                    'has_tier2_weights': args.forecast_baseline_enable and getattr(base_env, "control_variate_adapter", None) is not None,
-                    'forecast_routed_overlay_features': bool(
-                        args.forecast_baseline_enable and not getattr(config, 'tier2_cv_ablate_forecast_features', False)
+                    'has_tier2_weights': bool(
+                        args.forecast_baseline_enable
+                        and _get_tier2_value_adapter(base_env) is not None
+                        and hasattr(_get_tier2_value_adapter(base_env), "has_persisted_weights")
+                        and _get_tier2_value_adapter(base_env).has_persisted_weights()
+                    ),
+                    'has_tier2_policy_improvement_weights': bool(
+                        args.forecast_baseline_enable
+                        and _get_tier2_value_adapter(base_env) is not None
+                        and hasattr(_get_tier2_value_adapter(base_env), "has_persisted_weights")
+                        and _get_tier2_value_adapter(base_env).has_persisted_weights()
                     ),
                     'tier2_runtime_overlay_enabled': bool(
                         args.forecast_baseline_enable
                         and getattr(config, 'tier2_runtime_overlay_enable', True)
-                        and not getattr(config, 'tier2_cv_ablate_forecast_features', False)
+                        and not getattr(config, 'tier2_value_ablate_forecast_features', False)
                     ),
-                    'tier2_ablated': bool(getattr(config, 'tier2_cv_ablate_forecast_features', False)),
+                    'tier2_ablated': bool(getattr(config, 'tier2_value_ablate_forecast_features', False)),
                     'tier2_contract': (
-                        getattr(config, 'tier2_cv_architecture', 'short_horizon_conformal_residual_aware_decision_focused_defer_and_route_controller')
+                        getattr(config, 'tier2_value_architecture', 'ann_quality_end_to_end_selective_uplift_overlay')
                         if bool(getattr(config, 'forecast_baseline_enable', False))
                         else 'baseline'
                     ),
-                    'tier2_architecture': getattr(config, 'tier2_cv_architecture', None),
+                    'tier2_policy_family': getattr(config, 'tier2_policy_family', 'conservative_actor_critic'),
+                    'tier2_policy_objective': getattr(config, 'tier2_policy_objective', 'conservative_actor_critic_advantage'),
+                    'tier2_architecture': getattr(config, 'tier2_value_architecture', None),
                     'one_factor_investor_sleeve': True,
                 },
                 'final_config': {
                     'lr': config.lr,
                     'ent_coef': config.ent_coef,
                     'batch_size': config.batch_size,
+                    'max_position_size': getattr(config, 'max_position_size', None),
+                    'transaction_cost_bps': getattr(config, 'transaction_cost_bps', None),
+                    'transaction_fixed_cost': getattr(config, 'transaction_fixed_cost', None),
+                    'no_trade_threshold': getattr(config, 'no_trade_threshold', None),
+                    'capital_allocation_fraction': getattr(config, 'capital_allocation_fraction', None),
+                    'financial_allocation': getattr(config, 'financial_allocation', None),
                     'ppo_use_sde': getattr(config, 'ppo_use_sde', None),
                     'ppo_log_std_init': getattr(config, 'ppo_log_std_init', None),
                     'investor_use_beta_policy': getattr(config, 'investor_use_beta_policy', None),
@@ -3491,29 +3805,45 @@ def main():
                     'investor_active_risk_vol_mult': getattr(config, 'investor_active_risk_vol_mult', None),
                     'investor_mean_clip_hit_window': getattr(config, 'investor_mean_clip_hit_window', None),
                     'investor_mean_clip_hit_threshold': getattr(config, 'investor_mean_clip_hit_threshold', None),
-                    'tier2_cv_lr': getattr(config, 'tier2_cv_lr', None),
-                    'tier2_cv_batch_size': getattr(config, 'tier2_cv_batch_size', None),
+                    'tier2_value_lr': getattr(config, 'tier2_value_lr', None),
+                    'tier2_l2_reg': getattr(config, 'tier2_l2_reg', None),
+                    'tier2_value_batch_size': getattr(config, 'tier2_value_batch_size', None),
+                    'tier2_value_memory_steps': getattr(config, 'tier2_value_memory_steps', None),
+                    'tier2_value_train_epochs': getattr(config, 'tier2_value_train_epochs', None),
+                    'tier2_value_target_scale': getattr(config, 'tier2_value_target_scale', None),
                     'tier2_runtime_overlay_enable': getattr(config, 'tier2_runtime_overlay_enable', None),
                     'tier2_runtime_gain': getattr(config, 'tier2_runtime_gain', None),
                     'tier2_runtime_mc_samples': getattr(config, 'tier2_runtime_mc_samples', None),
                     'tier2_runtime_sigma_scale': getattr(config, 'tier2_runtime_sigma_scale', None),
+                    'tier2_runtime_min_abs_delta': getattr(config, 'tier2_runtime_min_abs_delta', None),
                     'tier2_runtime_conformal_margin': getattr(config, 'tier2_runtime_conformal_margin', None),
-                    'tier2_cv_delta_max': getattr(config, 'tier2_cv_delta_max', None),
-                    'tier2_cv_confidence_loss_weight': getattr(config, 'tier2_cv_confidence_loss_weight', None),
-                    'tier2_cv_decision_loss_weight': getattr(config, 'tier2_cv_decision_loss_weight', None),
-                    'tier2_cv_decision_horizon': getattr(config, 'tier2_cv_decision_horizon', None),
-                    'tier2_cv_decision_scale': getattr(config, 'tier2_cv_decision_scale', None),
-                    'tier2_cv_decision_downside_weight': getattr(config, 'tier2_cv_decision_downside_weight', None),
-                    'tier2_cv_decision_vol_weight': getattr(config, 'tier2_cv_decision_vol_weight', None),
-                    'tier2_cv_decision_stability_penalty': getattr(config, 'tier2_cv_decision_stability_penalty', None),
-                    'tier2_cv_route_loss_weight': getattr(config, 'tier2_cv_route_loss_weight', None),
-                    'tier2_cv_override_loss_weight': getattr(config, 'tier2_cv_override_loss_weight', None),
-                    'tier2_cv_route_grid_points': getattr(config, 'tier2_cv_route_grid_points', None),
-                    'tier2_cv_conformal_alpha': getattr(config, 'tier2_cv_conformal_alpha', None),
-                    'tier2_cv_conformal_scale': getattr(config, 'tier2_cv_conformal_scale', None),
-                    'tier2_feature_dim': getattr(config, 'tier2_feature_dim', getattr(config, 'cv_forecast_dim', None)),
-                    'cv_forecast_dim': getattr(config, 'cv_forecast_dim', None),
-                    'tier2_cv_architecture': getattr(config, 'tier2_cv_architecture', None),
+                    'tier2_runtime_delta_scale': getattr(config, 'tier2_runtime_delta_scale', None),
+                    'tier2_value_delta_max': getattr(config, 'tier2_value_delta_max', None),
+                    'tier2_value_confidence_loss_weight': getattr(config, 'tier2_value_confidence_loss_weight', None),
+                    'tier2_value_quantile_loss_weight': getattr(config, 'tier2_value_quantile_loss_weight', None),
+                    'tier2_value_lower_quantile': getattr(config, 'tier2_value_lower_quantile', None),
+                    'tier2_value_upper_quantile': getattr(config, 'tier2_value_upper_quantile', None),
+                    'tier2_value_return_floor_margin': getattr(config, 'tier2_value_return_floor_margin', None),
+                    'tier2_value_return_floor_interval_penalty': getattr(config, 'tier2_value_return_floor_interval_penalty', None),
+                    'tier2_value_nav_interval_penalty': getattr(config, 'tier2_value_nav_interval_penalty', None),
+                    'tier2_value_nav_head_scale': getattr(config, 'tier2_value_nav_head_scale', None),
+                    'tier2_value_return_floor_head_scale': getattr(config, 'tier2_value_return_floor_head_scale', None),
+                    'tier2_value_policy_loss_weight': getattr(config, 'tier2_value_policy_loss_weight', None),
+                    'tier2_value_decision_downside_weight': getattr(config, 'tier2_value_decision_downside_weight', None),
+                    'tier2_value_decision_drawdown_weight': getattr(config, 'tier2_value_decision_drawdown_weight', None),
+                    'tier2_value_decision_vol_weight': getattr(config, 'tier2_value_decision_vol_weight', None),
+                    'tier2_value_decision_stability_penalty': getattr(config, 'tier2_value_decision_stability_penalty', None),
+                    'tier2_value_baseline_quality_margin_scale': getattr(config, 'tier2_value_baseline_quality_margin_scale', None),
+                    'tier2_value_min_certified_improvement': getattr(config, 'tier2_value_min_certified_improvement', None),
+                    'tier2_value_min_route_margin': getattr(config, 'tier2_value_min_route_margin', None),
+                    'tier2_value_min_intervention_context': getattr(config, 'tier2_value_min_intervention_context', None),
+                    'tier2_value_nav_actor_weight': getattr(config, 'tier2_value_nav_actor_weight', None),
+                    'tier2_value_nav_lcb_actor_weight': getattr(config, 'tier2_value_nav_lcb_actor_weight', None),
+                    'tier2_feature_dim': getattr(config, 'tier2_feature_dim', None),
+                    'tier2_value_expert_winner_loss_weight': getattr(config, 'tier2_value_expert_winner_loss_weight', None),
+                    'tier2_policy_family': getattr(config, 'tier2_policy_family', 'conservative_actor_critic'),
+                    'tier2_policy_objective': getattr(config, 'tier2_policy_objective', 'conservative_actor_critic_advantage'),
+                    'tier2_value_architecture': getattr(config, 'tier2_value_architecture', None),
                     'investor_mean_collapse_window': getattr(config, 'investor_mean_collapse_window', None),
                     'investor_mean_collapse_abs_mean_threshold': getattr(config, 'investor_mean_collapse_abs_mean_threshold', None),
                     'investor_mean_collapse_sign_threshold': getattr(config, 'investor_mean_collapse_sign_threshold', None),
@@ -3539,14 +3869,18 @@ def main():
             }, f, indent=2)
         logger.info(f"Training configuration saved to: {cfg_file}")
 
-    # 10) Save the online-trained Tier-2 routed overlay weights (if possible)
-    if args.forecast_baseline_enable and hasattr(base_env, 'control_variate_adapter') and base_env.control_variate_adapter is not None:
+    # 10) Save the online-trained Tier-2 policy-improvement weights (if possible)
+    final_tier2_value_adapter = _get_tier2_value_adapter(base_env)
+    if args.forecast_baseline_enable and final_tier2_value_adapter is not None:
         try:
-            cv_path = os.path.join(final_dir, _cv_weights_filename())
-            if base_env.control_variate_adapter.save_weights(cv_path):
-                logger.info(f"[SAVE] Tier-2 routed overlay weights saved: {cv_path}")
+            tier2_weights_path = os.path.join(
+                final_dir,
+                _tier2_weights_filename(getattr(base_env, "config", None)),
+            )
+            if final_tier2_value_adapter.save_weights(tier2_weights_path):
+                logger.info(f"[SAVE] Tier-2 policy-improvement weights saved: {tier2_weights_path}")
         except Exception as e:
-            logger.warning(f"Could not save Tier-2 routed overlay weights: {e}")
+            logger.warning(f"Could not save Tier-2 policy-improvement weights: {e}")
 
     # 11) Force a final log flush (avoid losing buffered rows)
     try:
@@ -3600,10 +3934,10 @@ def smoke_test():
         return False
 
     try:
-        import tier2_routed_overlay
-        logger.info("[OK] tier2_routed_overlay.py imported successfully")
+        import tier2
+        logger.info("[OK] tier2.py imported successfully")
     except Exception as e:
-        logger.error(f"[FAIL] tier2_routed_overlay.py import failed: {e}")
+        logger.error(f"[FAIL] tier2.py import failed: {e}")
         return False
 
     try:
