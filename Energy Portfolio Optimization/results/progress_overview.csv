@@ -1,0 +1,33 @@
+experiment_group,paper_variant,suite,seed,paired_core_included,status,total_return_pct,reported_nav_return_pct,trading_return_pct,sharpe_ratio,reported_nav_sharpe,trading_sharpe,max_drawdown_pct,total_distributions_usd_m,mean_abs_exposure_dkk_m,notes
+ablation,Forecast prior only,abl_forecast_prior_only,7.0,False,completed,24.7929872581803,14.3771064076984,138.742891680257,140.118905180382,14.0455272637823,98.5915714085738,0.0521248065310629,83.327019,35.512999,completed
+ablation,Forecast prior only,abl_forecast_prior_only,42.0,False,completed,24.7779783301736,14.4517589717534,138.617548918071,140.044414477322,14.1632660917246,98.5314237876775,0.052052476489251,82.609727,35.421357,completed
+ablation,Forecast prior only,abl_forecast_prior_only,123.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+ablation,No prior path control,abl_no_prior_path_control,7.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+ablation,Weak conformal gate,abl_weak_conformal_gate,7.0,False,completed,50.4804468127972,14.4350316432165,352.666711336753,164.414464272979,7.49676992969939,122.929807668413,0.0858208205886653,288.363224,98.517161,completed
+ablation,Weak conformal gate,abl_weak_conformal_gate,42.0,False,completed,48.4818931686345,14.4652048480089,336.044014864791,172.557918351662,7.75749974452872,129.078213076064,0.0802742750667469,272.133414,92.651609,completed
+ablation,Weak conformal gate,abl_weak_conformal_gate,123.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+baseline,Buy-and-hold,baselines/Baseline3_BuyAndHold,,False,pending,,,,,,,,,,Passive cash/bond floor
+baseline,IEEE standards,baselines/Baseline4_IEEE,,False,pending,,,,,,,,,,Non-learning compliance baseline
+baseline,Rule-based heuristic,baselines/Baseline2_RuleBasedHeuristic,,False,pending,,,,,,,,,,Expert-rule baseline
+baseline,SARL,baselines/Baseline5_SARL,,False,pending,,,,,,,,,,Single-agent RL baseline
+baseline,Traditional portfolio,baselines/Baseline1_TraditionalPortfolio,,False,pending,,,,,,,,,,Markowitz-style optimization baseline
+core,Tier1,tiers_tier1_baseline,7.0,True,completed,26.093446714463,14.4175790128241,149.457963406453,99.8235084373178,13.0507374611918,71.3294796568884,0.0574491698479423,93.40691,76.735927,completed
+core,Tier1,tiers_tier1_baseline,42.0,True,completed,22.1792285312246,14.4326283826967,116.928541971348,111.808545873761,16.2284694400264,76.8647667582262,0.164722705477454,61.97278,56.034764,completed
+core,Tier1,tiers_tier1_baseline,123.0,True,completed,23.9406493172199,14.3756974237976,131.561709391563,126.444173877065,14.6159862033961,89.2107266291584,0.0368356309363185,76.519589,53.628829,completed
+core,Tier1,tiers_tier1_baseline,789.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+core,Tier1,tiers_tier1_baseline,2025.0,True,completed,16.2636179831389,14.328825316579,67.634189589147,107.324035634623,31.3700591518489,58.2855866097155,0.0430740483707968,15.478336,33.713195,completed
+core,Tier1,tiers_tier1_baseline,3007.0,True,completed,21.0446824549851,14.3918119896745,107.456197334917,157.609642903646,17.6016673451102,105.773181384926,0.0362421464780212,53.222946,38.231555,completed
+core,Tier1,tiers_tier1_baseline,5001.0,True,completed,20.3739498183517,14.3853733383234,101.893263853185,129.747980678829,18.5342387537719,84.5758643278035,0.0513616899678967,47.908596,41.494915,completed
+core,Tier1,tiers_tier1_baseline,7009.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+core,Tier1,tiers_tier1_baseline,8102.0,True,completed,23.8679089800305,14.4084767089504,130.956906592781,116.40188636498,14.5686906016302,80.5042927860113,0.0374678160697966,75.675433,58.789962,completed
+core,Tier1,tiers_tier1_baseline,9005.0,False,completed,19.6922425450043,14.4002422667022,96.0898151388682,87.2857868688124,19.1335168829748,57.0004769579389,0.114967664978284,42.335988,55.925571,unpaired_completed_run_not_in_core_average
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,7.0,True,completed,30.3830140254378,14.3846499796146,185.31278239769,152.887821799008,11.3588388996852,111.277710167802,0.0550450142850194,127.986869,48.12895,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,42.0,True,completed,30.6320657335289,14.3994257707884,187.389668452057,151.827025465971,11.249469730916,110.89685847358,0.0550110791308528,129.861076,50.061358,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,123.0,True,completed,21.9619778270797,14.4105820353947,115.13407364525,190.987841376663,16.6450601308361,133.25076753053,0.033501064189102,60.411146,30.414844,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,789.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,2025.0,True,completed,31.6116929163767,14.3814947610506,195.55089908506,153.322819667047,10.9224182662028,111.962087218693,0.0557376956491519,137.841539,50.952821,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,3007.0,True,completed,29.5813815361363,14.3610983083458,178.624169637114,144.262786140778,11.5843389382861,105.120495676834,0.0532794043588988,121.762225,47.502102,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,5001.0,True,completed,31.6979500605232,14.3624766999502,196.267758108305,151.661394812353,10.8623540462957,110.921924700093,0.0569075587984164,138.68374,53.166762,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,7009.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,8102.0,True,completed,32.285987110013,14.3998132667733,201.166205758576,149.7080458019,10.6894114461383,109.771065801123,0.0573246758276063,143.089343,54.563537,completed
+core,Tier1+Forecast,tiers_tier1_forecast_utilization,9005.0,False,summary_only_no_tier_result,,,,,,,,,,summary_present_no_completed_tier_result

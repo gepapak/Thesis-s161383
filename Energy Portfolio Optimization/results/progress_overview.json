@@ -1,0 +1,74 @@
+{
+  "generated_utc": "2026-05-15",
+  "paired_core_seeds": [
+    7,
+    42,
+    123,
+    2025,
+    3007,
+    5001,
+    8102
+  ],
+  "n_paired_seeds": 7,
+  "core_paired_means": {
+    "tier1": {
+      "total_return_pct": 21.966,
+      "reported_nav_return_pct": 14.391,
+      "trading_return_pct": 115.127,
+      "sharpe": 121.309,
+      "reported_nav_sharpe": 17.996,
+      "max_drawdown_pct": 0.061,
+      "distributions_usd_m": 60.6,
+      "mean_abs_exposure_dkk_m": 51.23
+    },
+    "tier1_forecast": {
+      "total_return_pct": 29.736,
+      "reported_nav_return_pct": 14.386,
+      "trading_return_pct": 179.921,
+      "sharpe": 156.38,
+      "reported_nav_sharpe": 11.902,
+      "max_drawdown_pct": 0.0524,
+      "distributions_usd_m": 122.81,
+      "mean_abs_exposure_dkk_m": 47.83
+    },
+    "delta_forecast_minus_tier1": {
+      "total_return_pp": 7.77,
+      "trading_return_pp": 64.794,
+      "sharpe": 35.071,
+      "reported_nav_return_pp": -0.006,
+      "max_drawdown_pp": -0.0086,
+      "exposure_dkk_m": -3.41
+    }
+  },
+  "completion_status": {
+    "core_tier1": {
+      "completed_paired": 7,
+      "completed_unpaired": 1,
+      "pending": 2
+    },
+    "core_tier1_forecast": {
+      "completed_paired": 7,
+      "completed_unpaired": 0,
+      "pending": 3
+    },
+    "ablation_forecast_prior_only": {
+      "completed": 2,
+      "pending": 1
+    },
+    "ablation_no_prior_path_control": {
+      "completed": 0,
+      "pending": 1
+    },
+    "ablation_weak_conformal_gate": {
+      "completed": 2,
+      "pending": 1
+    },
+    "baselines": {
+      "Traditional portfolio": "pending",
+      "Rule-based heuristic": "pending",
+      "Buy-and-hold": "pending",
+      "IEEE standards": "pending",
+      "SARL": "pending"
+    }
+  }
+}
