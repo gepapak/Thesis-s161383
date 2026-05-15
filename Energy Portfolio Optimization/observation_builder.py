@@ -101,38 +101,33 @@ class ObservationBuilder:
         current_exposure_norm: Optional[float] = None,
         risk_exposure_cap: float = 1.0,
         local_drawdown: float = 0.0,
+        step_pnl_return: float = 0.0,
+        medium_momentum: float = 0.0,
+        intraday_sin: float = 0.0,
+        intraday_cos: float = 1.0,
     ) -> None:
         """
-        Build investor agent 9D observations.
-        
-        Direct trading investor over a single effective financial factor.
-        Uses price momentum plus realized-volatility regime context.
-        Observation space is always 9D for both Tier-1 and Tier-2 variants;
-        the Tier-2 DL overlay communicates with the RL policy exclusively
-        through the exposure delta (unidirectional DL→RL).
-        
-        Args:
-            obs_array: Observation array to fill (modified in-place). Always 9D.
-            price_momentum: Normalized price return/momentum in [-1, 1]
-            realized_volatility: Normalized recent realized volatility in [0, 1]
-            budget: Current budget
-            init_budget: Initial budget
-            financial_positions: Dict with wind/solar/hydro instrument values
-            max_position_size: Maximum position size multiplier
-            capital_allocation_fraction: Capital allocation fraction
-            cumulative_mtm_pnl: Cumulative mark-to-market PnL
-            is_decision_step: 1.0 on investor decision steps else 0.0
-            current_exposure_norm: Optional current normalized exposure
-            risk_exposure_cap: Live risk-controller exposure cap
-            local_drawdown: Investor-sleeve local drawdown
+        Build investor agent 12D observations.
+
+        Observation layout:
+          [0]  price_momentum      short-horizon (1-hr) price return, [-1, 1]
+          [1]  realized_volatility short-horizon realized vol,         [0,  1]
+          [2]  budget_n            remaining capital / init,            [0,  1]
+          [3]  exposure_norm       signed aggregate exposure,          [-1, 1]
+          [4]  mtm_pnl_norm        cumulative PnL / init_budget,       [-1, 1]
+          [5]  is_decision_step    1 on investor cadence steps,        [0,  1]
+          [6]  capital_allocation  meta-agent's allocated fraction,    [0,  1]
+          [7]  risk_exposure_cap   risk-agent's cap on exposure,       [0,  1]
+          [8]  local_drawdown      sleeve-level drawdown,              [0,  1]
+          [9]  step_pnl_return     PnL return this decision period,    [-1, 1]
+          [10] medium_momentum     4-hr price return/momentum,         [-1, 1]
+          [11] intraday_sin        time-of-day encoding,               [-1, 1]
+          [12] (unused — kept for 12D shape; replaced by intraday_cos) [-1, 1]
+        Note: obs_array is shape (12,) so indices 0-11.
         """
         try:
-            # Normalize budget to [0, 1]
             budget_n = float(np.clip(SafeDivision.div(budget, init_budget, 0.0), 0.0, 1.0))
-            
-            # Aggregate exposure normalization. The bookkeeping sleeves share the
-            # same traded price factor, so the investor should observe one signed
-            # aggregate exposure rather than three redundant per-sleeve values.
+
             if current_exposure_norm is not None and np.isfinite(float(current_exposure_norm)):
                 exposure_norm = float(np.clip(float(current_exposure_norm), -1.0, 1.0))
             else:
@@ -143,23 +138,23 @@ class ObservationBuilder:
                     + financial_positions['hydro_instrument_value']
                 )
                 exposure_norm = float(np.clip(aggregate_position / max(max_pos, 1.0), -1.0, 1.0))
-            
-            # mtm_pnl_norm: cumulative PnL / init_budget, clipped to [-1, 1]
+
             mtm_pnl_norm = float(np.clip(
                 SafeDivision.div(cumulative_mtm_pnl, init_budget, 0.0), -1.0, 1.0
             ))
-            
-            # Base observations (9D): direct trading investor with explicit
-            # live execution constraints and local drawdown context.
-            obs_array[0] = float(np.clip(price_momentum, -1.0, 1.0))
-            obs_array[1] = float(np.clip(realized_volatility, 0.0, 1.0))
-            obs_array[2] = budget_n
-            obs_array[3] = exposure_norm
-            obs_array[4] = mtm_pnl_norm
-            obs_array[5] = float(np.clip(is_decision_step, 0.0, 1.0))
-            obs_array[6] = float(np.clip(capital_allocation_fraction, 0.0, 1.0))
-            obs_array[7] = float(np.clip(risk_exposure_cap, 0.0, 1.0))
-            obs_array[8] = float(np.clip(local_drawdown, 0.0, 1.0))
+
+            obs_array[0]  = float(np.clip(price_momentum, -1.0, 1.0))
+            obs_array[1]  = float(np.clip(realized_volatility, 0.0, 1.0))
+            obs_array[2]  = budget_n
+            obs_array[3]  = exposure_norm
+            obs_array[4]  = mtm_pnl_norm
+            obs_array[5]  = float(np.clip(is_decision_step, 0.0, 1.0))
+            obs_array[6]  = float(np.clip(capital_allocation_fraction, 0.0, 1.0))
+            obs_array[7]  = float(np.clip(risk_exposure_cap, 0.0, 1.0))
+            obs_array[8]  = float(np.clip(local_drawdown, 0.0, 1.0))
+            obs_array[9]  = float(np.clip(step_pnl_return, -1.0, 1.0))
+            obs_array[10] = float(np.clip(medium_momentum, -1.0, 1.0))
+            obs_array[11] = float(np.clip(intraday_sin, -1.0, 1.0))
 
         except Exception as e:
             raise RuntimeError(f"[OBS_INVESTOR_FATAL] Investor observation building failed: {e}") from e

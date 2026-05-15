@@ -32,12 +32,13 @@ import seaborn as sns
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import the optimizer
+from baseline_common import add_common_summary_fields
 from rule_based_optimizer import RuleBasedHeuristicOptimizer
 
 class RuleBasedBaselineRunner:
     """Runner for rule-based heuristic baseline."""
 
-    def __init__(self, data_path, output_dir="Baseline2_RuleBasedHeuristic/results", timebase_hours=None):
+    def __init__(self, data_path, output_dir="Baseline2_RuleBasedHeuristic/results", timebase_hours=None, seed=42):
         """
         Initialize runner.
 
@@ -63,7 +64,8 @@ class RuleBasedBaselineRunner:
         initial_budget_usd = 8e8  # $800M USD
         self.optimizer = RuleBasedHeuristicOptimizer(
             initial_budget_usd=initial_budget_usd,
-            timebase_hours=timebase_hours
+            timebase_hours=timebase_hours,
+            seed=seed,
         )
 
         # Results storage
@@ -174,6 +176,7 @@ class RuleBasedBaselineRunner:
 
         # Save summary metrics
         summary = self.optimizer.get_performance_metrics()
+        add_common_summary_fields(summary, method='Rule-Based Heuristic Portfolio')
 
         # Add additional metrics
         battery_actions = df['battery_action'].value_counts().to_dict()
@@ -285,11 +288,12 @@ def main():
                        help='Output directory')
     parser.add_argument('--timebase_hours', type=float, default=None,
                        help='Hours per timestep (None=auto-detect, 1.0 for hourly, 0.1667 for 10-min)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for deterministic diagnostics')
 
     args = parser.parse_args()
 
     # Run baseline
-    runner = RuleBasedBaselineRunner(args.data_path, args.output_dir, args.timebase_hours)
+    runner = RuleBasedBaselineRunner(args.data_path, args.output_dir, args.timebase_hours, seed=args.seed)
     final_metrics = runner.run_optimization(args.timesteps)
 
     # Print final results
@@ -298,7 +302,10 @@ def main():
     print("="*70)
     print(f"Initial Portfolio Value: ${final_metrics['initial_value_usd']/1e6:.2f}M USD")
     print(f"Final Portfolio Value:   ${final_metrics['final_value_usd']/1e6:.2f}M USD")
+    print(f"Distribution-Adjusted:   ${final_metrics.get('distribution_adjusted_final_value_usd', final_metrics['final_value_usd'])/1e6:.2f}M USD")
+    print(f"Total Distributions:     ${final_metrics.get('total_distributions_usd', 0.0)/1e6:.2f}M USD")
     print(f"Total Return:            {final_metrics['total_return']*100:+.2f}%")
+    print(f"Raw NAV Return:          {final_metrics.get('reported_nav_total_return', 0.0)*100:+.2f}%")
     print(f"Annual Return:           {final_metrics['annual_return']*100:+.2f}%")
     print(f"Sharpe Ratio:            {final_metrics['sharpe_ratio']:.3f}")
     print(f"Maximum Drawdown:        {final_metrics['max_drawdown']*100:.2f}%")

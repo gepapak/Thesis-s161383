@@ -4,11 +4,11 @@ UNIFIED UTILITIES MODULE (COMPREHENSIVE)
 
 Consolidates all utility functions and classes into a single, organized module:
 - safe_utils.py (SafeDivision, safe_clip, safe_mean, safe_std, sanitize_array, ensure_finite)
-- Tier-2 policy-improvement utilities (clear_tf_session, configure_tf_memory)
+- TensorFlow utility helpers (clear_tf_session, configure_tf_memory)
 - error_handling.py (ErrorHandler, safe_operation, validation functions, ContextualLogger)
 - memory_manager.py (UnifiedMemoryManager)
 - observation_validator.py (UnifiedObservationValidator)
-- tier2.py unified Tier-2 public runtime helpers
+- Runtime helper enums and compatibility utilities
 
 Single source of truth for all utility operations across the entire codebase.
 """
@@ -143,87 +143,6 @@ def ensure_finite(value: float, default: float = 0.0) -> float:
         return default
 
 
-# ============================================================================
-# FORECAST MATH UTILITIES (shared by Tier D forecast integration)
-# ============================================================================
-
-def convert_mape_to_price_relative(
-    mape_dict: Optional[Dict[str, float]],
-    current_price: float,
-    price_capacity: float,
-    price_floor: float = 50.0
-) -> Optional[Dict[str, float]]:
-    """Convert capacity-based MAPE values into price-relative percentages."""
-    if not mape_dict:
-        return None
-
-    try:
-        denom = max(abs(float(current_price)), float(price_floor), 1e-6)
-    except (TypeError, ValueError):
-        denom = max(price_floor, 1e-6)
-
-    try:
-        capacity_scale = float(price_capacity)
-    except (TypeError, ValueError):
-        capacity_scale = 1.0
-
-    scale = capacity_scale / denom if denom else 1.0
-    converted: Dict[str, float] = {}
-
-    for horizon, value in mape_dict.items():
-        try:
-            val = float(value)
-        except (TypeError, ValueError):
-            continue
-        if not np.isfinite(val):
-            continue
-        converted[horizon] = float(val * scale)
-
-    return converted if converted else None
-
-
-def compute_forecast_direction(
-    z_short: float,
-    z_medium: float,
-    z_long: float,
-    weights: Tuple[float, float, float] = (0.35, 0.40, 0.25)
-) -> float:
-    """Combine horizon-weighted z-scores into a capped directional signal."""
-    try:
-        w_short, w_medium, w_long = weights
-    except Exception:
-        w_short, w_medium, w_long = (0.35, 0.40, 0.25)
-
-    direction = (
-        w_short * np.sign(float(z_short)) +
-        w_medium * np.sign(float(z_medium)) +
-        w_long * np.sign(float(z_long))
-    )
-    return float(np.clip(direction, -1.0, 1.0))
-
-
-def normalize_position(total_position: float, max_position: float) -> float:
-    """Normalize a signed position by the configured max position size."""
-    try:
-        denom = max(abs(float(max_position)), 1.0)
-    except (TypeError, ValueError):
-        denom = 1.0
-    try:
-        return float(total_position) / denom
-    except Exception:
-        return 0.0
-
-
-def exposure_with_cap(total_position: float, max_position: float, cap: float = 0.3) -> float:
-    """Compute absolute exposure normalized by max position and optionally cap it."""
-    normalized = normalize_position(total_position, max_position)
-    try:
-        return float(np.clip(abs(normalized), 0.0, max(cap, 0.0)))
-    except Exception:
-        return float(abs(normalized))
-
-
-# ============================================================================
 def clear_tf_session():
     """Clear TensorFlow session to prevent memory/graph conflicts."""
     try:
@@ -328,28 +247,6 @@ def validate_type(value: Any, expected_type: Type, param_name: str) -> None:
         msg = f"{param_name} must be {expected_type.__name__}, got {type(value).__name__}"
         logger.error(msg)
         raise TypeError(msg)
-
-
-def validate_range(value: float, min_val: float, max_val: float, param_name: str) -> None:
-    """Validate that value is within expected range."""
-    try:
-        v = float(value)
-        if not (min_val <= v <= max_val):
-            msg = f"{param_name} must be in [{min_val}, {max_val}], got {v}"
-            logger.error(msg)
-            raise ValueError(msg)
-    except (TypeError, ValueError) as e:
-        msg = f"{param_name} must be a valid number in [{min_val}, {max_val}], got {value}"
-        logger.error(msg)
-        raise ValueError(msg) from e
-
-
-def validate_not_none(value: Any, param_name: str) -> None:
-    """Validate that value is not None."""
-    if value is None:
-        msg = f"{param_name} cannot be None"
-        logger.error(msg)
-        raise ValueError(msg)
 
 
 def validate_array_shape(array: np.ndarray, expected_shape: Tuple[int, ...], param_name: str) -> None:
@@ -595,7 +492,9 @@ class UnifiedMemoryManager:
     def _cleanup_medium(self) -> None:
         """Medium cleanup: Clear TensorFlow session."""
         try:
-            tf.keras.backend.clear_session()
+            _tf = _get_tf()
+            if _tf is not None:
+                _tf.keras.backend.clear_session()
         except Exception:
             pass
     
@@ -667,6 +566,20 @@ class UnifiedObservationValidator:
     def _validate_single_observation(self, agent_name: str, obs: Any) -> bool:
         """Validate a single observation."""
         try:
+            # Dict-shaped observations (e.g. FoCAL investor) are validated by
+            # recursively checking each value array.
+            if isinstance(obs, dict):
+                if not obs:
+                    self.logger.warning(f"{agent_name}: Dict observation is empty")
+                    return False
+                for k, v in obs.items():
+                    if not isinstance(v, np.ndarray):
+                        self.logger.warning(f"{agent_name}[{k}]: not numpy array: {type(v)}")
+                        return False
+                    if v.size == 0 or not np.all(np.isfinite(v)):
+                        return False
+                return True
+
             if not isinstance(obs, np.ndarray):
                 self.logger.warning(f"{agent_name}: Observation is not numpy array: {type(obs)}")
                 return False
@@ -745,9 +658,9 @@ class UnifiedObservationValidator:
 
 
 # ============================================================================
-# TIER-2 DL CONTROL VARIATE SYSTEM
+# TIER1 RUNTIME UTILITIES
 # ============================================================================
-# NOTE: Tier-2 policy-improvement public logic now lives in tier2.py.
+# NOTE: TensorFlow helpers are retained for the forecast backend.
 
 
 # ============================================================================
@@ -759,20 +672,13 @@ class UnifiedObservationValidator:
 # ============================================================================
 
 TIER_1 = "TIER_1"
-TIER_2 = "TIER_2"
 
 
-def determine_tier(
-    forecast_baseline_enable: bool,
-) -> str:
+def determine_tier(*_args, **_kwargs) -> str:
     """Return the paper-tier label for a run configuration.
 
-    Tier meanings in the paper refactor:
-    - TIER_1: MARL baseline (no forecast backend)
-    - TIER_2: MARL + Tier-2 short-horizon price-expert routed overlay backend
+    Only TIER_1 is supported in the active codebase.
     """
-    if forecast_baseline_enable:
-        return TIER_2
     return TIER_1
 
 
@@ -783,37 +689,31 @@ def get_expected_observation_dims(tier: str, agent_name: str) -> int:
         'risk_controller_0': 11,
         'meta_controller_0': 11,
     }
-    # Observation shapes are fixed (Tier-1) across baseline and Tier-2 variants.
+    # Observation shapes are fixed for Tier1.
     return base_dims.get(agent_name, 6)
 
 
 def get_tier_from_config(config) -> str:
-    forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
-    return determine_tier(forecast_baseline_enable)
+    return TIER_1
 
 
 def get_tier_from_env(env) -> str:
-    if not hasattr(env, 'config'):
-        return TIER_1
-    config = env.config
-    forecast_baseline_enable = getattr(config, 'forecast_baseline_enable', False)
-    has_cv = hasattr(env, 'control_variate_adapter') and env.control_variate_adapter is not None
-    return determine_tier(forecast_baseline_enable or has_cv)
+    return TIER_1
 
 
 def get_tier_description(tier: str) -> str:
     descriptions = {
-        TIER_1: "MARL baseline (no forecast backend; no extra observations)",
-        TIER_2: "MARL + Tier-2 short-horizon price-expert routed overlay backend (no extra observations)",
+        TIER_1: "MARL baseline with fixed investor observation contract",
     }
     return descriptions.get(tier, f"Unknown tier: {tier}")
+
 
 __all__ = [
     # Safe operations
     'SafeDivision', 'safe_clip', 'safe_mean', 'safe_std', 'safe_percentile',
     'sanitize_array', 'ensure_finite',
 
-    # Tier-2 routed-overlay utilities
+    # Runtime utilities
     'clear_tf_session', 'configure_tf_memory',
 
     # Error handling
@@ -827,7 +727,7 @@ __all__ = [
     'UnifiedObservationValidator',
 
     # Tier utilities
-    'TIER_1', 'TIER_2',
+    'TIER_1',
     'determine_tier', 'get_expected_observation_dims',
     'get_tier_from_config', 'get_tier_from_env', 'get_tier_description',
 ]

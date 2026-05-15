@@ -9,28 +9,6 @@ logger = logging.getLogger(__name__)
 # These constants ensure consistent configuration across all modes and code paths
 
 BASE_FEATURE_DIM = 18  # Base observation feature dimension (policy obs space)
-# Tier-2 value overlay (forecast-backed short-horizon investor layer):
-# Clean-room forecast-guided baseline over:
-# - 8D frozen Tier-1 state core
-# - 8-step raw market + ANN forecast memory
-# Core (8D):
-#   [proposed_exposure, abs_proposed_exposure, gross_exposure_ratio,
-#    tradeable_capital_ratio, realized_volatility_regime,
-#    investor_local_quality, investor_local_quality_delta,
-#    investor_local_drawdown]
-# Per-memory-step channels (22):
-#   ann_signal, ann_quality, ann_conformal_risk,
-#   expert_consensus_signal, expert_disagreement, short_imbalance_signal,
-#   ann_return_signal, ann_abs_return, ann_price_level_signal,
-#   ann_direction_margin, ann_direction_accuracy,
-#   ann_latent_0, ann_latent_1, ann_latent_2, ann_latent_3,
-#   ann_latent_norm,
-#   price_level_signal, price_return_signal,
-#   wind_level_signal, solar_level_signal, hydro_level_signal, load_level_signal
-TIER2_VALUE_CORE_DIM = 11  # 8 base + 3 ACRP feedback (trust_radius, advantage_strength, deployment_scale)
-TIER2_VALUE_MEMORY_STEPS = 8
-TIER2_VALUE_MEMORY_CHANNELS = 22
-TIER2_VALUE_FEATURE_DIM = TIER2_VALUE_CORE_DIM + TIER2_VALUE_MEMORY_STEPS * TIER2_VALUE_MEMORY_CHANNELS
 
 # Price normalization constants
 PRICE_MEAN = 250.0          # Historical mean price (DKK/MWh)
@@ -68,21 +46,6 @@ RISK_ACTION_CASH_RESERVE_DEFAULT = 0.10
 RISK_ACTION_HEDGE_DEFAULT = 0.50
 RISK_ACTION_REBALANCE_DEFAULT = 0.30
 RISK_ACTION_TOLERANCE_DEFAULT = 0.70
-
-# Forecast-base calibration defaults
-FORECAST_BASE_WINDOW_SIZE_DEFAULT = 2016       # ~2 weeks @ 10-min steps
-FORECAST_BASE_INIT_BUDGET_DEFAULT = 1e8        # 100M DKK default budget
-FORECAST_BASE_DIRECTION_WEIGHT_DEFAULT = 0.8   # 80% direction, 20% magnitude
-
-# Base feature-model loss weights
-FORECAST_BASE_LOSS_WEIGHTS = {
-    'pred_reward': 1.0,
-}
-
-# Wrapper cache defaults (fallback when no config)
-WRAPPER_FORECAST_CACHE_SIZE_DEFAULT = 1000
-WRAPPER_AGENT_CACHE_SIZE_DEFAULT = 2000
-WRAPPER_MEMORY_LIMIT_MB_DEFAULT = 1024.0
 
 # Environment constants
 ENV_MARKET_STRESS_DEFAULT = 0.5
@@ -203,6 +166,9 @@ class EnhancedConfig:
         self.battery_arbitrage_reward_weight = 1.00  # Direct realized arbitrage reward
         self.battery_arbitrage_reward_scale_dkk = 250.0
         self.battery_arbitrage_reward_clip = 5.0
+        self.battery_timing_reward_weight = 0.20   # Bonus/penalty for price-aligned charge/discharge timing
+        self.battery_floor_penalty_weight = 0.10   # Penalty per step for sitting at SOC floor
+        self.battery_infeasible_penalty_weight = 0.10  # Penalty for infeasible discharge/charge attempts
 
         # Battery operational parameters - FIXED: Convert USD to DKK
         self.battery_opex_rate = 0.0002  # Battery operational cost rate per MWh capacity
@@ -256,7 +222,7 @@ class EnhancedConfig:
         #
         # Goal: high notional exposure WITHOUT forcing the investor policy to saturate at +/-1.
         # Keep capital allocation reliably high, but pin the live trade cadence to the
-        # canonical short horizon so both Tier 1 and Tier 2 trade on 1h decisions by default.
+        # canonical short horizon so Tier1 trades on 1h decisions by default.
         self.meta_freq_min = 6   # 1h @ 10-min steps (short horizon)
         self.meta_freq_max = 6   # fixed short-horizon cadence
         self.meta_cap_min = 0.10  # allow meaningful de-risking when sleeve edge is weak
@@ -272,6 +238,10 @@ class EnhancedConfig:
         self.investment_freq = 6   # 1 hour @ 10-min steps
         self.min_investment_freq = 4   # 40 min minimum @ 10-min steps
         self.max_investment_freq = 12  # 2 hour maximum @ 10-min steps
+        # Strategic controller cadences — must be multiples of investment_freq for
+        # clean alignment with investor decision points.
+        self.risk_action_freq = 12   # 2 hours: risk sets cap before every 2 investor decisions
+        self.meta_action_freq = 24   # 4 hours: meta adjusts allocation once per half-session block
         self.capital_allocation_fraction = 0.60  # neutral starting point; meta-controller clamps within [meta_cap_min, meta_cap_max]
         self.risk_multiplier = 1.0  # Raised from 0.5 for full-size baseline trades
         # Clean Tier-1 sizing contract: risk controller sets an absolute
@@ -298,9 +268,6 @@ class EnhancedConfig:
         self.metacontroller_memory_mb = 12000  # Meta controller memory limit (INCREASED)
         self.wrapper_memory_mb = 2000  # Wrapper memory limit (INCREASED)
 
-        # Cache sizes - INCREASED FOR PERFORMANCE
-        self.forecast_cache_size = 2000  # Increased for better performance
-        self.agent_forecast_cache_size = 4000  # Increased for better performance
         self.lru_cache_size = 3000  # Increased for better performance
         self.lru_memory_limit_mb = 100.0  # Increased for better performance
 
@@ -366,11 +333,6 @@ class EnhancedConfig:
         self.portfolio_risk_exposure_weight = 0.25  # Trading exposure (financial positions) in portfolio risk
         self.liquidity_risk_buffer_weight = 0.6
         self.liquidity_risk_cashflow_weight = 0.4
-        # Weight for forecast-uncertainty risk inside overall risk aggregation.
-        # Overall risk code renormalizes base weights to keep total contribution at 1.0.
-        self.forecast_uncertainty_risk_weight = 0.10
-
-
         # NEW: Infrastructure fund performance targets
         self.annual_return_target = 0.06   # INFRASTRUCTURE: 6% annual return target (conservative infrastructure)
         self.max_annual_volatility = 0.08  # INFRASTRUCTURE: 8% maximum annual volatility (very stable)
@@ -391,7 +353,7 @@ class EnhancedConfig:
 
         # PRICE NORMALIZATION: Unified rule across all code paths
         # Actual implementation: price_n = clip(z_score, -3, 3) / 3 â†’ [-1, 1]
-        # This ensures consistent feature scaling across environment, wrapper, and the Tier-2 routed overlay feature path
+        # This ensures consistent feature scaling across environment and wrapper.
         # The actual pipeline uses: z_score clipped to Â±3Ïƒ, then divided by 3 to get [-1,1]
         self.price_z_score_clip = 3.0  # ACTUAL: Clip z-scores to Â±3Ïƒ before dividing by 3
 
@@ -404,46 +366,10 @@ class EnhancedConfig:
             "short": 6,          # 1 hour - 6 steps ahead
         }
         self.forecast_look_back = 24  # Canonical look-back for forecast training/loading
-        self.forecast_price_short_expert_only = True
-
-        # Forecast integration constants (Tier D add-ons)
-        self.forecast_price_capacity = 6982.0
-        self.forecast_direction_conflict_exposure = 0.12
-        self.forecast_low_exposure_threshold = 0.05
-        self.forecast_follow_target_exposure = 0.12
-        self.forecast_follow_bonus_scale = 0.015
-        # FIX: Increased penalty scales to strongly discourage misalignment
-        # This helps agent learn to align position direction with forecast direction
-        self.forecast_direction_penalty_scale = 2.0  # Increased to penalize direction conflicts more strongly
-        self.forecast_entry_penalty_scale = 0.12  # Keep moderate for entry gaps
-        self.forecast_neutral_penalty_scale = 1.2  # Keep for neutral positions
-        # Disable forecast-only bonuses to keep reward parity across tiers
-        self.forecast_usage_bonus_scale = 0.0
-        self.forecast_usage_bonus_mtm_scale = 15000.0
-        # Lower threshold so forecasts count as â€œusedâ€ even for small exploratory positions (Tier 2 obs-only fairness)
-        self.forecast_usage_exposure_threshold = 0.001
-        # Raise MTM loss exit threshold to allow positions to develop before forced exits (from 3% -> 6%)
-        self.mtm_loss_exit_threshold_pct = 0.06
-
-        # PHASE 1 FIX: Forecast confidence gating thresholds (balanced)
-        # Adjusted based on actual forecast quality: trust 0.48-0.51, confidence 0.99, z_combined 0.0-0.5
-        # Relaxed from overly strict values to enable forecast usage while maintaining quality
-        self.forecast_trust_threshold = 0.45  # Relaxed from 0.6 - allow moderate trust (0.48-0.51)
-        self.forecast_confidence_threshold = 0.7  # Keep (already passing with 0.99)
-        self.forecast_signal_threshold = 0.2  # Relaxed from 0.3 - allow weaker signals (z_combined often 0.0-0.5)
-
-        # PHASE 1 FIX: Forecast error penalty parameters (addresses reward mismatch)
-        self.forecast_error_penalty_scale = 0.5  # Scale for forecast error penalty in alignment reward
-        self.forecast_error_penalty_lambda = 0.3  # Lambda for forecast error penalty in signal score
-        self.loss_penalty_multiplier = 2.0  # More aggressive penalty for losses (was 1.0)
-        self.profitability_bonus_multiplier = 1.5  # Bonus multiplier for profitable positions
-
-        # Canonical live forecast target set for the final Tier-2 design.
-        # Tier-2 uses only short-horizon price experts.
         self.forecast_targets = ["price"]
 
-        # Canonical required horizons for the live Tier-2 design.
-        self.required_forecast_horizons = ["short"]
+        # Raise MTM loss exit threshold to allow positions to develop before forced exits (from 3% -> 6%)
+        self.mtm_loss_exit_threshold_pct = 0.06
 
         # CAPACITY-FACTOR TO MW CONVERSION SCALES: Configurable for different datasets
         # These values are used when converting capacity factors [0,1] to raw MW values
@@ -482,16 +408,13 @@ class EnhancedConfig:
         self.portfolio_transaction_cost_penalty = 0.001  # 0.1% penalty
 
         # =============================================================================
-        # REWARD AND FORECAST PARAMETERS
+        # REWARD PARAMETERS
         # =============================================================================
-
-        # Actual confidence control via confidence_floor (0.6) in MAPE-based calculation below
 
         # Reward calculation parameters - CAPITAL PRESERVATION FOCUS
         self.base_reward_scale = 1.0  # CAPITAL PRESERVATION: Minimal reward scale for stability
         self.profit_reward_weight = 1.0  # CAPITAL PRESERVATION: Equal weight to profit (not dominant)
         self.risk_penalty_weight = 5.0  # CAPITAL PRESERVATION: Very strong risk penalty for safety
-        self.forecast_accuracy_reward_weight = 0.30  # CAPITAL PRESERVATION: High weight on forecast accuracy
 
         # Reward normalization and clipping
         self.reward_clip_min = -10.0  # Minimum reward value
@@ -504,307 +427,80 @@ class EnhancedConfig:
         self.risk_controller_reward_weight = 1.0  # Risk controller reward scaling
         self.meta_controller_reward_weight = 1.0   # Meta controller reward scaling
 
-        # NEW: Expert guidance parameters for profit-seeking logic
-        self.expert_price_rise_threshold = 1.05  # Suggest 'long' if price forecast is >5% higher
-        self.expert_price_fall_threshold = 0.95  # Suggest 'short' if price forecast is <5% lower
-        self.expert_suggestion_strength = 1.2   # Strength of the suggestion (e.g., +1.2 or -1.2) - INCREASED FROM 0.8 FOR FULL PUNCH
+        # Forecast-cache directory consumed by the cache-only investor prior.
+        self.forecast_cache_dir = "forecast_cache"
 
-        # =============================================================================
-        # FORECAST-BASE / TIER-2 CONTROL VARIATE PARAMETERS
-        # =============================================================================
+        # ===== Forecast-cache investor exposure prior =======================
+        # Opt-in execution layer. When True, the ANN forecast cache is converted
+        # into a conformal, risk-aware target exposure and the PPO investor
+        # learns only a residual correction around that prior. Investor
+        # observations stay fixed at 12D.
+        self.enable_forecast_utilization = False
+        self.forecast_prior_window = 500
+        self.forecast_prior_min_samples = 50
+        self.forecast_prior_hit_lcb_z = 1.64
+        self.forecast_prior_residual_quantile = 0.70
+        self.forecast_prior_default_residual = 0.10
+        self.forecast_prior_edge_gain = 3.0
+        # Net-edge filter: the cached forecast must clear a fraction of its
+        # own causal residual error before it can size exposure.
+        self.forecast_prior_error_hurdle = 0.50
+        self.forecast_prior_skill_power = 1.0
+        # The prior is a high-confidence execution target, not a leverage
+        # override. Keep the policy residual small and cap prior exposure so
+        # directional edge improves Sharpe instead of only increasing NAV path
+        # variance and turnover.
+        self.forecast_prior_max_abs_exposure = 0.60
+        self.forecast_prior_residual_scale = 0.10
+        self.forecast_prior_blend = 0.85
+        self.forecast_prior_vol_half_life_steps = 288
+        self.forecast_prior_vol_target = 0.15
+        self.forecast_prior_horizon_steps = 6
+        self.forecast_prior_denom_floor = self.minimum_price_filter
+        # Enabled prior runs must not silently degrade into baseline because of
+        # a missing or malformed ANN cache.
+        self.forecast_prior_fail_fast = True
 
-        # === Confidence scaling ===
-        # FORECAST OPTIMIZATION: Lowered confidence floor from 0.6 to 0.5 for more trading opportunities
-        self.force_full_confidence = False  # DISABLED: Use actual forecast confidence from MAPE tracking
-        self.confidence_floor = 0.5  # Minimum confidence (50%) - lowered from 60% to allow more forecast-driven trades
-        self.forecast_base_conf_thresh = 0.5  # Threshold for forecast-base activation (50%)
-
-        # === Volatility brake (general risk control; independent of Tier-2 overlay) ===
-        self.volatility_brake_threshold = 2.5  # Multiply size by 0.8 if vol > 2.5x median (less frequent brake)
-        self.forecast_base_defense_gate_dkk = -50_000
-        self.forecast_base_defense_gate_severe_dkk = -100_000
-        self.forecast_base_dd_gate = 0.01
-
-        # === Per-horizon confidence thresholds (short-only) ===
-        self.horizon_confidence_thresholds = {
-            'short': 0.65,      # Short: Medium-high confidence
-        }
-
-        # === Tier-2 forecast-backed controller layer ===
-        # Tier-1 observations stay intact. When enabled, Tier-2:
-        # - learns a forecast-conditioned short-horizon defer-and-route expert controller, and
-        # - applies a bounded investor-only override on top of the Tier-1 exposure.
-        self.forecast_baseline_enable = False  # Default OFF; enabled explicitly for Tier-2 runs
-
-        # === Tier-2 learned forecast controller ===
-        # Canonical Tier-2 regularizer name for the active policy-improvement path.
-        self.tier2_l2_reg = 1e-4
-        self.tier2_feature_dim = int(TIER2_VALUE_FEATURE_DIM)
-
-        # === Forecast Trust Calibration ===
-        # Rolling window for online calibration of forecast trust (Ï„â‚œ)
-        # CRITICAL FIX: Reduced from 2016 to 500 for faster adaptation (Issue #4)
-        self.forecast_trust_window = 500      # ~3.5 days @ 10-min steps (was 2016 = ~2 weeks)
-        self.forecast_trust_metric = "hitrate"  # {"combo", "hitrate", "absdir"}: default hit-rate for runner/manual parity
-        self.forecast_trust_direction_weight = 0.8  # Weight for directional accuracy in combo metric (only used if metric="combo")
-        # CRITICAL FIX: Increased trust scale min from 0.5 to 0.8 to reduce penalty for low trust (Issue #4)
-        self.forecast_trust_scale_min = 0.8    # Minimum trust scale (was 0.5) - less penalty for low trust
-        self.forecast_trust_scale_max = 1.5    # Maximum trust scale
-        # Optional multiplicative trust optimism boost. Keep 0.0 by default for unbiased calibration.
-        self.forecast_trust_boost = 0.0
-        # Weight for blending runtime trust with pre-computed metadata quality (0.0 = runtime only, 1.0 = metadata only)
-        self.forecast_metadata_quality_weight = 0.3
-        # RATIONALE: directional accuracy is often more actionable than magnitude error in trading-style decisions,
-        # so "hitrate" is a sensible default for trust calibration.
-
-        # === Forecast trust: per-agent horizon selection ===
-        # Tier1 observations remain unchanged; this only affects trust scaling (tau_t).
-        #
-        # - "auto": pick the horizon with the best recent directional accuracy (requires enough samples).
-        # - explicit: {"short", "medium", "long"}
-        #
-        # Default trust choice stays short unless overridden; Tier-2 feature
-        # construction also stays short-horizon by design.
-        self.fgb_trust_horizon_by_agent = {
-            "investor_0": "short",
-            "battery_operator_0": "auto",
-            "risk_controller_0": "auto",
-        }
-        self.fgb_trust_min_samples = 50  # Minimum samples per horizon before "auto" trusts the estimate.
-        self.forecast_trust_floor = 0.3  # Minimum Ï„ only after explicit quality checks pass (avoids weak-regime overuse)
-
-        # --------------------------------------------------------------
-        # Forecast quality thresholds (price-relative MAPE)
-        # --------------------------------------------------------------
-        # These thresholds must be in the SAME units as the MAPE we compute online.
-        # We use price-relative MAPE with a denominator floor (see environment._update_calibration_tracker),
-        # which makes the signal robust even when spot prices approach 0.
-        #
-        # These values define fixed "acceptable error" bands used by online calibration
-        # (see environment._update_calibration_tracker) so trust/error semantics are stable.
-        self.forecast_mape_threshold_short = 0.10   # 10% (loosened from 8% for more forecast usage)
-        self.forecast_mape_threshold_medium = 0.15  # 15% (loosened from 12%)
-        self.forecast_mape_threshold_long = 0.25    # 25% (loosened from 20%)
-
-        # === Anti-saturation: Forecast return -> z-score mapping ===
-        # Problem: z_short/z_medium were often pinned at +/-1 due to extreme return spikes
-        # (e.g., low price denominators / floor behavior) + aggressive tanh scaling.
-        #
-        # Fix: (a) clip forecast returns to a reasonable bound, (b) use configurable tanh scale,
-        # (c) use a denominator floor so returns can't explode when prices are low.
-        # This makes forecast-derived obs informative (not binary), improving policy sensitivity.
-        # Increased signal strength (Tier2 obs-only usage): higher scale + slightly looser clip + lower denom floor.
-        # This makes forecast z-scores less "washed out" while staying bounded.
-        self.forecast_return_clip = 0.15              # tighter clip to curb saturation at decision cadence
-        self.forecast_return_tanh_scale = 1.5         # lower tanh scale for smoother signal
-        self.forecast_return_denom_floor = 0.25       # lower floor to keep calibrated trade_signal visible
-
-        self.fgb_lambda_max = 0.8             # Legacy forecast-baseline lambda ceiling
-        # NOTE: This clips the *per-step advantage correction* (delta A_t) in advantage units.
-        # It is NOT a return/bps unit. (Kept small to avoid distorting PPO advantage ranking.)
-        self.fgb_clip_adv = 0.10
-        # Backward-compatible alias (deprecated; kept for old scripts/CLI flags).
-        self.fgb_clip_bps = self.fgb_clip_adv
-        self.fgb_warmup_steps = 2000          # No correction before this many steps (warm-up period)
-        self.fgb_moment_beta = 0.01           # EMA rate for Cov/Var moments (0.01 = ~100-step window)
-        # Safer default: keep lambda* nonnegative unless explicitly overridden by CLI.
-        # This trades some theoretical variance-optimality for more stable cross-seed behavior.
-        self.fgb_allow_negative_lambda = False
-        # Rolling calibration of forecast-baseline scale against realized investor dNAV return.
-        self.fgb_cv_calib_beta = 0.10
-        self.fgb_cv_gain_min = 0.10
-        self.fgb_cv_gain_max = 1.50
-        # Fail-fast guard for forecast-backend paths (recommended for research runs).
-        # When enabled, forecast/meta failures raise immediately instead of silently degrading.
-        self.fgb_fail_fast = True
-        # expected_dnav fallback exposure floor ratio.
-        # A small nonzero default keeps the routed overlay informative when the sleeve is temporarily flat.
-        self.fgb_expected_dnav_min_exposure_ratio = 0.01
-        # expected_dnav blend weights (pred_reward + mwdir). Kept explicit for reproducible tuning.
-        self.fgb_expected_dnav_pred_weight = 0.85
-        self.fgb_expected_dnav_mwdir_weight = 0.15
-        # === Tier-2 short-horizon forecast controller ===
-        # Full model:
-        # - clean 8D investor-state core + flattened 8x21 ANN-cache memory block
-        # - ANN-primary short-horizon cross-attention policy-improvement model
-        # - no trust or handcrafted forecast summary features in the active path
-        # Ablation:
-        # - keeps the same controller/runtime path
-        # - neutralizes the full Tier-2 forecast-memory block
-        self.tier2_mape_window = 10
-        self.tier2_mape_reference = 0.25
-        self.tier2_value_delta_max = 0.20
-        self.tier2_value_target_scale = 0.01  # Investor sleeve return scale; 1% realized return -> tanh(1)
-        # Current Tier-2 continuous actor-value training learns too slowly at
-        # 3e-4 early in the run and becomes unstable/overreactive at 3e-3.
-        # Use 1e-3 as the default middle-ground unless explicitly overridden.
-        self.tier2_value_lr = 1e-3
-        self.tier2_value_train_every = 256
-        self.tier2_value_batch_size = 64
-        self.tier2_value_train_epochs = 1
-        self.tier2_value_memory_steps = int(TIER2_VALUE_MEMORY_STEPS)
-        # Continuous Tier-2 uses explicit residual-delta supervision weight.
-        self.tier2_value_delta_loss_weight = 0.05
-        # Keep aleatoric delta uncertainty calibrated by default; this was
-        # previously enabled accidentally via `or` fallbacks, so make the
-        # intended default explicit while still allowing an explicit 0.0
-        # override in config/CLI if needed.
-        self.tier2_value_confidence_loss_weight = 0.04
-        self.tier2_value_policy_loss_weight = 1.00
-        self.tier2_value_value_loss_weight = 0.75
-        self.tier2_value_quantile_loss_weight = 0.35
-        # Tier-2 now uses setup-specific regime supervision so the internal
-        # experts specialize around forecasted trend, mean-reversion,
-        # defensive risk-off, and neutral base conditions seen in the trading sleeve.
-        self.tier2_value_expert_mix_loss_weight = 0.08
-        self.tier2_value_expert_winner_loss_weight = 0.06
-        self.tier2_value_quality_anchor_weight = 0.05
-        self.tier2_value_trust_anchor_weight = 0.0
-        self.tier2_value_expert_temperature = 0.35
-        # Active under the current sparse gate teacher: controls what fraction
-        # of samples are labeled gate-positive per batch.
-        self.tier2_value_gate_top_fraction = 0.30
-        # Intervene classification is auxiliary but ACTIVE. This scales BCE loss
-        # for intervention selection (gate_target vs deployment_scale).
-        self.tier2_value_intervene_loss_weight = 0.05
-        self.tier2_value_lower_quantile = 0.25
-        self.tier2_value_upper_quantile = 0.75
-        # Enforce that Tier-2 must at least preserve a small positive return
-        # delta versus frozen Tier-1 on average, rather than winning purely by
-        # de-risking into lower volatility. The hard floor itself is blended
-        # with risk-adjusted sleeve utility so the no-harm gate is aligned with
-        # Sharpe improvement instead of pure raw-return dominance.
-        self.tier2_value_return_floor_margin = 5e-5
-        self.tier2_value_return_floor_return_mix = 0.35
-        # The deployed conformal return-floor radius can exceed 2x target
-        # scale late in training. Give the auxiliary heads enough dynamic range
-        # that positive certified lower bounds remain expressible at eval time.
-        self.tier2_value_nav_head_scale = 3.0
-        self.tier2_value_return_floor_head_scale = 4.0
-        # The factor-opportunity head is auxiliary only; keep it off by
-        # default so the core delta/gate/value heads dominate learning.
-        self.tier2_value_factor_loss_weight = 0.0
-        self.tier2_value_dual_lr = 0.03
-        self.tier2_value_tail_dual_lr = 0.02
-        self.tier2_value_tail_risk_budget = 0.10
-        # Penalize overly wide auxiliary quantile bands. The return-floor head
-        # had become so conservative that it blocked forecast-positive actions
-        # even when its mean prediction was comfortably positive.
-        self.tier2_value_return_floor_interval_penalty = 0.10
-        self.tier2_value_nav_interval_penalty = 0.05
-        # Keep routed Tier2 decision utility on the same short horizon used by
-        # the deployed short-price expert bank.
-        self.tier2_value_decision_horizon = 6
-        # Runtime/train decision improvements for the routed overlay now live in
-        # the ~1e-4 to 1e-2 range after moving Tier-2 to cadence-aligned,
-        # exposure-independent return targets. The old 0.05 scale crushed the
-        # learned gate to near-zero even on clearly certified interventions.
-        self.tier2_value_decision_scale = 7.5e-4
-        # Tier-2 rollouts are already sampled on investor decision steps, so a
-        # multiplier of 1.0 keeps the teacher aligned with the live 1-hour
-        # forecast contract instead of stretching labels across multiple
-        # decision intervals.
-        self.tier2_value_path_horizon_mult = 1.0
-        self.tier2_value_decision_downside_weight = 0.75
-        self.tier2_value_decision_drawdown_weight = 0.60
-        self.tier2_value_decision_vol_weight = 0.75
-        # The continuous counterfactual overlay remained too willing to take
-        # large deltas in clean directional regimes at 0.22. Raise the
-        # quadratic size penalty so Tier-2 must earn interior actions more
-        # selectively.
-        self.tier2_value_decision_stability_penalty = 0.18
-        self.tier2_value_baseline_quality_margin_scale = 0.0
-        self.tier2_value_conformal_alpha = 0.10
-        self.tier2_value_conformal_scale = 1.0
-        # Tier-2 uses only the short price horizon from the ANN forecaster.
-        self.tier2_value_sharpe_improvement_scale = 0.05
-        self.tier2_value_ablate_forecast_features = False  # If True: neutralize the full Tier-2 forecast-memory block for the no-forecast ablation
-        self.tier2_policy_family = "conservative_actor_critic"
-        self.tier2_policy_objective = "conservative_actor_critic_advantage"
-        self.tier2_value_architecture = "ann_cache_cross_attention_cleanroom_actor_critic"
-        self.tier2_primary_expert = "ann"
-        self.tier2_non_primary_mode = "context_only"
-        # Let the distributional value target teach when not to act. The ANN
-        # overlay no longer applies a second teacher-side improvement veto.
-        self.tier2_value_min_certified_improvement = 0.0
-        self.tier2_value_min_route_margin = 0.0
-        # Keep the training target as close as possible to the solved value
-        # objective rather than filtering it with fixed context thresholds.
-        self.tier2_value_min_intervention_context = 0.0
-        self.tier2_runtime_overlay_enable = True
-        self.tier2_runtime_gain = 1.0
-        self.tier2_runtime_mc_samples = 7
-        self.tier2_runtime_sigma_scale = 0.015
-        self.tier2_runtime_conformal_margin = 0.05
-        # Tier-2 deployment is continuous and learned end-to-end. Runtime now
-        # follows the model's own gate/confidence/tail-risk heads rather than
-        # an external rule wrapper; keep only a tiny execution rail for near-zero deltas.
-        self.tier2_runtime_min_abs_delta = 0.005
-        self.tier2_runtime_delta_scale = 1.0
-        # Keep the NAV/stability head as a soft auxiliary critic rather than a
-        # co-primary actor objective. This head should shape smoother actions
-        # and flag unstable proposals, but not drown out forecast-uplift and
-        # no-harm return-floor learning.
-        self.tier2_value_nav_actor_weight = 0.20
-        self.tier2_value_nav_lcb_actor_weight = 0.25
-        self.tier2_value_tail_loss_weight = 0.50
-        self.tier2_value_nav_confidence_weight = 0.04
-        self.tier2_value_nav_drag_weight = 0.04
-        # Weight for calibrating raw gate-head probability toward deployed
-        # intervention strength (policy_scale) to reduce confidence drift.
-        self.tier2_value_gate_calibration_weight = 0.10
-
-
-        # === Legacy Forecast-Reward Compatibility (unused in paper setup) ===
-        # Reward shaping by forecast quality is disabled (forecast reward weight = 0).
-        # These fields are retained for backward compatibility with old checkpoints/scripts.
-        self.forecast_alignment_multiplier = 14.0
-        self.forecast_alignment_multiplier_battery = 15.0
-        self.generation_forecast_weight = 0.3
-        # FIX: EMA std initialization parameters (Issue #1)
-        self.ema_std_init_samples = 20  # Number of samples to use for adaptive EMA std initialization
-        self.ema_std_init_alpha = 0.2   # Higher alpha for first 100 steps (faster convergence)
-        
-        # Legacy no-op in paper mode (forecast reward weight is zero); kept for compatibility.
-        self.forecast_reward_warmup_steps = 1000
-        self.ema_std_min = 10.0         # Minimum EMA std value (DKK) - prevents division by tiny values
-        # CRITICAL FIX: Increased from 500.0 to 2000.0 to prevent saturation (Issue #1)
-        self.ema_std_max = 2000.0       # Maximum EMA std value (DKK) - prevents extreme values (was 500.0)
-        # CRITICAL FIX: Increased EMA alpha from 0.05 to 0.1 for faster adaptation (Issue #9)
-        self.ema_alpha = 0.1            # EMA smoothing factor (was 0.05) - faster adaptation to forecast error distribution
-        # FIX: Forecast failure handling (Issue #5)
-        self.forecast_failure_decay = 0.95  # Decay factor for previous z-scores on forecast failure
-        # FIX: Generation EMA std clamping range (Issue #5)
-        self.gen_ema_std_min = 0.01  # Minimum EMA std for generation (normalized, not DKK)
-        self.gen_ema_std_max = 1.0   # Maximum EMA std for generation (normalized, not DKK)
-        self.forecast_pnl_reward_scale = 500.0
-
-        # === Expert Blending Mode (CRITICAL FIX: Added missing config attributes) ===
-        self.expert_blend_mode = "none"       # {"none", "fixed", "adaptive", "residual"}: expert blending mode
+        # === Expert Blending Mode ===
+        self.expert_blend_mode = "none"       # {"none", "fixed", "adaptive"}: expert blending mode
         self.expert_blend_weight = 0.0        # Blend weight for fixed mode (0.0-1.0)
 
         # =============================================================================
         # REINFORCEMENT LEARNING PARAMETERS
         # =============================================================================
 
-        # Training defaults - STRENGTHENED FOR BETTER LEARNING
-        self.update_every = 128  # OPTIMIZED: Reduced from 32 for more responsive learning
-        self.lr = 1.5e-3  # STRENGTHENED: Increased from 8e-4 to 1.5e-3 for faster learning (87% increase)
-        self.ent_coef = 0.030  # Increased to encourage exploration/position-taking (investor especially)
+        # Training defaults
+        # update_every = PPO rollout buffer collection length (also sets self.n_steps in metacontroller).
+        # rollout_cap  = hard ceiling on steps collected per rollout call in _collect_rollouts_enhanced.
+        # With update_every=256, rollout_cap=256, batch_size=64: 256/64=4 minibatches per epoch × 10 epochs
+        # = 40 gradient steps per rollout — matches IPPO best-practice for non-stationary MARL.
+        self.update_every = 256
+        self.rollout_cap  = 256
+        self.lr = 1.5e-3
+        self.ent_coef = 0.030  # promotes exploration; investor especially benefits from this
         self.verbose = 1
         self.seed = 42
-        # Determinism-first default: disable policy-level multithreaded updates.
         self.multithreading = False
 
-        # PPO-specific parameters - STRENGTHENED FOR BETTER LEARNING
-        self.batch_size = 256  # STRENGTHENED: Increased from 128 for more stable gradients
-        self.gamma = 0.995  # STRENGTHENED: Increased from 0.99 for longer horizon credit assignment
-        self.gae_lambda = 0.98  # STRENGTHENED: Increased from 0.95 for more stable value estimates
-        self.clip_range = 0.15  # STRENGTHENED: Reduced from 0.2 for more conservative updates
+        # Per-agent reward normalization (Welford online mean/std, applied before buffer insertion).
+        # Decouples reward scale from hyperparameter tuning; each agent's reward stream is
+        # normalized independently so different reward magnitudes don't bias value estimates.
+        self.reward_normalization_enabled = True
+        self.reward_normalization_clip    = 10.0   # final clip after normalization
+        self.reward_normalization_warmup  = 100    # steps before normalization activates
+
+        # PPO-specific parameters
+        # batch_size=64: with rollout cap at 256 steps, each of n_epochs=10 passes
+        # gets 4 minibatches (256/64=4). This matches IPPO literature — minibatch
+        # diversity matters more than large batch size in non-stationary MARL.
+        self.batch_size = 64
+        self.gamma = 0.995  # long horizon for fund-level credit assignment
+        self.gae_lambda = 0.98  # high lambda: low bias, acceptable variance with long rollouts
+        self.clip_range = 0.15  # conservative clip: limits policy drift in non-stationary env
         self.vf_coef = 0.5
         self.max_grad_norm = 0.5
-        self.n_epochs = 10  # STRENGTHENED: Increased from default 5 for more gradient updates
-        self.n_steps = 1024  # STRENGTHENED: Increased from 512 for more experience per update
+        self.n_epochs = 10  # 10 passes × 4 minibatches = 40 gradient steps per rollout
+        self.n_steps = 1024  # SB3 policy buffer size (actual rollout cap capped to 256 in metacontroller)
 
         # Optional SB3 PPO exploration controls. Keep the default path vanilla:
         # standard Gaussian policy, no gSDE, default policy log_std_init.
@@ -817,9 +513,9 @@ class EnhancedConfig:
         self.dqn_train_freq = 4
         self.dqn_gradient_steps = 1
         self.dqn_target_update_interval = 500
-        self.dqn_exploration_fraction = 0.20
+        self.dqn_exploration_fraction = 0.40       # fraction of steps over which epsilon decays
         self.dqn_exploration_initial_eps = 1.0
-        self.dqn_exploration_final_eps = 0.05
+        self.dqn_exploration_final_eps = 0.10      # keep 10% randomness throughout (was 0.05)
         # Investor-only bounded-support policy:
         # use a Beta policy for bounded continuous exposure instead of a Gaussian.
         self.investor_use_beta_policy = True
@@ -903,8 +599,8 @@ class EnhancedConfig:
         self.meta_local_risk_weight = 0.10
         self.meta_local_signal_clip = 2.0
         self.meta_capital_alignment_weight = 0.10
-        self.risk_controller_rule_based = True
-        self.meta_controller_rule_based = True
+        self.risk_controller_rule_based = False
+        self.meta_controller_rule_based = False
 
         # Global training step counter (persists across episode environments in episode training).
         # Needed because episode training creates a NEW env each episode, so env-local counters reset.
@@ -1001,8 +697,8 @@ class EnhancedConfig:
         self.agent_policies = [
             {"mode": "PPO"},  # investor_0
             {"mode": "DQN"},  # battery_operator_0
-            {"mode": "RULE"},  # risk_controller_0
-            {"mode": "RULE"},  # meta_controller_0
+            {"mode": "PPO"},  # risk_controller_0
+            {"mode": "PPO"},  # meta_controller_0
         ]
 
         if optimized_params:
@@ -1174,15 +870,6 @@ class EnhancedConfig:
             if not isinstance(horizon_steps, int) or horizon_steps <= 0:
                 errors.append(f"forecast_horizons[{horizon_name}]={horizon_steps} not a positive integer")
 
-        # 11. Overlay parameters should be valid
-        if not (0.0 <= float(self.fgb_cv_calib_beta) <= 1.0):
-            errors.append(f"fgb_cv_calib_beta ({self.fgb_cv_calib_beta}) not in [0, 1]")
-        if float(self.fgb_cv_gain_min) < 0.0:
-            errors.append(f"fgb_cv_gain_min ({self.fgb_cv_gain_min}) must be >= 0")
-        if float(self.fgb_cv_gain_max) < float(self.fgb_cv_gain_min):
-            errors.append(
-                f"fgb_cv_gain_max ({self.fgb_cv_gain_max}) < fgb_cv_gain_min ({self.fgb_cv_gain_min})"
-            )
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
             logger.error(error_msg)
@@ -1230,8 +917,8 @@ class EnhancedConfig:
             self.agent_policies = [
                 {"mode": params.get('investor_mode', 'PPO')},
                 {"mode": params.get('battery_mode', 'DQN')},
-                {"mode": params.get('risk_mode', 'RULE')},
-                {"mode": params.get('meta_mode', 'RULE')},
+                {"mode": params.get('risk_mode', 'PPO')},
+                {"mode": params.get('meta_mode', 'PPO')},
             ]
 
         print(f"   Learning rate: {self.lr:.2e}")
@@ -1242,10 +929,3 @@ class EnhancedConfig:
         print(f"   Batch size: {self.batch_size}")
 
 
-# =====================================================================
-# PAPER MODES (baseline vs Tier-2 routed overlay)
-# =====================================================================
-# Baseline: forecast_baseline_enable=False → investor_0 = 9D
-# Tier-2 routed overlay: forecast_baseline_enable=True → investor_0 = 9D (same as baseline; DL↔RL via exposure delta only)
-# Tier-2 ablation: tier2_value_ablate_forecast_features=True (same controller, full forecast-memory ablation)
-# Tier-2 full uses 176D temporal features: 8D investor core + flattened 8x21 ANN-cache short-memory block.

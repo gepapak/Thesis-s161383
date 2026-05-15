@@ -30,6 +30,17 @@ import pandas as pd
 from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from baseline_common import (
+    annual_rate_to_step_rate,
+    compute_performance_metrics,
+    distribute_excess_cash,
+    load_baseline_economic_config,
+    periods_per_year_from_hours,
+)
 
 
 class RuleBasedHeuristicOptimizer:
@@ -53,7 +64,7 @@ class RuleBasedHeuristicOptimizer:
     All decisions affect portfolio NAV through cash and capacity changes.
     """
     
-    def __init__(self, initial_budget_usd=8e8, timebase_hours=1.0):
+    def __init__(self, initial_budget_usd=8e8, timebase_hours=1.0, seed=42):
         """
         Initialize rule-based heuristic system.
         
@@ -63,12 +74,17 @@ class RuleBasedHeuristicOptimizer:
         """
         # Currency conversion
         self.dkk_to_usd_rate = 0.145  # 1 USD ≈ 6.9 DKK
+        self.econ_cfg = load_baseline_economic_config()
+        initial_budget_usd = float(initial_budget_usd or self.econ_cfg.initial_budget_usd)
+        timebase_hours = float(timebase_hours or self.econ_cfg.time_step_hours)
+        self.seed = int(seed)
+        self.dkk_to_usd_rate = self.econ_cfg.dkk_to_usd_rate
         self.initial_budget_dkk = initial_budget_usd / self.dkk_to_usd_rate
         self.initial_budget_usd = initial_budget_usd
         
         # Timebase
         self.timebase_hours = timebase_hours
-        self.steps_per_year = int(8760 / timebase_hours)  # 8760 hours/year
+        self.steps_per_year = periods_per_year_from_hours(timebase_hours)
         
         # Portfolio state
         self.cash_dkk = self.initial_budget_dkk
@@ -80,9 +96,9 @@ class RuleBasedHeuristicOptimizer:
         self.hydro_capacity_mw = 0.0
         
         # CAPEX costs (DKK per MW) - from industry standards
-        self.wind_capex_per_mw = 2_000_000 / self.dkk_to_usd_rate   # $2M/MW
-        self.solar_capex_per_mw = 1_000_000 / self.dkk_to_usd_rate  # $1M/MW
-        self.hydro_capex_per_mw = 1_500_000 / self.dkk_to_usd_rate  # $1.5M/MW
+        self.wind_capex_per_mw = self.econ_cfg.wind_capex_per_mw_dkk
+        self.solar_capex_per_mw = self.econ_cfg.solar_capex_per_mw_dkk
+        self.hydro_capex_per_mw = self.econ_cfg.hydro_capex_per_mw_dkk
         
         # Operating costs (% of revenue) - from industry standards
         self.wind_opex_rate = 0.05   # 5% O&M
@@ -90,10 +106,10 @@ class RuleBasedHeuristicOptimizer:
         self.hydro_opex_rate = 0.08  # 8% O&M
 
         # Battery parameters
-        self.battery_capacity_mwh = 100.0  # 100 MWh battery
+        self.battery_capacity_mwh = self.econ_cfg.owned_battery_capacity_mwh
         self.battery_soc = 0.5  # Start at 50% state of charge
-        self.battery_efficiency = 0.85  # 85% round-trip efficiency
-        self.battery_power_mw = 25.0  # 25 MW charge/discharge rate
+        self.battery_efficiency = 0.90
+        self.battery_power_mw = self.battery_capacity_mwh * 0.5
         
         # HEURISTIC RULE THRESHOLDS (domain expert knowledge)
         self.wind_favorable_threshold = 1200.0    # MW - strong wind
@@ -115,8 +131,10 @@ class RuleBasedHeuristicOptimizer:
         
         # Performance tracking
         self.portfolio_values = []
+        self.distribution_adjusted_portfolio_values = []
         self.returns_history = []
         self.decisions_log = []
+        self.total_distributions = 0.0
         
         # Rule trigger counters
         self.rule_triggers = {
@@ -430,8 +448,10 @@ class RuleBasedHeuristicOptimizer:
 
         Returns cash_return_dkk
         """
-        annual_rf_rate = 0.02
-        step_rf_rate = annual_rf_rate / self.steps_per_year
+        step_rf_rate = annual_rate_to_step_rate(
+            self.econ_cfg.annual_risk_free_rate,
+            self.steps_per_year,
+        )
         cash_return = self.cash_dkk * step_rf_rate
 
         # Add to cash
@@ -441,24 +461,26 @@ class RuleBasedHeuristicOptimizer:
 
     def add_random_noise(self):
         """
-        Add small random noise to simulate market fluctuations.
+        Return the deterministic mark-to-market adjustment.
 
-        This is a MINOR component - main returns come from:
+        The maintained publication baseline does not add stochastic noise; returns come from:
         1. Operational revenue (data-driven)
         2. Battery arbitrage (heuristic)
         3. Risk-free return (cash)
 
-        Random noise is just ±0.01% per step for realism.
-
         Returns noise_return_dkk
         """
-        noise_pct = np.random.normal(0, 0.0001)  # 0.01% std dev
-        noise_return = self.portfolio_value_dkk * noise_pct
+        return 0.0
 
-        # Apply to portfolio value
-        self.portfolio_value_dkk += noise_return
-
-        return noise_return
+    def distribute_excess_cash(self):
+        """Apply the current Tier1 shareholder distribution policy."""
+        self.cash_dkk, distribution_amount = distribute_excess_cash(
+            self.cash_dkk,
+            self.portfolio_value_dkk,
+            self.econ_cfg,
+        )
+        self.total_distributions += distribution_amount
+        return distribution_amount
 
     def step(self, data_row, timestep):
         """
@@ -471,7 +493,7 @@ class RuleBasedHeuristicOptimizer:
         4. Execute battery arbitrage (if rules trigger)
         5. Calculate operational revenue (data-driven)
         6. Add risk-free return on cash
-        7. Add small random noise
+        7. Apply shareholder distributions
         8. Update portfolio value
 
         Args:
@@ -501,7 +523,16 @@ class RuleBasedHeuristicOptimizer:
         # Calculate risk-free return on cash (data-driven)
         cash_return = self.calculate_risk_free_return()
 
-        # Add small random noise (minor component)
+        # Use the post-revenue NAV for the cash-distribution threshold.
+        pre_distribution_capacity_value = (
+            self.wind_capacity_mw * self.wind_capex_per_mw +
+            self.solar_capacity_mw * self.solar_capex_per_mw +
+            self.hydro_capacity_mw * self.hydro_capex_per_mw
+        )
+        self.portfolio_value_dkk = self.cash_dkk + pre_distribution_capacity_value
+        distribution_amount = self.distribute_excess_cash()
+
+        # Deterministic baseline: no random mark-to-market noise.
         noise_return = self.add_random_noise()
 
         # Update portfolio value = cash + capacity value
@@ -522,6 +553,9 @@ class RuleBasedHeuristicOptimizer:
 
         # Track portfolio value
         self.portfolio_values.append(self.portfolio_value_dkk)
+        self.distribution_adjusted_portfolio_values.append(
+            self.portfolio_value_dkk + self.total_distributions
+        )
 
         # Log decision
         decision_log = {
@@ -540,6 +574,12 @@ class RuleBasedHeuristicOptimizer:
             'battery_revenue': battery_revenue,
             'operational_revenue': operational_revenue,
             'cash_return': cash_return,
+            'distribution_amount': distribution_amount,
+            'total_distributions': self.total_distributions,
+            'distribution_adjusted_value': self.portfolio_value_dkk + self.total_distributions,
+            'distribution_adjusted_value_usd': (
+                self.portfolio_value_dkk + self.total_distributions
+            ) * self.dkk_to_usd_rate,
             'noise_return': noise_return,
             'step_return': step_return,
             'investments': investments,
@@ -567,6 +607,11 @@ class RuleBasedHeuristicOptimizer:
             'portfolio_value_usd': self.portfolio_value_dkk * self.dkk_to_usd_rate,
             'cash': self.cash_dkk,
             'cash_usd': self.cash_dkk * self.dkk_to_usd_rate,
+            'total_distributions': self.total_distributions,
+            'distribution_adjusted_value': self.portfolio_value_dkk + self.total_distributions,
+            'distribution_adjusted_value_usd': (
+                self.portfolio_value_dkk + self.total_distributions
+            ) * self.dkk_to_usd_rate,
             'capacity_value': capacity_value,
             'capacity_value_usd': capacity_value * self.dkk_to_usd_rate,
             'wind_capacity': self.wind_capacity_mw,
@@ -585,46 +630,32 @@ class RuleBasedHeuristicOptimizer:
                 'max_drawdown': 0.0,
                 'volatility': 0.0,
                 'final_value_usd': self.portfolio_value_dkk * self.dkk_to_usd_rate,
-                'initial_value_usd': self.initial_budget_usd
+                'initial_value_usd': self.initial_budget_usd,
+                'distribution_adjusted_evaluation': True,
             }
 
         # Portfolio values
         values = np.array(self.portfolio_values)
-        returns = np.array(self.returns_history)
-
-        # Total return
-        total_return = (values[-1] - values[0]) / values[0]
-
-        # Annualized return
-        n_steps = len(values)
-        years = n_steps / self.steps_per_year
-        annual_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
-
-        # Volatility (annualized)
-        if len(returns) > 1:
-            volatility = np.std(returns) * np.sqrt(self.steps_per_year)
-        else:
-            volatility = 0.0
-
-        # Sharpe ratio (assuming 2% risk-free rate)
-        rf_rate = 0.02
-        sharpe_ratio = (annual_return - rf_rate) / volatility if volatility > 0 else 0
-
-        # Maximum drawdown
-        cummax = np.maximum.accumulate(values)
-        drawdowns = (values - cummax) / cummax
-        max_drawdown = abs(np.min(drawdowns)) if len(drawdowns) > 0 else 0
+        adjusted_values = np.array(self.distribution_adjusted_portfolio_values)
+        metrics = compute_performance_metrics(
+            values * self.dkk_to_usd_rate,
+            periods_per_year=self.steps_per_year,
+            annual_risk_free_rate=self.econ_cfg.annual_risk_free_rate,
+            total_distributions=self.total_distributions * self.dkk_to_usd_rate,
+            distribution_adjusted_values=adjusted_values * self.dkk_to_usd_rate,
+            value_suffix="usd",
+        )
 
         return {
-            'total_return': float(total_return),
-            'annual_return': float(annual_return),
-            'sharpe_ratio': float(sharpe_ratio),
-            'max_drawdown': float(max_drawdown),
-            'volatility': float(volatility),
+            **metrics,
             'final_value_usd': float(values[-1] * self.dkk_to_usd_rate),
             'initial_value_usd': float(self.initial_budget_usd),
+            'distribution_adjusted_final_value_usd': float(
+                (values[-1] + self.total_distributions) * self.dkk_to_usd_rate
+            ),
             'final_value_dkk': float(values[-1]),
             'initial_value_dkk': float(self.initial_budget_dkk),
+            'total_distributions_dkk': float(self.total_distributions),
             'wind_capacity_mw': float(self.wind_capacity_mw),
             'solar_capacity_mw': float(self.solar_capacity_mw),
             'hydro_capacity_mw': float(self.hydro_capacity_mw),
@@ -632,4 +663,3 @@ class RuleBasedHeuristicOptimizer:
             'final_cash_dkk': float(self.cash_dkk),
             'rule_triggers': self.rule_triggers
         }
-

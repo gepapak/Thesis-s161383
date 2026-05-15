@@ -25,6 +25,15 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, List
 import json
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from baseline_common import (
+    HybridFundLedger,
+    load_baseline_economic_config,
+    periods_per_year_from_hours,
+)
 
 
 class BuyAndHoldOptimizer:
@@ -41,7 +50,13 @@ class BuyAndHoldOptimizer:
     to justify additional complexity and risk.
     """
     
-    def __init__(self, initial_budget_usd: float = 8e8, timebase_hours: float = 1/6):
+    def __init__(
+        self,
+        initial_budget_usd: float = 8e8,
+        timebase_hours: float = 1/6,
+        data: pd.DataFrame | None = None,
+        seed: int = 42,
+    ):
         """
         Initialize Buy-and-Hold optimizer.
         
@@ -49,29 +64,41 @@ class BuyAndHoldOptimizer:
             initial_budget_usd: Initial portfolio value in USD (default: $800M)
             timebase_hours: Hours per timestep (default: 0.1667 for 10-minute intervals)
         """
+        self.econ_cfg = load_baseline_economic_config()
+        initial_budget_usd = float(initial_budget_usd or self.econ_cfg.initial_budget_usd)
+        timebase_hours = float(timebase_hours or self.econ_cfg.time_step_hours)
+
+        if data is None:
+            data = pd.DataFrame([{"wind": 0.0, "solar": 0.0, "hydro": 0.0, "price": 0.0}])
+
+        self.ledger = HybridFundLedger(data, seed=seed, timebase_hours=timebase_hours)
+
         # Portfolio tracking
         self.initial_budget_usd = initial_budget_usd
-        self.current_value_usd = initial_budget_usd
+        self.current_value_usd = self.ledger.initial_budget_usd
         self.timebase_hours = timebase_hours
         
         # Risk-free rate parameters
-        self.annual_risk_free_rate = 0.02  # 2% annual (Danish government bonds)
-        self.steps_per_year = int(8760 / timebase_hours)  # Steps per year
-        self.timestep_rate = self.annual_risk_free_rate / self.steps_per_year
+        self.annual_risk_free_rate = self.econ_cfg.annual_risk_free_rate
+        self.steps_per_year = periods_per_year_from_hours(timebase_hours)
+        self.timestep_rate = 0.0
         
         # Performance tracking
-        self.portfolio_history = [initial_budget_usd]
+        self.portfolio_history = []
+        self.distribution_adjusted_history = []
         self.timestep_count = 0
         
-        # Currency conversion (for consistency with other baselines)
-        self.dkk_to_usd_rate = 0.145
+        # Currency conversion and shareholder distributions match Tier1 config.
+        self.dkk_to_usd_rate = self.econ_cfg.dkk_to_usd_rate
+        self.total_distributions = 0.0
         
-        print(f"Buy-and-Hold Optimizer initialized:")
-        print(f"  Initial Budget: ${initial_budget_usd/1e6:.1f}M USD")
-        print(f"  Risk-free Rate: {self.annual_risk_free_rate*100:.1f}% annual")
+        print(f"Hybrid Buy-and-Hold Optimizer initialized:")
+        print(f"  Initial Fund: ${self.ledger.initial_budget_usd/1e6:.1f}M USD")
+        print(f"  Physical Sleeve: ${self.ledger.physical_book_initial*self.dkk_to_usd_rate/1e6:.1f}M USD")
+        print(f"  Trading Sleeve: ${self.ledger.trading_allocation_budget*self.dkk_to_usd_rate/1e6:.1f}M USD")
+        print(f"  Risk-free Cash Accrual: disabled (matches current environment cash accounting)")
         print(f"  Timebase: {timebase_hours:.4f} hours per step")
         print(f"  Steps per Year: {self.steps_per_year:,}")
-        print(f"  Rate per Step: {self.timestep_rate*1e6:.3f} ppm")
     
     def step(self, data_row: pd.Series) -> Dict[str, Any]:
         """
@@ -83,15 +110,23 @@ class BuyAndHoldOptimizer:
         Returns:
             Dict with portfolio state and performance metrics
         """
-        # Compound interest calculation (risk-free growth)
-        self.current_value_usd *= (1 + self.timestep_rate)
+        record = self.ledger.step(
+            self.timestep_count,
+            target_exposure=None,
+            battery_action="idle",
+        )
+        self.current_value_usd = float(record["portfolio_value_usd"])
+        self.total_distributions = float(record["total_distributions"] * self.dkk_to_usd_rate)
         
         # Track portfolio evolution
         self.portfolio_history.append(self.current_value_usd)
+        self.distribution_adjusted_history.append(float(record["distribution_adjusted_value_usd"]))
         self.timestep_count += 1
         
         # Calculate performance metrics
-        total_return = (self.current_value_usd - self.initial_budget_usd) / self.initial_budget_usd
+        total_return = (
+            record["distribution_adjusted_value_usd"] - self.initial_budget_usd
+        ) / self.initial_budget_usd
         
         # Return step results
         return {
@@ -105,7 +140,13 @@ class BuyAndHoldOptimizer:
             'hydro_capacity_mw': 0.0,
             'battery_soc': 0.0,  # No battery
             'risk_free_return': self.current_value_usd - self.initial_budget_usd,
-            'method': 'Buy-and-Hold Strategy'
+            'physical_book_value_usd': record['physical_book_value_usd'],
+            'trading_cash_usd': record['trading_cash_usd'],
+            'operational_revenue_usd': record['operational_revenue'] * self.dkk_to_usd_rate,
+            'distribution_amount': record['distribution_amount'] * self.dkk_to_usd_rate,
+            'total_distributions': self.total_distributions,
+            'distribution_adjusted_value_usd': record['distribution_adjusted_value_usd'],
+            'method': 'Hybrid Buy-and-Hold Strategy'
         }
     
     def get_performance_metrics(self) -> Dict[str, Any]:
@@ -115,25 +156,13 @@ class BuyAndHoldOptimizer:
         Returns:
             Dict with all performance metrics for evaluation
         """
-        if len(self.portfolio_history) < 2:
+        if not self.ledger.nav_values_usd:
             return {'error': 'Insufficient data for metrics calculation'}
-        
-        # Basic performance
-        final_value = self.portfolio_history[-1]
-        total_return = (final_value - self.initial_budget_usd) / self.initial_budget_usd
-        
-        # Time-based metrics
+
+        metrics = self.ledger.performance_metrics()
+        final_value = float(metrics["final_value_usd"])
         days_elapsed = (self.timestep_count * self.timebase_hours) / 24
         years_elapsed = days_elapsed / 365.25
-        annual_return = (1 + total_return) ** (1 / years_elapsed) - 1 if years_elapsed > 0 else 0
-        
-        # Risk metrics (should all be zero for risk-free investment)
-        returns = np.diff(self.portfolio_history) / np.array(self.portfolio_history[:-1])
-        volatility = np.std(returns) if len(returns) > 1 else 0.0
-        max_drawdown = 0.0  # Risk-free investment has no drawdown
-        
-        # Sharpe ratio (should be 0 - no excess return over risk-free rate)
-        sharpe_ratio = 0.0
         
         # Currency conversion for consistency
         final_value_dkk = final_value / self.dkk_to_usd_rate
@@ -141,28 +170,27 @@ class BuyAndHoldOptimizer:
         
         return {
             # Core performance
-            'total_return': total_return,
-            'annual_return': annual_return,
-            'sharpe_ratio': sharpe_ratio,
-            'max_drawdown': max_drawdown,
-            'volatility': volatility,
+            **metrics,
             
             # Portfolio values
             'final_value_usd': final_value,
             'initial_value_usd': self.initial_budget_usd,
+            'distribution_adjusted_final_value_usd': float(metrics["distribution_adjusted_final_value_usd"]),
             'final_value_dkk': final_value_dkk,
             'initial_value_dkk': initial_value_dkk,
+            'total_distributions_usd': float(metrics.get("total_distributions_usd", 0.0)),
+            'total_distributions_dkk': float(metrics.get("total_distributions_usd", 0.0) / self.dkk_to_usd_rate),
             
             # Holdings (all cash/bonds)
-            'final_cash_usd': final_value,
-            'final_cash_dkk': final_value_dkk,
-            'wind_capacity_mw': 0.0,
-            'solar_capacity_mw': 0.0,
-            'hydro_capacity_mw': 0.0,
+            'final_cash_usd': float(metrics.get("final_trading_cash_usd", 0.0)),
+            'final_cash_dkk': float(metrics.get("final_trading_cash_usd", 0.0) / self.dkk_to_usd_rate),
+            'wind_capacity_mw': float(metrics.get("wind_capacity_mw", 0.0)),
+            'solar_capacity_mw': float(metrics.get("solar_capacity_mw", 0.0)),
+            'hydro_capacity_mw': float(metrics.get("hydro_capacity_mw", 0.0)),
             
             # Risk-free specific metrics
             'risk_free_rate_annual': self.annual_risk_free_rate,
-            'total_risk_free_return_usd': final_value - self.initial_budget_usd,
+            'total_risk_free_return_usd': 0.0,
             'compound_periods': self.timestep_count,
             
             # Time metrics
@@ -171,8 +199,8 @@ class BuyAndHoldOptimizer:
             'years_elapsed': years_elapsed,
             
             # Strategy identification
-            'method': 'Buy-and-Hold Strategy',
-            'strategy_type': 'Risk-Free Rate Baseline',
+            'method': 'Hybrid Buy-and-Hold Strategy',
+            'strategy_type': 'Passive Hybrid Fund Baseline',
             'active_decisions': 0,  # No active decisions made
             'market_exposure': 0.0,  # No market exposure
         }
@@ -187,11 +215,17 @@ class BuyAndHoldOptimizer:
         evolution = []
         
         for i, value in enumerate(self.portfolio_history):
-            total_return = (value - self.initial_budget_usd) / self.initial_budget_usd
+            adjusted = (
+                self.distribution_adjusted_history[i]
+                if i < len(self.distribution_adjusted_history)
+                else value
+            )
+            total_return = (adjusted - self.initial_budget_usd) / self.initial_budget_usd
             
             evolution.append({
                 'timestep': i,
                 'portfolio_value_usd': value,
+                'distribution_adjusted_value_usd': adjusted,
                 'total_return': total_return,
                 'cash_usd': value,
                 'capacity_value_usd': 0.0,
@@ -212,8 +246,10 @@ class BuyAndHoldOptimizer:
             'current_value_usd': self.current_value_usd,
             'timebase_hours': self.timebase_hours,
             'annual_risk_free_rate': self.annual_risk_free_rate,
+            'total_distributions': self.total_distributions,
             'timestep_count': self.timestep_count,
             'portfolio_history': self.portfolio_history,
+            'distribution_adjusted_history': self.distribution_adjusted_history,
             'performance_metrics': self.get_performance_metrics()
         }
         
@@ -229,8 +265,13 @@ class BuyAndHoldOptimizer:
         self.current_value_usd = state['current_value_usd']
         self.timebase_hours = state['timebase_hours']
         self.annual_risk_free_rate = state['annual_risk_free_rate']
+        self.total_distributions = float(state.get('total_distributions', 0.0))
         self.timestep_count = state['timestep_count']
         self.portfolio_history = state['portfolio_history']
+        self.distribution_adjusted_history = state.get(
+            'distribution_adjusted_history',
+            list(self.portfolio_history),
+        )
         
         # Recalculate derived parameters
         self.steps_per_year = int(8760 / self.timebase_hours)

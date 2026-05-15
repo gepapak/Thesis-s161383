@@ -16,7 +16,7 @@ Features:
 - Automatic latest checkpoint detection
 - Direct Stable Baselines3 model loading
 - MultiESGAgent system loading
-- Forecasting enable/disable for baseline comparison
+- Cache-only forecast utilization flag alignment
 - Comprehensive metrics calculation
 - Portfolio analysis with plotting
 - Flexible data input (defaults to unseen evaluation dataset)
@@ -29,8 +29,8 @@ Usage:
     # Evaluate specific agent directory
     python evaluation.py --mode agents --trained_agents saved_agents --eval_data "evaluation_dataset/unseendata.csv"
 
-    # Baseline comparison (no forecasting)
-    python evaluation.py --mode agents --trained_agents saved_agents --eval_data "evaluation_dataset/unseendata.csv" --no_forecast
+    # Baseline comparison
+    python evaluation.py --mode agents --trained_agents saved_agents --eval_data "evaluation_dataset/unseendata.csv"
 
     # With comprehensive analysis and plots
     python evaluation.py --mode checkpoint --analyze --plot
@@ -38,19 +38,32 @@ Usage:
 
 import argparse
 import builtins as _builtins
+import math
 import os
 import sys
+import re
 import warnings
 import glob
 import json
 import subprocess
-import time
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
 from config import EnhancedConfig
+from runtime_contract import (
+    build_runtime_contract,
+    forecast_prior_contract_settings,
+    runtime_contract_hash,
+)
+from forecast_prior_cli import (
+    add_forecast_prior_override_args,
+    apply_forecast_prior_overrides,
+)
+
+# Keep evaluation aligned with training-time rolling_past bootstrap.
+EVAL_ROLLING_PAST_HISTORY_DIR = "rolling_past_history_dataset"
 
 def setup_console_encoding():
     """
@@ -73,104 +86,7 @@ def setup_console_encoding():
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
-def _sanitize_console_text(message: str) -> str:
-    """Best-effort cleanup for legacy mojibake and old icon-heavy console strings."""
-    text = str(message)
-    for _ in range(2):
-        if any(ch in text for ch in ("Ã", "Â", "â")):
-            try:
-                repaired = text.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
-            except Exception:
-                break
-            if repaired and repaired != text:
-                text = repaired
-                continue
-        break
-    replacements = {
-        "✅": "[OK]",
-        "⚠": "[WARN]",
-        "❌": "[FAIL]",
-        "🚀": "",
-        "🔍": "[INFO]",
-        "📂": "[LOAD]",
-        "📁": "[LOAD]",
-        "📊": "[ANALYZE]",
-        "📈": "[EVAL]",
-        "💾": "[SAVE]",
-        "🎯": "[GOAL]",
-        "🔧": "[SETUP]",
-        "…": "...",
-    }
-    for src, dst in replacements.items():
-        text = text.replace(src, dst)
-    return " ".join(text.split())
-
-def print(*args, **kwargs):
-    """Module-local print wrapper that sanitizes legacy evaluation output."""
-    cleaned = [
-        _sanitize_console_text(arg) if isinstance(arg, str) else arg
-        for arg in args
-    ]
-    return _builtins.print(*cleaned, **kwargs)
-
-def print_progress(message: str, step: int = None, total: int = None):
-    """Print progress message with optional step counter."""
-    message = _sanitize_console_text(message)
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    if step is not None and total is not None:
-        progress = f"[{step}/{total}]"
-        print(f"[{timestamp}] {progress} {message}")
-    else:
-        print(f"[{timestamp}] {message}")
-    sys.stdout.flush()
-
-def print_section_header(title: str):
-    """Print a formatted section header."""
-    print("\n" + "="*80)
-    print(f"ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯ {title}")
-    print("="*80)
-    sys.stdout.flush()
-
-
-def _print_eval_loop_progress(
-    completed_steps: int,
-    total_steps: int,
-    portfolio_values: list,
-    rewards_by_agent: Dict[str, list],
-    successful_inference_actions: Optional[int] = None,
-    total_inference_attempts: Optional[int] = None,
-):
-    """
-    Emit a live evaluation progress line.
-
-    Progress is reported on completed-step boundaries so the console shows
-    `1000/10000`, `2000/10000`, ... instead of only logging at step 0.
-    """
-    if total_steps <= 0:
-        return
-
-    current_portfolio = portfolio_values[-1] if portfolio_values else 800_000_000
-    portfolio_change = ((current_portfolio / 800_000_000) - 1) * 100
-    total_reward = sum(sum(rewards_by_agent[agent]) for agent in rewards_by_agent)
-
-    msg = (
-        f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Progress: {completed_steps}/{total_steps} "
-        f"({completed_steps / total_steps * 100:.1f}%) | "
-        f"NAV: ${current_portfolio/1e6:.1f}M ({portfolio_change:+.2f}%) | "
-        f"Total Reward: {total_reward:.1f}"
-    )
-
-    if successful_inference_actions is not None and total_inference_attempts is not None:
-        success_rate = (
-            successful_inference_actions / total_inference_attempts
-            if total_inference_attempts > 0 else 0.0
-        )
-        msg += f" | Inference: {success_rate*100:.1f}%"
-
-    print_progress(msg)
-
-
-# Clean ASCII overrides for the legacy console helpers above.
+# Clean ASCII overrides for the console helpers above.
 def _sanitize_console_text(message: str) -> str:
     """Normalize evaluation console output to simple ASCII."""
     text = str(message)
@@ -266,12 +182,12 @@ def _print_eval_loop_progress(
 # Import project modules (no side effects / no prints at import time).
 from environment import RenewableMultiAgentEnv
 from metacontroller import MultiESGAgent
-from generator import MultiHorizonForecastGenerator, load_energy_data
+from generator import load_energy_data
+from utils import configure_tf_memory
 
 # Portfolio analysis imports
 try:
     import matplotlib.pyplot as plt
-    import seaborn as sns
     HAS_PLOTTING = True
 except ImportError:
     HAS_PLOTTING = False
@@ -672,6 +588,92 @@ class PortfolioAnalyzer:
 
         return confidence
 
+
+def _annual_rate_to_step_rate(annual_rate: float, periods_per_year: float) -> float:
+    annual = float(annual_rate)
+    periods = float(max(periods_per_year, 1.0))
+    if not np.isfinite(annual) or not np.isfinite(periods):
+        return 0.0
+    if annual <= -1.0:
+        return -1.0
+    return float((1.0 + annual) ** (1.0 / periods) - 1.0)
+
+
+def _infer_periods_per_year(timestamps, default_periods_per_year: float = 52560.0) -> float:
+    try:
+        if timestamps is None:
+            return float(default_periods_per_year)
+        ts = pd.Series(timestamps).dropna()
+        if ts.empty:
+            return float(default_periods_per_year)
+        parsed = pd.to_datetime(ts, errors="coerce").dropna().sort_values()
+        if parsed.size < 2:
+            return float(default_periods_per_year)
+        deltas = parsed.diff().dt.total_seconds().to_numpy(dtype=np.float64)
+        deltas = deltas[np.isfinite(deltas) & (deltas > 0.0)]
+        if deltas.size == 0:
+            return float(default_periods_per_year)
+        median_seconds = float(np.median(deltas))
+        if median_seconds <= 0.0:
+            return float(default_periods_per_year)
+        seconds_per_year = 365.25 * 24.0 * 60.0 * 60.0
+        inferred = seconds_per_year / median_seconds
+        return float(np.clip(inferred, 1.0, 60.0 * 24.0 * 365.25))
+    except Exception:
+        return float(default_periods_per_year)
+
+
+def _compute_annualized_risk_metrics(
+    returns,
+    *,
+    periods_per_year: float,
+    annual_risk_free_rate: float = 0.0,
+) -> Dict[str, float]:
+    vals = np.asarray(returns, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    periods = float(max(periods_per_year, 1.0))
+    if vals.size == 0:
+        return {
+            "step_mean_return": 0.0,
+            "step_volatility": 0.0,
+            "annualized_volatility": 0.0,
+            "annualized_sharpe": 0.0,
+            "per_step_risk_free_rate": _annual_rate_to_step_rate(annual_risk_free_rate, periods),
+        }
+
+    step_mean = float(np.mean(vals))
+    step_vol = float(np.std(vals)) if vals.size > 1 else 0.0
+    step_rf = _annual_rate_to_step_rate(annual_risk_free_rate, periods)
+    excess_mean = float(np.mean(vals - step_rf))
+    annualized_vol = float(step_vol * math.sqrt(periods))
+    annualized_sharpe = float((excess_mean / step_vol) * math.sqrt(periods)) if step_vol > 0.0 else 0.0
+    return {
+        "step_mean_return": step_mean,
+        "step_volatility": step_vol,
+        "annualized_volatility": annualized_vol,
+        "annualized_sharpe": annualized_sharpe,
+        "per_step_risk_free_rate": float(step_rf),
+    }
+
+
+def _resolve_eval_risk_free_rate(eval_env, default: float = 0.02) -> float:
+    try:
+        cfg = getattr(eval_env, "config", None)
+        if cfg is not None:
+            val = getattr(cfg, "risk_free_rate", None)
+            if val is not None:
+                return float(val)
+        wrapped = getattr(eval_env, "env", None)
+        if wrapped is not None:
+            cfg = getattr(wrapped, "config", None)
+            if cfg is not None:
+                val = getattr(cfg, "risk_free_rate", None)
+                if val is not None:
+                    return float(val)
+    except Exception:
+        pass
+    return float(default)
+
 def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[str, Any]:
     """
     Create a realistic Buy-and-Hold renewable energy baseline.
@@ -697,8 +699,8 @@ def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[st
 
     # Conservative risk-free rate (Danish government bonds ~2% annually)
     annual_risk_free_rate = 0.02
-    # Convert to per-timestep rate (assuming 10-minute intervals, 52,560 per year)
-    timestep_rate = annual_risk_free_rate / 52560
+    periods_per_year = _infer_periods_per_year(data.get("timestamp"))
+    timestep_rate = _annual_rate_to_step_rate(annual_risk_free_rate, periods_per_year)
 
     # Track portfolio values
     portfolio_values = [initial_value]
@@ -712,13 +714,15 @@ def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[st
     final_value = portfolio_values[-1]
     total_return = (final_value - initial_value) / initial_value
 
-    # Calculate returns for risk metrics
-    returns = np.diff(portfolio_values) / np.array(portfolio_values[:-1])
-    volatility = np.std(returns) if len(returns) > 1 else 0.0
-
-    # Sharpe ratio (excess return over risk-free rate, but this IS the risk-free rate)
-    # So Sharpe ratio should be 0 (no excess return over risk-free rate)
-    sharpe_ratio = 0.0
+    risk_stats = _compute_annualized_risk_metrics(
+        np.diff(portfolio_values) / np.array(portfolio_values[:-1]),
+        periods_per_year=periods_per_year,
+        annual_risk_free_rate=annual_risk_free_rate,
+    )
+    volatility = float(risk_stats["annualized_volatility"])
+    sharpe_ratio = float(risk_stats["annualized_sharpe"])
+    if abs(sharpe_ratio) < 1e-12:
+        sharpe_ratio = 0.0
 
     # Max drawdown (should be 0 for risk-free investment)
     max_drawdown = 0.0
@@ -729,6 +733,9 @@ def create_buy_and_hold_baseline(eval_data_path: str, timesteps: int) -> Dict[st
         'sharpe_ratio': sharpe_ratio,
         'max_drawdown': max_drawdown,
         'volatility': volatility,
+        'step_volatility': float(risk_stats["step_volatility"]),
+        'periods_per_year': float(periods_per_year),
+        'annual_risk_free_rate': float(annual_risk_free_rate),
         'final_value_usd': final_value,
         'initial_value_usd': initial_value,
         'final_portfolio_value': final_value,
@@ -943,7 +950,6 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
         try:
             import sys
             import types
-            import numpy as _np  # noqa: F401
             import numpy.core.numeric as _np_core_numeric
 
             if "numpy._core.numeric" not in sys.modules:
@@ -966,6 +972,8 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
         agent_modes = {
             "investor_0": "PPO",
             "battery_operator_0": "DQN",
+            "risk_controller_0": "PPO",
+            "meta_controller_0": "PPO",
         }
         config_path = os.path.join(checkpoint_dir, "training_config.json")
         if os.path.isfile(config_path):
@@ -974,9 +982,21 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
                     saved = json.load(f)
                 final_cfg = saved.get("final_config", {}) or {}
                 saved_policies = final_cfg.get("agent_policies", None)
-                if isinstance(saved_policies, list) and len(saved_policies) >= 2:
-                    agent_modes["investor_0"] = str((saved_policies[0] or {}).get("mode", agent_modes["investor_0"]))
-                    agent_modes["battery_operator_0"] = str((saved_policies[1] or {}).get("mode", agent_modes["battery_operator_0"]))
+                agent_order = [
+                    "investor_0",
+                    "battery_operator_0",
+                    "risk_controller_0",
+                    "meta_controller_0",
+                ]
+                if isinstance(saved_policies, list):
+                    for idx, agent_name in enumerate(agent_order):
+                        if idx >= len(saved_policies):
+                            break
+                        policy_cfg = saved_policies[idx] or {}
+                        if isinstance(policy_cfg, dict):
+                            agent_modes[agent_name] = str(
+                                policy_cfg.get("mode", agent_modes[agent_name])
+                            ).upper()
             except Exception as e:
                 print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Could not read training_config.json for algo detection: {e}")
 
@@ -984,6 +1004,8 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
         model_configs = [
             ("investor_0_policy.zip", algo_map.get(agent_modes["investor_0"], PPO)),
             ("battery_operator_0_policy.zip", algo_map.get(agent_modes["battery_operator_0"], DQN)),
+            ("risk_controller_0_policy.zip", algo_map.get(agent_modes["risk_controller_0"], PPO)),
+            ("meta_controller_0_policy.zip", algo_map.get(agent_modes["meta_controller_0"], PPO)),
         ]
         
         loaded_models = {}
@@ -1015,74 +1037,12 @@ def load_checkpoint_models(checkpoint_dir: str) -> Dict[str, Any]:
         return {}
 
 
-def _load_eval_forecast_paths_episode20(
-    forecast_base_dir: str = "forecast_models",
-    config: Optional[EnhancedConfig] = None,
-) -> Dict[str, str]:
-    """
-    Resolve the evaluation-reserved Episode-20 forecast stack.
-
-    If the reserved expert bank is missing, build it once and then validate the
-    canonical episode_20 paths so deployed Tier-2 evaluation stays aligned with
-    the current expert-bank contract.
-    """
-    def _validate_forecast_paths(paths: Dict[str, str], source: str) -> Dict[str, str]:
-        required = ("model_dir", "scaler_dir", "metadata_dir")
-        missing = []
-        for key in required:
-            p = paths.get(key)
-            if not isinstance(p, str) or not os.path.isdir(p):
-                missing.append(f"{key}={p}")
-        if missing:
-            raise FileNotFoundError(
-                f"[EVAL_FORECAST_PATHS_FATAL] Invalid forecast paths from {source}: "
-                + ", ".join(missing)
-            )
-        return paths
-
-    try:
-        from forecast_engine import get_evaluation_forecast_paths, check_episode_models_exist, train_evaluation_forecasts
-        cfg = config or EnhancedConfig()
-        if not check_episode_models_exist(20, forecast_base_dir=forecast_base_dir, config=cfg):
-            train_evaluation_forecasts(
-                episode_num=20,
-                forecast_training_dataset_dir="forecast_training_dataset",
-                forecast_base_dir=forecast_base_dir,
-                force_retrain=False,
-                config=cfg,
-            )
-        resolved = get_evaluation_forecast_paths(forecast_base_dir=forecast_base_dir)
-        return _validate_forecast_paths(resolved, "forecast_engine")
-    except Exception as e:
-        # Fallback to the conventional folder layout (validated, else fatal).
-        ep_dir = os.path.join(forecast_base_dir, "episode_20")
-        fallback = {
-            "model_dir": os.path.join(ep_dir, "models"),
-            "scaler_dir": os.path.join(ep_dir, "scalers"),
-            "metadata_dir": os.path.join(ep_dir, "metadata"),
-        }
-        try:
-            return _validate_forecast_paths(fallback, "conventional episode_20 layout")
-        except Exception as fallback_exc:
-            raise RuntimeError(
-                "[EVAL_FORECAST_PATHS_FATAL] Failed to resolve evaluation forecast paths "
-                f"(primary error: {e}; fallback error: {fallback_exc})"
-            ) from fallback_exc
-
 def _resolve_reserved_eval_forecast_context(
     args,
     output_dir: Optional[str] = None,
     config: Optional[EnhancedConfig] = None,
 ) -> Dict[str, Any]:
-    """
-    Resolve the canonical evaluation forecaster context.
-
-    All deployed Tier-2 evaluation should use the reserved Episode-20 forecast
-    stack rather than ad-hoc model/scaler paths.
-    """
-    forecast_base = str(getattr(args, "forecast_base_dir", "forecast_models") or "forecast_models")
-    cfg = config or _build_eval_config(args)
-    forecast_paths = _load_eval_forecast_paths_episode20(forecast_base_dir=forecast_base, config=cfg)
+    """Resolve the canonical evaluation forecast-cache context."""
 
     cache_root = str(getattr(args, "forecast_cache_dir", "forecast_cache") or "forecast_cache")
     cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025", "forecast_cache_eval_episode20_2025-full")
@@ -1090,84 +1050,10 @@ def _resolve_reserved_eval_forecast_context(
         cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
 
     return {
-        "model_dir": str(forecast_paths.get("model_dir") or ""),
-        "scaler_dir": str(forecast_paths.get("scaler_dir") or ""),
-        "metadata_dir": forecast_paths.get("metadata_dir", None),
         "forecast_cache_dir": cache_dir,
         "output_dir": output_dir,
     }
 
-
-def _expected_tier2_weight_names(variant: Optional[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """Return expected and incompatible Tier-2 checkpoint names."""
-    try:
-        from tier2 import get_tier2_weight_filenames
-
-        expected = tuple(get_tier2_weight_filenames())
-    except Exception:
-        expected = ("tier2_policy_improvement.pkl", "tier2_policy_improvement.h5")
-    return (expected, ())
-
-
-def _collect_tier2_weight_candidates(final_models_dir: str, tier_dir: str, names: Tuple[str, ...]) -> list[str]:
-    """Collect Tier-2 checkpoint candidates from final_models/ and episode checkpoints."""
-    import re
-
-    candidates = [os.path.join(final_models_dir, name) for name in names]
-    ckpt_root = os.path.join(tier_dir, "checkpoints")
-    if os.path.isdir(ckpt_root):
-        ep_dirs = []
-        try:
-            for name in os.listdir(ckpt_root):
-                m = re.match(r"episode_(\d+)$", name)
-                if m:
-                    ep_dirs.append((int(m.group(1)), os.path.join(ckpt_root, name)))
-        except Exception as e:
-            raise RuntimeError(
-                f"[EVAL_TIER2_WEIGHTS_FATAL] Failed to list checkpoint directory {ckpt_root}: {e}"
-            ) from e
-        for _, ep_path in sorted(ep_dirs, key=lambda x: x[0], reverse=True):
-            for name in names:
-                candidates.append(os.path.join(ep_path, name))
-    return candidates
-
-
-def _resolve_tier2_weights(final_models_dir: str, tier_dir: str, variant: Optional[str] = None) -> Optional[str]:
-    """Resolve the exact Tier-2 weights required for a tier variant."""
-    expected_names, incompatible_names = _expected_tier2_weight_names(variant)
-    candidates = _collect_tier2_weight_candidates(final_models_dir, tier_dir, expected_names)
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-
-    incompatible_candidates = _collect_tier2_weight_candidates(final_models_dir, tier_dir, incompatible_names)
-    found_incompatible = [p for p in incompatible_candidates if p and os.path.exists(p)]
-    if found_incompatible:
-        variant_name = str(variant or "").strip().lower() or "tier2"
-        raise RuntimeError(
-            f"Found incompatible Tier-2 weights for '{variant_name}': "
-            f"{os.path.basename(found_incompatible[0])}. Expected one of {list(expected_names)}."
-        )
-    return None
-
-
-def _resolve_tier2_weights_from_models_dir(models_dir: str) -> Optional[str]:
-    """Resolve Tier-2 weights from a generic models directory."""
-    try:
-        from tier2 import get_tier2_weight_filenames
-
-        candidate_names = tuple(get_tier2_weight_filenames())
-    except Exception:
-        candidate_names = ("tier2_policy_improvement.pkl", "tier2_policy_improvement.h5")
-    roots = [models_dir, os.path.join(models_dir, "final_models")]
-    for root in roots:
-        if not root:
-            continue
-        for name in candidate_names:
-            p = os.path.join(root, name)
-            if p and os.path.exists(p):
-                return p
-    return None
 
 def _build_eval_config(args):
     from config import EnhancedConfig
@@ -1181,7 +1067,99 @@ def _build_eval_config(args):
         cfg.meta_freq_max = int(args.meta_freq_max)
     if getattr(args, "global_norm_mode", None) is not None:
         cfg.use_global_normalization = bool(str(args.global_norm_mode).strip().lower() == "global")
+    if not bool(getattr(cfg, "use_global_normalization", False)):
+        cfg.rolling_past_history_enable = True
+        roll_dir = str(getattr(args, "rolling_past_history_dir", "") or "").strip()
+        cfg.rolling_past_history_dir = roll_dir or EVAL_ROLLING_PAST_HISTORY_DIR
+    # Forecast utilization opt-in: typically inherited from training_config.json via
+    # _hydrate_eval_config_from_training_config; CLI override accepted for
+    # symmetry with training.
+    if bool(getattr(args, "enable_forecast_utilization", False)):
+        cfg.enable_forecast_utilization = True
+    apply_forecast_prior_overrides(cfg, args)
     return cfg
+
+
+def _running_moments_from_values(values):
+    """Convert a historical series into the persistent online-state format."""
+    try:
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None
+        count = float(arr.size)
+        mean = float(np.mean(arr))
+        var = float(np.var(arr, ddof=0))
+        return {
+            "count": count,
+            "mean": mean,
+            "m2": max(var * count, 0.0),
+        }
+    except Exception:
+        return None
+
+
+def _robust_p95_scale(values, min_scale=0.1):
+    try:
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return max(float(min_scale), 1.0)
+        p95_val = float(np.percentile(np.abs(arr), 95))
+        if np.isfinite(p95_val) and p95_val > 0.0:
+            return max(p95_val, float(min_scale))
+    except Exception:
+        pass
+    return max(float(min_scale), 1.0)
+
+
+def _prime_eval_rolling_past_from_history(cfg):
+    """Prime rolling_past state from the newest available causal history file."""
+    history_dir = str(getattr(cfg, "rolling_past_history_dir", "") or "").strip()
+    if not history_dir:
+        return
+    pattern = os.path.join(history_dir, "history_*.csv")
+    candidates = []
+    for p in glob.glob(pattern):
+        name = os.path.basename(str(p))
+        m = re.match(r"^history_(\d+)\.csv$", name)
+        if m:
+            candidates.append((int(m.group(1)), p))
+    if not candidates:
+        print(f"[ROLLING_PAST][EVAL] No history file found in {history_dir}; continuing without bootstrap.")
+        return
+
+    candidates.sort(key=lambda x: x[0])
+    history_csv_path = candidates[-1][1]
+    history_df = load_energy_data(
+        history_csv_path,
+        convert_to_raw_units=False,
+        config=cfg,
+        mw_scale_overrides=None,
+    )
+
+    tail_days = int(getattr(cfg, "rolling_past_history_tail_days", 365) or 365)
+    rows_per_day = int(getattr(cfg, "rolling_past_history_rows_per_day", 144) or 144)
+    tail_rows = max(max(tail_days, 1) * max(rows_per_day, 1), max(rows_per_day, 1))
+    if len(history_df) > tail_rows:
+        history_df = history_df.iloc[-tail_rows:].copy()
+
+    if "price" not in history_df.columns:
+        raise RuntimeError(f"Evaluation rolling_past bootstrap missing price column: {history_csv_path}")
+
+    price_state = _running_moments_from_values(history_df["price"].to_numpy())
+    if price_state is None:
+        raise RuntimeError(f"Evaluation rolling_past bootstrap could not build price state: {history_csv_path}")
+
+    cfg.rolling_past_price_state = price_state
+    cfg.rolling_past_wind_scale = _robust_p95_scale(history_df["wind"].to_numpy(), min_scale=0.1)
+    cfg.rolling_past_solar_scale = _robust_p95_scale(history_df["solar"].to_numpy(), min_scale=0.1)
+    cfg.rolling_past_hydro_scale = _robust_p95_scale(history_df["hydro"].to_numpy(), min_scale=0.1)
+    cfg.rolling_past_load_scale = _robust_p95_scale(history_df["load"].to_numpy(), min_scale=0.1)
+    print(
+        f"[ROLLING_PAST][EVAL] Bootstrapped from {history_csv_path} "
+        f"(rows={len(history_df)}, price_mean={float(price_state['mean']):.3f})"
+    )
 
 
 def _hydrate_eval_config_from_training_config(cfg, final_models_dir: str):
@@ -1196,147 +1174,113 @@ def _hydrate_eval_config_from_training_config(cfg, final_models_dir: str):
         return cfg
 
     final_cfg = saved.get("final_config", {}) or {}
-    enhanced = saved.get("enhanced_features", {}) or {}
-
     for key, value in dict(final_cfg).items():
         if value is None:
             continue
-        normalized_key = str(key)
-        if hasattr(cfg, normalized_key):
-            setattr(cfg, normalized_key, value)
+        if hasattr(cfg, str(key)):
+            setattr(cfg, str(key), value)
 
-    if "tier2_ablated" in enhanced:
-        cfg.tier2_value_ablate_forecast_features = bool(enhanced.get("tier2_ablated", False))
+    runtime_contract = saved.get("runtime_contract", {}) or {}
+    if isinstance(runtime_contract, dict):
+        mode = str(runtime_contract.get("global_norm_mode", "") or "").strip().lower()
+        if mode:
+            cfg.use_global_normalization = bool(mode == "global")
+        for key in ("rolling_past_history_dir", "investment_freq", "meta_freq_min", "meta_freq_max"):
+            if key in runtime_contract and hasattr(cfg, key):
+                setattr(cfg, key, runtime_contract[key])
+        prior_contract = runtime_contract.get("forecast_prior", {}) or {}
+        if isinstance(prior_contract, dict):
+            for key, value in prior_contract.items():
+                if value is None:
+                    continue
+                if hasattr(cfg, str(key)):
+                    setattr(cfg, str(key), value)
+            if "forecast_prior_horizon_steps" in prior_contract:
+                horizon = int(prior_contract["forecast_prior_horizon_steps"])
+                horizons = dict(getattr(cfg, "forecast_horizons", {}) or {})
+                horizons["short"] = horizon
+                cfg.forecast_horizons = horizons
+            if "forecast_prior_denom_floor" in prior_contract:
+                cfg.forecast_prior_denom_floor = float(prior_contract["forecast_prior_denom_floor"])
+
+    flags = saved.get("flags", {}) or {}
+    if "enable_forecast_utilization" in flags:
+        cfg.enable_forecast_utilization = bool(flags.get("enable_forecast_utilization"))
+
     return cfg
 
 
+def _load_runtime_contract_hash_from_training_config(final_models_dir: str) -> str:
+    config_path = os.path.join(final_models_dir, "training_config.json")
+    if not os.path.isfile(config_path):
+        return ""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        return str(saved.get("runtime_contract_hash", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
-    """Tier-suite evaluation on unseen data.
-
-    Compares active training regimes under identical Tier-1 environment dynamics and
-    observation spaces (no forecast-derived observations):
-
-      - tier1:      Tier-1 hybrid RL baseline (no forecast backend)
-      - tier2:      Independent Tier-2 forecast-guided enhanced MARL baseline
-      - tier2_ablated: Independent Tier-2 enhanced MARL baseline with forecast-memory ablation
-
-    IMPORTANT:
-      - In paper mode, forecasts are NOT enabled and evaluation stays policy-only.
-      - In deployed mode, only Tier-2 variants enable runtime forecasting + Tier-2 weights.
-    """
+    """Tier1 evaluation on unseen data."""
     results: Dict[str, Any] = {
-        "evaluation_mode": "tiers",
+        "evaluation_mode": "tier1",
         "eval_data": args.eval_data,
         "tiers": {},
     }
 
-    # Default: evaluate the full unseen dataset unless user explicitly sets --eval_steps
     steps = args.eval_steps if args.eval_steps is not None else (len(eval_data) - 1)
     steps = int(max(1, steps))
 
-    def _tier_eval(name: str, run_dir: str) -> Dict[str, Any]:
-        tier_out = os.path.join(args.output_dir, name)
-        os.makedirs(tier_out, exist_ok=True)
-        env_log_dir = os.path.join(tier_out, "env_logs")
-        os.makedirs(env_log_dir, exist_ok=True)
+    tier_out = os.path.join(args.output_dir, "tier1")
+    os.makedirs(tier_out, exist_ok=True)
+    env_log_dir = os.path.join(tier_out, "env_logs")
+    os.makedirs(env_log_dir, exist_ok=True)
 
-        eval_mode = str(getattr(args, "tiers_eval_mode", "paper") or "paper").strip().lower()
-        deployed = (eval_mode == "deployed")
-        is_tier2_variant = name in ("tier2", "tier2_ablated")
-        is_ablated_variant = (name == "tier2_ablated")
+    run_dir = args.tier1_dir
+    policy_final_models_dir = os.path.join(run_dir, "final_models")
+    models = load_checkpoint_models(policy_final_models_dir)
+    cfg = _hydrate_eval_config_from_training_config(_build_eval_config(args), policy_final_models_dir)
 
-        # Each tier variant is evaluated from its own trained policy checkpoint.
-        # Tier-2 is an independent forecast-guided baseline, not a Tier-1 overlay
-        # checkpoint swap, so its RL policies and Tier-2 weights both come from
-        # the same run directory.
-        policy_run_dir = run_dir
-        policy_final_models_dir = os.path.join(run_dir, "final_models")
+    eval_runtime_contract = build_runtime_contract(
+        global_norm_mode="global" if bool(getattr(cfg, "use_global_normalization", False)) else "rolling_past",
+        rolling_past_history_dir=str(getattr(cfg, "rolling_past_history_dir", "") or ""),
+        investment_freq=int(getattr(cfg, "investment_freq", getattr(args, "investment_freq", 6)) or 6),
+        meta_freq_min=int(getattr(cfg, "meta_freq_min", getattr(args, "meta_freq_min", 6)) or 6),
+        meta_freq_max=int(getattr(cfg, "meta_freq_max", getattr(args, "meta_freq_max", 6)) or 6),
+        enable_forecast_utilization=bool(getattr(cfg, "enable_forecast_utilization", False)),
+        forecast_prior_settings=forecast_prior_contract_settings(cfg),
+    )
+    eval_runtime_hash = runtime_contract_hash(eval_runtime_contract)
+    train_hash = _load_runtime_contract_hash_from_training_config(policy_final_models_dir)
+    if train_hash and eval_runtime_hash != train_hash:
+        raise RuntimeError(
+            f"[EVAL_RUNTIME_CONTRACT] training/eval hash mismatch for tier1: "
+            f"train={train_hash}, eval={eval_runtime_hash}"
+        )
+    if not bool(getattr(cfg, "use_global_normalization", False)):
+        _prime_eval_rolling_past_from_history(cfg)
 
-        # Load SB3 policies
-        models = load_checkpoint_models(policy_final_models_dir)
+    eval_forecast_cache_dir = args.forecast_cache_dir
+    if bool(getattr(cfg, "enable_forecast_utilization", False)):
+        forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=tier_out, config=cfg)
+        eval_forecast_cache_dir = forecast_ctx["forecast_cache_dir"]
 
-        # Start from the same base evaluation config, then enable Tier-2 runtime extras only when requested.
-        cfg = _hydrate_eval_config_from_training_config(_build_eval_config(args), policy_final_models_dir)
-        dl_weights_path = None
+    env = create_evaluation_environment(
+        eval_data,
+        output_dir=tier_out,
+        investment_freq=args.investment_freq,
+        config=cfg,
+        env_log_dir=env_log_dir,
+        forecast_cache_dir=eval_forecast_cache_dir,
+        fail_fast=True,
+    )
 
-        if not deployed:
-            cfg.forecast_baseline_enable = False
-
-            env, _ = create_evaluation_environment(
-                eval_data,
-                enable_forecasting=False,
-                output_dir=tier_out,
-                investment_freq=args.investment_freq,
-                config=cfg,
-                env_log_dir=env_log_dir,
-                fail_fast=True,
-            )
-        else:
-            # Deployed/system evaluation: attach the runtime forecaster + Tier-2 policy-improvement layer only
-            # for Tier-2 variants. Baseline remains forecast-free even in deployed mode.
-            wants_cv = is_tier2_variant
-            enable_forecasting = bool(wants_cv)
-            model_dir = "forecast_models/episode_20/models"
-            scaler_dir = "forecast_models/episode_20/scalers"
-            metadata_dir = None
-            cache_dir = None
-
-            if enable_forecasting:
-                try:
-                    forecast_base = str(getattr(args, "forecast_base_dir", "forecast_models") or "forecast_models")
-                    forecast_paths = _load_eval_forecast_paths_episode20(
-                        forecast_base_dir=forecast_base,
-                        config=cfg,
-                    )
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Deployed tier evaluation requires valid forecast paths, but loading failed: {e}"
-                    ) from e
-
-                model_dir = str(forecast_paths.get("model_dir") or model_dir)
-                scaler_dir = str(forecast_paths.get("scaler_dir") or scaler_dir)
-                metadata_dir = forecast_paths.get("metadata_dir", None)
-
-                # Prefer using the existing evaluation cache directory if present.
-                cache_root = str(getattr(args, "forecast_cache_dir", "forecast_cache") or "forecast_cache")
-                cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025", "forecast_cache_eval_episode20_2025-full")
-                if not os.path.isdir(cache_dir):
-                    cache_dir = os.path.join(cache_root, "forecast_cache_eval_episode20_2025")
-
-                dl_weights_path = _resolve_tier2_weights(policy_final_models_dir, run_dir, variant=name)
-                if not dl_weights_path:
-                    raise RuntimeError(
-                        f"Deployed tier evaluation for '{name}' requires Tier-2 policy-improvement weights, but none were found in "
-                        f"'{policy_final_models_dir}' or checkpoints under '{run_dir}'."
-                    )
-
-            cfg.forecast_baseline_enable = bool(enable_forecasting and dl_weights_path)
-            cfg.tier2_value_ablate_forecast_features = bool(is_ablated_variant and dl_weights_path)
-
-            env, _ = create_evaluation_environment(
-                eval_data,
-                enable_forecasting=enable_forecasting,
-                model_dir=model_dir,
-                scaler_dir=scaler_dir,
-                metadata_dir=metadata_dir,
-                tier2_weights_path=dl_weights_path,
-                output_dir=tier_out,
-                investment_freq=args.investment_freq,
-                config=cfg,
-                env_log_dir=env_log_dir,
-                forecast_cache_dir=cache_dir,
-                precompute_forecasts=bool(getattr(args, "tiers_precompute_forecasts", False)),
-                precompute_batch_size=int(getattr(args, "tiers_precompute_batch_size", 8192) or 8192),
-                fail_fast=True,
-            )
-
-        tier_metrics = run_checkpoint_evaluation(models, env, eval_data, steps)
-        if tier_metrics is None:
-            return {"status": "failed", "error": "evaluation_failed"}
-
-        # Post-hoc reporting: decompose NAV into operating vs trading sleeves from env logs.
-        # This does not change evaluation dynamics; it just makes the report interpretable
-        # when physical book value dominates total NAV.
+    tier_metrics = run_checkpoint_evaluation(models, env, eval_data, steps)
+    if tier_metrics is None:
+        tier_metrics = {"status": "failed", "error": "evaluation_failed"}
+    else:
         try:
             debug_log_path = _find_env_debug_log(env_log_dir)
             tier_metrics["env_log_dir"] = env_log_dir
@@ -1348,48 +1292,14 @@ def run_tier_suite_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any]:
                 )
         except Exception as e:
             tier_metrics["sleeve_metrics"] = {"sleeve_metrics_error": str(e)}
-
-        tier_metrics["status"] = "completed"
-        tier_metrics["run_dir"] = run_dir
-        tier_metrics["final_models_dir"] = policy_final_models_dir
-        tier_metrics["base_policy_run_dir"] = policy_run_dir
-        tier_metrics["base_policy_models_dir"] = policy_final_models_dir
-        tier_metrics["evaluation_mode"] = "tiers"
-        tier_metrics["variant"] = name
-        tier_metrics["tiers_eval_mode"] = eval_mode
-        tier_metrics["deployed_enable_forecasting"] = bool(deployed and is_tier2_variant)
-        tier_metrics["deployed_tier2_weights_path"] = dl_weights_path or ""
-        tier_metrics["deployed_tier2_enabled"] = bool(deployed and is_tier2_variant and dl_weights_path)
-        tier_metrics["deployed_tier2_policy_family"] = str(
-            getattr(cfg, "tier2_policy_family", "conservative_actor_critic") or "conservative_actor_critic"
-        )
-        tier_metrics["deployed_tier2_feature_dim"] = int(
-            getattr(cfg, "tier2_feature_dim", 0) or 0
-        )
-        return tier_metrics
-
-    print_section_header("Tier Suite Evaluation (Unseen 2025 Full Year)")
-    print_progress(f"Evaluating for {steps} steps")
-
-    sel = str(getattr(args, "tiers_only", "all") or "all").strip().lower()
-
-    def _wants(key: str, legacy_key: str, include_in_all: bool = True) -> bool:
-        if sel == "all":
-            return bool(include_in_all)
-        return sel in (key, legacy_key)
-
-    # Tier 1 baseline (legacy alias: baseline)
-    if _wants("tier1", "baseline", include_in_all=True):
-        results["tiers"]["tier1"] = _tier_eval("tier1", args.tier1_dir)
-
-    # Tier-2 full forecast-guided enhanced baseline
-    if _wants("tier2", "tier2", include_in_all=True):
-        results["tiers"]["tier2"] = _tier_eval("tier2", args.tier2_dir)
-
-    # Tier-2 sole ablation: full forecast-memory ablation with the same controller
-    if _wants("tier2_ablated", "tier2_ablated", include_in_all=True):
-        results["tiers"]["tier2_ablated"] = _tier_eval("tier2_ablated", args.tier2_ablated_dir)
-
+        tier_metrics.update({
+            "status": "completed",
+            "run_dir": run_dir,
+            "final_models_dir": policy_final_models_dir,
+            "evaluation_mode": "tier1",
+            "variant": "tier1",
+        })
+    results["tiers"]["tier1"] = tier_metrics
     return results
 
 
@@ -1406,7 +1316,7 @@ def _pct(x: Any) -> float:
 
 
 def _extract_action_inference_success_rate(results: Dict[str, Any]) -> Optional[float]:
-    """Read the current or legacy action-inference success metric from result dictionaries."""
+    """Read the current or compatibility action-inference success metric from result dictionaries."""
     for key in ("action_inference_success_rate", "prediction_success_rate"):
         if key not in results:
             continue
@@ -1454,7 +1364,13 @@ def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: f
         "accumulated_operational_revenue_dkk",
         "financial_mtm_dkk",
     }
-    optional = {"financial_exposure_dkk", "decision_step"}
+    optional = {
+        "financial_exposure_dkk",
+        "decision_step",
+        "total_distributions_dkk",
+        "distribution_adjusted_nav_dkk",
+        "distribution_adjusted_trading_sleeve_dkk",
+    }
 
     try:
         with open(debug_csv_path, "r", encoding="utf-8") as f:
@@ -1477,12 +1393,22 @@ def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: f
         metrics["sleeve_metrics_error"] = f"read_failed:{e}"
         return metrics
 
-    # Convert to USD (all logs are in DKK).
-    nav_usd = df["fund_nav_dkk"].to_numpy(dtype=float) * dkk_to_usd_rate
-    trading_usd = (
+    # Convert to USD (all logs are in DKK). Prefer total-wealth series when
+    # available; keep raw NAV as explicit reported/ex-distribution diagnostics.
+    reported_nav_usd = df["fund_nav_dkk"].to_numpy(dtype=float) * dkk_to_usd_rate
+    if "distribution_adjusted_nav_dkk" in df.columns:
+        nav_usd = df["distribution_adjusted_nav_dkk"].to_numpy(dtype=float) * dkk_to_usd_rate
+    else:
+        nav_usd = reported_nav_usd
+
+    reported_trading_usd = (
         (df["trading_cash_dkk"].to_numpy(dtype=float) + df["financial_mtm_dkk"].to_numpy(dtype=float))
         * dkk_to_usd_rate
     )
+    if "distribution_adjusted_trading_sleeve_dkk" in df.columns:
+        trading_usd = df["distribution_adjusted_trading_sleeve_dkk"].to_numpy(dtype=float) * dkk_to_usd_rate
+    else:
+        trading_usd = reported_trading_usd
     operating_usd = (
         (df["physical_book_value_dkk"].to_numpy(dtype=float) + df["accumulated_operational_revenue_dkk"].to_numpy(dtype=float))
         * dkk_to_usd_rate
@@ -1499,13 +1425,19 @@ def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: f
         "sleeve_total_initial_usd": float(nav_usd[0]),
         "sleeve_total_final_usd": float(nav_usd[-1]),
         "sleeve_total_gain_usd": total_gain,
+        "sleeve_reported_nav_initial_usd": float(reported_nav_usd[0]),
+        "sleeve_reported_nav_final_usd": float(reported_nav_usd[-1]),
         "sleeve_trading_initial_usd": float(trading_usd[0]),
         "sleeve_trading_final_usd": float(trading_usd[-1]),
         "sleeve_trading_gain_usd": trading_gain,
+        "sleeve_reported_trading_initial_usd": float(reported_trading_usd[0]),
+        "sleeve_reported_trading_final_usd": float(reported_trading_usd[-1]),
         "sleeve_operating_initial_usd": float(operating_usd[0]),
         "sleeve_operating_final_usd": float(operating_usd[-1]),
         "sleeve_operating_gain_usd": operating_gain,
     })
+    if "total_distributions_dkk" in df.columns:
+        metrics["sleeve_total_distributions_usd"] = float(df["total_distributions_dkk"].to_numpy(dtype=float)[-1] * dkk_to_usd_rate)
 
     if total_gain != 0.0:
         metrics["sleeve_trading_gain_share"] = float(trading_gain / total_gain)
@@ -1526,12 +1458,20 @@ def _compute_sleeve_metrics_from_env_log(debug_csv_path: str, dkk_to_usd_rate: f
     try:
         if len(trading_usd) > 1 and float(trading_usd[0]) != 0.0:
             tr = np.diff(trading_usd) / trading_usd[:-1]
-            vol = float(np.std(tr)) if len(tr) > 1 else 0.0
-            sharpe = float(np.mean(tr) / np.std(tr)) if vol > 0 else 0.0
+            periods_per_year = _infer_periods_per_year(df["timestamp"] if "timestamp" in df.columns else None)
+            annual_risk_free_rate = float(getattr(PortfolioAnalysisConfig(), "risk_free_annual", 0.02))
+            risk_stats = _compute_annualized_risk_metrics(
+                tr,
+                periods_per_year=periods_per_year,
+                annual_risk_free_rate=annual_risk_free_rate,
+            )
+            vol = float(risk_stats["annualized_volatility"])
+            sharpe = float(risk_stats["annualized_sharpe"])
             peak = np.maximum.accumulate(trading_usd)
             drawdowns = np.where(peak > 0.0, (peak - trading_usd) / peak, 0.0)
             dd = float(np.max(drawdowns)) if len(drawdowns) else 0.0
             metrics["sleeve_trading_volatility"] = vol
+            metrics["sleeve_trading_step_volatility"] = float(risk_stats["step_volatility"])
             metrics["sleeve_trading_sharpe_ratio"] = sharpe
             metrics["sleeve_trading_max_drawdown_pct"] = dd * 100.0
     except Exception as e:
@@ -1563,13 +1503,11 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
     rows = []
     preferred_order = [
         "tier1",
-        "tier2",
-        "tier2_ablated",
     ]
     variants = [v for v in preferred_order if v in tier_results]
     variants.extend([v for v in tier_results.keys() if v not in variants])
     if not variants:
-        variants = preferred_order[:2]
+        variants = preferred_order[:1]
 
     for variant in variants:
         r = tier_results.get(variant, {}) or {}
@@ -1577,17 +1515,16 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         rows.append({
             "variant": variant,
             "status": r.get("status", "unknown"),
-            "tiers_eval_mode": str(r.get("tiers_eval_mode", "unknown") or "unknown"),
-            "deployed_enable_forecasting": bool(r.get("deployed_enable_forecasting", False)),
-            "deployed_tier2_enabled": bool(r.get("deployed_tier2_enabled", False)),
-            "deployed_tier2_feature_dim": int(r.get("deployed_tier2_feature_dim", 0) or 0),
-            "deployed_tier2_weights_path": r.get("deployed_tier2_weights_path", ""),
             "final_portfolio_value_usd": float(r.get("final_portfolio_value", 0.0)),
             "initial_portfolio_value_usd": float(r.get("initial_portfolio_value", 0.0)),
             "total_return_pct": _pct(r.get("total_return", 0.0)),
             "sharpe_ratio": float(r.get("sharpe_ratio", 0.0)),
             "max_drawdown_pct": _pct(r.get("max_drawdown", 0.0)),
             "volatility": float(r.get("volatility", 0.0)),
+            "total_distributions_usd": float(r.get("total_distributions_usd", 0.0)),
+            "reported_nav_final_usd": float(r.get("reported_nav_final_portfolio_value", 0.0)),
+            "reported_nav_return_pct": _pct(r.get("reported_nav_total_return", 0.0)),
+            "reported_nav_sharpe": float(r.get("reported_nav_sharpe_ratio", 0.0)),
             "total_rewards": float(r.get("total_rewards", 0.0)),
             "average_risk": float(r.get("average_risk", 0.0)),
             # Sleeve decomposition (from env debug logs)
@@ -1604,15 +1541,11 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         })
 
     df = pd.DataFrame(rows)
-    report_scope = "comparison" if len(df.index) > 1 else "single_variant"
-    report_prefix = "tier_comparison" if report_scope == "comparison" else "tier_result"
-    report_title = "Tier Comparison Report" if report_scope == "comparison" else "Tier Evaluation Report"
-    mode_values = sorted({
-        str(v).strip().lower()
-        for v in df.get("tiers_eval_mode", pd.Series(dtype=str)).tolist()
-        if str(v).strip()
-    })
-    mode_label = ", ".join(mode_values) if mode_values else "unknown"
+    report_scope = "single_variant"
+    report_prefix = "tier_result"
+    report_title = "Tier Evaluation Report"
+    mode_values = sorted({"tier1"})
+    mode_label = "tier1"
 
     csv_path = os.path.join(output_dir, f"{report_prefix}_{ts}.csv")
     df.to_csv(csv_path, index=False)
@@ -1623,21 +1556,14 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         f.write(f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"- Report scope: `{report_scope}`\n")
         f.write(f"- Evaluation mode: `{mode_label}`\n")
-        if mode_label == "deployed":
-            f.write("- Interpretation: end-to-end deployed system evaluation (not policy-only)\n")
         f.write(f"- Output CSV: `{os.path.basename(csv_path)}`\n\n")
 
         f.write("### Summary Table\n\n")
-        f.write("| Variant | Status | Mode | Forecasting | Tier-2 Overlay | Final (USD) | Return % | Sharpe | Max DD % | Trading Sharpe | Trading Max DD % |\n")
-        f.write("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|\n")
+        f.write("| Variant | Status | Final (USD) | Return % | Sharpe | Max DD % | Trading Sharpe | Trading Max DD % |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|---:|\n")
         for _, row in df.iterrows():
-            tier2_label = "off"
-            if bool(row.get("deployed_tier2_enabled", False)):
-                tier2_dim = int(row.get("deployed_tier2_feature_dim", 0) or 0)
-                tier2_label = f"on ({tier2_dim}D)" if tier2_dim > 0 else "on"
             f.write(
-                f"| {row['variant']} | {row['status']} | {row['tiers_eval_mode']} | "
-                f"{'on' if bool(row['deployed_enable_forecasting']) else 'off'} | {tier2_label} | "
+                f"| {row['variant']} | {row['status']} | "
                 f"{row['final_portfolio_value_usd']:.2f} | {row['total_return_pct']:.3f} | "
                 f"{row['sharpe_ratio']:.4f} | {row['max_drawdown_pct']:.3f} | "
                 f"{row['trading_sharpe']:.4f} | {row['trading_max_dd_pct']:.3f} |\n"
@@ -1649,13 +1575,6 @@ def write_tier_report(tier_results: Dict[str, Any], output_dir: str) -> Tuple[st
         f.write("\n### Evaluation Inputs / Runtime\n\n")
         for _, row in df.iterrows():
             f.write(f"- {row['variant']}:\n")
-            f.write(f"  - eval_mode: `{row['tiers_eval_mode']}`\n")
-            f.write(f"  - forecasting: `{'on' if bool(row['deployed_enable_forecasting']) else 'off'}`\n")
-            f.write(f"  - tier2_overlay: `{'on' if bool(row.get('deployed_tier2_enabled', False)) else 'off'}`\n")
-            if bool(row.get("deployed_tier2_enabled", False)):
-                f.write(f"  - tier2_feature_dim: `{int(row.get('deployed_tier2_feature_dim', 0) or 0)}D`\n")
-            if str((row.get('deployed_tier2_weights_path', '') or '')).strip():
-                f.write(f"  - tier2_weights: `{row.get('deployed_tier2_weights_path', '')}`\n")
             f.write(f"  - final_models: `{row['final_models_dir']}`\n")
             if str(row.get('run_dir', '')).strip() != "":
                 f.write(f"  - run_dir: `{row['run_dir']}`\n")
@@ -1706,305 +1625,46 @@ def load_agent_system(trained_agents_dir: str, eval_env, enhanced: bool = False)
         return None
 
 def load_enhanced_agent_system(enhanced_models_dir: str, eval_env) -> Optional[Any]:
-    """Load enhanced MultiESGAgent system with forecasting and the Tier-2 policy-improvement layer."""
+    """Load enhanced MultiESGAgent system with the fixed Tier1 evaluation runtime."""
     print(f"Loading enhanced agent system from: {enhanced_models_dir}")
-
-    config_file = os.path.join(enhanced_models_dir, "training_config.json")
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, "r") as f:
-                config = json.load(f)
-
-            enhanced_features = config.get("enhanced_features", {})
-            forecasting_enabled = bool(
-                enhanced_features.get("forecasting_enabled", False)
-                or enhanced_features.get("tier2_enabled", False)
-                or enhanced_features.get("tier2_policy_improvement_enabled", False)
-            )
-            tier2_enabled = bool(
-                enhanced_features.get("tier2_enabled", False)
-                or enhanced_features.get("tier2_policy_improvement_enabled", False)
-            )
-            has_tier2_weights = bool(
-                enhanced_features.get("has_tier2_weights", False)
-                or enhanced_features.get("has_tier2_policy_improvement_weights", False)
-            )
-
-            print("   Enhanced features detected:")
-            print(f"      Forecasting: {'yes' if forecasting_enabled else 'no'}")
-            print(f"      Tier-2 Policy Improvement: {'yes' if tier2_enabled else 'no'}")
-            print(f"      Tier-2 Weights: {'yes' if has_tier2_weights else 'no'}")
-
-            if has_tier2_weights:
-                dl_weights_path = _resolve_tier2_weights_from_models_dir(enhanced_models_dir)
-                if dl_weights_path and os.path.exists(dl_weights_path):
-                    print(f"   Tier-2 policy-improvement weights found: {dl_weights_path}")
-                else:
-                    print("   Tier-2 policy-improvement weights missing")
-        except Exception as e:
-            print(f"   Could not read training config: {e}")
 
     return load_agent_system(enhanced_models_dir, eval_env, enhanced=True)
 
 
-def create_evaluation_tier2_value_adapter(
-    tier2_weights_path: Optional[str],
-    obs_dim: int,
-    config=None,
-    strict_load: bool = False,
-):
-    """Create the Tier-2 policy-improvement adapter for evaluation. Loads weights if path exists."""
-    try:
-        from tier2 import (
-            TIER2_POLICY_IMPROVEMENT_FEATURE_DIM,
-            Tier2PolicyImprovementAdapter,
-        )
-
-        forecast_dim = int(
-            getattr(
-                config,
-                "tier2_feature_dim",
-                TIER2_POLICY_IMPROVEMENT_FEATURE_DIM,
-            )
-            or TIER2_POLICY_IMPROVEMENT_FEATURE_DIM
-        )
-        adapter = Tier2PolicyImprovementAdapter(
-            obs_dim=obs_dim,
-            forecast_dim=forecast_dim,
-            policy_family=getattr(config, "tier2_policy_family", None),
-            memory_steps=int(getattr(config, "tier2_value_memory_steps", 2) or 2),
-            value_target_scale=float(
-                getattr(config, "tier2_value_target_scale", 0.01) or 0.01
-            ),
-            runtime_min_abs_delta=float(getattr(config, "tier2_runtime_min_abs_delta", 0.0)),
-            nav_head_scale=float(getattr(config, "tier2_value_nav_head_scale", 3.0) or 3.0),
-            return_floor_head_scale=float(getattr(config, "tier2_value_return_floor_head_scale", 4.0) or 4.0),
-            seed=42,
-        )
-        if tier2_weights_path and os.path.exists(tier2_weights_path):
-            if adapter.load_weights(tier2_weights_path):
-                print_progress("Tier-2 policy-improvement weights loaded successfully")
-            else:
-                if strict_load:
-                    raise RuntimeError(f"Failed to load Tier-2 policy-improvement weights from {tier2_weights_path}")
-                print_progress(f"Could not load Tier-2 policy-improvement weights from {tier2_weights_path}")
-        else:
-            msg = "Tier-2 policy-improvement weights file not found"
-            if strict_load:
-                raise FileNotFoundError(msg)
-            print_progress(f"{msg} (continuing without the Tier-2 layer)")
-        return adapter
-    except Exception as e:
-        if strict_load:
-            raise RuntimeError(f"Failed to create Tier-2 policy-improvement adapter: {e}") from e
-        print_progress(f"Failed to create Tier-2 policy-improvement adapter: {e}")
-        return None
-
-
 def create_evaluation_environment(
     data: pd.DataFrame,
-    enable_forecasting: bool = True,
-    model_dir: str = "saved_models",
-    scaler_dir: str = "saved_scalers",
-    metadata_dir: Optional[str] = None,
     log_path: Optional[str] = None,
-    tier2_weights_path: Optional[str] = None,
     output_dir: str = "evaluation_results",
     investment_freq: int = 6,
     config=None,
     env_log_dir: Optional[str] = None,
     forecast_cache_dir: Optional[str] = None,
-    precompute_forecasts: bool = False,
-    precompute_batch_size: int = 8192,
     fail_fast: bool = True,
-) -> Tuple[Any, Optional[Any]]:
-    """Create evaluation environment with optional forecasting (Tier-aligned)."""
-    print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Setting up evaluation environment...")
+) -> Any:
+    """Create evaluation environment. Forecast utilization is cache-only."""
+    print_progress("Setting up evaluation environment...")
 
-    if config is not None and tier2_weights_path:
-        try:
-            config = _hydrate_eval_config_from_training_config(config, os.path.dirname(tier2_weights_path))
-        except Exception:
-            pass
-
-    # Setup forecaster
-    forecaster = None
-    if enable_forecasting:
-        print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â® Loading forecaster models and scalers...")
-        try:
-            # Auto-detect metadata directory if caller did not provide it
-            if metadata_dir is None:
-                if "Forecast_ANN" in model_dir or os.path.exists(os.path.join(os.path.dirname(model_dir), "metadata")):
-                    potential_metadata = os.path.join(os.path.dirname(model_dir), "metadata")
-                    if os.path.exists(potential_metadata):
-                        metadata_dir = potential_metadata
-            
-            forecaster = MultiHorizonForecastGenerator(
-                model_dir=model_dir,
-                scaler_dir=scaler_dir,
-                metadata_dir=metadata_dir,  # NEW: Auto-detected metadata directory
-                look_back=int(getattr(config, "forecast_look_back", 24) or 24),
-                expert_refresh_stride=int(getattr(config, "investment_freq", 6) or 6),
-                verbose=False,
-                fallback_mode=False,
-                config=config,
-            )
-            stats = forecaster.get_loading_stats()
-            models_loaded = int(stats.get("models_loaded", 0) or 0)
-            models_attempted = int(stats.get("models_attempted", 0) or 0)
-            scalers_loaded = int(stats.get("scalers_loaded", 0) or 0)
-            scalers_attempted = int(stats.get("scalers_attempted", 0) or 0)
-            experts_loaded = int(stats.get("price_short_experts_loaded", 0) or 0)
-            experts_expected = int(stats.get("price_short_experts_expected", 0) or 0)
-            if bool(stats.get("expert_only_mode", False)):
-                print_progress(
-                    "Forecaster loaded successfully "
-                    f"({experts_loaded}/{experts_expected} short-price experts, "
-                    f"{scalers_loaded}/{scalers_attempted} scalers)"
-                )
-            else:
-                print_progress(
-                "ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Forecaster loaded successfully "
-                f"({models_loaded}/{models_attempted} models, "
-                f"{scalers_loaded}/{scalers_attempted} scalers, "
-                f"{experts_loaded}/{experts_expected} price experts)"
-            )
-            if not bool(getattr(forecaster, "is_complete_stack", lambda: False)()):
-                raise RuntimeError(
-                    "Evaluation forecaster failed strict validation: "
-                    f"fallback_mode={bool(stats.get('fallback_mode', False))}, "
-                    f"models={models_loaded}/{models_attempted}, "
-                    f"scalers={scalers_loaded}/{scalers_attempted}, "
-                    f"price_experts={experts_loaded}/{experts_expected}."
-                )
-
-            # Optional: build/load an offline cache for the entire evaluation dataset.
-            # This mirrors training-time precompute and makes Tier 2/3 evaluation faster + deterministic.
-            if precompute_forecasts:
-                try:
-                    cache_dir = forecast_cache_dir or os.path.join(output_dir, "forecast_cache_eval")
-                    os.makedirs(cache_dir, exist_ok=True)
-                    print_progress(f"ÃƒÂ°Ã…Â¸Ã‚Â§Ã…Â  Precomputing/loading forecast cache for evaluation (batch_size={int(precompute_batch_size)})...")
-                    forecaster.precompute_offline(
-                        df=data,
-                        timestamp_col="timestamp",
-                        batch_size=max(1, int(precompute_batch_size)),
-                        cache_dir=cache_dir,
-                    )
-                    print_progress(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Evaluation forecast cache ready: {cache_dir}")
-                except Exception as e:
-                    msg = f"Forecast cache precompute failed: {e}"
-                    if fail_fast:
-                        raise RuntimeError(msg) from e
-                    print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â {msg} (continuing with on-the-fly forecasts)")
-        except Exception as e:
-            if fail_fast:
-                raise RuntimeError(f"Failed to load forecaster: {e}") from e
-            print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Failed to load forecaster: {e}")
-            print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã‚Â« Continuing without forecasting...")
-    else:
-        print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã‚Â« Forecasting disabled (baseline evaluation)")
-    
-    # Create base environment
     try:
-        print_progress("ÃƒÂ°Ã…Â¸Ã…â€™Ã‚Â Creating base environment...")
-
-        # Create base environment without forecaster for training-compatible mode
-        if enable_forecasting:
-            base_env = RenewableMultiAgentEnv(
-                data,
-                investment_freq=int(investment_freq),
-                forecast_generator=forecaster,
-                config=config,
-                log_dir=env_log_dir,
-            )
-            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Enhanced base environment created")
-        else:
-            # Create basic environment without forecaster for training compatibility
-            base_env = RenewableMultiAgentEnv(
-                data,
-                investment_freq=int(investment_freq),
-                forecast_generator=None,
-                config=config,
-                log_dir=env_log_dir,
-            )
-            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Basic base environment created")
-
-        active_cfg = getattr(base_env, "config", config)
-        if active_cfg is not None:
-            active_cfg.forecast_baseline_enable = bool(tier2_weights_path and os.path.exists(tier2_weights_path))
-
-        # Forecast-trust calibration is compatibility-only diagnostics for the
-        # clean-room Tier-2 path.
-        if enable_forecasting and active_cfg is not None:
+        if forecast_cache_dir is not None and bool(getattr(config, "enable_forecast_utilization", False)):
             try:
-                from tier2 import CalibrationTracker
+                config.forecast_cache_dir = str(forecast_cache_dir)
+            except Exception:
+                pass
 
-                base_env.calibration_tracker = CalibrationTracker(
-                    window_size=getattr(active_cfg, "forecast_trust_window", 500),
-                    trust_metric=getattr(active_cfg, "forecast_trust_metric", "hitrate"),
-                    verbose=False,
-                    init_budget=getattr(active_cfg, "init_budget", None),
-                    direction_weight=getattr(active_cfg, "forecast_trust_direction_weight", 0.8),
-                    trust_boost=getattr(active_cfg, "forecast_trust_boost", 0.0),
-                    fail_fast=bool(fail_fast),
-                )
-                print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ CalibrationTracker initialized for evaluation (forecast trust)")
-            except Exception as e:
-                base_env.calibration_tracker = None
-                # Diagnostics only; deployed Tier-2 eval remains valid without this helper.
-                print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â CalibrationTracker init failed: {e}")
-
-        # Setup Tier-2 layer if weights are provided.
-        # When Tier-2 is enabled and not ablated, the environment also activates
-        # the short-horizon runtime Tier-2 layer on top of investor exposure.
-        if tier2_weights_path and os.path.exists(tier2_weights_path):
-            try:
-                print_progress(f"Loading Tier-2 policy-improvement weights: {os.path.basename(tier2_weights_path)}")
-                obs_dim = int(base_env.observation_spaces["investor_0"].shape[0])
-                tier2_value_adapter = create_evaluation_tier2_value_adapter(
-                    tier2_weights_path,
-                    obs_dim=obs_dim,
-                    config=config,
-                    strict_load=bool(fail_fast),
-                )
-                if tier2_value_adapter:
-                    base_env.tier2_value_adapter = tier2_value_adapter
-                    if getattr(base_env, "config", None) is not None:
-                        base_env.config.forecast_baseline_enable = True
-                    print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Tier-2 layer attached to evaluation environment")
-                else:
-                    if fail_fast:
-                        raise RuntimeError("Failed to create Tier-2 policy-improvement adapter")
-                    print_progress("Failed to create Tier-2 policy-improvement adapter")
-            except Exception as e:
-                if fail_fast:
-                    raise RuntimeError(f"Failed to load Tier-2 policy-improvement weights: {e}") from e
-                print_progress(f"Failed to load Tier-2 policy-improvement weights: {e}")
-                print_progress("   Continuing evaluation without the Tier-2 layer...")
-        elif tier2_weights_path and fail_fast:
-            raise FileNotFoundError(f"Tier-2 policy-improvement weights path does not exist: {tier2_weights_path}")
-
-        # Wrap with forecasting if enabled
-        if forecaster is not None and enable_forecasting:
-            print_progress("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Å¾ Wrapping environment with forecasting...")
-            # We rely on the base env's log_dir instead.
-            # No wrapper: keep Tier-1 observation spaces fixed for a fair comparison.
-            eval_env = base_env
-            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Environment created with forecasting wrapper")
-        else:
-            eval_env = base_env
-            print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Environment created (training-compatible baseline mode)")
-
-        return eval_env, forecaster
+        base_env = RenewableMultiAgentEnv(
+            data,
+            investment_freq=int(investment_freq),
+            config=config,
+            log_dir=env_log_dir,
+        )
+        print_progress("Environment created")
+        return base_env
 
     except Exception as e:
         if fail_fast:
             raise
-        print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Error creating environment: {e}")
-        return None, None
-
-
+        print_progress(f"Failed to create evaluation environment: {e}")
+        return None
 
 
 def _coerce_action_for_space(action: np.ndarray, action_space):
@@ -2030,7 +1690,9 @@ def _coerce_action_for_space(action: np.ndarray, action_space):
 def calculate_performance_metrics(portfolio_values: list, 
                                 rewards_by_agent: Dict[str, list],
                                 risk_levels: list,
-                                evaluation_steps: int) -> Dict[str, Any]:
+                                evaluation_steps: int,
+                                timestamps=None,
+                                annual_risk_free_rate: float = 0.0) -> Dict[str, Any]:
     """Calculate comprehensive performance metrics."""
     metrics = {}
     
@@ -2039,10 +1701,20 @@ def calculate_performance_metrics(portfolio_values: list,
         if portfolio_values:
             pv_array = np.array(portfolio_values)
             returns = np.diff(pv_array) / pv_array[:-1]
-            
+            periods_per_year = _infer_periods_per_year(timestamps)
+            risk_stats = _compute_annualized_risk_metrics(
+                returns,
+                periods_per_year=periods_per_year,
+                annual_risk_free_rate=annual_risk_free_rate,
+            )
+
             metrics['total_return'] = (pv_array[-1] / pv_array[0] - 1) if len(pv_array) > 1 else 0.0
-            metrics['volatility'] = np.std(returns) if len(returns) > 1 else 0.0
-            metrics['sharpe_ratio'] = (np.mean(returns) / np.std(returns)) if np.std(returns) > 0 else 0.0
+            metrics['volatility'] = float(risk_stats['annualized_volatility'])
+            metrics['step_volatility'] = float(risk_stats['step_volatility'])
+            metrics['sharpe_ratio'] = float(risk_stats['annualized_sharpe'])
+            metrics['periods_per_year'] = float(periods_per_year)
+            metrics['annual_risk_free_rate'] = float(annual_risk_free_rate)
+            metrics['per_step_risk_free_rate'] = float(risk_stats['per_step_risk_free_rate'])
             if len(pv_array) > 0:
                 peak = np.maximum.accumulate(pv_array)
                 drawdowns = np.where(peak > 0.0, (peak - pv_array) / peak, 0.0)
@@ -2080,6 +1752,67 @@ def calculate_performance_metrics(portfolio_values: list,
     return metrics
 
 
+def _iter_env_chain(env):
+    """Yield an environment and simple wrapper parents."""
+    seen = set()
+    cur = env
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = getattr(cur, "env", None)
+
+
+def _get_total_distributions_dkk(env) -> float:
+    """Cash distributions are investor wealth and must be added back to NAV."""
+    for candidate in _iter_env_chain(env):
+        if hasattr(candidate, "total_distributions"):
+            try:
+                return float(max(0.0, getattr(candidate, "total_distributions", 0.0)))
+            except Exception:
+                return 0.0
+    for candidate in _iter_env_chain(env):
+        if hasattr(candidate, "distributed_profits"):
+            try:
+                return float(max(0.0, getattr(candidate, "distributed_profits", 0.0)))
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _attach_distribution_adjusted_context(
+    metrics: Dict[str, Any],
+    reported_nav_values: list,
+    risk_levels: list,
+    evaluation_steps: int,
+    timestamps=None,
+    annual_risk_free_rate: float = 0.0,
+    final_total_distributions_usd: float = 0.0,
+) -> Dict[str, Any]:
+    """Primary metrics use total wealth; raw NAV metrics stay visible."""
+    reported = calculate_performance_metrics(
+        reported_nav_values,
+        {},
+        risk_levels,
+        evaluation_steps,
+        timestamps=timestamps,
+        annual_risk_free_rate=annual_risk_free_rate,
+    )
+    for key in (
+        "total_return",
+        "volatility",
+        "step_volatility",
+        "sharpe_ratio",
+        "max_drawdown",
+        "initial_portfolio_value",
+        "final_portfolio_value",
+    ):
+        if key in reported:
+            metrics[f"reported_nav_{key}"] = reported[key]
+    metrics["distribution_adjusted_evaluation"] = True
+    metrics["total_distributions_usd"] = float(max(0.0, final_total_distributions_usd))
+    return metrics
+
+
 def run_checkpoint_evaluation(models: Dict[str, Any],
                             eval_env,
                             data: pd.DataFrame,
@@ -2106,10 +1839,13 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
 
     # Tracking metrics
     portfolio_values = []
+    reported_nav_values = []
     rewards_by_agent = {agent: [] for agent in eval_env.possible_agents}
     risk_levels = []
     successful_inference_actions = 0
     total_inference_attempts = 0
+    model_inference_successes = 0
+    model_inference_attempts = 0
 
     print(f"ÃƒÂ°Ã…Â¸Ã‚Â§Ã‚Âª Running evaluation for {steps} steps...")
 
@@ -2125,18 +1861,32 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
             agent_key = agent.replace('_0', '_0')  # Normalize agent name
 
             if agent_key in models and models[agent_key] is not None:
+                model_inference_attempts += 1
                 try:
                     # Use checkpoint model for prediction
                     action, _ = models[agent_key].predict(obs[agent], deterministic=True)
                     actions[agent] = action
                     successful_inference_actions += 1
+                    model_inference_successes += 1
                 except Exception as e:
-                    print(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Prediction error for {agent}: {e}")
+                    # FAIL-HARD on the investor agent: silent fallback to
+                    # rule-based actions would invalidate tier comparisons.
+                    if agent in ("investor_0", "investor"):
+                        raise RuntimeError(
+                            f"[EVAL FAIL-HARD] investor model prediction crashed; "
+                            f"refusing to silently fall back to rule-based actions. "
+                            f"Underlying error: {type(e).__name__}: {e}"
+                        ) from e
+                    print(f"[WARN] Prediction error for {agent}: {e}")
                     if hasattr(eval_env, "get_rule_based_agent_action"):
                         actions[agent] = eval_env.get_rule_based_agent_action(agent, obs[agent])
                     else:
                         actions[agent] = eval_env.action_space(agent).sample()
             else:
+                if agent in ("investor_0", "investor"):
+                    raise RuntimeError(
+                        "[EVAL FAIL-HARD] investor model is missing; refusing rule-based/sample fallback."
+                    )
                 if hasattr(eval_env, "get_rule_based_agent_action"):
                     actions[agent] = eval_env.get_rule_based_agent_action(agent, obs[agent])
                 else:
@@ -2192,8 +1942,12 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
             elif hasattr(eval_env, 'env') and hasattr(eval_env.env, 'config') and hasattr(eval_env.env.config, 'dkk_to_usd_rate'):
                 dkk_to_usd_rate = eval_env.env.config.dkk_to_usd_rate
 
-            # Convert to USD for analysis
-            portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
+            # Convert to USD for analysis. Primary evaluation uses total
+            # investor wealth: reported NAV plus cumulative cash distributions.
+            reported_portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
+            total_distributions_usd = _get_total_distributions_dkk(eval_env) * dkk_to_usd_rate
+            portfolio_value_usd = reported_portfolio_value_usd + total_distributions_usd
+            reported_nav_values.append(reported_portfolio_value_usd)
             portfolio_values.append(portfolio_value_usd)
 
             # Debug output for first step
@@ -2226,13 +1980,39 @@ def run_checkpoint_evaluation(models: Dict[str, Any],
 
     # Calculate metrics
     success_rate = (
+        model_inference_successes / model_inference_attempts
+        if model_inference_attempts > 0 else 0.0
+    )
+    success_rate_all_agents = (
         successful_inference_actions / total_inference_attempts
         if total_inference_attempts > 0 else 0.0
     )
-    metrics = calculate_performance_metrics(portfolio_values, rewards_by_agent, risk_levels, steps)
+    risk_free_rate = _resolve_eval_risk_free_rate(eval_env)
+    metrics = calculate_performance_metrics(
+        portfolio_values,
+        rewards_by_agent,
+        risk_levels,
+        steps,
+        timestamps=data.get("timestamp"),
+        annual_risk_free_rate=risk_free_rate,
+    )
+    metrics = _attach_distribution_adjusted_context(
+        metrics,
+        reported_nav_values,
+        risk_levels,
+        steps,
+        timestamps=data.get("timestamp"),
+        annual_risk_free_rate=risk_free_rate,
+        final_total_distributions_usd=(
+            float(portfolio_values[-1] - reported_nav_values[-1])
+            if portfolio_values and reported_nav_values
+            else 0.0
+        ),
+    )
 
     # Add checkpoint-specific metrics
     metrics['action_inference_success_rate'] = success_rate
+    metrics['action_inference_success_rate_all_agents'] = success_rate_all_agents
     metrics['models_loaded'] = loaded_count
     metrics['evaluation_mode'] = 'checkpoint'
 
@@ -2280,6 +2060,7 @@ def run_agent_evaluation(agent_system,
 
     # Tracking metrics
     portfolio_values = []
+    reported_nav_values = []
     rewards_by_agent = {agent: [] for agent in eval_env.possible_agents}
     risk_levels = []
     actions_taken = {agent: [] for agent in eval_env.possible_agents}
@@ -2314,6 +2095,10 @@ def run_agent_evaluation(agent_system,
                     if step == 0:
                         print_progress(f"ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Got prediction from {agent}")
                 else:
+                    if agent in ("investor_0", "investor"):
+                        raise RuntimeError(
+                            "[EVAL FAIL-HARD] investor policy has no predict() method; refusing sample fallback."
+                        )
                     act = eval_env.action_space(agent).sample()
 
                 act = _coerce_action_for_space(act, eval_env.action_space(agent))
@@ -2322,6 +2107,11 @@ def run_agent_evaluation(agent_system,
 
             except Exception as e:
                 print_progress(f"ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â Action prediction error for {agent}: {e}")
+                if agent in ("investor_0", "investor"):
+                    raise RuntimeError(
+                        f"[EVAL FAIL-HARD] investor policy prediction crashed in agent evaluation; "
+                        f"refusing sample fallback. Underlying error: {type(e).__name__}: {e}"
+                    ) from e
                 actions[agent] = eval_env.action_space(agent).sample()
 
         if step == 0:
@@ -2370,8 +2160,12 @@ def run_agent_evaluation(agent_system,
             elif hasattr(eval_env, 'env') and hasattr(eval_env.env, 'config') and hasattr(eval_env.env.config, 'dkk_to_usd_rate'):
                 dkk_to_usd_rate = eval_env.env.config.dkk_to_usd_rate
 
-            # Convert to USD for analysis
-            portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
+            # Convert to USD for analysis. Primary evaluation uses total
+            # investor wealth: reported NAV plus cumulative cash distributions.
+            reported_portfolio_value_usd = portfolio_value_dkk * dkk_to_usd_rate
+            total_distributions_usd = _get_total_distributions_dkk(eval_env) * dkk_to_usd_rate
+            portfolio_value_usd = reported_portfolio_value_usd + total_distributions_usd
+            reported_nav_values.append(reported_portfolio_value_usd)
             portfolio_values.append(portfolio_value_usd)
 
             if hasattr(eval_env, 'get_risk_level'):
@@ -2397,7 +2191,28 @@ def run_agent_evaluation(agent_system,
     print("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Agent evaluation completed")
 
     # Calculate metrics
-    metrics = calculate_performance_metrics(portfolio_values, rewards_by_agent, risk_levels, evaluation_steps)
+    risk_free_rate = _resolve_eval_risk_free_rate(eval_env)
+    metrics = calculate_performance_metrics(
+        portfolio_values,
+        rewards_by_agent,
+        risk_levels,
+        evaluation_steps,
+        timestamps=data.get("timestamp"),
+        annual_risk_free_rate=risk_free_rate,
+    )
+    metrics = _attach_distribution_adjusted_context(
+        metrics,
+        reported_nav_values,
+        risk_levels,
+        evaluation_steps,
+        timestamps=data.get("timestamp"),
+        annual_risk_free_rate=risk_free_rate,
+        final_total_distributions_usd=(
+            float(portfolio_values[-1] - reported_nav_values[-1])
+            if portfolio_values and reported_nav_values
+            else 0.0
+        ),
+    )
     metrics['evaluation_mode'] = 'agents'
 
     return metrics
@@ -2430,20 +2245,19 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
         print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Baseline evaluation error: {e}")
         comprehensive_results['configurations']['baselines'] = {'error': str(e)}
 
-    # 2. Evaluate Normal Models (no forecasts, no Tier-2 layer) - Create basic environment
-    print_progress("ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ [2/3] EVALUATING NORMAL MODELS (No Forecasts/Tier-2)...", 2, 3)
+    # 2. Evaluate Normal Models (no forecasts, no Tier1 runtime) - Create basic environment
+    print_progress("[2/3] EVALUATING NORMAL MODELS", 2, 3)
     try:
         if os.path.exists(args.normal_models):
-            # Create basic environment for normal models (no forecasting)
+            # Create basic environment for normal models.
             print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Creating basic environment for normal models...")
-            normal_eval_env, _ = create_evaluation_environment(
+            normal_cfg = _build_eval_config(args)
+            normal_cfg.enable_forecast_utilization = False
+            normal_eval_env = create_evaluation_environment(
                 eval_data,
-                enable_forecasting=False,  # No forecasting for normal models
-                model_dir=args.model_dir,
-                scaler_dir=args.scaler_dir,
                 output_dir=args.output_dir,
                 investment_freq=args.investment_freq,
-                config=_build_eval_config(args),
+                config=normal_cfg,
                 fail_fast=True,
             )
 
@@ -2456,7 +2270,7 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                     normal_results = run_agent_evaluation(normal_agent_system, normal_eval_env, eval_data, args.eval_steps)
                     if normal_results:
                         normal_results['model_type'] = 'normal'
-                        normal_results['features'] = {'forecasting': False, 'tier2_policy_improvement': False}
+                        normal_results['features'] = {'forecast_utilization': False, 'tier1_reward_shaping': False}
                         comprehensive_results['configurations']['normal_agents'] = normal_results
                         print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Normal agent evaluation completed")
                     else:
@@ -2475,25 +2289,22 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
         print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Normal agent evaluation error: {e}")
         comprehensive_results['configurations']['normal_agents'] = {'error': str(e)}
 
-    # 3. Evaluate Full Models (with forecasts and the Tier-2 policy-improvement layer) - Create enhanced environment
-    print_progress("ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ [3/3] EVALUATING FULL MODELS (With Forecasts + Tier-2 Policy Improvement)...", 3, 3)
+    # 3. Evaluate Full Models with the fixed Tier1 runtime.
+    print_progress("[3/3] EVALUATING FULL MODELS", 3, 3)
     try:
         if os.path.exists(args.full_models):
-            # Create enhanced evaluation environment with the Tier-2 policy-improvement layer
-            print_progress("ÃƒÂ°Ã…Â¸Ã‚ÂÃ¢â‚¬â€ÃƒÂ¯Ã‚Â¸Ã‚Â Creating enhanced environment for full models...")
-            dl_weights_path = _resolve_tier2_weights_from_models_dir(args.full_models)
-            forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
-            enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
+            # Create enhanced evaluation environment with the fixed-observation runtime.
+            print_progress("Creating enhanced environment for full models...")
+            full_cfg = _build_eval_config(args)
+            forecast_ctx = None
+            if bool(getattr(full_cfg, "enable_forecast_utilization", False)):
+                forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir, config=full_cfg)
+            enhanced_eval_env = create_evaluation_environment(
                 eval_data,
-                enable_forecasting=True,  # Enable forecasting for full models
-                model_dir=forecast_ctx["model_dir"],
-                scaler_dir=forecast_ctx["scaler_dir"],
-                metadata_dir=forecast_ctx["metadata_dir"],
-                tier2_weights_path=dl_weights_path,
                 output_dir=args.output_dir,
                 investment_freq=args.investment_freq,
-                config=_build_eval_config(args),
-                forecast_cache_dir=forecast_ctx["forecast_cache_dir"],
+                config=full_cfg,
+                forecast_cache_dir=forecast_ctx["forecast_cache_dir"] if forecast_ctx else args.forecast_cache_dir,
                 fail_fast=True,
             )
 
@@ -2506,7 +2317,10 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
                     full_results = run_agent_evaluation(full_agent_system, enhanced_eval_env, eval_data, args.eval_steps)
                     if full_results:
                         full_results['model_type'] = 'enhanced'
-                        full_results['features'] = {'forecasting': True, 'tier2_policy_improvement': True}
+                        full_results['features'] = {
+                            'forecast_utilization': bool(getattr(full_cfg, "enable_forecast_utilization", False)),
+                            'tier1_reward_shaping': False,
+                        }
                         comprehensive_results['configurations']['full_agents'] = full_results
                         print_progress("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Full agent evaluation completed")
                     else:
@@ -2526,8 +2340,6 @@ def run_comprehensive_evaluation(eval_data: pd.DataFrame, args) -> Dict[str, Any
         comprehensive_results['configurations']['full_agents'] = {'error': str(e)}
 
     print_progress("ÃƒÂ°Ã…Â¸Ã…Â½Ã¢â‚¬Â° Comprehensive evaluation completed!")
-    return comprehensive_results
-
     return comprehensive_results
 
 
@@ -2622,8 +2434,8 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
                     'final_value_usd': final_value,
                     'initial_value_usd': initial_value,
                     'type': 'agent',
-                    'forecasting': features.get('forecasting', False),
-                    'tier2_policy_improvement': features.get('tier2_policy_improvement', False)
+                    'forecast_utilization': features.get('forecast_utilization', False),
+                    'tier1_reward_shaping': features.get('tier1_reward_shaping', False)
                 }
 
     # Sort by final portfolio value for the main table
@@ -2638,8 +2450,8 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
         features_str = ""
         if metrics['type'] == 'agent':
             features = []
-            if metrics.get('forecasting'): features.append("Forecasting")
-            if metrics.get('tier2_policy_improvement', False): features.append("Tier-2 Policy Improvement")
+            if metrics.get('forecast_utilization'): features.append("Forecast Utilization")
+            if metrics.get('tier1_reward_shaping', False): features.append("Tier1 Reward Shaping")
             features_str = ', '.join(features) if features else 'Basic RL'
         else:
             features_str = 'Traditional'
@@ -2665,8 +2477,8 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
         features_str = ""
         if metrics['type'] == 'agent':
             features = []
-            if metrics.get('forecasting'): features.append("Forecasting")
-            if metrics.get('tier2_policy_improvement', False): features.append("Tier-2 Policy Improvement")
+            if metrics.get('forecast_utilization'): features.append("Forecast Utilization")
+            if metrics.get('tier1_reward_shaping', False): features.append("Tier1 Reward Shaping")
             features_str = f" ({', '.join(features) if features else 'Basic'})"
 
         print(f"   {i}. {config_name}{features_str}")
@@ -2684,9 +2496,9 @@ def analyze_comprehensive_results(comprehensive_results: Dict[str, Any]) -> Dict
 
         for config_name, metrics in performance_data.items():
             if metrics['type'] == 'agent':
-                if not metrics.get('forecasting') and not metrics.get('tier2_policy_improvement', False):
+                if not metrics.get('forecast_utilization') and not metrics.get('tier1_reward_shaping', False):
                     normal_metrics = metrics
-                elif metrics.get('forecasting') and metrics.get('tier2_policy_improvement', False):
+                elif metrics.get('forecast_utilization') and metrics.get('tier1_reward_shaping', False):
                     full_metrics = metrics
 
         if normal_metrics and full_metrics:
@@ -2737,7 +2549,7 @@ def main():
             "'baselines' for traditional methods, "
             "'compare' for comprehensive comparison, "
             "'comprehensive' for all configurations, "
-            "'tiers' to evaluate tier1 vs tier2 vs tier2_ablated on unseen data using final_models/"
+            "'tiers' to evaluate Tier1/baseline models on unseen data using final_models/"
         ),
     )
 
@@ -2749,26 +2561,15 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="normal/checkpoints",
                        help="Base directory for checkpoints (for 'checkpoint' mode)")
 
-    # Forecasting options
-    parser.add_argument("--model_dir", type=str, default="Forecast_ANN/models",
-                       help="Legacy standalone forecast compatibility path; tiered evaluation uses --forecast_base_dir episode expert-bank artifacts instead.")
-    parser.add_argument("--scaler_dir", type=str, default="Forecast_ANN/scalers",
-                       help="Legacy standalone forecast compatibility path; tiered evaluation uses episode expert-bank scalers instead.")
-    parser.add_argument("--no_forecast", action="store_true",
-                       help="Disable forecasting for baseline comparison")
-
-
     # Enhanced model support
     parser.add_argument("--enhanced_models", type=str, default=None,
-                       help="Directory with enhanced models (forecasting + Tier-2 policy-improvement layer enabled)")
-    parser.add_argument("--force_forecasting", action="store_true",
-                       help="Force enable forecasting for enhanced models")
+                       help="Directory with enhanced models")
 
     # Comprehensive evaluation paths
     parser.add_argument("--normal_models", type=str, default="normal/final_models",
-                       help="Directory with normal models (agents without forecasts/Tier-2 layer)")
+                       help="Directory with normal agent policies")
     parser.add_argument("--full_models", type=str, default="full/final_models",
-                       help="Directory with full models (agents with forecasts and the Tier-2 policy-improvement layer)")
+                       help="Directory with full agent policies")
 
     # Evaluation options
     parser.add_argument("--eval_steps", type=int, default=None,
@@ -2784,68 +2585,51 @@ def main():
     parser.add_argument(
         "--global_norm_mode",
         type=str,
-        default="global",
+        default="rolling_past",
         choices=["rolling_past", "global"],
         help="Normalization mode for evaluation config; keep aligned with training defaults.",
     )
+    parser.add_argument(
+        "--rolling_past_history_dir",
+        type=str,
+        default="",
+        help=(
+            "Directory with history_*.csv for rolling_past eval bootstrap when global_norm_mode=rolling_past "
+            f"(default: {EVAL_ROLLING_PAST_HISTORY_DIR})."
+        ),
+    )
 
-    # Tier-suite evaluation (paper modes on unseen data)
+    # Tier1/baseline evaluation.
     parser.add_argument("--tier1_dir", type=str, default="tier1_seed789",
                        help="Tier1 run directory containing final_models/")
-    parser.add_argument("--tier2_dir", type=str, default="tier2_seed789",
-                       help="Tier2 run directory containing its own final_models/ and Tier-2 weights")
-    parser.add_argument("--tier2_ablated_dir", type=str, default="tier2_ablated_seed789",
-                       help="Tier2 ablated run directory containing its own final_models/ and Tier-2 weights")
     parser.add_argument(
         "--tiers_only",
         type=str,
-        default="all",
+        default="tier1",
         choices=[
-            "all",
             "tier1",
             "baseline",
-            "tier2",
-            "tier2_ablated",
         ],
-        help=(
-            "Run only a subset in --mode tiers. Canonical variants are 'tier1', 'tier2', and 'tier2_ablated'."
-        ),
+        help="Run only a subset in --mode tiers.",
     )
-    parser.add_argument(
-        "--tiers_eval_mode",
-        type=str,
-        default="paper",
-        choices=["paper", "deployed"],
-        help=(
-            "In --mode tiers: "
-            "'paper' evaluates the learned SB3 policies only (forecasts+Tier-2 layer disabled; paper-fair). "
-            "'deployed' enables forecasting and loads each Tier-2 variant's own policy-improvement .h5 weights (system-level evaluation; NOT paper-fair). "
-            "In deployed mode, forecast-enabled tiers now fail fast on forecast/Tier-2 setup errors."
-        ),
-    )
-    parser.add_argument(
-        "--forecast_base_dir",
-        type=str,
-        default="forecast_models",
-        help="Base directory that contains episode-specific forecast models (e.g., forecast_models/episode_20/...). Used in --tiers_eval_mode deployed.",
-    )
+    parser.set_defaults(tier1_dir=None)
     parser.add_argument(
         "--forecast_cache_dir",
         type=str,
         default="forecast_cache",
-        help="Base directory for forecast caches. Used in --tiers_eval_mode deployed.",
+        help="Base directory for forecast caches.",
     )
     parser.add_argument(
-        "--tiers_precompute_forecasts",
+        "--enable_forecast_utilization",
         action="store_true",
-        help="When --tiers_eval_mode deployed: precompute/load offline forecast cache for the evaluation dataset (recommended for speed/determinism).",
+        default=False,
+        help=(
+            "Single switch for ANN forecast-cache utilization during evaluation. "
+            "Usually inherited from training_config.json; exposed here so "
+            "per-variant eval CLIs stay symmetric with training."
+        ),
     )
-    parser.add_argument(
-        "--tiers_precompute_batch_size",
-        type=int,
-        default=8192,
-        help="Batch size for offline forecast precompute when --tiers_precompute_forecasts is set.",
-    )
+    add_forecast_prior_override_args(parser)
 
     # Analysis options
     parser.add_argument("--analyze", action="store_true",
@@ -2856,6 +2640,9 @@ def main():
                        help="Save plots to files instead of displaying (requires --plot)")
 
     args = parser.parse_args()
+
+    # Enable GPU memory growth before any TF graph operations.
+    configure_tf_memory()
 
     print_progress("Parsing arguments and validating paths...")
 
@@ -2880,7 +2667,7 @@ def main():
                     is_enhanced = False
 
                     # Method 1: Check directory name
-                    if "enhanced" in candidate.lower() or args.force_forecasting:
+                    if "enhanced" in candidate.lower():
                         is_enhanced = True
 
                     # Method 2: Check training config for enhanced features
@@ -2891,9 +2678,8 @@ def main():
                                 config = json.load(f)
                             enhanced_features = config.get('enhanced_features', {})
                             if (
-                                enhanced_features.get('forecasting_enabled')
-                                or enhanced_features.get('tier2_enabled')
-                                or enhanced_features.get('tier2_policy_improvement_enabled')
+                                enhanced_features.get('tier1_enabled')
+                                or enhanced_features.get('tier1_reward_shaping_enabled')
                             ):
                                 is_enhanced = True
                         except Exception as e:
@@ -2933,12 +2719,9 @@ def main():
             results = run_tier_suite_evaluation(eval_data, args)
             # Always write a single consolidated report (CSV + Markdown)
             csv_path, md_path = write_tier_report(results.get("tiers", {}), args.output_dir)
-            report_scope = "comparison" if len(results.get("tiers", {})) > 1 else "single_variant"
             results["tier_report_csv"] = csv_path
             results["tier_report_md"] = md_path
-            results["tier_report_scope"] = report_scope
-            results["tier_comparison_csv"] = csv_path if report_scope == "comparison" else ""
-            results["tier_comparison_md"] = md_path if report_scope == "comparison" else ""
+            results["tier_report_scope"] = "single_variant"
 
             analysis = None
             if args.analyze:
@@ -2952,17 +2735,20 @@ def main():
             print_progress(f"ÃƒÂ¢Ã‚ÂÃ…â€™ Tier suite evaluation failed: {e}")
             raise
 
-    # Create evaluation environment for other modes
-    enable_forecasting = (not args.no_forecast) and (args.mode not in ["agents", "checkpoint", "compare", "baselines", "comprehensive"])
+    # Create evaluation environment for other modes. Forecast utilization is
+    # cache-prior execution logic only.
+    eval_cfg = _build_eval_config(args)
+    eval_forecast_cache_dir = args.forecast_cache_dir
+    if bool(getattr(eval_cfg, "enable_forecast_utilization", False)):
+        forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir, config=eval_cfg)
+        eval_forecast_cache_dir = forecast_ctx["forecast_cache_dir"]
 
-    eval_env, forecaster = create_evaluation_environment(
+    eval_env = create_evaluation_environment(
         eval_data,
-        enable_forecasting=enable_forecasting,
-        model_dir=args.model_dir,
-        scaler_dir=args.scaler_dir,
         output_dir=args.output_dir,
         investment_freq=args.investment_freq,
-        config=_build_eval_config(args),
+        config=eval_cfg,
+        forecast_cache_dir=eval_forecast_cache_dir,
         fail_fast=True,
     )
 
@@ -3004,26 +2790,7 @@ def main():
                 print(f"Enhanced models directory not found: {args.enhanced_models}")
                 sys.exit(1)
 
-            print("Loading enhanced models with forecasting and the Tier-2 policy-improvement layer...")
-
-            # Create enhanced evaluation environment with the Tier-2 policy-improvement layer
-            dl_weights_path = _resolve_tier2_weights_from_models_dir(args.enhanced_models)
-            if dl_weights_path and os.path.exists(dl_weights_path):
-                forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
-                enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
-                    eval_data,
-                    enable_forecasting=True,
-                    model_dir=forecast_ctx["model_dir"],
-                    scaler_dir=forecast_ctx["scaler_dir"],
-                    metadata_dir=forecast_ctx["metadata_dir"],
-                    tier2_weights_path=dl_weights_path,
-                    output_dir=args.output_dir,
-                    investment_freq=args.investment_freq,
-                    config=_build_eval_config(args),
-                    forecast_cache_dir=forecast_ctx["forecast_cache_dir"],
-                    fail_fast=True,
-                )
-                eval_env = enhanced_eval_env if enhanced_eval_env else eval_env
+            print("Loading enhanced models with the Tier1 evaluation runtime...")
 
             agent_system = load_enhanced_agent_system(args.enhanced_models, eval_env)
             model_path = args.enhanced_models
@@ -3080,25 +2847,6 @@ def main():
 
         # Run AI evaluation first (enhanced or standard models)
         if args.enhanced_models:
-            # Use enhanced models with the Tier-2 policy-improvement layer
-            dl_weights_path = _resolve_tier2_weights_from_models_dir(args.enhanced_models)
-            if dl_weights_path and os.path.exists(dl_weights_path):
-                forecast_ctx = _resolve_reserved_eval_forecast_context(args, output_dir=args.output_dir)
-                enhanced_eval_env, enhanced_forecaster = create_evaluation_environment(
-                    eval_data,
-                    enable_forecasting=True,
-                    model_dir=forecast_ctx["model_dir"],
-                    scaler_dir=forecast_ctx["scaler_dir"],
-                    metadata_dir=forecast_ctx["metadata_dir"],
-                    tier2_weights_path=dl_weights_path,
-                    output_dir=args.output_dir,
-                    investment_freq=args.investment_freq,
-                    config=_build_eval_config(args),
-                    forecast_cache_dir=forecast_ctx["forecast_cache_dir"],
-                    fail_fast=True,
-                )
-                eval_env = enhanced_eval_env if enhanced_eval_env else eval_env
-
             agent_system = load_enhanced_agent_system(args.enhanced_models, eval_env)
             if agent_system:
                 ai_results = run_agent_evaluation(agent_system, eval_env, eval_data, args.eval_steps)
@@ -3172,7 +2920,7 @@ def main():
     if results:
         # Add common metadata
         results['eval_data_path'] = args.eval_data
-        results['forecasting_enabled'] = enable_forecasting
+        results['forecast_utilization_enabled'] = bool(getattr(eval_cfg, "enable_forecast_utilization", False))
         results['eval_steps_requested'] = args.eval_steps
 
         # Perform analysis if requested

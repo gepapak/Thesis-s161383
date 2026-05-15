@@ -59,6 +59,69 @@ def resolve_algo_class(policy_mode: str, agent_name: str, config: Optional[Enhan
     return {"PPO": PPO, "SAC": SAC, "TD3": TD3, "DQN": DQN}[policy_mode]
 
 
+def _flat_obs_dim(space) -> Optional[int]:
+    """Return the flat observation dimension for an arbitrary space.
+
+    Box → ``prod(shape)``. ``spaces.Dict`` → sum of child Box element counts
+    (this is used purely for *consistency comparisons*, not for tensor
+    reshaping). Any space whose dimension cannot be determined returns
+    ``None``. Counts the TOTAL number of elements per space (matching
+    ``_actual_obs_dim``) so multi-rank sub-spaces contribute the product
+    of their dimensions.
+    """
+    if space is None:
+        return None
+    shp = getattr(space, "shape", None)
+    if shp is not None:
+        try:
+            return int(np.prod(shp))
+        except Exception:
+            return None
+    sub_spaces = getattr(space, "spaces", None)
+    if sub_spaces is not None:
+        try:
+            total = 0
+            for _, sub in sub_spaces.items():
+                sub_shape = getattr(sub, "shape", None)
+                if sub_shape is not None:
+                    total += int(np.prod(sub_shape))
+            return int(total) if total > 0 else None
+        except Exception:
+            return None
+    return None
+
+
+def _copy_obs(obs):
+    """Deep-ish copy of an observation: ndarray .copy() or dict-of-ndarrays."""
+    if isinstance(obs, dict):
+        return {k: (v.copy() if hasattr(v, "copy") else v) for k, v in obs.items()}
+    return obs.copy() if hasattr(obs, "copy") else obs
+
+
+def _actual_obs_dim(obs) -> Optional[int]:
+    """Return the flat dim of an actual observation (numpy array or dict)."""
+    if obs is None:
+        return None
+    if isinstance(obs, dict):
+        try:
+            total = 0
+            for v in obs.values():
+                if hasattr(v, "shape") and v.shape:
+                    total += int(np.asarray(v).reshape(-1).shape[0])
+            return int(total) if total > 0 else None
+        except Exception:
+            return None
+    if hasattr(obs, "shape"):
+        try:
+            arr = np.asarray(obs)
+            if arr.ndim > 1:
+                arr = arr.squeeze(0) if arr.shape[0] == 1 else arr.flatten()
+            return int(arr.shape[0])
+        except Exception:
+            return None
+    return None
+
+
 # ============================= Training Monitor =============================
 class StabilizedTrainingMonitor(BaseCallback):
     """Enhanced performance monitoring with memory management."""
@@ -91,7 +154,12 @@ class StabilizedTrainingMonitor(BaseCallback):
 
 # ============================== Dummy Gym Env ===============================
 class DummyGymEnv(Env):
-    """Lightweight dummy environment for SB3 initialization."""
+    """Lightweight dummy environment for SB3 initialization.
+
+    Handles both flat Box and Dict observation spaces. Dict support is
+    required for the FoCAL DL layer, which exposes the investor agent's
+    obs as Dict({"obs": Box(12,), "fcst": Box(9,)}) under MultiInputPolicy.
+    """
 
     metadata = {"render_modes": []}
 
@@ -100,23 +168,33 @@ class DummyGymEnv(Env):
         self.action_space = action_space
         self._step_count = 0
 
+    @staticmethod
+    def _coerce_obs(space, obs):
+        # Box: clip to bounds, cast to float32
+        if isinstance(space, spaces.Box):
+            obs = np.clip(obs, space.low, space.high)
+            return obs.astype(np.float32)
+        # Dict: recursively coerce each sub-space
+        if isinstance(space, spaces.Dict):
+            return {k: DummyGymEnv._coerce_obs(sub, obs[k])
+                    for k, sub in space.spaces.items()}
+        return obs
+
     def reset(self, *, seed=None, options=None):
         obs = self.observation_space.sample()
-        if hasattr(self.observation_space, "low") and hasattr(self.observation_space, "high"):
-            obs = np.clip(obs, self.observation_space.low, self.observation_space.high)
+        obs = self._coerce_obs(self.observation_space, obs)
         self._step_count = 0
-        return obs.astype(np.float32), {}
+        return obs, {}
 
     def step(self, action):
         self._step_count += 1
         obs = self.observation_space.sample()
-        if hasattr(self.observation_space, "low") and hasattr(self.observation_space, "high"):
-            obs = np.clip(obs, self.observation_space.low, self.observation_space.high)
+        obs = self._coerce_obs(self.observation_space, obs)
         reward = 0.0
         terminated = self._step_count >= 100
         truncated = False
         info = {}
-        return obs.astype(np.float32), reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info
 
     def render(self):
         pass
@@ -168,6 +246,64 @@ from wrapper import EnhancedObservationValidator
 # (The actual implementation is in wrapper.py)
 
 
+# ======================== Reward Normalizer ==================================
+
+class RunningRewardNormalizer:
+    """Per-agent Welford online running mean/variance for reward normalization.
+
+    Normalizes each agent's reward stream independently so that agents with
+    different reward magnitudes (e.g. investor DKK-scale vs battery kWh-scale)
+    all feed the same effective signal range into their value networks.
+
+    Formula: r_norm = clip((r - μ) / (σ + ε), -clip_val, clip_val)
+
+    During warm-up (count < warmup) the raw reward is returned unchanged so
+    that the running statistics accumulate before normalization begins.
+    """
+
+    def __init__(self, clip: float = 10.0, warmup: int = 100):
+        self._mean: float = 0.0
+        self._m2:   float = 0.0
+        self._var:  float = 1.0
+        self._count: int  = 0
+        self.clip   = float(clip)
+        self.warmup = int(warmup)
+
+    # ------------------------------------------------------------------
+    def update_and_normalize(self, reward: float) -> float:
+        """Update running stats then return the normalized reward."""
+        reward = float(reward)
+        self._count += 1
+        # Welford online update
+        delta        = reward - self._mean
+        self._mean  += delta / self._count
+        delta2       = reward - self._mean
+        self._m2    += delta * delta2
+        if self._count >= 2:
+            self._var = self._m2 / (self._count - 1)
+
+        if self._count < self.warmup:
+            return reward  # pass-through until stats are meaningful
+
+        std = float(np.sqrt(max(self._var, 1e-8)))
+        return float(np.clip((reward - self._mean) / std, -self.clip, self.clip))
+
+    # ------------------------------------------------------------------
+    def state_dict(self) -> dict:
+        return {
+            "mean":  self._mean,
+            "var":   self._var,
+            "m2":    self._m2,
+            "count": self._count,
+        }
+
+    def load_state_dict(self, d: dict) -> None:
+        self._mean  = float(d.get("mean",  0.0))
+        self._var   = float(d.get("var",   1.0))
+        self._m2    = float(d.get("m2",    0.0))
+        self._count = int(d.get("count",   0))
+
+
 # =========================== Multi Agent Controller =========================
 class MultiESGAgent:
     """Enhanced multi-agent system with memory management and validation."""
@@ -178,10 +314,7 @@ class MultiESGAgent:
         self.possible_agents = list(env.possible_agents)
         self.num_agents = len(self.possible_agents)
         self.num_envs = 1
-        # Keep Tier-1 PPO rollout cadence aligned with the older stable collector behavior.
-        # Short-horizon trading already increases decision density; doubling PPO rollout size on
-        # top of that made the investor updates too aggressive in practice.
-        self.n_steps = int(getattr(config, "update_every", 128))
+        self.n_steps = int(getattr(config, "update_every", 256))
         self.verbose = int(getattr(config, "verbose", 0))
         self.debug = bool(debug)
         self.multithreading = bool(getattr(config, "multithreading", False))
@@ -190,9 +323,16 @@ class MultiESGAgent:
         self.logger = self._logger
 
         self.memory_tracker = EnhancedMemoryTracker(max_memory_mb=int(getattr(config, "max_memory_mb", 5000)))
-        # Get forecaster from env if available
-        forecaster = getattr(env, 'forecast_generator', None)
-        self.obs_validator = EnhancedObservationValidator(env, forecaster=forecaster, debug=debug)
+        self.obs_validator = EnhancedObservationValidator(env, debug=debug)
+
+        # Per-agent reward normalizers (Welford online mean/std).
+        # Initialized here so they persist across episodes within a training run.
+        _rn_clip    = float(getattr(config, "reward_normalization_clip",   10.0))
+        _rn_warmup  = int(getattr(config,   "reward_normalization_warmup", 100))
+        self._reward_normalizers: Dict[str, RunningRewardNormalizer] = {
+            name: RunningRewardNormalizer(clip=_rn_clip, warmup=_rn_warmup)
+            for name in env.possible_agents
+        }
 
         # Spaces
         self.observation_spaces: Dict[str, spaces.Box] = {}
@@ -254,7 +394,7 @@ class MultiESGAgent:
         - Learning rate schedules
         - Buffer states
         - Episode tracking variables
-        - Legacy Tier-2 buffers (CRITICAL for OOM prevention)
+        - Rollout buffers (CRITICAL for OOM prevention)
 
         CRITICAL: Does NOT reset total_steps - this must be preserved for learning continuity!
         """
@@ -325,13 +465,35 @@ class MultiESGAgent:
                 obs_space_from_env = self.env.observation_space(agent)
                 self.observation_spaces[agent] = obs_space_from_env
                 self.action_spaces[agent] = self.env.action_space(agent)
-                # CRITICAL: Log observation space dimensions for debugging
-                obs_dim = obs_space_from_env.shape[0] if hasattr(obs_space_from_env, 'shape') else None
-                self.logger.info(f"[OBS_SPACE_INIT] {agent}: observation_space={obs_dim}D (from env.observation_space())")
+                # CRITICAL: Log observation space dimensions for debugging.
+                # spaces.Dict has a .shape attribute equal to None, so we cannot
+                # rely on hasattr alone; treat None-shaped spaces (Dict) by
+                # summing the shapes of their child Box subspaces.
+                _shape_attr = getattr(obs_space_from_env, "shape", None)
+                if _shape_attr is not None:
+                    obs_dim = int(_shape_attr[0])
+                    obs_dim_str = f"{obs_dim}D"
+                else:
+                    try:
+                        from gymnasium import spaces as _gspaces  # local import
+                        if isinstance(obs_space_from_env, _gspaces.Dict):
+                            parts = {
+                                k: int(v.shape[0])
+                                for k, v in obs_space_from_env.spaces.items()
+                                if getattr(v, "shape", None) is not None
+                            }
+                            obs_dim_str = "Dict(" + ", ".join(
+                                f"{k}={d}" for k, d in parts.items()
+                            ) + ")"
+                        else:
+                            obs_dim_str = "<unknown>"
+                    except Exception:
+                        obs_dim_str = "<unknown>"
+                self.logger.info(f"[OBS_SPACE_INIT] {agent}: observation_space={obs_dim_str} (from env.observation_space())")
                 if self.debug:
                     obs_space = self.observation_spaces[agent]
                     act_space = self.action_spaces[agent]
-                    print(f"{agent} | Obs: {obs_space.shape} | Act: {getattr(act_space,'shape',act_space)}")
+                    print(f"{agent} | Obs: {getattr(obs_space, 'shape', obs_space)} | Act: {getattr(act_space,'shape',act_space)}")
             except Exception as e:
                 error_msg = f"[CRITICAL] Failed to get observation/action spaces for {agent}: {e}"
                 self.logger.error(error_msg)
@@ -367,17 +529,20 @@ class MultiESGAgent:
                     mismatches.append(f"{agent}: No observation returned from environment")
                     continue
                 
-                declared_dim = self.observation_spaces[agent].shape[0]
+                declared_dim = _flat_obs_dim(self.observation_spaces[agent])
                 actual_obs_array = actual_obs[agent]
-                
-                # Ensure observation is 1D
-                if actual_obs_array.ndim > 1:
-                    if actual_obs_array.shape[0] == 1:
-                        actual_obs_array = actual_obs_array.squeeze(0)
-                    else:
-                        actual_obs_array = actual_obs_array.flatten()
-                
-                actual_dim = actual_obs_array.shape[0]
+
+                # For Dict spaces (e.g. FoCAL investor) use the flat-dim helper
+                # directly; otherwise normalise to a 1-D ndarray as before.
+                if isinstance(actual_obs_array, dict):
+                    actual_dim = _actual_obs_dim(actual_obs_array)
+                else:
+                    if actual_obs_array.ndim > 1:
+                        if actual_obs_array.shape[0] == 1:
+                            actual_obs_array = actual_obs_array.squeeze(0)
+                        else:
+                            actual_obs_array = actual_obs_array.flatten()
+                    actual_dim = actual_obs_array.shape[0]
                 
                 if declared_dim != actual_dim:
                     mismatches.append(
@@ -436,20 +601,21 @@ class MultiESGAgent:
                 mismatches.append(f"{agent_name}: Observation space not found")
                 continue
             
-            env_obs_dim = env_obs_space.shape[0]
-            
-            # Check policy's observation_space attribute
-            policy_obs_dim = None
-            if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                policy_obs_dim = policy.observation_space.shape[0]
-            
+            env_obs_dim = _flat_obs_dim(env_obs_space)
+
+            # Check policy's observation_space attribute (Dict-aware).
+            policy_obs_dim = _flat_obs_dim(getattr(policy, 'observation_space', None))
+
             # Check actual network input dimension (most reliable)
             network_input_dim = None
             try:
                 if hasattr(policy, 'policy') and hasattr(policy.policy, 'features_extractor'):
                     fe = policy.policy.features_extractor
                     # Check feature extractor-declared observation dimension first.
-                    if hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
+                    fe_obs_space = getattr(fe, 'observation_space', None)
+                    if fe_obs_space is not None:
+                        network_input_dim = _flat_obs_dim(fe_obs_space)
+                    if network_input_dim is None and hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
                         network_input_dim = fe.observation_space.shape[0]
                     # Fallback: check first MLP layer input dimension.
                     elif hasattr(fe, 'mlp') and len(fe.mlp) > 0:
@@ -504,7 +670,7 @@ class MultiESGAgent:
         they were initialized with the old observation space dimensions.
         """
         self.logger.info("[OBS_SPACE_REINIT] Reinitializing observation spaces from environment")
-        old_spaces = {agent: self.observation_spaces[agent].shape[0] if agent in self.observation_spaces and hasattr(self.observation_spaces[agent], 'shape') else None 
+        old_spaces = {agent: _flat_obs_dim(self.observation_spaces.get(agent))
                       for agent in self.possible_agents}
         
         # Reinitialize spaces from environment
@@ -513,7 +679,7 @@ class MultiESGAgent:
             try:
                 obs_space_from_env = self.env.observation_space(agent)
                 old_dim = old_spaces.get(agent)
-                new_dim = obs_space_from_env.shape[0] if hasattr(obs_space_from_env, 'shape') else None
+                new_dim = _flat_obs_dim(obs_space_from_env)
                 
                 if old_dim is not None and new_dim is not None and old_dim != new_dim:
                     self.logger.info(f"[OBS_SPACE_REINIT] {agent}: observation_space changed from {old_dim}D to {new_dim}D")
@@ -535,7 +701,7 @@ class MultiESGAgent:
                 "Fix the config/feature toggles so observation dimensions are constant, then retrain.\n"
                 f"Old dims: {old_spaces}\n"
                 f"New dims: "
-                + str({agent: (self.observation_spaces.get(agent).shape[0] if agent in self.observation_spaces and hasattr(self.observation_spaces[agent], 'shape') else None)
+                + str({agent: _flat_obs_dim(self.observation_spaces.get(agent))
                       for agent in self.possible_agents})
             )
             self.logger.error(msg)
@@ -557,21 +723,23 @@ class MultiESGAgent:
                     actual_obs = obs[agent]
                     expected_space = self.observation_spaces[agent]
 
-                    # Check shape consistency
-                    if isinstance(actual_obs, np.ndarray):
-                        if actual_obs.shape[0] != expected_space.shape[0]:
+                    # Check shape consistency (Dict-aware via flat-dim helpers).
+                    if isinstance(actual_obs, np.ndarray) or isinstance(actual_obs, dict):
+                        actual_dim = _actual_obs_dim(actual_obs)
+                        expected_dim = _flat_obs_dim(expected_space)
+                        if actual_dim is not None and expected_dim is not None and actual_dim != expected_dim:
                             self.logger.error(
                                 f"[CRITICAL] Observation space mismatch for {agent}: "
-                                f"expected shape {expected_space.shape}, got {actual_obs.shape}. "
-                                f"This will cause training failures. Fix environment or observation space definition."
+                                f"expected flat dim {expected_dim}, got {actual_dim}. "
+                                f"Fix environment or observation space definition."
                             )
                             raise ValueError(
                                 f"Observation space mismatch for {agent}: "
-                                f"expected {expected_space.shape}, got {actual_obs.shape}"
+                                f"expected {expected_dim}, got {actual_dim}"
                             )
                     else:
-                        self.logger.error(f"[CRITICAL] Observation for {agent} is not numpy array: {type(actual_obs)}")
-                        raise TypeError(f"Observation for {agent} must be numpy array, got {type(actual_obs)}")
+                        self.logger.error(f"[CRITICAL] Observation for {agent} is not numpy array or dict: {type(actual_obs)}")
+                        raise TypeError(f"Observation for {agent} must be numpy array or dict, got {type(actual_obs)}")
 
             self.logger.info("[OK] Observation spaces validated successfully")
         except Exception as e:
@@ -647,6 +815,7 @@ class MultiESGAgent:
                 "optimizer_kwargs": {"eps": 1e-8, "weight_decay": 0.0},
             }
             policy_class = "MlpPolicy"
+
             if (
                 policy_mode == "PPO"
                 and agent == "investor_0"
@@ -676,6 +845,22 @@ class MultiESGAgent:
             }
 
             if policy_mode == "PPO":
+                # Per-agent stability overrides.
+                # meta_controller and risk_controller act on long cadences (24/12 steps)
+                # and see large per-decision advantages (|td_err| observed ~20-40). With
+                # the global lr/n_epochs (3e-4 / 10) their MLPs slowly drift to non-finite
+                # weights -> NaN action means -> Normal(loc, scale) raises mid-train.
+                # Lower lr and fewer epochs shrink each update enough that grad clip
+                # actually binds before drift accumulates.
+                _lr = float(getattr(config, "lr", 3e-4))
+                _n_epochs = int(getattr(config, "n_epochs", 10))
+                if agent == "meta_controller_0":
+                    _lr = float(getattr(config, "meta_lr", min(_lr, 5e-5)))
+                    _n_epochs = int(getattr(config, "meta_n_epochs", min(_n_epochs, 5)))
+                elif agent == "risk_controller_0":
+                    _lr = float(getattr(config, "risk_lr", min(_lr, 1e-4)))
+                    _n_epochs = int(getattr(config, "risk_n_epochs", min(_n_epochs, 5)))
+                algo_kwargs["learning_rate"] = _lr
                 algo_kwargs.update(
                     {
                         "ent_coef": getattr(config, "ent_coef", 0.005),
@@ -687,12 +872,16 @@ class MultiESGAgent:
                         "vf_coef": float(getattr(config, "vf_coef", 0.5)),
                         "max_grad_norm": float(getattr(config, "max_grad_norm", 0.5)),
                         "gamma": float(getattr(config, "gamma", 0.995)),
-                        "n_epochs": int(min(getattr(config, "n_epochs", 10), getattr(config, "n_epochs", 10))),  # STRENGTHENED: Increased from 5 to 10
+                        "n_epochs": _n_epochs,
                         # Exploration knobs (optional)
                         "use_sde": bool(getattr(config, "ppo_use_sde", False)),
                         "sde_sample_freq": int(getattr(config, "ppo_sde_sample_freq", 1)),
                     }
                 )
+                if agent in ("meta_controller_0", "risk_controller_0"):
+                    self.logger.info(
+                        f"[PPO_STABILITY] {agent}: lr={_lr}, n_epochs={_n_epochs} (per-agent override)."
+                    )
             elif policy_mode in ("SAC", "TD3"):
                 algo_kwargs.update(
                     {
@@ -744,10 +933,10 @@ class MultiESGAgent:
             
             # CRITICAL FIX: Verify and fix policy observation space to match environment
             # This ensures the policy always uses the correct observation space, even if it was saved with wrong dimensions
-            if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                policy_obs_dim = policy.observation_space.shape[0]
-                env_obs_dim = obs_space.shape[0]
-                if policy_obs_dim != env_obs_dim:
+            policy_obs_dim = _flat_obs_dim(getattr(policy, 'observation_space', None))
+            env_obs_dim = _flat_obs_dim(obs_space)
+            if policy_obs_dim is not None and env_obs_dim is not None and policy_obs_dim != env_obs_dim:
+                if True:
                     self.logger.warning(f"[OBS_SPACE_FIX] {agent}: Policy initialized with {policy_obs_dim}D, but environment provides {env_obs_dim}D. Fixing...")
                     policy.observation_space = obs_space
                     if hasattr(policy, 'policy') and hasattr(policy.policy, 'observation_space'):
@@ -810,7 +999,7 @@ class MultiESGAgent:
                 # This ensures we get the actual current observation space
                 try:
                     env_obs_space = self.env.observation_space(agent_name)
-                    env_obs_dim = env_obs_space.shape[0] if hasattr(env_obs_space, 'shape') else None
+                    env_obs_dim = _flat_obs_dim(env_obs_space)
                     # Update cached observation space
                     self.observation_spaces[agent_name] = env_obs_space
                 except Exception as e:
@@ -822,9 +1011,8 @@ class MultiESGAgent:
                     continue
                 
                 # Check if policy's observation space matches environment
-                policy_obs_dim = None
-                if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                    policy_obs_dim = policy.observation_space.shape[0]
+                policy_obs_dim = _flat_obs_dim(getattr(policy, 'observation_space', None))
+                if policy_obs_dim is not None:
                     self.logger.debug(f"[ROBUST_CHECK] {agent_name}: Policy obs_space dimension = {policy_obs_dim}D")
                 else:
                     self.logger.warning(f"[ROBUST_CHECK] {agent_name}: Policy has no observation_space attribute or shape")
@@ -834,8 +1022,10 @@ class MultiESGAgent:
                 try:
                     if hasattr(policy, 'policy') and hasattr(policy.policy, 'features_extractor'):
                         fe = policy.policy.features_extractor
-                        # Check feature extractor-declared observation dimension first.
-                        if hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
+                        fe_space = getattr(fe, 'observation_space', None)
+                        if fe_space is not None:
+                            network_input_dim = _flat_obs_dim(fe_space)
+                        if network_input_dim is None and hasattr(fe, 'observation_space') and hasattr(fe.observation_space, 'shape'):
                             network_input_dim = fe.observation_space.shape[0]
                         # Fallback: check first MLP layer input dimension.
                         elif hasattr(fe, 'mlp') and len(fe.mlp) > 0:
@@ -937,14 +1127,15 @@ class MultiESGAgent:
                 if env_obs_space is None:
                     continue
                 
-                env_obs_dim = env_obs_space.shape[0] if hasattr(env_obs_space, 'shape') else None
+                env_obs_dim = _flat_obs_dim(env_obs_space)
                 if env_obs_dim is None:
                     continue
                 
                 # Check policy observation space AND network input dimension
                 policy_needs_recreation = False
-                if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                    policy_obs_dim = policy.observation_space.shape[0]
+                policy_obs_dim_chk = _flat_obs_dim(getattr(policy, 'observation_space', None))
+                if policy_obs_dim_chk is not None:
+                    policy_obs_dim = policy_obs_dim_chk
                     if policy_obs_dim != env_obs_dim:
                         # Check if the network was actually built with wrong dimensions
                         network_input_dim = None
@@ -1301,6 +1492,9 @@ class MultiESGAgent:
             try:
                 if getattr(policy, "mode", None) in LEARNING_MODES:
                     adjusted = max(1000, int(total_timesteps) // max(1, self.num_agents))
+                    # Reset per-learn() rollback budget so each training interval gets one
+                    # chance to recover from a transient NaN before failing hard.
+                    policy._nan_rollback_count = 0
                     policy._setup_learn(total_timesteps=adjusted, reset_num_timesteps=reset_num_timesteps)
                     policy.callback = policy._init_callback(callbacks[polid])
                     policy.callback.on_training_start(locals(), globals())
@@ -1359,10 +1553,6 @@ class MultiESGAgent:
             policy for policy in self.policies
             if getattr(policy, "mode", None) in LEARNING_MODES
         ]
-        if bool(getattr(self.config, "forecast_baseline_enable", False)):
-            self.logger.info(
-                "[TIER2] Joint training active: Tier-2 RL policies learn together with the forecast-guided Tier-2 layer."
-            )
         saved_console_levels = set_console_logging_level(logging.WARNING)
 
         try:
@@ -1402,6 +1592,13 @@ class MultiESGAgent:
                         self.memory_tracker.cleanup("medium")
 
                 except Exception as e:
+                    # FAIL-HARD: NaN_GUARD raises with the [NAN_GUARD] prefix; never swallow these.
+                    if isinstance(e, RuntimeError) and "[NAN_GUARD]" in str(e):
+                        self.logger.error(
+                            f"[FAIL_HARD] NaN guard tripped during training; aborting run. "
+                            f"This run produces no valid checkpoint. Original error: {e}"
+                        )
+                        raise
                     self._handle_training_error_enhanced(e)
                     if self._consecutive_errors >= self._max_consecutive_errors:
                         break
@@ -1435,16 +1632,168 @@ class MultiESGAgent:
 
         if has_enough_data:
             try:
-                # Train policy and capture training metrics if available
-                train_info = policy.train()
+                # PRE-TRAIN BUFFER SANITY CHECK: if rollout buffer already contains NaN/Inf
+                # (advantages/returns/observations), policy.train() will inevitably produce
+                # NaN params. Detect upstream and fail loudly so we can debug, not silently
+                # poison the network.
+                try:
+                    for _attr in ("observations", "actions", "rewards", "advantages", "returns", "values", "log_probs"):
+                        _arr = getattr(buffer, _attr, None)
+                        if _arr is None:
+                            continue
+                        if isinstance(_arr, dict):
+                            for _k, _v in _arr.items():
+                                if hasattr(_v, "__array__") and not np.all(np.isfinite(np.asarray(_v))):
+                                    raise RuntimeError(
+                                        f"[NAN_GUARD] {policy.agent_name}: rollout buffer.{_attr}[{_k}] "
+                                        f"contains non-finite values BEFORE policy.train(). "
+                                        f"Upstream env/reward bug — refusing to train."
+                                    )
+                        elif hasattr(_arr, "__array__"):
+                            _np = np.asarray(_arr)
+                            if _np.size and not np.all(np.isfinite(_np)):
+                                raise RuntimeError(
+                                    f"[NAN_GUARD] {policy.agent_name}: rollout buffer.{_attr} "
+                                    f"contains non-finite values BEFORE policy.train() "
+                                    f"(min={np.nanmin(_np)}, max={np.nanmax(_np)}, "
+                                    f"finite_frac={float(np.isfinite(_np).mean()):.4f}). "
+                                    f"Upstream env/reward bug — refusing to train."
+                                )
+                except RuntimeError:
+                    raise
+                except Exception as _check_err:
+                    self.logger.warning(f"[NAN_GUARD] buffer check skipped for {policy.agent_name}: {_check_err}")
+
+                # ROBUSTNESS: Snapshot weights BEFORE training so we can roll back on NaN.
+                # Without this, a single explosive update poisons the policy and
+                # all downstream episodes collect 0 steps (action distribution NaN).
+                _pre_state = None
+                try:
+                    if hasattr(policy, "policy") and policy.policy is not None:
+                        _pre_state = {
+                            k: v.detach().clone()
+                            for k, v in policy.policy.state_dict().items()
+                        }
+                except Exception:
+                    _pre_state = None
+
+                # Train policy and capture training metrics if available.
+                # ROBUSTNESS: SB3's policy.train() can raise mid-loop when an intermediate
+                # mini-batch produces NaN parameters (e.g. `Normal(loc, scale)` with NaN
+                # loc). When that happens, weights have ALREADY been partially updated to
+                # NaN values; the exception bypasses the post-train NaN guard below and
+                # the policy is left corrupt for the next action-collection. Catch the
+                # raise here and restore the pre-train snapshot before re-raising, so the
+                # rollback logic applies regardless of WHERE inside train() the NaN occurred.
+                train_info = None
+                try:
+                    train_info = policy.train()
+                except Exception as _train_exc:
+                    if _pre_state is not None:
+                        try:
+                            policy.policy.load_state_dict(_pre_state)
+                        except Exception as _restore_err:
+                            self.logger.error(
+                                f"[NAN_GUARD] {policy.agent_name}: train() raised AND pre-state "
+                                f"restore failed: {_restore_err}. Original error: {_train_exc}"
+                            )
+                            raise
+                    rollback_count = getattr(policy, "_nan_rollback_count", 0)
+                    if rollback_count >= 1:
+                        raise RuntimeError(
+                            f"[NAN_GUARD] {policy.agent_name}: train() raised non-finite distribution "
+                            f"params for the {rollback_count + 1}-th time this policy. One rollback "
+                            f"already used; refusing to silently corrupt training. Investigate reward "
+                            f"scaling, advantage clipping, or learning rate. Original error: {_train_exc}"
+                        ) from _train_exc
+                    policy._nan_rollback_count = rollback_count + 1
+                    self.logger.error(
+                        f"[NAN_GUARD] {policy.agent_name}: policy.train() raised "
+                        f"({type(_train_exc).__name__}: {_train_exc}); rolled back to pre-update "
+                        f"snapshot (use #{rollback_count + 1}/1). Skipping this train step. "
+                        f"NEXT NaN WILL FAIL HARD."
+                    )
+                    self._training_metrics["policy_errors"] = (
+                        self._training_metrics.get("policy_errors", 0) + 1
+                    )
+                    # train_info stays None; downstream metric logging tolerates this.
+
+                # POST-TRAIN log_std CLAMP (root-cause prevention).
+                # PPO's log_std is a free nn.Parameter with no built-in bounds. Under large
+                # advantages (e.g. meta_controller has reward magnitudes ~50x investor),
+                # gradient updates drift log_std to extreme values where exp(log_std) under/
+                # overflows, producing NaN in the next forward pass. Clamp to [-5, 2] →
+                # sigma ∈ [6.7e-3, 7.4], which is wide enough for exploration but immune to
+                # numeric blow-up.
+                try:
+                    if hasattr(policy, "policy") and policy.policy is not None:
+                        log_std_param = getattr(policy.policy, "log_std", None)
+                        if log_std_param is not None and hasattr(log_std_param, "data"):
+                            with torch.no_grad():
+                                log_std_param.data.clamp_(min=-5.0, max=2.0)
+                except Exception as _clamp_err:
+                    self.logger.warning(f"[NAN_GUARD] log_std clamp failed for {policy.agent_name}: {_clamp_err}")
+
+                # Post-train NaN/Inf guard: if any param became non-finite, restore snapshot.
+                # FAIL-HARD POLICY: rollback once per policy per episode; if NaN appears
+                # again, raise — silent skipping is forbidden.
+                try:
+                    has_bad = False
+                    if hasattr(policy, "policy") and policy.policy is not None:
+                        for p in policy.policy.parameters():
+                            if not torch.isfinite(p).all():
+                                has_bad = True
+                                break
+                    if has_bad:
+                        rollback_count = getattr(policy, "_nan_rollback_count", 0)
+                        if _pre_state is None:
+                            raise RuntimeError(
+                                f"[NAN_GUARD] {policy.agent_name}: NaN/Inf in params after train() "
+                                f"and no snapshot was taken. Cannot recover — failing hard."
+                            )
+                        if rollback_count >= 1:
+                            raise RuntimeError(
+                                f"[NAN_GUARD] {policy.agent_name}: NaN/Inf detected in params for the "
+                                f"{rollback_count + 1}-th time this policy. One rollback already used; "
+                                f"refusing to silently corrupt training. Investigate reward scaling, "
+                                f"advantage clipping, or learning rate."
+                            )
+                        policy.policy.load_state_dict(_pre_state)
+                        policy._nan_rollback_count = rollback_count + 1
+                        self.logger.error(
+                            f"[NAN_GUARD] {policy.agent_name}: NaN/Inf in params after train(); "
+                            f"rolled back to pre-update snapshot (use #{rollback_count + 1}/1). "
+                            f"Buffer reset, training step skipped. NEXT NaN WILL FAIL HARD."
+                        )
+                        self._training_metrics["policy_errors"] = (
+                            self._training_metrics.get("policy_errors", 0) + 1
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as guard_err:
+                    self.logger.warning(f"[NAN_GUARD] check failed for {policy.agent_name}: {guard_err}")
                 
-                # Log training proof: policy updates happening
+                # Log training proof: policy updates happening.
+                # SB3's PPO.train() returns None; the metrics we want live in
+                # policy.logger.name_to_value (last logged values per key). Build a
+                # train_info dict from there as a fallback so [TRAINING_PROOF] lines
+                # actually show policy_loss / value_loss / approx_kl instead of
+                # "(metrics not available)".
+                if not (train_info and isinstance(train_info, dict)):
+                    try:
+                        sb3_logger = getattr(policy, "logger", None)
+                        n2v = getattr(sb3_logger, "name_to_value", None) if sb3_logger is not None else None
+                        if isinstance(n2v, dict) and n2v:
+                            train_info = dict(n2v)
+                    except Exception:
+                        pass
+
                 if train_info and isinstance(train_info, dict):
                     policy_loss = train_info.get('train/policy_loss', train_info.get('policy_loss', 'N/A'))
                     value_loss = train_info.get('train/value_loss', train_info.get('value_loss', 'N/A'))
                     entropy_loss = train_info.get('train/entropy_loss', train_info.get('entropy_loss', 'N/A'))
                     approx_kl = train_info.get('train/approx_kl', train_info.get('approx_kl', 'N/A'))
-                    
+
                     # Log periodically to show training is happening
                     if self.total_steps % 5000 == 0 or (hasattr(self, '_last_log_step') and self.total_steps - self._last_log_step >= 5000):
                         self.logger.info(f"[TRAINING_PROOF] {policy.agent_name} policy updated at step {self.total_steps}: "
@@ -1563,7 +1912,9 @@ class MultiESGAgent:
     def _initialize_environment_enhanced(self):
         try:
             self._last_obs, _ = self.env.reset()
-            # CRITICAL FIX: Ensure all observations are 1D (remove batch dimensions)
+            # CRITICAL FIX: Ensure all observations are 1D (remove batch dimensions).
+            # Dict observations (e.g. FoCAL) are passed through unchanged; the
+            # SB3 Dict policy handles per-key tensorisation natively.
             for agent in self._last_obs:
                 obs = self._last_obs[agent]
                 if isinstance(obs, np.ndarray):
@@ -1583,9 +1934,9 @@ class MultiESGAgent:
             # This should NEVER fail if initialization was correct
             for agent in self._last_obs:
                 if agent in self.observation_spaces:
-                    expected_dim = self.observation_spaces[agent].shape[0]
-                    actual_dim = self._last_obs[agent].shape[0]
-                    if expected_dim != actual_dim:
+                    expected_dim = _flat_obs_dim(self.observation_spaces[agent])
+                    actual_dim = _actual_obs_dim(self._last_obs[agent])
+                    if expected_dim is not None and actual_dim is not None and expected_dim != actual_dim:
                         error_msg = (
                             f"[CRITICAL RUNTIME ERROR] Observation space mismatch for {agent}: "
                             f"Policy expects {expected_dim}D but environment produces {actual_dim}D. "
@@ -1614,7 +1965,8 @@ class MultiESGAgent:
 
     def _collect_rollouts_enhanced(self, callbacks):
         steps_collected = 0
-        max_steps_per_rollout = min(self.n_steps, 256)
+        _rollout_cap = int(getattr(self.config, "rollout_cap", 256))
+        max_steps_per_rollout = min(self.n_steps, _rollout_cap)
 
         level, _ = self.memory_tracker.should_cleanup()
         if level == "heavy":
@@ -1642,8 +1994,7 @@ class MultiESGAgent:
                 steps_collected += 1
 
                 # Stop immediately when PPO rollout buffers are ready. This must hold even during
-                # episode training: overflow is fatal, and Tier-2 uses this same PPO buffer cadence
-                # to trigger rollout finalization and online Tier-2 updates.
+                # episode training: overflow is fatal, and the same cadence controls rollout finalization.
                 if self._check_buffers_full():
                     break
 
@@ -1653,13 +2004,13 @@ class MultiESGAgent:
                         self.memory_tracker.cleanup("light")
             except Exception as e:
                 self.logger.error(f"Rollout step error: {e}")
+                # FAIL-HARD: NaN_GUARD must propagate; never silently break the rollout.
+                if isinstance(e, RuntimeError) and "[NAN_GUARD]" in str(e):
+                    raise
                 break
 
         self._finalize_rollouts_enhanced()
         return steps_collected
-
-    # REMOVED: _blend_with_expert_suggestions() - Legacy action blending removed.
-    # Tier-2 routed overlay does NOT blend actions inside PPO; PPO learns directly from observations.
 
     def _collect_actions_enhanced(self):
         actions_dict: Dict[str, Any] = {}
@@ -1684,7 +2035,7 @@ class MultiESGAgent:
                     proc = self._process_action_enhanced(pred, self.action_spaces[agent_name])
                     proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
                     agent_data[polid] = {
-                        "obs": self._last_obs[agent_name].copy(),
+                        "obs": _copy_obs(self._last_obs[agent_name]),
                         "action": self._snapshot_action(proc),
                         "value_t": None,
                         "log_prob_t": None,
@@ -1705,13 +2056,11 @@ class MultiESGAgent:
                 
                 # ROBUST VERIFICATION: Verify observation dimension matches policy's expected dimension
                 # NO WORKAROUNDS - if dimensions don't match, this is a CRITICAL ERROR indicating initialization failure
-                if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                    expected_dim = policy.observation_space.shape[0]
-                else:
-                    expected_dim = self.observation_spaces[agent_name].shape[0]
-                
-                actual_dim = raw_obs.shape[0]
-                if actual_dim != expected_dim:
+                expected_dim = _flat_obs_dim(getattr(policy, 'observation_space', None))
+                if expected_dim is None:
+                    expected_dim = _flat_obs_dim(self.observation_spaces[agent_name])
+                actual_dim = _actual_obs_dim(raw_obs)
+                if actual_dim is not None and expected_dim is not None and actual_dim != expected_dim:
                     # CRITICAL ERROR: Observation dimension mismatch detected during action collection
                     # This should NEVER happen if initialization was correct
                     # This indicates a bug in initialization or environment observation space changed
@@ -1730,12 +2079,34 @@ class MultiESGAgent:
                     self.logger.error(error_msg)
                     raise RuntimeError(error_msg)
                 
-                # Now reshape to (1, -1) for policy input
-                obs = raw_obs.reshape(1, -1)
+                # Now reshape to (1, -1) for policy input (Dict-aware: dict obs
+                # become a dict of arrays with a leading batch axis, preserving
+                # per-subspace shape).
+                if isinstance(raw_obs, dict):
+                    obs = {
+                        k: np.asarray(v, dtype=np.float32)[None, ...]
+                        for k, v in raw_obs.items()
+                    }
+                else:
+                    obs = raw_obs.reshape(1, -1)
 
                 with torch.no_grad():
                     obs_tensor = obs_as_tensor(obs, policy.device)
                     if getattr(policy, "mode", None) == "PPO":
+                        # NAN_GUARD (FAIL-HARD): if params are non-finite at action time,
+                        # the train-time guard already failed. Surface the bug — do NOT
+                        # silently sanitise, that would hide the root cause.
+                        try:
+                            for _p in policy.policy.parameters():
+                                if not torch.isfinite(_p).all():
+                                    raise RuntimeError(
+                                        f"[NAN_GUARD] {agent_name}: non-finite params at action time. "
+                                        f"Train-time guard must have failed; refusing to continue with "
+                                        f"corrupt policy."
+                                    )
+                        except RuntimeError:
+                            raise
+
                         # Stable SB3 API: distribution sampling + log_prob + value
                         distribution = policy.policy.get_distribution(obs_tensor)
                         action_t = distribution.get_actions(deterministic=False)
@@ -1881,13 +2252,8 @@ class MultiESGAgent:
                             self.logger.info(f"[DECISION_PROOF] {agent_name} sampled action {action_str} at step {self.total_steps} "
                                            f"(value={value_mean}, log_prob={log_prob_mean})")
 
-                        # Legacy expert-action blending removed.
-                        # The Tier-2 routed overlay never overrides PPO actions directly inside PPO sampling.
-                        # if agent_name == "investor_0":
-                        #     proc = self._blend_with_expert_suggestions(proc, agent_name)
-
                         agent_data[polid] = {
-                            "obs": self._last_obs[agent_name].copy(),
+                            "obs": _copy_obs(self._last_obs[agent_name]),
                             "action": self._snapshot_action(proc),
                             "value_t": value_t,
                             "log_prob_t": log_prob_t,
@@ -1900,7 +2266,7 @@ class MultiESGAgent:
                         proc = self._process_action_enhanced(pred, self.action_spaces[agent_name])
                         proc = self._ensure_action_shape(proc, self.action_spaces[agent_name])
                         agent_data[polid] = {
-                            "obs": self._last_obs[agent_name].copy(),
+                            "obs": _copy_obs(self._last_obs[agent_name]),
                             "action": self._snapshot_action(proc),
                             "value_t": None,
                             "log_prob_t": None,
@@ -1998,10 +2364,17 @@ class MultiESGAgent:
 
     def _handle_training_error_enhanced(self, error):
         self._consecutive_errors += 1
-        if self.debug:
-            self.logger.error(
-                f"Training error {self._consecutive_errors}/{self._max_consecutive_errors}: {error}"
-            )
+        # ALWAYS log the error with traceback (not just in debug mode) — silent
+        # swallowing of rollout-collection errors here makes env / policy
+        # bugs invisible: the symptom is "0 steps collected" with no traceback,
+        # which then trips the FAIL_HARD two-zero-interval guard upstream and
+        # the user has no idea what actually broke.
+        import traceback as _tb
+        self.logger.error(
+            f"[ROLLOUT_ERROR] {self._consecutive_errors}/{self._max_consecutive_errors} "
+            f"{type(error).__name__}: {error}\n"
+            f"{_tb.format_exc()}"
+        )
         if self._consecutive_errors < self._max_consecutive_errors // 2:
             self.memory_tracker.cleanup("medium")
         else:
@@ -2037,30 +2410,84 @@ class MultiESGAgent:
                 reward = float(rewards.get(agent_name, 0.0))
                 done = bool(dones.get(agent_name, False))
 
-                # TD-error proxy for diagnosing credit assignment vs action saturation.
-                # We compute this only for PPO (has V(s) readily available) and export it to env for CSV logging.
+                # Per-agent reward normalization: Welford online mean/std.
+                # Decouples value-function learning from hand-tuned reward scales.
+                # Disabled for RULE-mode agents (they don't learn) and during warmup.
+                if bool(getattr(self.config, "reward_normalization_enabled", True)):
+                    normalizer = self._reward_normalizers.get(agent_name)
+                    if normalizer is not None:
+                        reward = normalizer.update_and_normalize(reward)
+
+                # Health diagnostics — value estimate, TD-error proxy, and action stats
+                # exported to the env for per-step CSV logging.  We cover all four
+                # learning agents so the debug CSVs are symmetric across the MARL system.
                 try:
-                    if agent_name == "investor_0" and getattr(policy, "mode", None) == "PPO":
+                    env_ref = getattr(self, "env", None)
+                    if env_ref is not None and getattr(policy, "mode", None) == "PPO":
                         v_t = data.get("value_t", None)
                         if v_t is not None:
-                            # Ensure next_obs is (1, obs_dim)
                             next_obs_agent = next_obs.get(agent_name, None) if isinstance(next_obs, dict) else None
                             if next_obs_agent is not None:
-                                next_arr = np.asarray(next_obs_agent, dtype=np.float32).reshape(1, -1)
+                                # Build a batched obs that works for both Box and Dict
+                                # observation spaces. The DL-enabled investor uses a
+                                # Dict({"obs": Box(12), "fcst": Box(9)}) and would
+                                # otherwise raise inside np.asarray(...).reshape(...),
+                                # silently skipping all health metrics for that agent.
+                                if isinstance(next_obs_agent, dict):
+                                    next_batch: Any = {
+                                        k: np.asarray(v, dtype=np.float32).reshape(1, -1)
+                                        for k, v in next_obs_agent.items()
+                                    }
+                                else:
+                                    next_batch = np.asarray(next_obs_agent, dtype=np.float32).reshape(1, -1)
                                 with torch.no_grad():
-                                    next_tensor = obs_as_tensor(next_arr, policy.device)
+                                    next_tensor = obs_as_tensor(next_batch, policy.device)
                                     v_next = policy.policy.predict_values(next_tensor)
-
                                 gamma = float(getattr(policy, "gamma", getattr(self.config, "gamma", 0.99)))
                                 not_done = 0.0 if done else 1.0
-                                td_err = float(reward) + float(gamma * not_done) * float(v_next.detach().cpu().numpy().flatten()[0]) - float(v_t.detach().cpu().numpy().flatten()[0])
+                                v_t_f   = float(v_t.detach().cpu().numpy().flatten()[0])
+                                v_next_f = float(v_next.detach().cpu().numpy().flatten()[0])
+                                td_err  = float(reward) + gamma * not_done * v_next_f - v_t_f
 
-                                env_ref = getattr(self, "env", None)
-                                if env_ref is not None:
+                                if agent_name == "investor_0":
                                     env_ref._inv_reward_step = float(reward)
-                                    env_ref._inv_value = float(v_t.detach().cpu().numpy().flatten()[0])
-                                    env_ref._inv_value_next = float(v_next.detach().cpu().numpy().flatten()[0])
-                                    env_ref._inv_td_error = float(td_err)
+                                    env_ref._inv_value       = v_t_f
+                                    env_ref._inv_value_next  = v_next_f
+                                    env_ref._inv_td_error    = td_err
+                                elif agent_name == "risk_controller_0":
+                                    env_ref._risk_reward_step = float(reward)
+                                    env_ref._risk_value       = v_t_f
+                                    env_ref._risk_value_next  = v_next_f
+                                    env_ref._risk_td_error    = td_err
+                                    # Store raw action for logging
+                                    act = data.get("action", None)
+                                    if act is not None:
+                                        env_ref._risk_action_raw = float(np.asarray(act).flatten()[0])
+                                elif agent_name == "meta_controller_0":
+                                    env_ref._meta_reward_step = float(reward)
+                                    env_ref._meta_value       = v_t_f
+                                    env_ref._meta_value_next  = v_next_f
+                                    env_ref._meta_td_error    = td_err
+                                    act = data.get("action", None)
+                                    if act is not None:
+                                        env_ref._meta_action_raw = float(np.asarray(act).flatten()[0])
+
+                    # Battery (DQN) — store action index, reward, and Q-value proxy
+                    if env_ref is not None and agent_name == "battery_operator_0" and getattr(policy, "mode", None) == "DQN":
+                        act = data.get("action", None)
+                        if act is not None:
+                            env_ref._batt_action_idx = int(np.asarray(act).flatten()[0])
+                        env_ref._batt_reward_step = float(reward)
+                        # Q-value proxy: read from policy q_net if accessible (best-effort)
+                        try:
+                            obs_arr = np.asarray(data["obs"], dtype=np.float32).reshape(1, -1)
+                            with torch.no_grad():
+                                obs_t = obs_as_tensor(obs_arr, policy.device)
+                                q_vals = policy.q_net(obs_t)
+                            env_ref._batt_q_max = float(q_vals.max().item())
+                            env_ref._batt_q_chosen = float(q_vals[0, env_ref._batt_action_idx].item()) if hasattr(env_ref, "_batt_action_idx") else float(q_vals.max().item())
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -2090,12 +2517,16 @@ class MultiESGAgent:
         if not hasattr(policy, "rollout_buffer") or policy.rollout_buffer is None:
             return True
         
-        if not hasattr(policy, 'observation_space') or not hasattr(policy.observation_space, 'shape'):
+        # Dict observation spaces (FoCAL) use SB3's DictRolloutBuffer which has
+        # its own per-key observation arrays \u2014 we let SB3 manage that and skip
+        # the legacy single-array buffer-shape validation here.
+        _obs_space = getattr(policy, 'observation_space', None)
+        if _obs_space is None or getattr(_obs_space, 'shape', None) is None:
             return True
         
         try:
             buffer = policy.rollout_buffer
-            expected_obs_dim = policy.observation_space.shape[0]
+            expected_obs_dim = int(_obs_space.shape[0])
             buffer_size = getattr(buffer, 'buffer_size', 128)
             
             # Check if buffer has observations array
@@ -2192,121 +2623,44 @@ class MultiESGAgent:
             buffer_size = getattr(buffer, 'buffer_size', 128)
             current_pos = getattr(buffer, 'pos', 0)
 
-            # --- Tier-2 controller experience collection (investor_0 only) ---
-            base_env = getattr(self.env, "base_env", getattr(self.env, "env", self.env))
-            if hasattr(base_env, "env"):
-                base_env = getattr(base_env, "env", base_env)
-            tier2_value_adapter = getattr(base_env, "tier2_value_adapter", None)
-            tier2_value_buffer = getattr(base_env, "tier2_value_buffer", None)
-            fgb_enabled = bool(getattr(self.config, "forecast_baseline_enable", False))
-            if (
-                agent_name == "investor_0"
-                and fgb_enabled
-                and tier2_value_adapter is not None
-                and infos is not None
-            ):
-                info_inv = infos.get("investor_0", infos) if isinstance(infos, dict) else {}
-                tier2_features = info_inv.get("tier2_features")
-                if tier2_features is not None and tier2_value_buffer is not None:
-                    obs = data.get("obs")
-                    if obs is not None:
-                        obs_np = np.asarray(obs, dtype=np.float32).flatten()
-                        decision_step_flag = info_inv.get("decision_step", None)
-                        if decision_step_flag is None and info_inv.get("is_decision_step", None) is not None:
-                            decision_step_flag = info_inv.get("is_decision_step", None)
-                            legacy_count = int(getattr(self, "_tier2_legacy_decision_step_count", 0)) + 1
-                            self._tier2_legacy_decision_step_count = legacy_count
-                            if legacy_count in (1, 5, 20, 100):
-                                self.logger.warning(
-                                    "[TIER2_DECISION_STEP_LEGACY] using legacy info['is_decision_step']; "
-                                    "prefer explicit info['decision_step']"
-                                )
-                        if decision_step_flag is None:
-                            missing_count = int(getattr(self, "_tier2_missing_decision_step_count", 0)) + 1
-                            self._tier2_missing_decision_step_count = missing_count
-                            if missing_count in (1, 5, 20, 100):
-                                self.logger.warning(
-                                    "[TIER2_DECISION_STEP_MISSING] missing explicit decision_step in info; "
-                                    "skipping Tier-2 sample collection instead of falling back to obs layout"
-                                )
-                            obs_np = None
-                        obs_decision_step = float(obs_np[5]) if (obs_np is not None and obs_np.size > 5) else None
-                        if decision_step_flag is not None and obs_decision_step is not None:
-                            try:
-                                info_decision_step = float(decision_step_flag)
-                                if abs(info_decision_step - obs_decision_step) > 0.5:
-                                    mismatch_count = int(getattr(self, "_tier2_decision_step_mismatch_count", 0)) + 1
-                                    self._tier2_decision_step_mismatch_count = mismatch_count
-                                    if mismatch_count in (1, 5, 20, 100):
-                                        self.logger.warning(
-                                            "[TIER2_DECISION_STEP_MISMATCH] info decision_step=%.3f obs[5]=%.3f; "
-                                            "using info decision_step as source of truth",
-                                            info_decision_step,
-                                            obs_decision_step,
-                                        )
-                            except Exception:
-                                pass
-                        is_decision_step = bool(float(decision_step_flag) > 0.5) if decision_step_flag is not None else False
-                        if not is_decision_step:
-                            obs_np = None
-                        if obs_np is None:
-                            pass
-                        else:
-                            tier2_features = np.asarray(tier2_features, dtype=np.float32).flatten()
-                            realized_return = float(
-                                info_inv.get(
-                                    "tier2_training_return",
-                                    info_inv.get(
-                                        "price_return_invfreq",
-                                        info_inv.get("price_return_1step", info_inv.get("realized_investor_return", 0.0)),
-                                    ),
-                                ) or 0.0
-                            )
-                            return_horizon_steps = int(
-                                max(info_inv.get("tier2_training_horizon_steps", info_inv.get("investment_freq", 1)) or 1, 1)
-                            )
-                            executed_exposure = info_inv.get("executed_investor_exposure", None)
-                            if executed_exposure is None and tier2_features.size > 0:
-                                executed_exposure = float(tier2_features[0])
-                            env_step = int(info_inv.get("timestep", info_inv.get("step_in_episode", -1)) or -1)
-                            tier2_value_buffer.add(
-                                obs_np,
-                                tier2_features,
-                                realized_return=realized_return,
-                                executed_exposure=executed_exposure,
-                                rollout_pos=current_pos,
-                                env_step=env_step,
-                                return_horizon_steps=return_horizon_steps,
-                                decision_step_sampled=True,
-                            )
-
             # --- obs -> numpy (CPU, float32, shape (obs_dim,)) ---
             # CRITICAL FIX: SB3 RolloutBuffer.add() expects observations as (obs_dim,) NOT (1, obs_dim)
-            # The buffer internally handles batching - we pass a single flattened observation
+            # The buffer internally handles batching - we pass a single flattened observation.
+            # Dict observations flow through SB3's DictRolloutBuffer natively
+            # as ``{key: <space.shape>}`` per-step entries. Per-key shape is
+            # preserved (no flatten); SB3 internally prepends an n_envs axis.
             obs = data["obs"]
-            if "torch" in str(type(obs)):
-                obs = obs.detach().cpu().numpy()
-            elif not isinstance(obs, np.ndarray):
-                obs = np.asarray(obs)
-            
-            # Flatten to 1D array (obs_dim,) for SB3 buffer
-            obs_np = obs.astype(np.float32).flatten()
+            if isinstance(obs, dict):
+                obs_np = {}
+                for k, v in obs.items():
+                    if "torch" in str(type(v)):
+                        v = v.detach().cpu().numpy()
+                    arr = np.asarray(v, dtype=np.float32)
+                    # If the upstream gave us a (1, *space_shape) batched
+                    # array, drop the leading axis; otherwise keep as-is.
+                    if arr.ndim >= 1 and arr.shape[0] == 1:
+                        arr = arr[0]
+                    obs_np[k] = arr
+                actual_obs_dim = int(sum(int(np.prod(arr.shape)) for arr in obs_np.values()))
+            else:
+                if "torch" in str(type(obs)):
+                    obs = obs.detach().cpu().numpy()
+                elif not isinstance(obs, np.ndarray):
+                    obs = np.asarray(obs)
+                # Flatten to 1D array (obs_dim,) for SB3 buffer
+                obs_np = obs.astype(np.float32).flatten()
+                actual_obs_dim = int(obs_np.shape[0])
             
             # CRITICAL: Validate observation dimension matches policy's expected dimension
             # After rebuild_observation_spaces() is called, dimensions should always match
-            # CRITICAL FIX: obs_np is now 1D (obs_dim,), so we check shape[0]
-            if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                expected_obs_dim = policy.observation_space.shape[0]
-                actual_obs_dim = obs_np.shape[0]  # obs_np is now 1D (obs_dim,)
-                
+            expected_obs_dim = _flat_obs_dim(getattr(policy, 'observation_space', None))
+            if expected_obs_dim is not None:
                 if actual_obs_dim != expected_obs_dim:
                     # ROBUST FIX: NO TRUNCATION/PADDING - this is a critical error
                     error_msg = (
                         f"[CRITICAL] Observation dimension mismatch for policy {polid} ({policy.agent_name}): "
                         f"Expected {expected_obs_dim}D (policy obs_space), got {actual_obs_dim}D (actual observation). "
-                        f"This indicates a bug - observation spaces must match exactly. "
-                        f"Policy obs_space: {policy.observation_space.shape if hasattr(policy, 'observation_space') else 'N/A'}, "
-                        f"Actual observation shape: {obs_np.shape}"
+                        f"This indicates a bug - observation spaces must match exactly."
                     )
                     self.logger.error(error_msg)
                     raise ValueError(error_msg)
@@ -2337,8 +2691,9 @@ class MultiESGAgent:
             # - value: (1, 1) tensor or scalar
             # - log_prob: (1, 1) tensor or scalar
             
-            # Ensure 1D shape
-            if obs_np.ndim > 1:
+            # Ensure 1D shape (Dict obs left untouched — SB3 DictRolloutBuffer
+            # consumes per-key arrays).
+            if not isinstance(obs_np, dict) and obs_np.ndim > 1:
                 obs_np = obs_np.flatten()
             if action_np.ndim > 1:
                 action_np = action_np.flatten()
@@ -2358,7 +2713,7 @@ class MultiESGAgent:
                     f"[BUFFER_OVERFLOW] Policy {polid} ({policy.agent_name}): "
                     f"rollout buffer pos={current_pos} reached/exceeded size={buffer_size} before add()."
                 )
-            
+
             policy.rollout_buffer.add(obs_np, action_np, reward_np, starts_np, value_t, log_prob_t)
 
         except Exception as e:
@@ -2616,13 +2971,28 @@ class MultiESGAgent:
                         # This usually happens when buffer has wrong observation shape internally
                         # Our truncation in _add_ppo_experience should prevent mismatches
 
-                        final_obs = self._last_obs[agent_name].reshape(1, -1)
+                        # Dict-aware: build a per-key dict with a leading batch
+                        # axis but preserved per-subspace shape.
+                        _raw_final = self._last_obs[agent_name]
+                        if isinstance(_raw_final, dict):
+                            final_obs = {
+                                k: np.asarray(v, dtype=np.float32)[None, ...]
+                                for k, v in _raw_final.items()
+                            }
+                        else:
+                            final_obs = _raw_final.reshape(1, -1)
                         
                         # CRITICAL FIX: Ensure final_obs matches policy's expected observation dimension
                         # This prevents tensor dimension mismatches in predict_values
-                        if hasattr(policy, 'observation_space') and hasattr(policy.observation_space, 'shape'):
-                            expected_obs_dim = policy.observation_space.shape[0]
-                            actual_obs_dim = final_obs.shape[1]
+                        expected_obs_dim = _flat_obs_dim(getattr(policy, 'observation_space', None))
+                        if expected_obs_dim is not None:
+                            # Count TOTAL elements across the leading-batched
+                            # final_obs (dict subspace shapes can be rank>1).
+                            actual_obs_dim = (
+                                int(sum(int(np.prod(arr.shape[1:])) for arr in final_obs.values()))
+                                if isinstance(final_obs, dict)
+                                else int(np.prod(final_obs.shape[1:]))
+                            )
                             
                             if actual_obs_dim != expected_obs_dim:
                                 raise RuntimeError(
@@ -2705,114 +3075,6 @@ class MultiESGAgent:
                         # Call GAE with tensor final_value - SB3 will handle tensor operations correctly
                         try:
                             policy.rollout_buffer.compute_returns_and_advantage(final_value, dones_b)
-                            # Tier-2: Train the routed residual-aware overlay on this rollout (investor_0 only)
-                            if agent_name == "investor_0" and bool(getattr(self.config, "forecast_baseline_enable", False)):
-                                base_env = getattr(self.env, "base_env", getattr(self.env, "env", self.env))
-                                if hasattr(base_env, "env"):
-                                    base_env = getattr(base_env, "env", base_env)
-                                tier2_value_trainer = getattr(base_env, "tier2_value_trainer", None)
-                                tier2_value_buffer = getattr(base_env, "tier2_value_buffer", None)
-                                if tier2_value_trainer is not None and tier2_value_buffer is not None and tier2_value_buffer.size() > 0:
-                                    try:
-                                        current_rollout = tier2_value_buffer.get_current_rollout()
-                                        tier2_value_train_every = max(
-                                            1,
-                                            int(getattr(self.config, "tier2_value_train_every", 100) or 100),
-                                        )
-                                        last_tier2_train_step = int(getattr(self, "_last_tier2_train_step", -10**12))
-                                        should_train = int(getattr(self, "total_steps", 0)) - last_tier2_train_step >= tier2_value_train_every
-                                        if should_train:
-                                            if len(current_rollout) >= 8:
-                                                tier2_value_result = tier2_value_trainer.train_continuous(current_rollout, None, tier2_value_buffer, training_step=int(getattr(self, "total_steps", 0)))
-                                                self._last_tier2_train_step = int(getattr(self, "total_steps", 0))
-                                                if isinstance(tier2_value_result, dict):
-                                                    status = str(tier2_value_result.get("status", "unknown"))
-                                                    if status == "ok":
-                                                        self.logger.info(
-                                                            "[TIER2_VALUE_TRAIN] step=%s rollout=%s loss=%.6f action_target=%.4f "
-                                                            "decision=%.6f value_pred=%.6f uplift_pred=%.6f uplift_lcb=%.6f "
-                                                            "nav_pred=%.6f nav_lcb=%.6f ret_floor=%.6f floor_lcb=%.6f "
-                                                            "tail_risk=%.6f factor=%.6f lambda=%.4f tail_lambda=%.4f "
-                                                            "nav_delta=%.6f value_loss=%.6f gate=%.4f active=%.4f conf=%.4f "
-                                                            "teacher_adv=%.6f teacher_gate=%.4f teacher_pos=%.4f "
-                                                            "ann_q=%.4f trust=%.4f mix_base=%.3f mix_trend=%.3f mix_rev=%.3f mix_def=%.3f mix_ent=%.3f "
-                                                            "q_anchor=%.6f t_anchor=%.6f mix_loss=%.6f winner_loss=%.6f "
-                                                            "trade_cost=%.6f replay_loss=%.6f",
-                                                            int(getattr(self, "total_steps", 0)),
-                                                            len(current_rollout),
-                                                            float(tier2_value_result.get("loss", 0.0)),
-                                                            float(tier2_value_result.get("action_target_mean", 0.0)),
-                                                            float(tier2_value_result.get("decision_improvement_mean", 0.0)),
-                                                            float(tier2_value_result.get("value_prediction_mean", 0.0)),
-                                                            float(tier2_value_result.get("uplift_prediction_mean", 0.0)),
-                                                            float(tier2_value_result.get("uplift_certified_lcb_mean", 0.0)),
-                                                            float(tier2_value_result.get("nav_prediction_mean", 0.0)),
-                                                            float(tier2_value_result.get("nav_certified_lcb_mean", 0.0)),
-                                                            float(tier2_value_result.get("return_floor_prediction_mean", 0.0)),
-                                                            float(tier2_value_result.get("return_floor_certified_lcb_mean", 0.0)),
-                                                            float(tier2_value_result.get("tail_risk_prediction_mean", 0.0)),
-                                                            float(tier2_value_result.get("factor_opportunity_mean", 0.0)),
-                                                            float(tier2_value_result.get("return_constraint_lambda", 0.0)),
-                                                            float(tier2_value_result.get("tail_risk_constraint_lambda", 0.0)),
-                                                            float(tier2_value_result.get("nav_return_delta_mean", 0.0)),
-                                                            float(tier2_value_result.get("value_loss", 0.0)),
-                                                            float(tier2_value_result.get("gate_probability_mean", 0.0)),
-                                                            float(tier2_value_result.get("action_active_prob", 0.0)),
-                                                            float(tier2_value_result.get("confidence_mean", 0.0)),
-                                                            float(tier2_value_result.get("teacher_advantage_mean", 0.0)),
-                                                            float(tier2_value_result.get("teacher_gate_target_mean", 0.0)),
-                                                            float(tier2_value_result.get("teacher_positive_rate", 0.0)),
-                                                            float(tier2_value_result.get("ann_quality_mean", 0.0)),
-                                                            float(tier2_value_result.get("forecast_trust_mean", 0.0)),
-                                                            float(tier2_value_result.get("base_internal_weight_mean", 0.0)),
-                                                            float(tier2_value_result.get("trend_internal_weight_mean", 0.0)),
-                                                            float(tier2_value_result.get("reversion_internal_weight_mean", 0.0)),
-                                                            float(tier2_value_result.get("defensive_internal_weight_mean", 0.0)),
-                                                            float(tier2_value_result.get("expert_weight_entropy_mean", 0.0)),
-                                                            float(tier2_value_result.get("quality_anchor_loss", 0.0)),
-                                                            float(tier2_value_result.get("trust_anchor_loss", 0.0)),
-                                                            float(tier2_value_result.get("expert_mix_loss", 0.0)),
-                                                            float(tier2_value_result.get("expert_winner_loss", 0.0)),
-                                                            float(tier2_value_result.get("trade_cost_mean", 0.0)),
-                                                            float(tier2_value_result.get("replay_loss", 0.0)),
-                                                        )
-                                                    else:
-                                                        self.logger.info(
-                                                            "[TIER2_VALUE_TRAIN_SKIP] step=%s rollout=%s status=%s",
-                                                            int(getattr(self, "total_steps", 0)),
-                                                            len(current_rollout),
-                                                            status,
-                                                        )
-                                            else:
-                                                self.logger.debug(
-                                                    "[TIER2_VALUE_TRAIN_SKIP_SHORT] rollout=%s",
-                                                    len(current_rollout),
-                                                )
-                                                tier2_value_buffer.clear_rollout()
-                                        else:
-                                            # Keep the CV buffer scoped to one completed rollout.
-                                            # If this rollout is not trained now, drop it instead of
-                                            # carrying stale experiences into a later return target.
-                                            tier2_value_buffer.clear_rollout()
-                                    except Exception as tier2_err:
-                                        tier2_error_signature = f"{type(tier2_err).__name__}: {tier2_err}"
-                                        tier2_error_count = int(getattr(self, "_tier2_train_error_count", 0)) + 1
-                                        last_tier2_error_signature = getattr(self, "_last_tier2_train_error_signature", None)
-                                        self._tier2_train_error_count = tier2_error_count
-                                        self._last_tier2_train_error_signature = tier2_error_signature
-                                        if tier2_error_signature != last_tier2_error_signature or tier2_error_count in (1, 5, 20, 100):
-                                            self.logger.warning(
-                                                "[TIER2_VALUE_TRAIN_ERROR] step=%s count=%s error=%s",
-                                                int(getattr(self, "total_steps", 0)),
-                                                tier2_error_count,
-                                                tier2_error_signature,
-                                            )
-                                        if bool(getattr(self.config, "fgb_fail_fast", False)):
-                                            raise RuntimeError(
-                                                f"Tier-2 training failed at step {int(getattr(self, 'total_steps', 0))}"
-                                            ) from tier2_err
-                                        tier2_value_buffer.clear_rollout()
-
                         except Exception as gae_error:
                             error_str = str(gae_error)
                             if 'clone' in error_str.lower():
@@ -2900,6 +3162,22 @@ class MultiESGAgent:
                     self.logger.warning(f"Policy {agent_name} has no save()")
                     continue
 
+                # NAN_GUARD (FAIL-HARD): refuse to checkpoint NaN weights. A poisoned
+                # checkpoint silently corrupts every subsequent episode that loads it.
+                # If we got here with NaN params it means the rollout/train guards
+                # failed — surface the bug, do not paper over it.
+                try:
+                    if hasattr(policy, "policy") and policy.policy is not None:
+                        for _p in policy.policy.parameters():
+                            if not torch.isfinite(_p).all():
+                                raise RuntimeError(
+                                    f"[NAN_GUARD] {agent_name}: refusing to save checkpoint with "
+                                    f"non-finite parameters. This indicates a guard failure upstream "
+                                    f"— do NOT proceed with this run; investigate and re-train."
+                                )
+                except RuntimeError:
+                    raise
+
                 path = os.path.join(save_dir, f"{agent_name}_policy.zip")
 
                 # Temporarily detach non-picklables
@@ -2943,6 +3221,12 @@ class MultiESGAgent:
                 self.logger.error(msg)
 
         try:
+            # Persist reward normalizer running statistics so continuity is
+            # maintained across episode checkpoints.
+            rn_state = {
+                name: norm.state_dict()
+                for name, norm in self._reward_normalizers.items()
+            }
             meta = {
                 "timestamp": datetime.now().isoformat(),
                 "total_steps": self.total_steps,
@@ -2950,6 +3234,7 @@ class MultiESGAgent:
                 "memory_stats": self.memory_tracker.get_memory_stats(),
                 "validation_stats": self.obs_validator.get_validation_stats(),
                 "save_errors": save_errors,
+                "reward_normalizer_states": rn_state,
             }
             with open(os.path.join(save_dir, "training_metadata.json"), "w") as f:
                 json.dump(meta, f, indent=2)
@@ -3012,15 +3297,20 @@ class MultiESGAgent:
                                     saved_obs_dim = None
                                 
                                 if saved_obs_dim is not None:
-                                    current_obs_dim = int(obs_space.shape[0])
-                                    if saved_obs_dim != current_obs_dim:
-                                        self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Saved policy has {saved_obs_dim}D observations, "
-                                                           f"but current environment expects {current_obs_dim}D. Skipping load - will use existing policy.")
-                                        load_errors.append(f"Observation space mismatch: saved={saved_obs_dim}D, current={current_obs_dim}D")
-                                        continue
+                                    # Dict observation spaces (e.g. investor_0 with FoCAL DL layer)
+                                    # have shape=None; skip scalar pre-check and let SB3 verify on load.
+                                    if isinstance(obs_space, spaces.Dict) or getattr(obs_space, 'shape', None) is None:
+                                        self.logger.debug(f"[OBS_SPACE_CHECK] {agent_name}: Dict obs space - skipping scalar pre-check, will verify after load.")
                                     else:
-                                        pre_check_passed = True
-                                        self.logger.debug(f"[OBS_SPACE_CHECK] {agent_name}: Pre-check passed ({saved_obs_dim}D matches {current_obs_dim}D)")
+                                        current_obs_dim = int(obs_space.shape[0])
+                                        if saved_obs_dim != current_obs_dim:
+                                            self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Saved policy has {saved_obs_dim}D observations, "
+                                                               f"but current environment expects {current_obs_dim}D. Skipping load - will use existing policy.")
+                                            load_errors.append(f"Observation space mismatch: saved={saved_obs_dim}D, current={current_obs_dim}D")
+                                            continue
+                                        else:
+                                            pre_check_passed = True
+                                            self.logger.debug(f"[OBS_SPACE_CHECK] {agent_name}: Pre-check passed ({saved_obs_dim}D matches {current_obs_dim}D)")
                 except Exception as check_error:
                     # If we can't check, proceed with load and verify after loading
                     # This handles edge cases like corrupted metadata or different SB3 versions
@@ -3049,8 +3339,42 @@ class MultiESGAgent:
                 # This catches cases where pre-check failed or policy was saved with different format
                 observation_space_valid = False
                 try:
-                    if hasattr(loaded, 'observation_space') and hasattr(loaded.observation_space, 'shape'):
-                        loaded_obs_dim = int(loaded.observation_space.shape[0])
+                    loaded_space = getattr(loaded, 'observation_space', None)
+                    # --- Dict observation space path (e.g. investor_0 with FoCAL DL layer) ---
+                    if isinstance(loaded_space, spaces.Dict) or isinstance(obs_space, spaces.Dict):
+                        if not (isinstance(loaded_space, spaces.Dict) and isinstance(obs_space, spaces.Dict)):
+                            self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Dict/Box space type mismatch "
+                                               f"(loaded={type(loaded_space).__name__}, current={type(obs_space).__name__}). Skipping load.")
+                            load_errors.append(f"Observation space type mismatch: loaded={type(loaded_space).__name__}, current={type(obs_space).__name__}")
+                            continue
+                        loaded_keys = set(loaded_space.spaces.keys())
+                        current_keys = set(obs_space.spaces.keys())
+                        if loaded_keys != current_keys:
+                            self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Dict keys differ "
+                                               f"(loaded={sorted(loaded_keys)}, current={sorted(current_keys)}). Skipping load.")
+                            load_errors.append(f"Dict keys mismatch: loaded={sorted(loaded_keys)}, current={sorted(current_keys)}")
+                            continue
+                        shape_mismatch = False
+                        for k in current_keys:
+                            if tuple(loaded_space.spaces[k].shape) != tuple(obs_space.spaces[k].shape):
+                                self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Dict sub-space '{k}' shape "
+                                                   f"loaded={loaded_space.spaces[k].shape} vs current={obs_space.spaces[k].shape}. Skipping load.")
+                                load_errors.append(f"Dict sub-space '{k}' shape mismatch")
+                                shape_mismatch = True
+                                break
+                        if shape_mismatch:
+                            continue
+                        observation_space_valid = True
+                        loaded.observation_space = obs_space
+                        if hasattr(loaded, 'policy') and hasattr(loaded.policy, 'observation_space'):
+                            loaded.policy.observation_space = obs_space
+                        # Validate rollout buffer (Dict buffer in SB3 is DictRolloutBuffer)
+                        if hasattr(loaded, 'rollout_buffer') and loaded.rollout_buffer is not None:
+                            self._validate_and_fix_buffer_shape(loaded, idx)
+                        self.logger.info(f"[OBS_SPACE_CHECK] {agent_name}: Dict obs space verified "
+                                        f"(keys={sorted(current_keys)}, shapes={ {k: tuple(obs_space.spaces[k].shape) for k in current_keys} }).")
+                    elif loaded_space is not None and getattr(loaded_space, 'shape', None) is not None and getattr(obs_space, 'shape', None) is not None:
+                        loaded_obs_dim = int(loaded_space.shape[0])
                         current_obs_dim = int(obs_space.shape[0])
                         if loaded_obs_dim != current_obs_dim:
                             self.logger.warning(f"[OBS_SPACE_MISMATCH] {agent_name}: Loaded policy has {loaded_obs_dim}D observations, "
@@ -3143,7 +3467,19 @@ class MultiESGAgent:
             meta_path = os.path.join(load_dir, "training_metadata.json")
             if os.path.exists(meta_path):
                 with open(meta_path, "r") as f:
-                    _ = json.load(f)  # not used; kept for completeness
+                    meta = json.load(f)
+                # Restore reward normalizer running statistics so that the
+                # Welford mean/var accumulated in the previous episode carries
+                # forward rather than resetting to zero.
+                rn_states = meta.get("reward_normalizer_states", {})
+                for name, state in rn_states.items():
+                    if name in self._reward_normalizers:
+                        self._reward_normalizers[name].load_state_dict(state)
+                        self.logger.debug(
+                            f"[REWARD_NORM] Restored normalizer for {name}: "
+                            f"mean={state.get('mean', 0):.4f} var={state.get('var', 1):.4f} "
+                            f"count={state.get('count', 0)}"
+                        )
                 if self.debug:
                     print(f"Loaded training metadata from: {meta_path}")
         except Exception as e:
@@ -3308,11 +3644,15 @@ class OptunaHyperparameterOptimizer:
 
                 obs, _, _, _, _ = self.env.step(actions)
                 
-                # Correctly access the base environment's equity
-                base_env = getattr(self.env, 'env', self.env)
-                equity = getattr(base_env, 'equity', None)
-                if equity is not None:
-                    portfolio_values.append(equity)
+                # Correctly access the base environment's current NAV
+                base_env = self.env
+                while hasattr(base_env, 'env'):
+                    base_env = base_env.env
+                if hasattr(base_env, '_calculate_fund_nav'):
+                    nav = base_env._calculate_fund_nav()
+                    portfolio_values.append(nav)
+                elif hasattr(base_env, 'budget'):
+                    portfolio_values.append(base_env.budget)
 
                 # Optuna Pruning Hook
                 trial.report(np.mean(portfolio_values) if portfolio_values else 0, step)

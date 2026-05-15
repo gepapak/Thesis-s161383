@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 """
-Run canonical tier phases across multiple seeds.
+Run Tier-1 baseline training and evaluation across multiple seeds.
 
-Phase ordering per seed:
-- tier1_tier2:
-  1) Tier 1 hybrid RL baseline
-  2) Tier 2 forecast-guided enhanced MARL baseline
-- tier1_enhancer:
-  1) Tier 1 hybrid RL baseline
-  2) Tier 2 forecast-guided enhanced MARL baseline
-
-For each run: train via main.py, evaluate via evaluation.py --mode tiers.
-The runner forwards an explicit tier evaluation mode so suites can validate the
-deployed Tier-2 path or stay in paper-only policy evaluation.
+For each seed: train via main.py, then evaluate via evaluation.py --mode tiers.
 """
 
 import argparse
@@ -23,6 +13,26 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from runtime_contract import (
+    build_runtime_contract,
+    forecast_prior_contract_settings,
+    runtime_contract_hash,
+)
+from forecast_prior_cli import (
+    add_forecast_prior_override_args,
+    collect_forecast_prior_overrides,
+    forecast_prior_override_cli_args,
+)
+
+
+DEFAULT_ROLLING_PAST_HISTORY_DIR = "rolling_past_history_dataset"
+
+
+def _effective_rolling_past_history_dir(args) -> str:
+    explicit = str(getattr(args, "rolling_past_history_dir", "") or "").strip()
+    if str(getattr(args, "global_norm_mode", "")).strip().lower() == "rolling_past":
+        return explicit or DEFAULT_ROLLING_PAST_HISTORY_DIR
+    return explicit
 
 
 VARIANT_TRAIN_SPECS = {
@@ -30,59 +40,52 @@ VARIANT_TRAIN_SPECS = {
         "name": "Tier 1 hybrid RL baseline",
         "slug": "tier1",
         "extra": [],
+        "eval_extra": [],
+        "reuse_train_from": None,
     },
-    "tier2": {
-        "name": "Tier 2 forecast-guided enhanced MARL baseline",
-        "slug": "tier2",
-        "extra": [
-            "--forecast_baseline_enable",
-        ],
-    },
-    "tier2_ablated": {
-        "name": "Tier 2 forecast-ablated enhanced MARL control run",
-        "slug": "tier2_ablated",
-        "extra": [
-            "--forecast_baseline_enable",
-            "--tier2_value_ablate_forecast_features",
-        ],
+    "tier1_forecast_utilization": {
+        "name": "Tier 1 + conformal ANN forecast-cache utilization",
+        "slug": "tier1_forecast_utilization",
+        "extra": ["--enable_forecast_utilization"],
+        "eval_extra": ["--enable_forecast_utilization"],
+        "reuse_train_from": None,
     },
 }
 
 PHASE_VARIANTS = {
-    "tier1_tier2": [
-        "tier1",
-        "tier2",
-    ],
-    # Legacy alias kept only for backward compatibility with existing scripts/suite dirs.
-    "tier1_enhancer": [
-        "tier1",
-        "tier2",
-    ],
-    "tier2_only": ["tier2"],
-    "tier1_tier2_full_ablated": [
-        "tier1",
-        "tier2",
-        "tier2_ablated",
-    ],
+    "tier1_only": ["tier1"],
+    "tier1_forecast_utilization_only": ["tier1_forecast_utilization"],
+    "tier1_forecast_utilization_pair": ["tier1", "tier1_forecast_utilization"],
 }
 
 EVAL_DIR_ARG_BY_VARIANT = {
     "tier1": "--tier1_dir",
-    "tier2": "--tier2_dir",
-    "tier2_ablated": "--tier2_ablated_dir",
+    "tier1_forecast_utilization": "--tier1_dir",
 }
 
-# evaluation.py --tiers_only accepts canonical tier names, with "baseline" as
-# a legacy alias for tier1.
 EVAL_TIERS_ONLY_BY_VARIANT = {
     "tier1": "tier1",
-    "tier2": "tier2",
-    "tier2_ablated": "tier2_ablated",
+    "tier1_forecast_utilization": "tier1",
+}
+
+# Variants that require their own evaluation forecast-cache directory.
+# Empty string ⇒ use the value of args.forecast_cache_dir (default).
+EVAL_FORECAST_CACHE_DIR_OVERRIDE = {
+    "tier1": "",
+    "tier1_forecast_utilization": "",
 }
 
 
 def format_cmd(cmd):
     return subprocess.list2cmdline(cmd)
+
+
+def _run_timeout_seconds() -> int:
+    try:
+        hours = float(os.environ.get("TIER_RUN_TIMEOUT_HOURS", "8"))
+        return max(60, int(hours * 3600))
+    except Exception:
+        return 8 * 3600
 
 
 def run_command(cmd, name: str) -> dict:
@@ -95,6 +98,7 @@ def run_command(cmd, name: str) -> dict:
     print(f"{'='*100}\n")
 
     try:
+        timeout_s = _run_timeout_seconds()
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -104,11 +108,18 @@ def run_command(cmd, name: str) -> dict:
             errors="replace",
             bufsize=1,
         )
+        timed_out = False
+        deadline = time.time() + timeout_s
         for line in process.stdout:
             print(line, end="")
+            if time.time() > deadline:
+                process.kill()
+                timed_out = True
+                print(f"\n[TIMEOUT] {name} exceeded {timeout_s}s — process killed.")
+                break
         process.wait()
         elapsed = time.time() - start
-        ok = process.returncode == 0
+        ok = process.returncode == 0 and not timed_out
         finished_at = datetime.now()
         print(f"\n{'='*100}")
         print(f"{'SUCCESS' if ok else 'FAILED'}: {name} (exit={process.returncode})")
@@ -138,9 +149,8 @@ def resolve_eval_steps(eval_data_path: str, eval_steps: int = None) -> int:
         return int(eval_steps)
     try:
         import pandas as pd
-        # Load only first column to get row count (avoids loading full file)
         df = pd.read_csv(eval_data_path, usecols=[0])
-        return max(1, len(df) - 1)  # steps = rows - 1 (matches evaluation.py convention)
+        return max(1, len(df) - 1)
     except Exception:
         return 1000
 
@@ -164,6 +174,8 @@ def extract_eval_metrics(json_path: str, canonical_variant: str = None) -> dict:
         source = data
         if canonical_variant and isinstance(data.get("tiers"), dict):
             tier_entry = data.get("tiers", {}).get(canonical_variant, {})
+            if not tier_entry and str(canonical_variant).startswith("tier1"):
+                tier_entry = data.get("tiers", {}).get("tier1", {})
             if isinstance(tier_entry, dict):
                 source = tier_entry
 
@@ -177,7 +189,7 @@ def extract_eval_metrics(json_path: str, canonical_variant: str = None) -> dict:
                     if isinstance(v, (int, float, str, bool)):
                         out[k] = v
 
-        for k in ("tier_report_scope", "tier_comparison_csv", "tier_comparison_md"):
+        for k in ("tier_report_scope", "tier_report_csv", "tier_report_md"):
             v = data.get(k)
             if isinstance(v, (int, float, str, bool)):
                 out[k] = v
@@ -189,7 +201,6 @@ def extract_eval_metrics(json_path: str, canonical_variant: str = None) -> dict:
 def write_seed_summary_csv(rows: list, csv_path: str):
     if not rows:
         return
-    # Stable union of keys across rows (preserve first-seen order)
     fieldnames = []
     seen = set()
     for row in rows:
@@ -300,58 +311,42 @@ def _load_existing_protocol(path: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run multi-seed tier phases with evaluation.")
+    parser = argparse.ArgumentParser(description="Run multi-seed Tier-1 training and evaluation.")
     parser.add_argument("--seeds", nargs="+", required=True, help="Seeds, e.g. --seeds 7 42 123 789 2025")
-    parser.add_argument("--phase", type=str, default="tier1_tier2_full_ablated",
+    parser.add_argument("--phase", type=str, default="tier1_only",
                         choices=list(PHASE_VARIANTS.keys()),
-                        help="Phase: tier1_tier2_full_ablated (3 runs/seed) or tier1_tier2, tier1_enhancer (legacy alias only), tier2_only")
+                        help="Phase to run.")
     parser.add_argument("--episode_data_dir", type=str, default="training_dataset")
     parser.add_argument("--start_episode", type=int, default=0)
     parser.add_argument("--end_episode", type=int, default=19)
-    parser.add_argument("--global_norm_mode", type=str, default="global", choices=["rolling_past", "global"],
-                        help="Normalization mode forwarded to main.py.")
-    parser.add_argument("--rolling_past_history_dir", type=str, default="",
-                        help="Optional rolling-past history dir forwarded to main.py when --global_norm_mode rolling_past.")
+    parser.add_argument("--global_norm_mode", type=str, default="rolling_past", choices=["rolling_past", "global"])
+    parser.add_argument("--rolling_past_history_dir", type=str, default="")
     parser.add_argument("--investment_freq", type=int, default=6)
-    parser.add_argument("--meta_freq_min", type=int, default=6,
-                        help="Default live investor cadence minimum forwarded to train/eval. Default pins short horizon.")
-    parser.add_argument("--meta_freq_max", type=int, default=6,
-                        help="Default live investor cadence maximum forwarded to train/eval. Default pins short horizon.")
+    parser.add_argument("--meta_freq_min", type=int, default=6)
+    parser.add_argument("--meta_freq_max", type=int, default=6)
     parser.add_argument("--cooling_period", type=int, default=0)
-    parser.add_argument("--forecast_training_dataset_dir", type=str, default="forecast_training_dataset")
-    parser.add_argument("--forecast_base_dir", type=str, default="forecast_models")
     parser.add_argument("--forecast_cache_dir", type=str, default="forecast_cache")
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Pinned PPO learning rate for canonical seed-suite runs.")
-    parser.add_argument("--ent_coef", type=float, default=0.03,
-                        help="Pinned PPO entropy coefficient for canonical seed-suite runs.")
-    parser.add_argument("--tier2_value_lr", type=float, default=1e-3,
-                        help="Explicit Tier-2 optimizer learning rate forwarded to main.py for Tier-2 runs.")
-    parser.add_argument("--dl_train_every", type=int, default=128,
-                        help="Explicit Tier-2 online training frequency forwarded to main.py for Tier-2 runs.")
-    parser.add_argument("--ppo_log_std_init", type=float, default=None,
-                        help="Pinned PPO log_std_init for canonical seed-suite runs.")
-    parser.add_argument("--enable_ppo_use_sde", action="store_true",
-                        help="Enable SB3 PPO gSDE. Default suite path stays vanilla without gSDE.")
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--ent_coef", type=float, default=0.03)
+    parser.add_argument("--ppo_log_std_init", type=float, default=None)
+    parser.add_argument("--enable_ppo_use_sde", action="store_true")
     parser.add_argument("--eval_data", type=str, default="evaluation_dataset/unseendata.csv")
     parser.add_argument("--eval_steps", type=int, default=None)
-    parser.add_argument("--tiers_eval_mode", type=str, default="deployed", choices=["paper", "deployed"],
-                        help="Evaluation mode forwarded to evaluation.py. Default is deployed so Tier-2 runs are checked with Tier-2 weights attached.")
-    parser.add_argument("--tiers_precompute_forecasts", action="store_true",
-                        help="When tiers_eval_mode=deployed, precompute/load the evaluation forecast cache for speed and determinism.")
-    parser.add_argument("--tiers_precompute_batch_size", type=int, default=8192,
-                        help="Batch size forwarded to evaluation.py when --tiers_precompute_forecasts is enabled.")
     parser.add_argument("--output_root", type=str, default="batch_tier_phase_runs")
     parser.add_argument("--suite_dir", type=str, default="",
-                        help="Optional existing suite directory to resume into. If empty, a new suite dir is created.")
+                        help="Existing suite directory to resume into. If empty, a new one is created.")
     parser.add_argument("--start_run_number", type=int, default=1,
                         help="Global run number to start from (1-based) for resume after OOM.")
     parser.add_argument("--end_run_number", type=int, default=None,
                         help="Optional global run number to stop at (inclusive).")
     parser.add_argument("--run_tag", type=str, default="")
     parser.add_argument("--continue_on_error", action="store_true")
+    add_forecast_prior_override_args(parser)
 
     args = parser.parse_args()
+    if str(args.global_norm_mode).strip().lower() != "rolling_past":
+        print("Error: this suite is pinned to rolling_past for consistency. Use --global_norm_mode rolling_past.")
+        sys.exit(1)
     seeds = _parse_seeds(args.seeds)
     if not seeds:
         print("Error: No valid seeds provided.")
@@ -360,11 +355,13 @@ def main():
     phase_variants = PHASE_VARIANTS[args.phase]
     py = sys.executable
     eval_steps = resolve_eval_steps(args.eval_data, args.eval_steps)
+
     if str(args.suite_dir).strip():
         suite_dir = str(args.suite_dir).strip()
         os.makedirs(suite_dir, exist_ok=True)
     else:
         suite_dir = _build_suite_dir(args.output_root, args.phase, args.run_tag)
+
     summary_csv = os.path.join(suite_dir, f"{args.phase}_seed_suite_summary.csv")
     run_plan_csv = os.path.join(suite_dir, f"{args.phase}_run_plan.csv")
 
@@ -383,23 +380,51 @@ def main():
     ]
     if args.ppo_log_std_init is not None:
         common_args.extend(["--ppo_log_std_init", str(args.ppo_log_std_init)])
-    if str(getattr(args, "rolling_past_history_dir", "")).strip():
-        common_args.extend([
-            "--rolling_past_history_dir", str(args.rolling_past_history_dir).strip(),
-        ])
+    eff_roll = _effective_rolling_past_history_dir(args)
+    if eff_roll:
+        common_args.extend(["--rolling_past_history_dir", eff_roll])
     if bool(args.enable_ppo_use_sde):
         common_args.append("--ppo_use_sde")
-    baseline_policy_args = []
+
     forecast_args = [
-        "--forecast_training_dataset_dir", args.forecast_training_dataset_dir,
-        "--forecast_base_dir", args.forecast_base_dir,
         "--forecast_cache_dir", args.forecast_cache_dir,
     ]
-    tier2_policy_args = [
-        "--tier2_value_lr", str(args.tier2_value_lr),
-        "--dl_train_every", str(args.dl_train_every),
-    ]
+    forecast_prior_overrides = collect_forecast_prior_overrides(args)
+    forecast_prior_args = forecast_prior_override_cli_args(args)
+
+    base_contract = build_runtime_contract(
+        global_norm_mode=str(args.global_norm_mode),
+        rolling_past_history_dir=eff_roll,
+        investment_freq=int(args.investment_freq),
+        meta_freq_min=int(args.meta_freq_min),
+        meta_freq_max=int(args.meta_freq_max),
+        enable_forecast_utilization=False,
+    )
+    base_contract_hash = runtime_contract_hash(base_contract)
+    forecast_contract = build_runtime_contract(
+        global_norm_mode=str(args.global_norm_mode),
+        rolling_past_history_dir=eff_roll,
+        investment_freq=int(args.investment_freq),
+        meta_freq_min=int(args.meta_freq_min),
+        meta_freq_max=int(args.meta_freq_max),
+        enable_forecast_utilization=True,
+        forecast_prior_settings=forecast_prior_contract_settings(forecast_prior_overrides),
+    )
+    runtime_contracts_by_variant = {
+        "tier1": base_contract,
+        "tier1_forecast_utilization": forecast_contract,
+    }
+    runtime_contract_hashes_by_variant = {
+        key: runtime_contract_hash(value)
+        for key, value in runtime_contracts_by_variant.items()
+    }
+    active_runtime_contract_hashes = {
+        key: runtime_contract_hashes_by_variant[key]
+        for key in phase_variants
+    }
+
     protocol_path = os.path.join(suite_dir, "phase_protocol.json")
+
     if str(args.suite_dir).strip():
         existing_protocol = _load_existing_protocol(protocol_path)
         if existing_protocol:
@@ -411,8 +436,8 @@ def main():
                 "meta_freq_max": int(args.meta_freq_max),
                 "ppo_use_sde": bool(args.enable_ppo_use_sde),
                 "ppo_log_std_init": None if args.ppo_log_std_init is None else float(args.ppo_log_std_init),
-                "tier2_value_lr": float(args.tier2_value_lr),
-                "dl_train_every": int(args.dl_train_every),
+                "runtime_contract_hash": base_contract_hash,
+                "variant_runtime_contract_hashes": active_runtime_contract_hashes,
             }
             for key, expected in compatibility_checks.items():
                 actual = existing_protocol.get(key)
@@ -422,49 +447,75 @@ def main():
                         f"existing={actual!r}, requested={expected!r}"
                     )
                     sys.exit(1)
+            if str(args.global_norm_mode).strip().lower() == "rolling_past":
+                exp_roll = _effective_rolling_past_history_dir(args)
+                act_roll = str(existing_protocol.get("rolling_past_history_dir", "") or "").strip()
+                norm_roll = lambda x: x or DEFAULT_ROLLING_PAST_HISTORY_DIR
+                if norm_roll(act_roll) != norm_roll(exp_roll):
+                    print(
+                        "Error: suite_dir protocol mismatch for 'rolling_past_history_dir' "
+                        f"(normalized): existing={act_roll!r}, requested={exp_roll!r}"
+                    )
+                    sys.exit(1)
+
     write_phase_protocol_json(
         protocol_path,
         {
             "phase": args.phase,
+            "phase_variants": list(phase_variants),
             "global_norm_mode": str(args.global_norm_mode),
-            "rolling_past_history_dir": str(getattr(args, "rolling_past_history_dir", "") or ""),
+            "rolling_past_history_dir": _effective_rolling_past_history_dir(args),
+            "runtime_contract": base_contract,
+            "runtime_contract_hash": base_contract_hash,
+            "variant_runtime_contracts": {
+                key: runtime_contracts_by_variant[key]
+                for key in phase_variants
+            },
+            "variant_runtime_contract_hashes": active_runtime_contract_hashes,
             "investment_freq": int(args.investment_freq),
             "meta_freq_min": int(args.meta_freq_min),
             "meta_freq_max": int(args.meta_freq_max),
             "ppo_use_sde": bool(args.enable_ppo_use_sde),
             "ppo_log_std_init": None if args.ppo_log_std_init is None else float(args.ppo_log_std_init),
-            "tier2_value_lr": float(args.tier2_value_lr),
-            "dl_train_every": int(args.dl_train_every),
-            "tiers_eval_mode": str(args.tiers_eval_mode),
-            "tiers_precompute_forecasts": bool(args.tiers_precompute_forecasts),
-            "tiers_precompute_batch_size": int(args.tiers_precompute_batch_size),
             "shared_training_args": common_args,
-            "tier1_policy_args": baseline_policy_args,
-            "forecast_args_for_tier2": forecast_args,
-            "tier2_policy_args": tier2_policy_args,
-            "documentation": (
-                "Tier 1 uses the hybrid RL baseline. Tier 2 is an independent forecast-guided enhanced MARL "
-                "baseline that trains its own RL policies together with its own ANN-primary short-horizon "
-                "forecast-conditioned Tier-2 layer. Tier 2 ablated keeps the same training contract but removes "
-                "the full Tier-2 forecast-memory block."
-            ),
-            "tier2_training_contract": "independent_forecast_guided_enhanced_marl_baseline",
+            "forecast_args": forecast_args,
+            "forecast_prior_overrides": forecast_prior_overrides,
         },
     )
+
     # Build full run plan with deterministic global numbering.
     planned_runs = []
     global_run = 0
     for seed in seeds:
         seed_dir = os.path.join(suite_dir, f"seed{seed}")
         os.makedirs(seed_dir, exist_ok=True)
+        # Pre-resolve save_dirs by canonical variant within this seed so that
+        # variants with reuse_train_from=<other> point at <other>'s save_dir.
+        save_dir_by_canonical = {}
+        for canonical in phase_variants:
+            spec = VARIANT_TRAIN_SPECS[canonical]
+            reuse_from = spec.get("reuse_train_from")
+            if reuse_from:
+                if reuse_from not in save_dir_by_canonical:
+                    raise ValueError(
+                        f"Variant '{canonical}' has reuse_train_from='{reuse_from}' "
+                        f"but '{reuse_from}' has not been planned earlier in phase "
+                        f"'{args.phase}'. Reorder PHASE_VARIANTS so the source "
+                        f"variant comes first."
+                    )
+                save_dir_by_canonical[canonical] = save_dir_by_canonical[reuse_from]
+            else:
+                save_dir_by_canonical[canonical] = os.path.join(
+                    seed_dir, f"{spec['slug']}_seed{seed}"
+                )
         for idx, canonical in enumerate(phase_variants, 1):
             spec = VARIANT_TRAIN_SPECS[canonical]
-            save_dir = os.path.join(seed_dir, f"{spec['slug']}_seed{seed}")
+            save_dir = save_dir_by_canonical[canonical]
             eval_out = os.path.join(seed_dir, "evaluations_2025", canonical)
             global_run += 1
             planned_runs.append({
                 "global_run_number": global_run,
-                "total_planned_runs": 0,  # filled below
+                "total_planned_runs": 0,
                 "seed": seed,
                 "seed_run_order": idx,
                 "run_name": spec["name"],
@@ -493,7 +544,7 @@ def main():
     print(f"\nPhase: {args.phase}")
     print(f"Seeds: {seeds}")
     print(f"Suite dir: {suite_dir}")
-    print(f"Protocol doc: {protocol_path}")
+    print(f"Protocol: {protocol_path}")
     print(f"Run plan CSV: {run_plan_csv}")
     print(f"Summary CSV: {summary_csv}\n")
     print(f"Run range: {args.start_run_number}..{end_run} / {total_runs}\n")
@@ -513,21 +564,43 @@ def main():
         spec = VARIANT_TRAIN_SPECS[canonical]
         save_dir = str(plan["save_dir"])
         eval_out = str(plan["eval_output_dir"])
-        current_seed_dir = os.path.join(suite_dir, f"seed{seed}")
-        current_tier1_dir = os.path.join(
-            current_seed_dir,
-            f"{VARIANT_TRAIN_SPECS['tier1']['slug']}_seed{seed}",
-        )
 
-        extra = list(spec["extra"])
-        train_extra_args = []
-        if canonical != "tier1":
-            train_extra_args = list(baseline_policy_args) + forecast_args + tier2_policy_args
-        else:
-            train_extra_args = list(baseline_policy_args)
         label = f"[Run {run_no}/{total_runs}] {spec['name']} (seed={seed}, order={idx})"
-        train_cmd = [py, "main.py"] + common_args + ["--seed", str(seed), "--save_dir", save_dir] + train_extra_args + extra
-        train_result = run_command(train_cmd, label)
+        variant_extra = list(spec.get("extra", []) or [])
+        reuse_from = spec.get("reuse_train_from")
+        if reuse_from:
+            print(f"\n[REUSE_TRAIN] {label}: reusing trained checkpoint from variant "
+                  f"'{reuse_from}' at {save_dir}")
+            if not os.path.isdir(os.path.join(save_dir, "final_models")):
+                train_result = {
+                    "success": False,
+                    "returncode": -2,
+                    "duration_seconds": 0,
+                    "started_at": datetime.now().isoformat(),
+                    "finished_at": datetime.now().isoformat(),
+                }
+                print(f"[REUSE_TRAIN][ERROR] expected final_models dir not found at "
+                      f"{save_dir}; the source variant must have completed training.")
+            else:
+                train_result = {
+                    "success": True,
+                    "returncode": 0,
+                    "duration_seconds": 0,
+                    "started_at": datetime.now().isoformat(),
+                    "finished_at": datetime.now().isoformat(),
+                    "reused_from": reuse_from,
+                }
+        else:
+            train_cmd = (
+                [py, "main.py"]
+                + common_args
+                + ["--seed", str(seed), "--save_dir", save_dir]
+                + forecast_args
+                + variant_extra
+            )
+            if canonical == "tier1_forecast_utilization":
+                train_cmd += forecast_prior_args
+            train_result = run_command(train_cmd, label)
 
         row = {
             "phase": args.phase,
@@ -549,23 +622,31 @@ def main():
             eval_dir_arg = EVAL_DIR_ARG_BY_VARIANT[canonical]
             os.makedirs(eval_out, exist_ok=True)
             tiers_only_val = EVAL_TIERS_ONLY_BY_VARIANT[canonical]
+            # Variant-specific eval forecast-cache override (FoCAL needs the
+            # episode-20 unseen-data cache; baseline ignores the cache entirely).
+            eval_forecast_cache_dir = (
+                EVAL_FORECAST_CACHE_DIR_OVERRIDE.get(canonical, "")
+                or args.forecast_cache_dir
+            )
             eval_cmd = [
-                py, "evaluation.py", "--mode", "tiers", "--tiers_only", tiers_only_val,
+                py, "evaluation.py", "--mode", "tiers",
+                "--tiers_only", tiers_only_val,
                 eval_dir_arg, save_dir,
-                "--tier1_dir", current_tier1_dir,
                 "--eval_data", args.eval_data,
                 "--eval_steps", str(eval_steps),
                 "--output_dir", eval_out,
                 "--investment_freq", str(args.investment_freq),
                 "--meta_freq_min", str(args.meta_freq_min),
                 "--meta_freq_max", str(args.meta_freq_max),
-                "--tiers_eval_mode", str(args.tiers_eval_mode),
-                "--forecast_base_dir", args.forecast_base_dir,
-                "--forecast_cache_dir", args.forecast_cache_dir,
-                "--tiers_precompute_batch_size", str(args.tiers_precompute_batch_size),
+                "--global_norm_mode", str(args.global_norm_mode),
+                "--forecast_cache_dir", eval_forecast_cache_dir,
             ]
-            if bool(args.tiers_precompute_forecasts):
-                eval_cmd.append("--tiers_precompute_forecasts")
+            # Variant-specific eval extras (e.g., extra eval-only flags).
+            eval_cmd.extend(list(spec.get("eval_extra", []) or []))
+            if canonical == "tier1_forecast_utilization":
+                eval_cmd.extend(forecast_prior_args)
+            if eff_roll:
+                eval_cmd.extend(["--rolling_past_history_dir", eff_roll])
             eval_label = f"[Run {run_no}/{total_runs}] Eval {canonical} (seed={seed})"
             eval_result = run_command(eval_cmd, eval_label)
             row["evaluation_success"] = eval_result.get("success", False)

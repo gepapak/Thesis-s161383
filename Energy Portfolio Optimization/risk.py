@@ -125,14 +125,6 @@ class EnhancedRiskController:
                 'liquidity': 0.15,
                 'regulatory': 0.15
             }
-        self.forecast_uncertainty_risk_weight = float(
-            np.clip(
-                getattr(config, 'forecast_uncertainty_risk_weight', 0.10) if config else 0.10,
-                0.0,
-                1.0,
-            )
-        )
-
         # Adaptive thresholds from config
         if config and hasattr(config, 'risk_thresholds'):
             self.adaptive_thresholds = config.risk_thresholds.copy()
@@ -342,63 +334,6 @@ class EnhancedRiskController:
             self.logger.warning(f"Regulatory risk calculation failed: {e}")
             return REGULATORY_RISK_FALLBACK_ERROR
 
-    def calculate_forecast_uncertainty_risk(self, env_state: Dict) -> float:
-        """
-        FIX #6: Calculate risk from forecast uncertainty (MAPE-based).
-        
-        Maps forecast MAPE (Mean Absolute Percentage Error) to risk:
-        - MAPE < 5%: Low uncertainty risk (0.0)
-        - MAPE 5-10%: Moderate risk (0.2-0.4)
-        - MAPE 10-20%: High risk (0.4-0.7)
-        - MAPE > 20%: Very high risk (0.7-1.0)
-        
-        Returns a value in [0, 1].
-        """
-        try:
-            # Get forecast MAPE if available from env
-            forecast_mape = float(env_state.get('forecast_mape', 0.15))
-            
-            # Map MAPE to risk [0, 1]
-            # MAPE is typically 0.05 to 0.35; map nonlinearly to emphasize high error
-            forecast_mape = float(np.clip(forecast_mape, 0.0, 0.4))
-            
-            if forecast_mape < 0.05:
-                risk = 0.0
-            elif forecast_mape < 0.10:
-                risk = (forecast_mape - 0.05) / 0.05 * 0.3  # [0.0, 0.3]
-            elif forecast_mape < 0.20:
-                risk = 0.3 + (forecast_mape - 0.10) / 0.10 * 0.4  # [0.3, 0.7]
-            else:
-                risk = 0.7 + (forecast_mape - 0.20) / 0.20 * 0.3  # [0.7, 1.0]
-            
-            # Extract forecast quantiles if available (alternative method)
-            price_forecasts = env_state.get('price_forecasts', [])
-            if isinstance(price_forecasts, (list, tuple)) and len(price_forecasts) >= 3:
-                # Assume forecasts are [q10, q50, q90] or similar
-                forecasts = np.array(price_forecasts, dtype=np.float64)
-                if len(forecasts) >= 3:
-                    q10, q50, q90 = forecasts[0], forecasts[1], forecasts[2]
-                    if q50 > 0:
-                        uncertainty = (q90 - q10) / q50  # Relative spread
-                        # Combine MAPE and quantile uncertainty
-                        quantile_risk = float(np.clip(uncertainty * 0.5, 0.0, 1.0))
-                        risk = 0.6 * risk + 0.4 * quantile_risk  # Blend approaches
-
-            # Fallback: use price volatility as proxy for forecast uncertainty
-            if len(self.price_history) >= 5:
-                prices = np.array(list(self.price_history)[-5:], dtype=np.float64)
-                volatility = np.std(prices) / max(np.mean(prices), 1.0)
-                volatility_risk = float(np.clip(volatility * 2.0, 0.0, 1.0))
-                # If MAPE not available, use volatility as fallback
-                if forecast_mape == 0.15:  # Default value
-                    risk = 0.5 * risk + 0.5 * volatility_risk
-
-            return float(np.clip(risk, 0.0, 1.0))
-        except Exception as e:
-            msg = f"[RISK_FORECAST_UNCERTAINTY_FATAL] Forecast uncertainty risk calculation failed: {e}"
-            self.logger.error(msg)
-            raise RuntimeError(msg) from e
-
     # ----------------------------- Aggregation & API -----------------------------
 
     def calculate_comprehensive_risk(self, env_state: Dict) -> Dict[str, float]:
@@ -426,9 +361,6 @@ class EnhancedRiskController:
                 'battery': _cap('battery_capacity_mwh', 'battery_capacity'),
             }
 
-            # ENHANCEMENT: Add forecast uncertainty risk
-            forecast_uncertainty_risk = self.calculate_forecast_uncertainty_risk(env_state)
-
             financial_positions = env_state.get('financial_positions')
             if isinstance(financial_positions, dict):
                 fp = financial_positions
@@ -441,7 +373,6 @@ class EnhancedRiskController:
                 'portfolio_risk':   self.calculate_portfolio_risk(capacities, budget, initial_budget, financial_positions=fp),
                 'liquidity_risk':   self.calculate_liquidity_risk(budget, initial_budget),
                 'regulatory_risk':  self.calculate_regulatory_risk(timestep),
-                'forecast_uncertainty_risk': forecast_uncertainty_risk,
             }
 
             w_market = max(0.0, float(self.risk_weights.get('market', 0.0)))
@@ -454,8 +385,7 @@ class EnhancedRiskController:
                 w_market, w_oper, w_port, w_liq, w_reg = 0.25, 0.20, 0.25, 0.15, 0.15
                 base_sum = 1.0
 
-            forecast_w = float(np.clip(self.forecast_uncertainty_risk_weight, 0.0, 1.0))
-            base_scale = (1.0 - forecast_w) / base_sum
+            base_scale = 1.0 / base_sum
             overall = (
                 base_scale * (
                     w_market * comp['market_risk'] +
@@ -464,7 +394,6 @@ class EnhancedRiskController:
                     w_liq * comp['liquidity_risk'] +
                     w_reg * comp['regulatory_risk']
                 )
-                + forecast_w * comp['forecast_uncertainty_risk']
             )
 
             # Apply adaptive scaling to prevent saturation

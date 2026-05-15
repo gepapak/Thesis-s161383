@@ -3,7 +3,6 @@ Centralized Logging Module
 
 This module provides:
 1. Centralized application logging configuration
-2. RewardLogger: CSV data logging for Tier 1 vs Tier 2 comparison
 
 ALL logging should go through this module - no print() statements or direct logging.basicConfig() calls.
 """
@@ -171,7 +170,7 @@ def emit_progress_lines(lines) -> None:
         try:
             if isinstance(handler, ProgressAwareConsoleHandler):
                 stream = getattr(handler, "stream", None)
-                if stream is not None and stream.__class__.__name__ == "TeeOutput":
+                if stream is not None and isinstance(stream, TeeOutput):
                     console_captures_file = True
                     break
         except Exception:
@@ -321,7 +320,6 @@ class RewardLogger:
     def __init__(self, log_dir: str = "debug_logs", tier_name: str = "tier1"):
         self.log_dir = log_dir
         self.tier_name = tier_name
-        self.is_tier2 = tier_name in ("tier2", "tier2_ablated")
         self.flush_every_steps = 100
         os.makedirs(log_dir, exist_ok=True)
 
@@ -362,15 +360,77 @@ class RewardLogger:
             'fund_nav_usd',
             'fund_nav_dkk',
             'price_return_1step',
-            'price_return_forecast',
+            'price_return_invfreq',
+            'training_return',
+            'training_horizon_steps',
             'investor_action',
         ]
+
+        # ---- Battery operator health ----
+        self.battery_health_fields = [
+            'bat_action_idx',
+            'bat_q_max',
+            'bat_q_chosen',
+            'bat_reward_step',
+        ]
+        self.battery_health_context_fields = [
+            'episode', 'timestep', 'training_global_step',
+            'bat_decision_step', 'bat_soc', 'bat_spread',
+            'bat_energy', 'bat_capacity',
+            'battery_reward',
+        ]
+
+        # ---- Risk controller health ----
+        self.risk_health_fields = [
+            'risk_action_raw',
+            'risk_reward_step',
+            'risk_value',
+            'risk_value_next',
+            'risk_td_error',
+        ]
+        self.risk_health_context_fields = [
+            'episode', 'timestep', 'training_global_step',
+            'risk_decision_step', 'risk_multiplier',
+            'risk_drawdown', 'overall_risk_snapshot',
+            'risk_score',
+        ]
+
+        # ---- Meta controller health ----
+        self.meta_health_fields = [
+            'meta_action_raw',
+            'meta_reward_step',
+            'meta_value',
+            'meta_value_next',
+            'meta_td_error',
+        ]
+        self.meta_health_context_fields = [
+            'episode', 'timestep', 'training_global_step',
+            'meta_decision_step', 'meta_cap_fraction',
+            'meta_budget_n',
+            'base_reward',
+        ]
         
+        # Combined field order for each agent's health CSV (context + health fields in one row)
+        self.investor_health_all_fields = self.investor_health_context_fields + [
+            f for f in self.investor_health_fields if f not in self.investor_health_context_fields
+        ]
+        self.battery_health_all_fields = self.battery_health_context_fields + [
+            f for f in self.battery_health_fields if f not in self.battery_health_context_fields
+        ]
+        self.risk_health_all_fields = self.risk_health_context_fields + [
+            f for f in self.risk_health_fields if f not in self.risk_health_context_fields
+        ]
+        self.meta_health_all_fields = self.meta_health_context_fields + [
+            f for f in self.meta_health_fields if f not in self.meta_health_context_fields
+        ]
+
         # CSV file for step-by-step logging (will be set per episode)
         self.csv_file = None
         self.csv_writer = None
         self.csv_file_handle = None
-        self.episode_investor_health_rows = []
+        # Per-agent health CSV handles (written incrementally, one row per log_step)
+        self.agent_health_handles = {}   # key: 'investor'|'battery'|'risk'|'meta'
+        self.agent_health_writers = {}   # matching DictWriters
         
         # Category-specific CSV writers (portfolio, forecast, rewards, positions)
         self.category_writers = {}
@@ -387,13 +447,16 @@ class RewardLogger:
                 # Fund NAV component breakdown (DKK)
                 'fund_nav_dkk', 'trading_cash_dkk', 'trading_sleeve_value_dkk', 'physical_book_value_dkk',
                 'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
+                'total_distributions_dkk', 'distribution_adjusted_nav_dkk',
+                'distribution_adjusted_trading_sleeve_dkk',
                 'depreciation_ratio', 'years_elapsed',
                 # NAV attribution drivers (per-step fund NAV, not trading cash)
                 'nav_start', 'nav_end', 'pnl_total', 'pnl_battery', 'pnl_generation', 'pnl_hedge', 'cash_delta_ops',
                 # Battery dispatch metrics (FIX #5)
                 'battery_decision', 'battery_intensity', 'battery_spread', 'battery_adjusted_hurdle', 'battery_volatility_adj',
                 # Price & returns
-                'price_current', 'price_return_1step', 'price_return_forecast'
+                'price_current', 'price_return_1step', 'price_return_invfreq',
+                'training_return', 'training_horizon_steps'
             ],
             'positions': [
                 'episode', 'timestep',
@@ -402,40 +465,11 @@ class RewardLogger:
                 'decision_step', 'exposure_exec', 'action_sign',
                 'trade_signal_active', 'trade_signal_sign',
                 'risk_multiplier', 'tradeable_capital', 'mtm_exit_count',
+                'forecast_prior_exposure', 'forecast_prior_target', 'forecast_prior_blend',
+                'forecast_prior_active', 'forecast_prior_skill', 'forecast_prior_hit_lcb',
+                'forecast_prior_residual_q', 'forecast_prior_magnitude',
+                'forecast_prior_edge_excess', 'forecast_prior_reason',
                 'investor_action', 'battery_action',
-                'tier2_overlay_enabled', 'tier2_overlay_delta', 'tier2_overlay_pred_sigma', 'tier2_overlay_reliability',
-                'tier2_overlay_gain', 'tier2_overlay_forecast_trust',
-                'tier2_overlay_calibrated_forecast_trust',
-                'tier2_overlay_mape_quality',
-                'tier2_overlay_alignment', 'tier2_overlay_forecast_signal',
-                'tier2_overlay_edge_signal', 'tier2_overlay_consensus_signal',
-                'tier2_overlay_curvature_signal', 'tier2_overlay_uncertainty_quality',
-                'tier2_overlay_metadata_skill', 'tier2_overlay_imbalance_signal',
-                'tier2_overlay_context_strength', 'tier2_overlay_realized_gain_signal',
-                'tier2_overlay_target_delta', 'tier2_overlay_delta_prediction', 'tier2_overlay_sharpe_signal',
-                'tier2_overlay_sharpe_before', 'tier2_overlay_sharpe_after',
-                'tier2_overlay_sharpe_delta',
-                'tier2_overlay_value_prediction', 'tier2_overlay_value_lcb',
-                'tier2_overlay_nav_prediction', 'tier2_overlay_nav_lcb',
-                'tier2_overlay_return_floor_prediction', 'tier2_overlay_return_floor_lcb',
-                'tier2_overlay_tail_risk_prediction',
-                'tier2_overlay_value_gate', 'tier2_overlay_nav_gate',
-                'tier2_overlay_return_floor_gate', 'tier2_overlay_delta_gate',
-                'tier2_overlay_learned_gate',
-                'tier2_overlay_certified_override_gain',
-                'tier2_overlay_dominant_expert_weight',
-                'tier2_overlay_expert_weight_entropy',
-                'tier2_overlay_internal_base_weight',
-                'tier2_overlay_internal_trend_weight',
-                'tier2_overlay_internal_reversion_weight',
-                'tier2_overlay_internal_defensive_weight',
-                # ACRP-v2 diagnostics
-                'tier2_overlay_acrp_trust_radius',
-                'tier2_overlay_acrp_advantage_strength',
-                'tier2_overlay_acrp_da_learned_scalar',
-                'tier2_overlay_acrp_attn_gate_weight',
-                'tier2_overlay_acrp_attn_conf_weight',
-                'tier2_overlay_acrp_attn_outlook_weight',
                 'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw',
                 'inv_action_mean', 'inv_action_sigma', 'inv_action_sample',
                 'inv_tanh_mu', 'inv_tanh_a',
@@ -443,13 +477,7 @@ class RewardLogger:
                 'inv_mu_abs_roll', 'inv_mu_sign_consistency',
                 'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
                 'inv_reward_step', 'inv_value', 'inv_value_next', 'inv_td_error'
-                , 'probe_r2_base', 'probe_r2_base_plus_signal', 'probe_delta_r2'
             ],
-             'forecast': ['episode', 'timestep', 'z_short', 'z_medium', 'z_long', 'z_combined',
-                          'tier2_expert_confidence', 'forecast_confidence', 'forecast_mape', 'forecast_trust',
-                          'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason', 'agent_followed_forecast',
-                          'mape_short', 'mape_medium', 'mape_long',
-                          'obs_trade_signal'],
             'rewards': ['episode', 'timestep', 'base_reward', 'investor_reward', 'battery_reward',
                         'risk_score', 'operational_score']
         }
@@ -461,12 +489,6 @@ class RewardLogger:
             field for field in self.category_fields['positions']
             if field not in self.investor_health_fields
         ]
-        if not self.is_tier2:
-            self.category_fields.pop('forecast', None)
-            self.category_fields['positions'] = [
-                field for field in self.category_fields['positions']
-                if not field.startswith('tier2_overlay_')
-            ]
 
     @staticmethod
     def _strip_row_fields(row: dict, prefixes) -> None:
@@ -475,12 +497,7 @@ class RewardLogger:
                 row.pop(key, None)
 
     def _filter_main_fieldnames(self, fieldnames):
-        filtered = []
-        for name in fieldnames:
-            if not self.is_tier2 and name.startswith('tier2_overlay_'):
-                continue
-            filtered.append(name)
-        return filtered
+        return list(fieldnames)
 
     def _should_flush(self, timestep: int) -> bool:
         try:
@@ -500,6 +517,12 @@ class RewardLogger:
                     handle.flush()
             except Exception:
                 pass
+        for handle in self.agent_health_handles.values():
+            try:
+                if handle is not None:
+                    handle.flush()
+            except Exception:
+                pass
         
     def start_episode(self, episode_num: int):
         """Initialize logging for a new episode - creates a new CSV file per episode"""
@@ -508,22 +531,27 @@ class RewardLogger:
             self.csv_file_handle.close()
             self.csv_file_handle = None
             self.csv_writer = None
-        
+
         # Close previous category files
         for handle in self.category_handles.values():
             if handle is not None:
                 handle.close()
         self.category_handles.clear()
         self.category_writers.clear()
-        
+
+        # Close previous agent health files
+        for handle in self.agent_health_handles.values():
+            if handle is not None:
+                handle.close()
+        self.agent_health_handles.clear()
+        self.agent_health_writers.clear()
+
         self.current_episode = episode_num
-        self.episode_investor_health_rows = []
-        
-        # Create new CSV file for this episode (renamed from _reward_debug_ to _debug_)
-        # Single canonical file name per episode.
+
+        # Create new CSV file for this episode.
         # Desired behavior: re-running an episode overwrites its prior logs (e.g., after OOM/restart).
         self.csv_file = os.path.join(self.log_dir, f"{self.tier_name}_debug_ep{episode_num}.csv")
-        
+
         try:
             # Always create new file (write mode) for each episode
             self.csv_file_handle = open(self.csv_file, 'w', newline='', encoding='utf-8')
@@ -531,9 +559,32 @@ class RewardLogger:
             self.csv_writer.writeheader()
             self.csv_file_handle.flush()
             logging.info(f"[LOGGER] Created new log file for episode {episode_num}: {self.csv_file}")
-            
+
             # Create category-specific CSV files
             self._create_category_csvs(episode_num)
+
+            # Create per-agent health CSV files (one per agent, written incrementally)
+            _agent_health_specs = [
+                ('investor', self.investor_health_all_fields),
+                ('battery',  self.battery_health_all_fields),
+                ('risk',     self.risk_health_all_fields),
+                ('meta',     self.meta_health_all_fields),
+            ]
+            for agent_key, fields in _agent_health_specs:
+                health_path = os.path.join(
+                    self.log_dir,
+                    f"{self.tier_name}_{agent_key}_health_ep{episode_num}.csv"
+                )
+                try:
+                    h = open(health_path, 'w', newline='', encoding='utf-8')
+                    w = csv.DictWriter(h, fieldnames=fields, extrasaction='ignore')
+                    w.writeheader()
+                    h.flush()
+                    self.agent_health_handles[agent_key] = h
+                    self.agent_health_writers[agent_key] = w
+                    logging.info(f"[LOGGER] Created {agent_key} health log: {health_path}")
+                except Exception as e:
+                    logging.warning(f"[LOGGER] Could not create {agent_key} health CSV: {e}")
         except Exception as e:
             logging.exception(f"[LOGGER] ERROR creating log file {self.csv_file}: {e}")
     
@@ -566,30 +617,19 @@ class RewardLogger:
                  trading_sleeve_value_usd_thousands: float = 0.0,
                  trading_mtm_tracker_usd_thousands: float = 0.0,
                  operating_revenue_usd_thousands: float = 0.0,
-                 # Fund NAV component breakdown (DKK)
+                # Fund NAV component breakdown (DKK)
                  fund_nav_dkk: float = 0.0,
+                 distribution_adjusted_nav_dkk: float = 0.0,
+                 total_distributions_dkk: float = 0.0,
                  trading_cash_dkk: float = 0.0,
                  trading_sleeve_value_dkk: float = 0.0,
+                 distribution_adjusted_trading_sleeve_dkk: float = 0.0,
                  physical_book_value_dkk: float = 0.0,
                  accumulated_operational_revenue_dkk: float = 0.0,
                  financial_mtm_dkk: float = 0.0,
                  financial_exposure_dkk: float = 0.0,
                  depreciation_ratio: float = 0.0,
                  years_elapsed: float = 0.0,
-                 # Forecast signals
-                 z_short: float = 0.0,
-                 z_medium: float = 0.0,
-                 z_long: float = 0.0,
-                 z_combined: float = 0.0,
-                 tier2_expert_confidence: float = 0.0,
-                 forecast_confidence: float = 0.0,
-                 forecast_trust: float = 0.0,
-                 # OBSERVATION-LEVEL forecast signals (what the policy sees after warmup/ablation)
-                 obs_z_short: float = 0.0,
-                 obs_z_long: float = 0.0,
-                 obs_forecast_trust: float = 0.0,
-                 obs_normalized_error: float = 0.0,
-                 obs_trade_signal: float = 0.0,
                  # Position info
                  position_signed: float = 0.0,
                  position_exposure: float = 0.0,
@@ -601,23 +641,33 @@ class RewardLogger:
                  risk_multiplier: float = 1.0,
                  tradeable_capital: float = 0.0,
                  mtm_exit_count: float = 0.0,
+                 forecast_prior_exposure: float = 0.0,
+                 forecast_prior_target: float = 0.0,
+                 forecast_prior_blend: float = 0.0,
+                 forecast_prior_active: float = 0.0,
+                 forecast_prior_skill: float = 0.0,
+                 forecast_prior_hit_lcb: float = 0.5,
+                 forecast_prior_residual_q: float = 0.0,
+                 forecast_prior_magnitude: float = 0.0,
+                 forecast_prior_edge_excess: float = 0.0,
+                 forecast_prior_reason: str = '',
                  # Price data (for forward-looking accuracy analysis)
                  price_current: float = 0.0,  # Raw price at current timestep (DKK/MWh)
                  # Price returns
                  price_return_1step: float = 0.0,
-                 price_return_forecast: float = 0.0,
+                 price_return_invfreq: float = 0.0,
+                 training_return: float = 0.0,
+                 training_horizon_steps: float = 0.0,
                  # Main reward components
                  operational_score: float = 0.0,
                  risk_score: float = 0.0,
                  hedging_score: float = 0.0,
                  nav_stability_score: float = 0.0,
-                 forecast_score: float = 0.0,
                  # Reward weights
                  weight_operational: float = 0.0,
                  weight_risk: float = 0.0,
                  weight_hedging: float = 0.0,
                  weight_nav: float = 0.0,
-                 weight_forecast: float = 0.0,
                  # Final rewards
                  base_reward: float = 0.0,
                  investor_reward: float = 0.0,
@@ -627,26 +677,6 @@ class RewardLogger:
                  # Actions
                  investor_action: Optional[Dict] = None,
                  battery_action: Optional[Dict] = None,
-                 # NEW: Enhanced debugging fields
-                 # Alignment debugging
-                 base_alignment: float = 0.0,
-                 profitability_factor: float = 0.0,
-                 alignment_multiplier: float = 0.0,
-                 misalignment_penalty_mult: float = 0.0,
-                 forecast_direction: float = 0.0,
-                 position_direction: float = 0.0,
-                 is_aligned: float = 0.0,
-                 alignment_status: str = '',
-                 # Correlation debugging
-                 corr_short: float = 0.0,
-                 corr_medium: float = 0.0,
-                 corr_long: float = 0.0,
-                 weight_short: float = 0.0,
-                 weight_medium: float = 0.0,
-                 weight_long: float = 0.0,
-                 use_short: bool = False,
-                 use_medium: bool = False,
-                 use_long: bool = False,
                  # Reward breakdown debugging
                  unrealized_pnl_norm: float = 0.0,
                  combined_confidence: float = 0.0,
@@ -655,71 +685,15 @@ class RewardLogger:
                  wind_pos_norm: float = 0.0,
                  solar_pos_norm: float = 0.0,
                  hydro_pos_norm: float = 0.0,
-                 # Forecast quality
-                 forecast_error: float = 0.0,
-                 forecast_mape: float = 0.0,
-                 realized_vs_forecast: float = 0.0,
-                 # NEW: Battery and generation forecast debugging
-                 z_short_wind: float = 0.0,
-                 z_short_solar: float = 0.0,
-                 z_short_hydro: float = 0.0,
-                 z_short_total_gen: float = 0.0,
-                 # NEW: Adaptive forecast weight
-                 adaptive_forecast_weight: float = 0.0,
-                 # NEW: Forecast utilization flag
-                 enable_forecast_util: bool = False,
-                 forecast_gate_passed: bool = False,
-                 forecast_used: bool = False,
-                 forecast_not_used_reason: str = '',
                  # NEW: Position alignment diagnostics (Bug #1 fix tracking)
                  position_alignment_status: str = 'no_strategy',
                  investor_position_ratio: float = 0.0,
                  investor_position_direction: int = 0,
                  investor_total_position: float = 0.0,
                  investor_exploration_bonus: float = 0.0,
-                 # NEW: Per-horizon MAPE tracking
-                 mape_short: float = 0.0,
-                 mape_medium: float = 0.0,
-                 mape_long: float = 0.0,
-                 mape_short_recent: float = 0.0,
-                 mape_medium_recent: float = 0.0,
-                 mape_long_recent: float = 0.0,
-                 # NEW: Per-horizon correlation tracking
-                 horizon_corr_short: float = 0.0,
-                 horizon_corr_medium: float = 0.0,
-                 horizon_corr_long: float = 0.0,
-                 # NEW: Per-asset forecast accuracy
-                 mape_wind: float = 0.0,
-                 mape_solar: float = 0.0,
-                 mape_hydro: float = 0.0,
-                 mape_price: float = 0.0,
-                 mape_load: float = 0.0,
-                 # NEW: Forecast deltas (for debugging strategy)
-                 forecast_delta_short: float = 0.0,
-                 forecast_delta_medium: float = 0.0,
-                 forecast_delta_long: float = 0.0,
-                 # NEW: MAPE thresholds (for debugging strategy)
-                 mape_threshold_short: float = 0.0,
-                 mape_threshold_medium: float = 0.0,
-                 mape_threshold_long: float = 0.0,
                  # NEW: Price floor diagnostics (Bug #4 fix tracking)
                  price_raw: float = 0.0,
                  price_floor_used: float = 0.0,
-                 # NEW: Directional accuracy
-                 direction_accuracy_short: float = 0.0,
-                 direction_accuracy_medium: float = 0.0,
-                 direction_accuracy_long: float = 0.0,
-                 # NEW: Battery forecast bonus
-                 battery_forecast_bonus: float = 0.0,
-                 # NEW: Forecast vs actual comparison (for deep debugging)
-                 current_price_dkk: float = 0.0,
-                 forecast_price_short_dkk: float = 0.0,
-                 forecast_price_medium_dkk: float = 0.0,
-                 forecast_price_long_dkk: float = 0.0,
-                 forecast_error_short_pct: float = 0.0,
-                 forecast_error_medium_pct: float = 0.0,
-                 forecast_error_long_pct: float = 0.0,
-                 agent_followed_forecast: bool = False,
                  # NEW: NAV attribution drivers (per-step fund NAV breakdown)
                  nav_start: float = 0.0,
                  nav_end: float = 0.0,
@@ -764,9 +738,34 @@ class RewardLogger:
                  inv_value: float = 0.0,
                  inv_value_next: float = 0.0,
                  inv_td_error: float = 0.0,
-                 probe_r2_base: float = 0.0,
-                 probe_r2_base_plus_signal: float = 0.0,
-                 probe_delta_r2: float = 0.0,
+                 # Battery operator health diagnostics
+                 bat_decision_step: float = 0.0,
+                 bat_action_idx: int = 0,
+                 bat_q_max: float = 0.0,
+                 bat_q_chosen: float = 0.0,
+                 bat_reward_step: float = 0.0,
+                 bat_soc: float = 0.0,
+                 bat_spread: float = 0.0,
+                 bat_energy: float = 0.0,
+                 bat_capacity: float = 0.0,
+                 # Risk controller health diagnostics
+                 risk_decision_step: float = 0.0,
+                 risk_action_raw: float = 0.0,
+                 risk_reward_step: float = 0.0,
+                 risk_value: float = 0.0,
+                 risk_value_next: float = 0.0,
+                 risk_td_error: float = 0.0,
+                 risk_drawdown: float = 0.0,
+                 overall_risk_snapshot: float = 0.0,
+                 # Meta controller health diagnostics
+                 meta_decision_step: float = 0.0,
+                 meta_action_raw: float = 0.0,
+                 meta_reward_step: float = 0.0,
+                 meta_value: float = 0.0,
+                 meta_value_next: float = 0.0,
+                 meta_td_error: float = 0.0,
+                 meta_cap_fraction: float = 0.0,
+                 meta_budget_n: float = 0.0,
                  **extra_fields: Any):
         """Log detailed step information"""
         # DEBUG to verify log_step is being called
@@ -786,76 +785,8 @@ class RewardLogger:
         if timestep % 100 == 0:
             logging.debug(f"[LOGGER] csv_writer EXISTS, writing row for timestep={timestep}")
 
-        # CRITICAL FIX: Use forecast_direction parameter instead of computing from z_combined
-        # The new approach uses forecast_direction (weighted combination of z-scores)
-        # instead of z_combined (correlation-based combination)
-        forecast_dir = forecast_direction
-        position_dir = position_direction
-        aligned = is_aligned
-        align_status = alignment_status if alignment_status else 'NEUTRAL'
-        tier2_overlay_enabled = float(extra_fields.get('tier2_overlay_enabled', 0.0))
-        tier2_overlay_delta = float(extra_fields.get('tier2_overlay_delta', 0.0))
-        tier2_overlay_pred_sigma = float(extra_fields.get('tier2_overlay_pred_sigma', 0.0))
-        tier2_overlay_reliability = float(extra_fields.get('tier2_overlay_reliability', 1.0))
-        tier2_overlay_gain = float(extra_fields.get('tier2_overlay_gain', 0.0))
-        tier2_overlay_forecast_trust = float(extra_fields.get('tier2_overlay_forecast_trust', 0.0))
-        tier2_overlay_mape_quality = float(extra_fields.get('tier2_overlay_mape_quality', 1.0))
-        tier2_overlay_alignment = float(extra_fields.get('tier2_overlay_alignment', 0.0))
-        tier2_overlay_forecast_signal = float(extra_fields.get('tier2_overlay_forecast_signal', 0.0))
-        tier2_overlay_edge_signal = float(extra_fields.get('tier2_overlay_edge_signal', 0.0))
-        tier2_overlay_consensus_signal = float(extra_fields.get('tier2_overlay_consensus_signal', 0.0))
-        tier2_overlay_curvature_signal = float(extra_fields.get('tier2_overlay_curvature_signal', 0.0))
-        tier2_overlay_uncertainty_quality = float(extra_fields.get('tier2_overlay_uncertainty_quality', 1.0))
-        tier2_overlay_route_uncertainty_quality = float(extra_fields.get('tier2_overlay_route_uncertainty_quality', 1.0))
-        tier2_overlay_metadata_skill = float(extra_fields.get('tier2_overlay_metadata_skill', 0.5))
-        tier2_overlay_imbalance_signal = float(extra_fields.get('tier2_overlay_imbalance_signal', 0.0))
-        tier2_overlay_context_strength = float(extra_fields.get('tier2_overlay_context_strength', 0.0))
-        tier2_overlay_realized_gain_signal = float(extra_fields.get('tier2_overlay_realized_gain_signal', 0.0))
-        tier2_overlay_target_delta = float(extra_fields.get('tier2_overlay_target_delta', 0.0))
-        tier2_overlay_delta_prediction = float(extra_fields.get('tier2_overlay_delta_prediction', 0.0))
-        tier2_overlay_sharpe_signal = float(extra_fields.get('tier2_overlay_sharpe_signal', 0.0))
-        tier2_overlay_sharpe_before = float(extra_fields.get('tier2_overlay_sharpe_before', 0.0))
-        tier2_overlay_sharpe_after = float(extra_fields.get('tier2_overlay_sharpe_after', 0.0))
-        tier2_overlay_sharpe_delta = float(extra_fields.get('tier2_overlay_sharpe_delta', 0.0))
-        tier2_overlay_value_prediction = float(extra_fields.get('tier2_overlay_value_prediction', 0.0))
-        tier2_overlay_value_lcb = float(extra_fields.get('tier2_overlay_value_lcb', 0.0))
-        tier2_overlay_nav_prediction = float(extra_fields.get('tier2_overlay_nav_prediction', 0.0))
-        tier2_overlay_nav_lcb = float(extra_fields.get('tier2_overlay_nav_lcb', 0.0))
-        tier2_overlay_return_floor_prediction = float(extra_fields.get('tier2_overlay_return_floor_prediction', 0.0))
-        tier2_overlay_return_floor_lcb = float(extra_fields.get('tier2_overlay_return_floor_lcb', 0.0))
-        tier2_overlay_tail_risk_prediction = float(extra_fields.get('tier2_overlay_tail_risk_prediction', 0.0))
-        tier2_overlay_value_gate = float(extra_fields.get('tier2_overlay_value_gate', 0.0))
-        tier2_overlay_nav_gate = float(extra_fields.get('tier2_overlay_nav_gate', 0.0))
-        tier2_overlay_return_floor_gate = float(extra_fields.get('tier2_overlay_return_floor_gate', 0.0))
-        tier2_overlay_delta_gate = float(extra_fields.get('tier2_overlay_delta_gate', 0.0))
-        tier2_overlay_dominant_expert_weight = float(
-            extra_fields.get('tier2_overlay_dominant_expert_weight', 0.0)
-        )
-        tier2_overlay_expert_weight_entropy = float(
-            extra_fields.get('tier2_overlay_expert_weight_entropy', 0.0)
-        )
-        tier2_overlay_internal_base_weight = float(
-            extra_fields.get('tier2_overlay_internal_base_weight', 0.0)
-        )
-        tier2_overlay_internal_trend_weight = float(
-            extra_fields.get('tier2_overlay_internal_trend_weight', 0.0)
-        )
-        tier2_overlay_internal_reversion_weight = float(
-            extra_fields.get('tier2_overlay_internal_reversion_weight', 0.0)
-        )
-        tier2_overlay_internal_defensive_weight = float(
-            extra_fields.get('tier2_overlay_internal_defensive_weight', 0.0)
-        )
-        tier2_overlay_certified_override_gain = float(
-            extra_fields.get('tier2_overlay_certified_override_gain', 0.0)
-        )
-        tier2_overlay_learned_gate = float(
-            extra_fields.get('tier2_overlay_learned_gate', tier2_overlay_reliability)
-        )
-
         row = {
             # ===================================================================
-            # COMMON COLUMNS (Tier 1 & Tier 2) - First columns
             # ===================================================================
             # Portfolio metrics (logged at every timestep)
             'episode': self.current_episode,
@@ -870,8 +801,11 @@ class RewardLogger:
             'mtm_pnl': mtm_pnl,
             # Fund NAV component breakdown (DKK)
             'fund_nav_dkk': fund_nav_dkk,
+            'distribution_adjusted_nav_dkk': distribution_adjusted_nav_dkk,
+            'total_distributions_dkk': total_distributions_dkk,
             'trading_cash_dkk': trading_cash_dkk,
             'trading_sleeve_value_dkk': trading_sleeve_value_dkk,
+            'distribution_adjusted_trading_sleeve_dkk': distribution_adjusted_trading_sleeve_dkk,
             'physical_book_value_dkk': physical_book_value_dkk,
             'accumulated_operational_revenue_dkk': accumulated_operational_revenue_dkk,
             'financial_mtm_dkk': financial_mtm_dkk,
@@ -889,11 +823,23 @@ class RewardLogger:
             'risk_multiplier': risk_multiplier,
             'tradeable_capital': tradeable_capital,
             'mtm_exit_count': mtm_exit_count,
+            'forecast_prior_exposure': forecast_prior_exposure,
+            'forecast_prior_target': forecast_prior_target,
+            'forecast_prior_blend': forecast_prior_blend,
+            'forecast_prior_active': forecast_prior_active,
+            'forecast_prior_skill': forecast_prior_skill,
+            'forecast_prior_hit_lcb': forecast_prior_hit_lcb,
+            'forecast_prior_residual_q': forecast_prior_residual_q,
+            'forecast_prior_magnitude': forecast_prior_magnitude,
+            'forecast_prior_edge_excess': forecast_prior_edge_excess,
+            'forecast_prior_reason': forecast_prior_reason,
             # Price data (for forward-looking accuracy analysis)
             'price_current': price_current,  # Raw price at current timestep (DKK/MWh)
             # Price returns
             'price_return_1step': price_return_1step,
-            'price_return_forecast': price_return_forecast,
+            'price_return_invfreq': price_return_invfreq,
+            'training_return': training_return,
+            'training_horizon_steps': training_horizon_steps,
             # Main reward components
             'operational_score': operational_score,
             'risk_score': risk_score,
@@ -914,57 +860,10 @@ class RewardLogger:
             'inv_mean_clip_hit_rate': float(inv_mean_clip_hit_rate),
             'inv_mu_abs_roll': float(inv_mu_abs_roll),
             'inv_mu_sign_consistency': float(inv_mu_sign_consistency),
-            # Tier-2 routed residual-aware overlay diagnostics
-            'tier2_overlay_enabled': float(tier2_overlay_enabled),
-            'tier2_overlay_delta': float(tier2_overlay_delta),
-            'tier2_overlay_pred_sigma': float(tier2_overlay_pred_sigma),
-            'tier2_overlay_reliability': float(tier2_overlay_reliability),
-            'tier2_overlay_gain': float(tier2_overlay_gain),
-            'tier2_overlay_forecast_trust': float(tier2_overlay_forecast_trust),
-            'tier2_overlay_mape_quality': float(tier2_overlay_mape_quality),
-            'tier2_overlay_alignment': float(tier2_overlay_alignment),
-            'tier2_overlay_forecast_signal': float(tier2_overlay_forecast_signal),
-            'tier2_overlay_edge_signal': float(tier2_overlay_edge_signal),
-            'tier2_overlay_consensus_signal': float(tier2_overlay_consensus_signal),
-            'tier2_overlay_curvature_signal': float(tier2_overlay_curvature_signal),
-            'tier2_overlay_uncertainty_quality': float(tier2_overlay_uncertainty_quality),
-            'tier2_overlay_route_uncertainty_quality': float(tier2_overlay_route_uncertainty_quality),
-            'tier2_overlay_metadata_skill': float(tier2_overlay_metadata_skill),
-            'tier2_overlay_imbalance_signal': float(tier2_overlay_imbalance_signal),
-            'tier2_overlay_context_strength': float(tier2_overlay_context_strength),
-            'tier2_overlay_realized_gain_signal': float(tier2_overlay_realized_gain_signal),
-            'tier2_overlay_target_delta': float(tier2_overlay_target_delta),
-            'tier2_overlay_delta_prediction': float(tier2_overlay_delta_prediction),
-            'tier2_overlay_sharpe_signal': float(tier2_overlay_sharpe_signal),
-            'tier2_overlay_sharpe_before': float(tier2_overlay_sharpe_before),
-            'tier2_overlay_sharpe_after': float(tier2_overlay_sharpe_after),
-            'tier2_overlay_sharpe_delta': float(tier2_overlay_sharpe_delta),
-            'tier2_overlay_value_prediction': float(tier2_overlay_value_prediction),
-            'tier2_overlay_value_lcb': float(tier2_overlay_value_lcb),
-            'tier2_overlay_nav_prediction': float(tier2_overlay_nav_prediction),
-            'tier2_overlay_nav_lcb': float(tier2_overlay_nav_lcb),
-            'tier2_overlay_return_floor_prediction': float(tier2_overlay_return_floor_prediction),
-            'tier2_overlay_return_floor_lcb': float(tier2_overlay_return_floor_lcb),
-            'tier2_overlay_tail_risk_prediction': float(tier2_overlay_tail_risk_prediction),
-            'tier2_overlay_value_gate': float(tier2_overlay_value_gate),
-            'tier2_overlay_nav_gate': float(tier2_overlay_nav_gate),
-            'tier2_overlay_return_floor_gate': float(tier2_overlay_return_floor_gate),
-            'tier2_overlay_delta_gate': float(tier2_overlay_delta_gate),
-            'tier2_overlay_learned_gate': float(tier2_overlay_learned_gate),
-            'tier2_overlay_certified_override_gain': float(tier2_overlay_certified_override_gain),
-            'tier2_overlay_dominant_expert_weight': float(tier2_overlay_dominant_expert_weight),
-            'tier2_overlay_expert_weight_entropy': float(tier2_overlay_expert_weight_entropy),
-            'tier2_overlay_internal_base_weight': float(tier2_overlay_internal_base_weight),
-            'tier2_overlay_internal_trend_weight': float(tier2_overlay_internal_trend_weight),
-            'tier2_overlay_internal_reversion_weight': float(tier2_overlay_internal_reversion_weight),
-            'tier2_overlay_internal_defensive_weight': float(tier2_overlay_internal_defensive_weight),
-            # ACRP-v2 diagnostics
-            'tier2_overlay_acrp_trust_radius': float(extra_fields.get('tier2_overlay_acrp_trust_radius', 0.0)),
-            'tier2_overlay_acrp_advantage_strength': float(extra_fields.get('tier2_overlay_acrp_advantage_strength', 0.0)),
-            'tier2_overlay_acrp_da_learned_scalar': float(extra_fields.get('tier2_overlay_acrp_da_learned_scalar', 0.0)),
-            'tier2_overlay_acrp_attn_gate_weight': float(extra_fields.get('tier2_overlay_acrp_attn_gate_weight', 0.0)),
-            'tier2_overlay_acrp_attn_conf_weight': float(extra_fields.get('tier2_overlay_acrp_attn_conf_weight', 0.0)),
-            'tier2_overlay_acrp_attn_outlook_weight': float(extra_fields.get('tier2_overlay_acrp_attn_outlook_weight', 0.0)),
+        }
+
+
+        row.update({
             # Position breakdown
             'wind_pos_norm': wind_pos_norm,
             'solar_pos_norm': solar_pos_norm,
@@ -974,113 +873,16 @@ class RewardLogger:
             'combined_confidence': combined_confidence,
             'adaptive_multiplier': adaptive_multiplier,
             
-            # ===================================================================
-            # FORECAST-RELATED COLUMNS (Tier 2 only) - At the END
-            # ===================================================================
-            # Forecast signals
-            'z_short': z_short,
-            'z_medium': z_medium,
-            'z_long': z_long,
-            'z_combined': z_combined,
-            'tier2_expert_confidence': tier2_expert_confidence,
-            'forecast_confidence': forecast_confidence,
-            'forecast_trust': forecast_trust,
-            # OBSERVATION-LEVEL forecast signals (policy-visible; post-ablation)
-            'obs_z_short': obs_z_short,
-            'obs_z_long': obs_z_long,
-            'obs_forecast_trust': obs_forecast_trust,
-            'obs_normalized_error': obs_normalized_error,
-            'obs_trade_signal': obs_trade_signal,
-            # Forecast score
-            'forecast_score': forecast_score,
-            # Forecast weight
-            'weight_forecast': weight_forecast,
-            # Alignment debugging
-            'base_alignment': base_alignment,
-            'profitability_factor': profitability_factor,
-            'alignment_multiplier': alignment_multiplier,
-            'misalignment_penalty_mult': misalignment_penalty_mult,
-            'forecast_direction': forecast_dir,
-            'position_direction': position_dir,
-            'is_aligned': aligned,
-            'alignment_status': align_status,
-            # Correlation debugging
-            'corr_short': corr_short,
-            'corr_medium': corr_medium,
-            'corr_long': corr_long,
-            'weight_short': weight_short,
-            'weight_medium': weight_medium,
-            'weight_long': weight_long,
-            'use_short': 1.0 if use_short else 0.0,
-            'use_medium': 1.0 if use_medium else 0.0,
-            'use_long': 1.0 if use_long else 0.0,
-            # Forecast quality
-            'forecast_error': forecast_error,
-            'forecast_mape': forecast_mape,
-            'realized_vs_forecast': realized_vs_forecast,
-            # Battery and generation forecast debugging
-            'z_short_wind': z_short_wind,
-            'z_short_solar': z_short_solar,
-            'z_short_hydro': z_short_hydro,
-            'z_short_total_gen': z_short_total_gen,
-            # Adaptive forecast weight
-            'adaptive_forecast_weight': adaptive_forecast_weight,
-            # Forecast utilization flag
-            'enable_forecast_util': 1.0 if enable_forecast_util else 0.0,
-            'forecast_gate_passed': 1.0 if forecast_gate_passed else 0.0,
-            'forecast_used': 1.0 if forecast_used else 0.0,
-            'forecast_not_used_reason': forecast_not_used_reason,
-            'agent_followed_forecast': 1.0 if agent_followed_forecast else 0.0,
-            # NOVEL: Investor strategy fields
+            # Forecast utilization is represented only by forecast_prior_* fields.
             # NEW: Position alignment diagnostics (Bug #1 fix tracking)
             'position_alignment_status': position_alignment_status,
             'investor_position_ratio': investor_position_ratio,
             'investor_position_direction': investor_position_direction,
             'investor_total_position': investor_total_position,
             'investor_exploration_bonus': investor_exploration_bonus,
-            # NEW: Per-horizon MAPE tracking
-            'mape_short': mape_short,
-            'mape_medium': mape_medium,
-            'mape_long': mape_long,
-            'mape_short_recent': mape_short_recent,
-            'mape_medium_recent': mape_medium_recent,
-            'mape_long_recent': mape_long_recent,
-            # NEW: Per-horizon correlation tracking
-            'horizon_corr_short': horizon_corr_short,
-            'horizon_corr_medium': horizon_corr_medium,
-            'horizon_corr_long': horizon_corr_long,
-            # NEW: Per-asset forecast accuracy
-            'mape_wind': mape_wind,
-            'mape_solar': mape_solar,
-            'mape_hydro': mape_hydro,
-            'mape_price': mape_price,
-            'mape_load': mape_load,
-            # NEW: Forecast deltas (for debugging strategy)
-            'forecast_delta_short': forecast_delta_short,
-            'forecast_delta_medium': forecast_delta_medium,
-            'forecast_delta_long': forecast_delta_long,
-            # NEW: MAPE thresholds (for debugging strategy)
-            'mape_threshold_short': mape_threshold_short,
-            'mape_threshold_medium': mape_threshold_medium,
-            'mape_threshold_long': mape_threshold_long,
             # NEW: Price floor diagnostics (Bug #4 fix tracking)
             'price_raw': price_raw,
             'price_floor_used': price_floor_used,
-            # NEW: Directional accuracy
-            'direction_accuracy_short': direction_accuracy_short,
-            'direction_accuracy_medium': direction_accuracy_medium,
-            'direction_accuracy_long': direction_accuracy_long,
-            # NEW: Battery forecast bonus
-            'battery_forecast_bonus': battery_forecast_bonus,
-            # NEW: Forecast vs actual comparison (for deep debugging)
-            'current_price_dkk': current_price_dkk,
-            'forecast_price_short_dkk': forecast_price_short_dkk,
-            'forecast_price_medium_dkk': forecast_price_medium_dkk,
-            'forecast_price_long_dkk': forecast_price_long_dkk,
-            'forecast_error_short_pct': forecast_error_short_pct,
-            'forecast_error_medium_pct': forecast_error_medium_pct,
-            'forecast_error_long_pct': forecast_error_long_pct,
-            'agent_followed_forecast': int(agent_followed_forecast),
             # NEW: NAV attribution drivers (per-step fund NAV breakdown)
             'nav_start': nav_start,
             'nav_end': nav_end,
@@ -1122,11 +924,35 @@ class RewardLogger:
             'inv_value': inv_value,
             'inv_value_next': inv_value_next,
             'inv_td_error': inv_td_error,
-            # Linear probe (forecast utilization): exposure_exec ~ base_obs (+ trade_signal)
-            'probe_r2_base': probe_r2_base,
-            'probe_r2_base_plus_signal': probe_r2_base_plus_signal,
-            'probe_delta_r2': probe_delta_r2,
-        }
+            # Battery operator health diagnostics
+            'bat_decision_step': bat_decision_step,
+            'bat_action_idx': int(bat_action_idx),
+            'bat_q_max': bat_q_max,
+            'bat_q_chosen': bat_q_chosen,
+            'bat_reward_step': bat_reward_step,
+            'bat_soc': bat_soc,
+            'bat_spread': bat_spread,
+            'bat_energy': bat_energy,
+            'bat_capacity': bat_capacity,
+            # Risk controller health diagnostics
+            'risk_decision_step': risk_decision_step,
+            'risk_action_raw': risk_action_raw,
+            'risk_reward_step': risk_reward_step,
+            'risk_value': risk_value,
+            'risk_value_next': risk_value_next,
+            'risk_td_error': risk_td_error,
+            'risk_drawdown': risk_drawdown,
+            'overall_risk_snapshot': overall_risk_snapshot,
+            # Meta controller health diagnostics
+            'meta_decision_step': meta_decision_step,
+            'meta_action_raw': meta_action_raw,
+            'meta_reward_step': meta_reward_step,
+            'meta_value': meta_value,
+            'meta_value_next': meta_value_next,
+            'meta_td_error': meta_td_error,
+            'meta_cap_fraction': meta_cap_fraction,
+            'meta_budget_n': meta_budget_n,
+        })
         
         # Add action info if available
         # CRITICAL FIX: Handle arrays and dicts properly to avoid boolean ambiguity
@@ -1195,46 +1021,72 @@ class RewardLogger:
             if field in row:
                 investor_health_row[field] = row.pop(field, '')
         if investor_health_row:
-            self.episode_investor_health_rows.append(investor_health_row)
-        
-        # NEW: NAV attribution drivers (per-step fund NAV breakdown)
-        row['nav_start'] = nav_start
-        row['nav_end'] = nav_end
-        row['pnl_total'] = pnl_total
-        row['pnl_battery'] = pnl_battery
-        row['pnl_generation'] = pnl_generation
-        row['pnl_hedge'] = pnl_hedge
-        row['cash_delta_ops'] = cash_delta_ops
-        
-        # NEW: Battery dispatch metrics (FIX #5)
-        row['battery_decision'] = battery_decision
-        row['battery_intensity'] = battery_intensity
-        row['battery_spread'] = battery_spread
-        row['battery_adjusted_hurdle'] = battery_adjusted_hurdle
-        row['battery_volatility_adj'] = battery_volatility_adj
-        # NEW: Battery state metrics (BATTERY REWARD FIX)
-        row['battery_energy'] = battery_energy
-        row['battery_capacity'] = battery_capacity
-        row['battery_soc'] = battery_soc
-        row['battery_cash_delta'] = battery_cash_delta
-        row['battery_throughput'] = battery_throughput
-        row['battery_degradation_cost'] = battery_degradation_cost
-        row['battery_eta_charge'] = battery_eta_charge
-        row['battery_eta_discharge'] = battery_eta_discharge
-        
-        # NEW: Forecast vs actual comparison
-        row['current_price_dkk'] = current_price_dkk
-        row['forecast_price_short_dkk'] = forecast_price_short_dkk
-        row['forecast_price_medium_dkk'] = forecast_price_medium_dkk
-        row['forecast_price_long_dkk'] = forecast_price_long_dkk
-        row['forecast_error_short_pct'] = forecast_error_short_pct
-        row['forecast_error_medium_pct'] = forecast_error_medium_pct
-        row['forecast_error_long_pct'] = forecast_error_long_pct
-        row['agent_followed_forecast'] = int(agent_followed_forecast)
+            _w = self.agent_health_writers.get('investor')
+            if _w is not None:
+                try:
+                    _w.writerow(investor_health_row)
+                except Exception:
+                    pass
 
-        if not self.is_tier2:
-            self._strip_row_fields(row, ('tier2_overlay_',))
-        
+        # Battery health row
+        battery_health_row = {
+            field: row.get(field, '')
+            for field in self.battery_health_context_fields
+            if field in row
+        }
+        for field in self.battery_health_fields:
+            if field in row:
+                battery_health_row[field] = row.pop(field, '')
+        # Pop agent-specific context fields that don't belong in the main CSV
+        for _f in ('bat_decision_step', 'bat_soc', 'bat_spread', 'bat_energy', 'bat_capacity'):
+            row.pop(_f, None)
+        if battery_health_row:
+            _w = self.agent_health_writers.get('battery')
+            if _w is not None:
+                try:
+                    _w.writerow(battery_health_row)
+                except Exception:
+                    pass
+
+        # Risk health row
+        risk_health_row = {
+            field: row.get(field, '')
+            for field in self.risk_health_context_fields
+            if field in row
+        }
+        for field in self.risk_health_fields:
+            if field in row:
+                risk_health_row[field] = row.pop(field, '')
+        for _f in ('risk_decision_step', 'risk_drawdown', 'overall_risk_snapshot'):
+            row.pop(_f, None)
+        if risk_health_row:
+            _w = self.agent_health_writers.get('risk')
+            if _w is not None:
+                try:
+                    _w.writerow(risk_health_row)
+                except Exception:
+                    pass
+
+        # Meta health row
+        meta_health_row = {
+            field: row.get(field, '')
+            for field in self.meta_health_context_fields
+            if field in row
+        }
+        for field in self.meta_health_fields:
+            if field in row:
+                meta_health_row[field] = row.pop(field, '')
+        for _f in ('meta_decision_step', 'meta_cap_fraction', 'meta_budget_n'):
+            row.pop(_f, None)
+        if meta_health_row:
+            _w = self.agent_health_writers.get('meta')
+            if _w is not None:
+                try:
+                    _w.writerow(meta_health_row)
+                except Exception:
+                    pass
+
+
         row_to_write = row
         try:
             writer_fieldnames = getattr(self.csv_writer, 'fieldnames', None)
@@ -1326,7 +1178,6 @@ class RewardLogger:
         """Get CSV field names - common columns first, forecast columns at the end"""
         fieldnames = [
             # ===================================================================
-            # COMMON COLUMNS (Tier 1 & Tier 2) - First columns
             # ===================================================================
             # Portfolio metrics (logged at every timestep)
             'episode', 'timestep',
@@ -1338,15 +1189,22 @@ class RewardLogger:
             # Fund NAV component breakdown (DKK)
             'fund_nav_dkk', 'trading_cash_dkk', 'trading_sleeve_value_dkk', 'physical_book_value_dkk',
             'accumulated_operational_revenue_dkk', 'financial_mtm_dkk', 'financial_exposure_dkk',
+            'total_distributions_dkk', 'distribution_adjusted_nav_dkk',
+            'distribution_adjusted_trading_sleeve_dkk',
             'depreciation_ratio', 'years_elapsed',
             # Position info (common to both tiers)
             'position_signed', 'position_exposure', 'decision_step', 'exposure_exec', 'action_sign',
             'trade_signal_active', 'trade_signal_sign',
             'risk_multiplier', 'tradeable_capital', 'mtm_exit_count',
+            'forecast_prior_exposure', 'forecast_prior_target', 'forecast_prior_blend',
+            'forecast_prior_active', 'forecast_prior_skill', 'forecast_prior_hit_lcb',
+            'forecast_prior_residual_q', 'forecast_prior_magnitude',
+            'forecast_prior_edge_excess', 'forecast_prior_reason',
             # Price data (for forward-looking accuracy analysis)
             'price_current',  # Raw price at current timestep (DKK/MWh)
             # Price returns (common to both tiers)
-            'price_return_1step', 'price_return_forecast',
+            'price_return_1step', 'price_return_invfreq',
+            'training_return', 'training_horizon_steps',
             # Main reward components (common to both tiers)
             'operational_score', 'risk_score', 'hedging_score', 'nav_stability_score',
             # Reward weights (common to both tiers, forecast weight will be 0.0 for Tier 1)
@@ -1357,40 +1215,9 @@ class RewardLogger:
             'training_global_step',
             'inv_mean_clip_hit', 'inv_mean_clip_hit_rate',
             'inv_mu_abs_roll', 'inv_mu_sign_consistency',
-            # Tier-2 routed residual-aware overlay diagnostics
-            'tier2_overlay_enabled', 'tier2_overlay_delta', 'tier2_overlay_reliability',
-            'tier2_overlay_gain', 'tier2_overlay_forecast_trust',
-            'tier2_overlay_mape_quality',
-            'tier2_overlay_alignment', 'tier2_overlay_forecast_signal',
-            'tier2_overlay_edge_signal', 'tier2_overlay_consensus_signal',
-            'tier2_overlay_curvature_signal', 'tier2_overlay_context_strength',
-            'tier2_overlay_pred_sigma', 'tier2_overlay_uncertainty_quality',
-            'tier2_overlay_route_uncertainty_quality',
-            'tier2_overlay_metadata_skill', 'tier2_overlay_imbalance_signal',
-            'tier2_overlay_realized_gain_signal', 'tier2_overlay_target_delta', 'tier2_overlay_delta_prediction',
-            'tier2_overlay_sharpe_signal', 'tier2_overlay_sharpe_before',
-            'tier2_overlay_sharpe_after', 'tier2_overlay_sharpe_delta',
-            'tier2_overlay_value_prediction', 'tier2_overlay_value_lcb',
-            'tier2_overlay_nav_prediction', 'tier2_overlay_nav_lcb',
-            'tier2_overlay_return_floor_prediction', 'tier2_overlay_return_floor_lcb',
-            'tier2_overlay_tail_risk_prediction',
-            'tier2_overlay_value_gate', 'tier2_overlay_nav_gate',
-            'tier2_overlay_return_floor_gate', 'tier2_overlay_delta_gate',
-            'tier2_overlay_learned_gate',
-            'tier2_overlay_certified_override_gain',
-            'tier2_overlay_dominant_expert_weight',
-            'tier2_overlay_expert_weight_entropy',
-            'tier2_overlay_internal_base_weight',
-            'tier2_overlay_internal_trend_weight',
-            'tier2_overlay_internal_reversion_weight',
-            'tier2_overlay_internal_defensive_weight',
-            # ACRP-v2 diagnostics
-            'tier2_overlay_acrp_trust_radius',
-            'tier2_overlay_acrp_advantage_strength',
-            'tier2_overlay_acrp_da_learned_scalar',
-            'tier2_overlay_acrp_attn_gate_weight',
-            'tier2_overlay_acrp_attn_conf_weight',
-            'tier2_overlay_acrp_attn_outlook_weight',
+            # MSCD: Multi-Signal Certified Deployment runtime gate
+            # FCPRO persistence telemetry + FQDP forecast-quality decay
+            # Reference-model diagnostics
             # Investor policy diagnostics: native distribution stats plus
             # deployed action-space mean/sample.
             'inv_mu_raw', 'inv_sigma_raw', 'inv_a_raw',
@@ -1399,8 +1226,6 @@ class RewardLogger:
             'inv_sat_mean', 'inv_sat_sample', 'inv_sat_noise_only',
             # Investor TD-error proxy (credit assignment diagnostics)
             'inv_reward_step', 'inv_value', 'inv_value_next', 'inv_td_error',
-            # Linear probe (forecast utilization)
-            'probe_r2_base', 'probe_r2_base_plus_signal', 'probe_delta_r2',
             # Actions (common to both tiers)
             'inv_wind', 'inv_solar', 'inv_hydro', 'batt_charge', 'batt_discharge',
             'investor_action', 'battery_action',
@@ -1409,57 +1234,11 @@ class RewardLogger:
             # Reward breakdown debugging (common to both tiers)
             'unrealized_pnl_norm', 'combined_confidence', 'adaptive_multiplier',
             
-            # ===================================================================
-            # FORECAST-RELATED COLUMNS (Tier 2 only) - At the END
-            # ===================================================================
-            # Forecast signals (0.0 for Tier 1, populated for Tier 2)
-            'z_short', 'z_medium', 'z_long', 'z_combined', 'tier2_expert_confidence', 'forecast_confidence', 'forecast_trust',
-            # OBSERVATION-LEVEL forecast signals (what the policy actually sees after ablations/warmup)
-            # These are critical for proving forecast usage and for causal ablations.
-            'obs_z_short', 'obs_z_long',
-            'obs_forecast_trust', 'obs_normalized_error', 'obs_trade_signal',
-            # Forecast score from reward components (0.0 for Tier 1)
-            'forecast_score',
-            # Forecast weight from reward weights (0.0 for Tier 1)
-            'weight_forecast',
-            # Alignment debugging (0.0/NEUTRAL for Tier 1, populated for Tier 2)
-            'base_alignment', 'profitability_factor', 'alignment_multiplier', 'misalignment_penalty_mult',
-            'forecast_direction', 'position_direction', 'is_aligned', 'alignment_status',
-            # Correlation debugging (0.0 for Tier 1, populated for Tier 2)
-            'corr_short', 'corr_medium', 'corr_long', 'weight_short', 'weight_medium', 'weight_long',
-            'use_short', 'use_medium', 'use_long',
-            # Forecast quality (0.0 for Tier 1, populated for Tier 2)
-            'forecast_error', 'forecast_mape', 'realized_vs_forecast',
-            # Battery and generation forecast debugging (0.0 for Tier 1, populated for Tier 2)
-            'z_short_wind', 'z_short_solar', 'z_short_hydro', 'z_short_total_gen',
-            # Adaptive forecast weight (0.0 for Tier 1, populated for Tier 2)
-            'adaptive_forecast_weight',
-            # Forecast utilization flag (0.0 for Tier 1, 1.0 for Tier 2)
-            'enable_forecast_util', 'forecast_gate_passed', 'forecast_used', 'forecast_not_used_reason',
             # NEW: Position alignment diagnostics (Bug #1 fix tracking)
             'position_alignment_status', 'investor_position_ratio', 'investor_position_direction',
             'investor_total_position', 'investor_exploration_bonus',
-            # NEW: Per-horizon MAPE tracking (Tier 2 only)
-            'mape_short', 'mape_medium', 'mape_long',
-            'mape_short_recent', 'mape_medium_recent', 'mape_long_recent',
-            # NEW: Per-horizon correlation tracking (Tier 2 only)
-            'horizon_corr_short', 'horizon_corr_medium', 'horizon_corr_long',
-            # NEW: Per-asset forecast accuracy (Tier 2 only)
-            'mape_wind', 'mape_solar', 'mape_hydro', 'mape_price', 'mape_load',
-            # NEW: Forecast deltas for debugging strategy (Tier 2 only)
-            'forecast_delta_short', 'forecast_delta_medium', 'forecast_delta_long',
-            # NEW: MAPE thresholds for debugging strategy (Tier 2 only)
-            'mape_threshold_short', 'mape_threshold_medium', 'mape_threshold_long',
             # NEW: Price floor diagnostics (Bug #4 fix tracking)
             'price_raw', 'price_floor_used',
-            # NEW: Directional accuracy (Tier 2 only)
-            'direction_accuracy_short', 'direction_accuracy_medium', 'direction_accuracy_long',
-            # NEW: Battery forecast bonus (Tier 2 only)
-            'battery_forecast_bonus',
-            # NEW: Forecast vs actual comparison (deep debugging)
-            'current_price_dkk', 'forecast_price_short_dkk', 'forecast_price_medium_dkk', 'forecast_price_long_dkk',
-            'forecast_error_short_pct', 'forecast_error_medium_pct', 'forecast_error_long_pct',
-            'agent_followed_forecast',
             # NEW: NAV attribution drivers (per-step financial breakdown)
             'nav_start', 'nav_end', 'pnl_total', 'pnl_battery', 'pnl_generation', 'pnl_hedge', 'cash_delta_ops',
             # NEW: Battery dispatch metrics (FIX #5)
@@ -1485,7 +1264,19 @@ class RewardLogger:
                 seen.add(required)
 
         filtered = self._filter_main_fieldnames(deduped)
-        return [name for name in filtered if name not in self.investor_health_fields]
+        all_health_fields = (
+            set(self.investor_health_fields)
+            | set(self.battery_health_fields)
+            | set(self.risk_health_fields)
+            | set(self.meta_health_fields)
+        )
+        # Also exclude the agent-specific context fields that belong only in health CSVs
+        health_only_context = {
+            'bat_decision_step', 'bat_soc', 'bat_spread', 'bat_energy', 'bat_capacity',
+            'risk_decision_step', 'risk_drawdown', 'overall_risk_snapshot',
+            'meta_decision_step', 'meta_cap_fraction', 'meta_budget_n',
+        }
+        return [name for name in filtered if name not in all_health_fields and name not in health_only_context]
     
     def close(self):
         """Close log files"""
@@ -1493,3 +1284,19 @@ class RewardLogger:
             self.csv_file_handle.close()
             self.csv_file_handle = None
             self.csv_writer = None
+        for handle in self.category_handles.values():
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+        self.category_handles.clear()
+        self.category_writers.clear()
+        for handle in self.agent_health_handles.values():
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+        self.agent_health_handles.clear()
+        self.agent_health_writers.clear()

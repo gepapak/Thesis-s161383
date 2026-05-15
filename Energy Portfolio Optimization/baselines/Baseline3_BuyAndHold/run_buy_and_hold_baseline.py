@@ -2,13 +2,10 @@
 """
 Buy-and-Hold Baseline Runner (Baseline3)
 
-This script runs the Buy-and-Hold baseline strategy, which represents the simplest
-possible investment approach: earning the risk-free rate through government bonds
-or cash equivalents.
+This script runs the hybrid buy-and-hold baseline: the current fund's fixed
+physical infrastructure is held passively while the trading sleeve stays idle.
 
-This baseline serves as the "floor" for investment performance evaluation.
-Any active strategy should be able to beat this risk-free rate to justify
-the additional complexity and risk.
+This baseline is the passive hybrid-fund floor for active trading strategies.
 
 Usage:
     python run_buy_and_hold_baseline.py --data_path evaluation_dataset/unseendata.csv
@@ -29,7 +26,9 @@ from pathlib import Path
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from baseline_common import add_common_summary_fields
 from buy_and_hold_optimizer import BuyAndHoldOptimizer
 
 
@@ -67,7 +66,8 @@ class BuyAndHoldBaselineRunner:
         initial_budget_usd = 8e8  # $800M USD
         self.optimizer = BuyAndHoldOptimizer(
             initial_budget_usd=initial_budget_usd,
-            timebase_hours=timebase_hours
+            timebase_hours=timebase_hours,
+            data=self.data,
         )
         
         # Results storage
@@ -115,7 +115,7 @@ class BuyAndHoldBaselineRunner:
             max_timesteps: Maximum number of timesteps to run (None = all data)
         """
         print("\n" + "="*70)
-        print("Baseline 3: Buy-and-Hold Strategy (Risk-Free Rate)")
+        print("Baseline 3: Hybrid Buy-and-Hold Strategy")
         print("="*70)
         
         # Determine timesteps to run
@@ -131,9 +131,9 @@ class BuyAndHoldBaselineRunner:
         progress_interval = max(1, total_timesteps // 20)  # 20 progress updates
         start_time = datetime.now()
         
-        # Run strategy (very simple - just compound interest)
+        # Run strategy: fixed physical book + operating revenue, idle trading sleeve.
         for i in range(total_timesteps):
-            # Get data row (not actually used by buy-and-hold)
+            # Get data row for current physical-sleeve operating revenue.
             data_row = self.data.iloc[i] if i < len(self.data) else pd.Series()
             
             # Execute strategy step
@@ -169,6 +169,7 @@ class BuyAndHoldBaselineRunner:
         
         # 2. Summary metrics JSON
         metrics = self.optimizer.get_performance_metrics()
+        add_common_summary_fields(metrics, method='Buy-and-Hold Strategy')
         
         summary_metrics_path = os.path.join(self.output_dir, "summary_metrics.json")
         with open(summary_metrics_path, 'w') as f:
@@ -280,7 +281,7 @@ additional complexity and risk.
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Baseline 3: Buy-and-Hold Strategy (Risk-Free Rate)')
+    parser = argparse.ArgumentParser(description='Baseline 3: Hybrid Buy-and-Hold Strategy')
     parser.add_argument('--data_path', type=str, required=True, help='Path to evaluation dataset CSV')
     parser.add_argument('--timesteps', type=int, default=None, help='Maximum timesteps to run')
     parser.add_argument('--output_dir', type=str, default='Baseline3_BuyAndHold/results', 
@@ -305,17 +306,20 @@ def main():
     
     # Print final summary
     print("\n" + "="*70)
-    print("FINAL RESULTS - Baseline 3: Buy-and-Hold Strategy")
+    print("FINAL RESULTS - Baseline 3: Hybrid Buy-and-Hold Strategy")
     print("="*70)
     print(f"Initial Portfolio Value: ${final_metrics['initial_value_usd']/1e6:.2f}M USD")
     print(f"Final Portfolio Value:   ${final_metrics['final_value_usd']/1e6:.2f}M USD")
+    print(f"Distribution-Adjusted:   ${final_metrics.get('distribution_adjusted_final_value_usd', final_metrics['final_value_usd'])/1e6:.2f}M USD")
+    print(f"Total Distributions:     ${final_metrics.get('total_distributions_usd', 0.0)/1e6:.2f}M USD")
     print(f"Total Return:            {final_metrics['total_return']*100:+.2f}%")
+    print(f"Raw NAV Return:          {final_metrics.get('reported_nav_total_return', 0.0)*100:+.2f}%")
     print(f"Annual Return:           {final_metrics['annual_return']*100:+.2f}%")
     print(f"Sharpe Ratio:            {final_metrics['sharpe_ratio']:.3f}")
     print(f"Maximum Drawdown:        {final_metrics['max_drawdown']*100:.2f}%")
     print(f"Volatility:              {final_metrics['volatility']*100:.4f}%")
     print(f"\nStrategy Characteristics:")
-    print(f"Risk-Free Rate:          {final_metrics['risk_free_rate_annual']*100:.1f}% annual")
+    print(f"Risk-Free Rate:          not accrued to cash (matches current environment)")
     print(f"Market Exposure:         {final_metrics['market_exposure']*100:.1f}%")
     print(f"Active Decisions:        {final_metrics['active_decisions']}")
     print(f"Final Cash Holdings:     ${final_metrics['final_cash_usd']/1e6:.2f}M USD")

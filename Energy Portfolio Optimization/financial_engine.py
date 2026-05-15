@@ -533,130 +533,31 @@ class FinancialEngine:
     def calculate_price_returns(
         timestep: int,
         current_price: float,
-        price_history: np.ndarray,
-        enable_forecast_util: bool,
-        horizon_correlations: Optional[Dict[str, float]] = None
+        price_history: np.ndarray
     ) -> Dict[str, Any]:
         """
-        REFACTORED: Calculate multi-horizon price returns for forecast reward alignment.
+        Calculate realized price returns for MTM and diagnostics.
+
+        Forecast-shaped price returns are intentionally not computed here. The
+        single forecast-utilization mechanism is the environment's cache-derived
+        investor execution prior.
         
         Args:
             timestep: Current timestep index
             current_price: Current electricity price (DKK/MWh)
             price_history: Historical price array
-            enable_forecast_util: Whether forecast utilization is enabled
-            horizon_correlations: Optional dict with 'short', 'medium', 'long' correlations
             
         Returns:
-            Dict with price returns and correlation-based weights
+            Dict with realized price returns and neutral correlation diagnostics.
         """
         try:
             prev_price = float(np.clip(price_history[timestep-1] if timestep > 0 else current_price, -1000.0, 1e9))
             current_price = float(np.clip(current_price, -1000.0, 1e9))
-            
-            price_return_short = None
-            price_return_medium = None
-            price_return_long = None
-            
-            if enable_forecast_util and timestep >= 6:
-                # Short horizon: 6 steps back
-                price_6_steps_ago = float(np.clip(price_history[timestep-6], -1000.0, 1e9))
-                price_return_short = (current_price - price_6_steps_ago) / max(abs(price_6_steps_ago), 1e-6)
-                
-                # Medium horizon: 24 steps back
-                if timestep >= 24:
-                    price_24_steps_ago = float(np.clip(price_history[timestep-24], -1000.0, 1e9))
-                    price_return_medium = (current_price - price_24_steps_ago) / max(abs(price_24_steps_ago), 1e-6)
-                else:
-                    price_return_medium = price_return_short
-                
-                # Long horizon: 144 steps back
-                if timestep >= 144:
-                    price_144_steps_ago = float(np.clip(price_history[timestep-144], -1000.0, 1e9))
-                    price_return_long = (current_price - price_144_steps_ago) / max(abs(price_144_steps_ago), 1e-6)
-                else:
-                    price_return_long = price_return_medium
-                
-                # Correlation-based weighting
-                if horizon_correlations:
-                    corr_short = horizon_correlations.get('short', 0.0)
-                    corr_medium = horizon_correlations.get('medium', 0.0)
-                    corr_long = horizon_correlations.get('long', 0.0)
-                    
-                    use_short = corr_short > 0.0
-                    use_medium = corr_medium > 0.0
-                    use_long = corr_long > 0.0
-                    
-                    # If at least one horizon has positive correlation, weight by correlation strength.
-                    # Otherwise, fall back to default weights (do NOT collapse forecast return to 0.0).
-                    if (use_short or use_medium or use_long):
-                        epsilon = 1e-6
-                        weight_short_raw = max(0.0, corr_short) if use_short else 0.0
-                        weight_medium_raw = max(0.0, corr_medium) if use_medium else 0.0
-                        weight_long_raw = max(0.0, corr_long) if use_long else 0.0
-                        
-                        total_weight = weight_short_raw + weight_medium_raw + weight_long_raw
-                        if total_weight > epsilon:
-                            weight_short = weight_short_raw / total_weight
-                            weight_medium = weight_medium_raw / total_weight
-                            weight_long = weight_long_raw / total_weight
-                        else:
-                            num_horizons = sum([use_short, use_medium, use_long])
-                            if num_horizons > 0:
-                                weight_short = (1.0 / num_horizons) if use_short else 0.0
-                                weight_medium = (1.0 / num_horizons) if use_medium else 0.0
-                                weight_long = (1.0 / num_horizons) if use_long else 0.0
-                            else:
-                                weight_short, weight_medium, weight_long = 0.0, 0.0, 0.0
-                    else:
-                        # No positive correlations: use safe defaults.
-                        weight_short, weight_medium, weight_long = 0.7, 0.2, 0.1
-                else:
-                    weight_short, weight_medium, weight_long = 0.7, 0.2, 0.1
-                    corr_short = corr_medium = corr_long = 0.0
-                    use_short = use_medium = use_long = False
-                
-                # Combined forecast return
-                price_return_forecast = float(
-                    weight_short * price_return_short + 
-                    weight_medium * price_return_medium + 
-                    weight_long * price_return_long
-                )
-            else:
-                # Fallback: 1-step return
-                price_return_forecast = float((current_price - prev_price) / max(abs(prev_price), 1e-6))
-                weight_short = weight_medium = weight_long = 0.0
-                corr_short = corr_medium = corr_long = 0.0
-                use_short = use_medium = use_long = False
-            
-            # 1-step return for MTM
             price_return = float((current_price - prev_price) / max(abs(prev_price), 1e-6))
-            
-            # Fill in missing values
-            if price_return_short is None:
-                price_return_short = price_return
-            if price_return_medium is None:
-                price_return_medium = price_return
-            if price_return_long is None:
-                price_return_long = price_return
             
             return {
                 'price_return': price_return,
-                'price_return_short': price_return_short,
-                'price_return_medium': price_return_medium,
-                'price_return_long': price_return_long,
-                'price_return_forecast': price_return_forecast,
-                'correlation_debug': {
-                    'corr_short': corr_short if enable_forecast_util else 0.0,
-                    'corr_medium': corr_medium if enable_forecast_util else 0.0,
-                    'corr_long': corr_long if enable_forecast_util else 0.0,
-                    'weight_short': weight_short if enable_forecast_util else 0.0,
-                    'weight_medium': weight_medium if enable_forecast_util else 0.0,
-                    'weight_long': weight_long if enable_forecast_util else 0.0,
-                    'use_short': use_short if enable_forecast_util else False,
-                    'use_medium': use_medium if enable_forecast_util else False,
-                    'use_long': use_long if enable_forecast_util else False,
-                }
+                'correlation_debug': {}
             }
             
         except Exception as e:

@@ -64,7 +64,7 @@ class TradingEngine:
         meta_cap_max: float,
         meta_freq_min: int,
         meta_freq_max: int,
-        forecast_confidence: float = 0.5,
+        confidence_signal: float = 0.5,
         disable_confidence_scaling: bool = False
     ) -> Tuple[float, int]:
         """
@@ -81,7 +81,7 @@ class TradingEngine:
             meta_cap_max: Maximum capital allocation fraction
             meta_freq_min: Minimum trading frequency
             meta_freq_max: Maximum trading frequency
-            forecast_confidence: Optional confidence scaling input when enabled
+            confidence_signal: Optional confidence scaling input when enabled
             
         Returns:
             Tuple of (capital_allocation_fraction, investment_freq)
@@ -103,8 +103,8 @@ class TradingEngine:
             if disable_confidence_scaling:
                 confidence_multiplier = 1.0
             else:
-                forecast_confidence = float(np.clip(forecast_confidence, 0.2, 1.0))
-                confidence_multiplier = 0.7 + (forecast_confidence - 0.2) / 0.8 * 0.8
+                confidence_signal = float(np.clip(confidence_signal, 0.2, 1.0))
+                confidence_multiplier = 0.7 + (confidence_signal - 0.2) / 0.8 * 0.8
 
             clip_lo = max(0.0, float(meta_cap_min) * 0.7)  # Allow up to 30% reduction
             clip_hi = min(1.0, float(meta_cap_max) * 1.5)  # Allow up to 50% increase but cap at 1.0

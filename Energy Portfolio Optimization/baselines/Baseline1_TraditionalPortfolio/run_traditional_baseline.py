@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List
 
@@ -27,6 +28,14 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from baseline_common import (
+    HybridFundLedger,
+    add_common_summary_fields,
+    compute_performance_metrics as compute_baseline_performance_metrics,
+    load_baseline_economic_config,
+)
 
 from traditional_portfolio_optimizer import (
     Timebase,
@@ -141,6 +150,7 @@ def run(
     seed: int,
 ) -> None:
 
+    econ_cfg = load_baseline_economic_config()
     tb = Timebase(time_step_hours=10.0 / 60.0)
     steps_per_year = tb.steps_per_year
     steps_per_month = max(1, steps_per_year // 12)
@@ -181,71 +191,78 @@ def run(
         df = df.iloc[:max_steps]
         logger.info("Limited to %d timesteps", max_steps)
 
-    rebalance_every = steps_per_month if monthly_rebalance else 1
+    ledger = HybridFundLedger(df, seed=seed, timebase_hours=tb.time_step_hours)
+
+    # Match the current Tier1 trading cadence unless monthly rebalancing is explicitly requested.
+    rebalance_every = steps_per_month if monthly_rebalance else ledger.investment_freq
     lookback_steps = max(steps_per_month * lookback_months, steps_per_year)
 
     logger.info("Rebalancing every %d steps (monthly=%s)", rebalance_every, monthly_rebalance)
     logger.info("Lookback window: %d steps", lookback_steps)
 
-    initial_nav = 800_000_000.0
+    initial_nav = ledger.initial_budget_usd
     nav = initial_nav
     nav_series = []
     weights_records: List[Dict] = []
     step_returns = []
 
-    # Distribution tracking (match MARL's shareholder payout mechanism)
-    total_distributions = 0.0
-    target_cash_ratio = 0.10  # 10% of NAV (match MARL)
-    distribution_rate = 0.10  # 10% of excess cash (match MARL)
-    min_distribution_threshold_ratio = 0.005  # 0.5% of NAV minimum (match MARL)
-
     w = {a: 1.0 / len(opt.risky_assets) for a in opt.risky_assets}
     w["cash"] = 1.0 - sum(w.values())
+
+    def weights_to_exposure(weights: Dict[str, float]) -> float:
+        risky = float(sum(float(weights.get(a, 0.0)) for a in opt.risky_assets))
+        return float(np.clip(risky, -1.0, 1.0))
 
     logger.info("Starting simulation with %d timesteps...", len(returns))
     
     for t in range(len(returns)):
         row = returns.iloc[t]
         
+        target_exposure = None
         if t > 0 and (t % rebalance_every == 0):
             start = max(0, t - lookback_steps)
             window = returns.iloc[start:t]
             try:
                 w = opt.rebalance_weights(window, method=method)
+                target_exposure = weights_to_exposure(w)
                 if t % (rebalance_every * 10) == 0:
                     logger.info("Rebalanced at step %d: %s", t, {k: f"{v:.3f}" for k, v in w.items()})
             except Exception as e:
                 logger.exception("Rebalance failed at t=%d — keeping previous weights. Error: %s", t, e)
 
-        # Get returns for all risky assets (now includes 'price')
+        # Traditional optimizer return is diagnostic; NAV is updated by the
+        # shared current-codebase hybrid fund ledger.
         r_vec = np.array([row[a] for a in opt.risky_assets], dtype=float)
         risky_weight_vec = np.array([w[a] for a in opt.risky_assets], dtype=float)
         w_cash = float(w["cash"])
 
         step_r = float(risky_weight_vec @ r_vec) + w_cash * opt.rf_step
-        nav *= (1.0 + step_r)
+        record = ledger.step(t, target_exposure=target_exposure, battery_action="idle")
+        nav = float(record["portfolio_value_usd"])
 
-        # INFRASTRUCTURE FUND: Distribute excess cash to shareholders (match MARL)
-        # Calculate cash portion of NAV
-        cash_value = nav * w_cash
-        target_cash_level = nav * target_cash_ratio
-        excess_cash = cash_value - target_cash_level
-        distribution_threshold = nav * min_distribution_threshold_ratio
-
-        if excess_cash > distribution_threshold:
-            # Distribute 10% of excess cash (match MARL's distribution_rate)
-            distribution_amount = excess_cash * distribution_rate
-            nav -= distribution_amount  # Reduce NAV by distribution
-            total_distributions += distribution_amount
-
-        nav_series.append({"timestamp": row["timestamp"], "nav": nav})
+        nav_series.append({
+            "timestamp": row["timestamp"],
+            "nav": nav,
+            "distribution_amount": record["distribution_amount"] * ledger.dkk_to_usd_rate,
+            "total_distributions": record["total_distributions"] * ledger.dkk_to_usd_rate,
+            "distribution_adjusted_nav": record["distribution_adjusted_value_usd"],
+            "physical_book_value_usd": record["physical_book_value_usd"],
+            "trading_cash_usd": record["trading_cash_usd"],
+            "financial_mtm_usd": record["financial_mtm_usd"],
+            "operational_revenue_usd": record["operational_revenue"] * ledger.dkk_to_usd_rate,
+            "mtm_pnl_usd": record["mtm_pnl"] * ledger.dkk_to_usd_rate,
+            "transaction_cost_usd": record["transaction_cost"] * ledger.dkk_to_usd_rate,
+            "target_exposure": record["target_exposure"],
+            "current_abs_exposure_usd": record["current_abs_exposure_dkk"] * ledger.dkk_to_usd_rate,
+            "traditional_sleeve_return": step_r,
+        })
         weights_records.append({"timestamp": row["timestamp"], **w})
         step_returns.append(step_r)
         
         if t % 1000 == 0 or t == len(returns) - 1:
-            portfolio_return = (nav - initial_nav) / initial_nav * 100
+            portfolio_return = (record["distribution_adjusted_value_usd"] - initial_nav) / initial_nav * 100
             logger.info("Step %d/%d (%.1f%%) | Portfolio: $%.1fM | Return: %+.2f%%",
-                       t, len(returns), 100 * t / len(returns), nav / 1e6, portfolio_return)
+                       t, len(returns), 100 * t / len(returns), record["distribution_adjusted_value_usd"] / 1e6, portfolio_return)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     nav_df = pd.DataFrame(nav_series)
@@ -256,19 +273,16 @@ def run(
     plot_nav(nav_df, output_dir / "nav.png")
     plot_weights(w_df, output_dir / "weights.png")
 
-    summary = compute_performance(
-        nav=nav_df["nav"].values,
-        step_returns=np.array(step_returns, dtype=float),
-        steps_per_year=steps_per_year,
-        rf_step=opt.rf_step,
-    )
+    summary = ledger.performance_metrics()
     
     summary["final_value_usd"] = float(nav)
     summary["initial_value_usd"] = float(initial_nav)
-    summary["final_portfolio_value"] = float(nav)
+    summary["distribution_adjusted_final_value_usd"] = float(nav_df["distribution_adjusted_nav"].iloc[-1])
+    summary["total_distributions_usd"] = float(nav_df["total_distributions"].iloc[-1])
+    summary["final_portfolio_value"] = float(nav_df["distribution_adjusted_nav"].iloc[-1])
     summary["initial_portfolio_value"] = float(initial_nav)
-    summary["method"] = f"Traditional Portfolio - {method}"
-    summary["status"] = "completed"
+    summary["traditional_sleeve_return_mean"] = float(np.nanmean(step_returns)) if step_returns else 0.0
+    add_common_summary_fields(summary, method=f"Traditional Portfolio - {method}")
     
     atomic_write_json(summary, output_dir / "summary_metrics.json")
     
@@ -279,6 +293,8 @@ def run(
         "max_drawdown": summary["max_drawdown"],
         "volatility": summary["volatility"],
         "final_value_usd": summary["final_value_usd"],
+        "distribution_adjusted_final_value_usd": summary["distribution_adjusted_final_value_usd"],
+        "total_distributions_usd": summary["total_distributions_usd"],
         "initial_value_usd": summary["initial_value_usd"],
         "final_portfolio_value": summary["final_portfolio_value"],
         "initial_portfolio_value": summary["initial_portfolio_value"],
@@ -332,4 +348,3 @@ if __name__ == "__main__":
         allow_short=args.allow_short,
         seed=args.seed,
     )
-
